@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="Platform macOS | Linux" />
   <img src="https://img.shields.io/badge/architecture-BYO--tmux%20%C2%B7%20Zellij%20%C2%B7%20Zero%20Headless-1E1D1B" alt="BYO-tmux · Zellij · Zero Headless" />
+  <img src="https://img.shields.io/badge/privacy-Zero%20Telemetry%20%C2%B7%20Local--First-237A4B" alt="Privacy: Zero Telemetry · Local-First" />
 </p>
 
 ---
@@ -41,6 +42,18 @@ Most coding-agent orchestrators wrap providers in one-shot headless `exec` / `-p
 - **Native `tmux` Backup & Reboot Restore**: Built-in `[tmux.backup]` periodically saves deduplicated `tmux` session/window/split-layout snapshots, can auto-restore missing sessions on daemon start (`auto_restore_on_start = true`), and optionally re-launches `claude --resume` / `codex resume` sessions (`starfane tmux backup | restore | backups`).
 - **Swarm, Subagents & Evidence-Gated Playbooks**: Automatically folds native subagents and Swarm workers under parent sessions, surfaces live context-window utilization and generation throughput (`tok/s`), and provides **Feature Pipeline** (`Plan → Implement → Test & Review → Report`) and **Two-Speed Debug** (`Triage → Deep RCA`) with deterministic G1/G2/G3 verification.
 - **Network-Agnostic `AccessGate`**: Precompiled IPv4/IPv6 `allowed_cidrs`, exact & `*.suffix` wildcard `allowed_hosts` (reverse-proxy friendly), named `presets` (`easytier`, `tailscale`), and `[[web.scoped_tokens]]` (`read_only` viewer or peer federation tokens) while strictly rejecting untrusted LAN and public traffic with `403 Forbidden`.
+
+---
+
+## Privacy & Zero-Telemetry Guarantee
+
+`starfane` is **100% local-first** and will **never collect, transmit, fingerprint, or monetize any user data**:
+
+- **Zero Telemetry — Not Even Opt-Out**: `starfane` contains no analytics SDKs (no PostHog, Sentry, Axiom, or external OTLP sinks), no crash reporters, no update-check phone-home requests, and no external web CDNs or third-party fonts. The embedded Web console enforces a strict `Content-Security-Policy` (`default-src 'self'; connect-src 'self'`).
+- **Your Prompts, Code, & Credentials Stay Local**: `starfane` never uploads your prompts, transcripts, source code, file paths, usage counts, or hashes of your local `claude` / `codex` / `agy` authentication tokens. It never runs or requires a hosted cloud relay.
+- **Zero Default Outbound Network Traffic**: Out of the box (`[[nodes]] = []`, `[[notifiers]] = []`, `[feishu] enabled = false`), `starfaned` makes **zero outbound network connections**—everything stays on your local Unix socket (`starfaned.sock`), loopback interface, and local state files (`~/.local/state/starfane/`).
+- **Explicit, Auditable Network Boundaries**: Outbound traffic occurs *only* to destinations you explicitly configure in `~/.config/starfane/config.toml`—your own remote SSH/federated hosts (`crates/starfane-daemon/src/nodes.rs`) or your own notification endpoints (`crates/starfane-daemon/src/notify.rs`, `lark.rs`). Multi-host **Split Ownership** (`node_local` by default) ensures work-machine notification credentials never leave that machine.
+- **Don't Trust—Verify**: `starfane` is a compact, zero-`node_modules` Rust workspace that works fully offline / air-gapped. You can audit every outbound call in minutes—and we commit never to introduce default-on or silent telemetry in future releases.
 
 ---
 

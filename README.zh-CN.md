@@ -17,6 +17,7 @@
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="Platform macOS | Linux" />
   <img src="https://img.shields.io/badge/architecture-BYO--tmux%20%C2%B7%20Zellij%20%C2%B7%20Zero%20Headless-1E1D1B" alt="BYO-tmux · Zellij · Zero Headless" />
+  <img src="https://img.shields.io/badge/privacy-Zero%20Telemetry%20%C2%B7%20Local--First-237A4B" alt="Privacy: Zero Telemetry · Local-First" />
 </p>
 
 ---
@@ -39,6 +40,18 @@
 - **原生 `tmux` 定期快照与重启自动恢复**：内置 `[tmux.backup]` 支持定期保存去重后的 `tmux` 会话、窗口与分屏布局，支持守护进程启动时在空 `tmux` 环境下自动重建现场（`auto_restore_on_start = true`）并按需恢复 `claude --resume` / `codex resume` 会话（`starfane tmux backup | restore | backups`）。
 - **Swarm 子会话可观测与防误报证据门禁**：自动折叠父子会话与 Swarm Worker，实时展示上下文占比与生成速度（`tok/s`）；内置 **新功能协作（Feature Pipeline）** 与 **两速查错（Two-Speed Debug）**，支持自然语言阶段模型绑定与确定性 G1/G2/G3 证据核验。
 - **组网无关通用访问门禁（`AccessGate`）**：启动期预编译 IPv4/IPv6 `allowed_cidrs`、精确与 `*.suffix` 通配 `allowed_hosts`（适配反向代理 80/443/自定义端口）、具名 `presets`（`easytier` / `tailscale`）以及 `[[web.scoped_tokens]]`（支持 `read_only` 只读观察令牌或联邦令牌），在网关层严格拦截未授权局域网与公网访问（`403`）。
+
+---
+
+## 隐私与零遥测承诺
+
+`starfane` 坚持 **100% 本地优先（Local-First）**，郑重承诺**绝不收集、上传、追踪或利用任何用户数据**：
+
+- **彻底零遥测（不是默认开启再让你关）**：代码中不含任何埋点、统计分析或错误上报 SDK（无 PostHog / Sentry / Axiom / 第三方遥测端点），无联网检查更新，Web 前端零外部 CDN 与外链字体，且响应头强制开启严格 CSP（`default-src 'self'; connect-src 'self'`）。
+- **代码、对话与凭证绝不出本机**：`starfane` 不会上传你的 Prompt、转录对话、代码内容、本地目录路径、用量统计，更不会读取或哈希你的 `claude` / `codex` / `agy` 登录凭证来生成跨设备追踪 ID；不依赖、也不提供任何云端中继服务器。
+- **默认零外联请求**：默认配置下（未配置 `[[nodes]]` 与通知渠道时），`starfaned` **不会发起任何一条外部网络连接**，所有状态与数据均仅保存在本机 Unix Socket（`starfaned.sock`）与 `~/.local/state/starfane/` 目录内。
+- **所有出网行为均显式配置、清晰可审计**：只有当你在 `~/.config/starfane/config.toml` 中主动填写目标地址时，程序才会连接你自己指定的远端主机（`crates/starfane-daemon/src/nodes.rs`）或你自己配置的通知通道（`crates/starfane-daemon/src/notify.rs`、`lark.rs`）；多机协同默认采用凭证本地隔离（Split Ownership），工作机密钥绝不跨机同步。
+- **不必轻信口号，随时可验证**：整个项目为轻量单二进制 Rust 工程 + 零 `node_modules` 前端，完全支持断网 / 离线环境运行；你可以直接审查上述出网代码，我们也承诺未来版本绝不静默引入任何形式的遥测或数据收集。
 
 ---
 
