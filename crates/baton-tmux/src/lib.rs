@@ -52,6 +52,16 @@ pub struct Tmux {
     pub socket_name: Option<String>,
 }
 
+/// Outcome of focusing a tmux pane across single-client, multi-client, or detached servers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FocusOutcome {
+    pub pane_id: PaneId,
+    pub session_name: String,
+    pub tmux_target: String,
+    pub switched_client: Option<String>,
+    pub already_in_session: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnWindow {
     /// `None` → use (or create) the detached session [`DEFAULT_DETACHED_SESSION`].
@@ -385,11 +395,77 @@ impl Tmux {
             })
     }
 
-    /// `switch-client -t <pane>` on the most recently active client.
-    pub fn switch_to(&self, pane: &PaneId) -> Result<(), TmuxError> {
+    /// Pick the best client to receive focus for `target_session`:
+    /// prefers clients already attached to `target_session` (by focused flag, then latest
+    /// activity) so sibling multi-client terminals are not hijacked, then falls back to the
+    /// most recently active/focused attached client overall.
+    pub fn pick_focus_client<'a>(
+        clients: &'a [ClientInfo],
+        target_session: &str,
+    ) -> Option<&'a ClientInfo> {
+        let rank = |c: &ClientInfo| {
+            let focused = c.flags.split(',').any(|f| f.trim() == "focused");
+            (focused, c.activity_s)
+        };
+        clients
+            .iter()
+            .filter(|c| c.session_name == target_session)
+            .max_by_key(|c| rank(c))
+            .or_else(|| clients.iter().max_by_key(|c| rank(c)))
+    }
+
+    /// Select `pane`'s window and pane, and switch an appropriate attached client without
+    /// hijacking other sessions' terminals. Succeeds cleanly even when all sessions are detached.
+    pub fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError> {
         valid_pane(pane)?;
-        self.run(&["switch-client", "-t", pane.as_str()], None)
-            .map(|_| ())
+        let panes = self.list_panes()?;
+        let info = panes
+            .into_iter()
+            .find(|p| &p.pane_id == pane)
+            .ok_or_else(|| TmuxError::Command {
+                args: format!("focus {pane}"),
+                code: Some(1),
+                stderr: format!("pane {pane} not found"),
+            })?;
+        self.run(&["select-window", "-t", pane.as_str()], None)?;
+        self.run(&["select-pane", "-t", pane.as_str()], None)?;
+        let tmux_target = format!(
+            "{}:{}.{}",
+            info.session_name, info.window_index, info.pane_index
+        );
+        let clients = self.list_clients()?;
+        let (switched_client, already_in_session) =
+            match Self::pick_focus_client(&clients, &info.session_name) {
+                Some(client) if client.session_name == info.session_name => {
+                    (Some(client.tty.clone()), true)
+                }
+                Some(client) => {
+                    self.run(
+                        &[
+                            "switch-client",
+                            "-c",
+                            client.tty.as_str(),
+                            "-t",
+                            pane.as_str(),
+                        ],
+                        None,
+                    )?;
+                    (Some(client.tty.clone()), false)
+                }
+                None => (None, false),
+            };
+        Ok(FocusOutcome {
+            pane_id: pane.clone(),
+            session_name: info.session_name,
+            tmux_target,
+            switched_client,
+            already_in_session,
+        })
+    }
+
+    /// Focus `pane` on the best matching client (`focus_pane` wrapper).
+    pub fn switch_to(&self, pane: &PaneId) -> Result<(), TmuxError> {
+        self.focus_pane(pane).map(|_| ())
     }
 
     /// Stop the tmux server on this socket. Intended for sandbox sockets in tests; a server
@@ -415,5 +491,49 @@ fn state_name(st: SessionState) -> &'static str {
         SessionState::NeedsInput => "needs_input",
         SessionState::Error => "error",
         SessionState::Ended => "ended",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_client(tty: &str, session: &str, activity_s: u64, flags: &str) -> ClientInfo {
+        ClientInfo {
+            tty: tty.into(),
+            session_name: session.into(),
+            activity_s,
+            flags: flags.into(),
+        }
+    }
+
+    #[test]
+    fn pick_focus_client_preserves_multi_client_sessions() {
+        let clients = vec![
+            mk_client("/dev/ttys001", "prome", 9_999, "attached,focused,UTF-8"),
+            mk_client("/dev/ttys043", "learning", 5_000, "attached,UTF-8"),
+            mk_client("/dev/ttys044", "learning", 6_000, "attached,focused,UTF-8"),
+        ];
+
+        // Prefers same-session client (and focused/newer within it) over busier other session.
+        let hit = Tmux::pick_focus_client(&clients, "learning").unwrap();
+        assert_eq!(hit.tty, "/dev/ttys044");
+
+        // When target session is detached, falls back to focused/most active attached client.
+        let fallback = Tmux::pick_focus_client(&clients, "spot").unwrap();
+        assert_eq!(fallback.tty, "/dev/ttys001");
+
+        // Without focused flag, picks highest activity_s.
+        let unfocused = vec![
+            mk_client("/dev/ttys001", "a", 100, "attached"),
+            mk_client("/dev/ttys002", "b", 250, "attached"),
+        ];
+        assert_eq!(
+            Tmux::pick_focus_client(&unfocused, "spot").unwrap().tty,
+            "/dev/ttys002"
+        );
+
+        // No attached clients -> None.
+        assert!(Tmux::pick_focus_client(&[], "spot").is_none());
     }
 }

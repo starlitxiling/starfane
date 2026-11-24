@@ -1495,7 +1495,11 @@ return turns;
 const mdProse = renderMarkdown;
 const focusBtn = (id, cls = 'ghost sm') => btn('切到 tmux', {
 cls, title: '切换 tmux 焦点到该 pane', busyKey: `focus:${id}`,
-onclick: () => act(`focus:${id}`, () => api('POST', `/api/sessions/${enc(id)}/focus`, {}), '已切换 tmux 焦点'),
+onclick: () => act(`focus:${id}`, () => api('POST', `/api/sessions/${enc(id)}/focus`, {}), (r) => {
+if (r?.switched_client) return `已切到 tmux ${r.tmux_target || ''}`.trim();
+if (r?.attach_command) return `已选中 ${r.tmux_target || ''}（无已 attach 客户端，可运行 ${r.attach_command}）`;
+return '已切换 tmux 焦点';
+}),
 });
 let TOP = null;
 function applyMuteRemote(payload, label, fallbackUntil) {

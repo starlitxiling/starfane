@@ -503,7 +503,7 @@ impl Core {
         }
     }
 
-    /// Switch the most recent tmux client to the session's pane.
+    /// Focus the pane's tmux window/pane and switch the appropriate client without hijacking other sessions.
     pub async fn focus_session(&self, id: &SessionId) -> Result<serde_json::Value, ApiError> {
         let pane = lock(&self.inner.state)
             .sessions
@@ -511,11 +511,21 @@ impl Core {
             .and_then(|s| s.pane.clone())
             .ok_or_else(|| ApiError::not_found(format!("session {id} has no known pane")))?;
         let core = self.clone();
-        tokio::task::spawn_blocking(move || core.inner.tmux.switch_to(&pane))
+        let outcome = tokio::task::spawn_blocking(move || core.inner.tmux.focus_pane(&pane))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
             .map_err(|e| ApiError::new(ErrorCode::Unavailable, e.to_string()))?;
-        Ok(serde_json::json!({}))
+        let mut payload = serde_json::to_value(&outcome)
+            .map_err(|e| ApiError::internal(format!("serialize focus outcome: {e}")))?;
+        if outcome.switched_client.is_none() {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "attach_command".into(),
+                    serde_json::Value::String(format!("tmux attach -t {}", outcome.session_name)),
+                );
+            }
+        }
+        Ok(payload)
     }
 
     /// State snapshot as JSON (always includes `feishu_muted_until_ms` for the Web UI).
