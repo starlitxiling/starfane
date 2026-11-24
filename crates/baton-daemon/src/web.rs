@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, mpsc};
 const INDEX_HTML: &[u8] = include_bytes!("../../../web/index.html");
 const APP_JS: &[u8] = include_bytes!("../../../web/app.js");
 const APP_CSS: &[u8] = include_bytes!("../../../web/app.css");
+const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
 const COOKIE: &str = "baton_token";
 
 pub async fn serve(core: Core) -> Result<(), String> {
@@ -395,12 +396,16 @@ fn load_asset(core: &Core, name: &str) -> Option<(Vec<u8>, &'static str)> {
         if name.contains("..") || name.contains('/') || name.contains('\\') {
             return None;
         }
-        return std::fs::read(dir.join(name)).ok().map(|b| (b, ctype));
+        return std::fs::read(dir.join(name))
+            .ok()
+            .or_else(|| (name == "logo.svg").then(|| LOGO_SVG.to_vec()))
+            .map(|b| (b, ctype));
     }
     let bytes = match name {
         "index.html" => INDEX_HTML,
         "app.js" => APP_JS,
         "app.css" => APP_CSS,
+        "logo.svg" => LOGO_SVG,
         _ => return None,
     };
     Some((bytes.to_vec(), ctype))
@@ -1261,6 +1266,7 @@ mod tests {
         assert!(INDEX_HTML.starts_with(b"<!doctype html>"));
         assert!(!APP_JS.is_empty());
         assert!(!APP_CSS.is_empty());
+        assert!(LOGO_SVG.starts_with(b"<svg"));
     }
 
     #[test]

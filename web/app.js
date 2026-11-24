@@ -1594,7 +1594,7 @@ onclick: () => { UI.muteMenu = !UI.muteMenu; rerender(); },
 const mutePopSlot = h('div');
 const muteWrap = h('div', { class: 'mute-wrap' }, muteBtn, mutePopSlot);
 bar.replaceChildren(
-h('a', { class: 'brand', href: '#/workspace' }, h('span', { class: 'logo' }), h('span', null, 'baton')),
+h('a', { class: 'brand', href: '#/workspace' }, h('img', { class: 'logo', src: '/assets/logo.svg', alt: '', width: 26, height: 26 }), h('span', null, 'baton')),
 nav,
 h('div', { class: 'top-tools' }, connPill, muteWrap));
 TOP = { bar, nav, connPill, muteBtn, mutePopSlot, popKey: '' };
