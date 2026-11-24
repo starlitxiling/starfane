@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/baton-proto",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal workspace crates
+baton-proto = { path = "crates/baton-proto" }
+
+# Minimal external dependencies (default-features = false everywhere)
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+log = { version = "0.4", default-features = false }
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+opt-level = 1
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+incremental = false
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
