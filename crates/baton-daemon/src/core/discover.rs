@@ -487,6 +487,21 @@ pub(crate) fn apply_legacy_tail_hash(
     }
 }
 
+/// Compute the next sequential `<agent>-<N>` window name inside a tmux session.
+pub(crate) fn next_sequential_window_name(
+    existing_window_names: &[String],
+    agent: AgentKind,
+) -> String {
+    let prefix = format!("{}-", agent.as_str());
+    let max_num = existing_window_names
+        .iter()
+        .filter_map(|name| name.trim().strip_prefix(&prefix))
+        .filter_map(|rest| rest.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("{prefix}{}", max_num + 1)
+}
+
 /// Default relative directory under `$HOME` used for direct interactive sessions
 /// when the caller leaves `project_root` empty.
 pub const DEFAULT_AGENT_SESSION_DIR: &str = ".agent_session";
@@ -1373,11 +1388,22 @@ impl Core {
         std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
     }
 
+    /// List live tmux session names (sorted, empty when tmux server is not running).
+    pub async fn list_tmux_sessions(&self) -> Result<Vec<String>, ApiError> {
+        let core = self.clone();
+        tokio::task::spawn_blocking(move || core.inner.tmux.list_sessions())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .map_err(|e| ApiError::new(ErrorCode::Unavailable, format!("tmux list-sessions: {e}")))
+    }
+
     /// Spawn a standalone interactive session directly in tmux (L4, no pipeline required).
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_direct_session(
         &self,
         agent: AgentKind,
         project_root: Option<String>,
+        tmux_session: Option<String>,
         model: Option<String>,
         effort: Option<Effort>,
         prompt: Option<String>,
@@ -1385,6 +1411,54 @@ impl Core {
     ) -> Result<serde_json::Value, ApiError> {
         let home_env = std::env::var_os("HOME").map(PathBuf::from);
         let cwd = self.resolve_spawn_cwd_in(home_env.as_deref(), project_root.as_deref())?;
+
+        let target_session = match tmux_session
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => {
+                if s.contains([':', '.']) || s.chars().any(char::is_control) {
+                    return Err(ApiError::bad_request(format!(
+                        "invalid tmux session name {s:?}"
+                    )));
+                }
+                s.to_string()
+            }
+            None => baton_tmux::DEFAULT_DETACHED_SESSION.to_string(),
+        };
+
+        let explicit_name = name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let win_label = match explicit_name {
+            Some(w) => {
+                if w.chars().any(char::is_control) {
+                    return Err(ApiError::bad_request("window name contains control chars"));
+                }
+                w
+            }
+            None => {
+                let core_list = self.clone();
+                let sess_for_scan = target_session.clone();
+                let existing = tokio::task::spawn_blocking(move || {
+                    core_list
+                        .inner
+                        .tmux
+                        .list_panes()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|p| p.session_name == sess_for_scan)
+                        .map(|p| p.window_name)
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .unwrap_or_default();
+                next_sequential_window_name(&existing, agent)
+            }
+        };
 
         let bin = PathBuf::from(self.inner.cfg.agent_bin(agent));
         let mut extra = crate::config::TeamConfig::load(Path::new(&cwd))
@@ -1397,21 +1471,6 @@ impl Core {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| util::sanitize_line(s, self.inner.cfg.gate.max_pointer_len.max(1000)));
-
-        let win_label = name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                let slug = util::project_name(&cwd);
-                let clean = slug.trim_start_matches('.');
-                format!(
-                    "{}-{}",
-                    agent.as_str(),
-                    if clean.is_empty() { "session" } else { clean }
-                )
-            });
 
         let argv = if let Some(p) = prompt_clean {
             baton_adapters::build_l4_spawn_cmd(&baton_adapters::SpawnRequest {
@@ -1439,16 +1498,12 @@ impl Core {
 
         let core = self.clone();
         let cwd_clone = cwd.clone();
-        let win_name = format!("baton:{win_label}");
+        let sess_clone = target_session.clone();
+        let win_name = win_label.clone();
         let (pane, tmux_target, tmux_label) = tokio::task::spawn_blocking(move || {
-            let target_session = core.inner.tmux.list_panes().ok().and_then(|panes| {
-                panes
-                    .into_iter()
-                    .find(|p| util::path_starts_with(&p.current_path, &cwd_clone))
-                    .map(|p| p.session_name)
-            });
             let pane = core.inner.tmux.spawn_window(&baton_tmux::SpawnWindow {
-                target_session,
+                target_session: Some(sess_clone),
+                create_session: true,
                 window_name: win_name,
                 cwd: PathBuf::from(&cwd_clone),
                 env: Vec::new(),
@@ -2122,5 +2177,31 @@ mod tests {
         assert_eq!(hash_tail(a), hash_tail(b));
         let c = "codex output changed\n› Ask Codex to do anything";
         assert_ne!(hash_tail(a), hash_tail(c));
+    }
+
+    #[test]
+    fn sequential_window_naming_increments_per_agent() {
+        assert_eq!(
+            next_sequential_window_name(&[], AgentKind::Claude),
+            "claude-1"
+        );
+        let existing = vec![
+            "claude-1".into(),
+            "claude-3".into(),
+            "agy-1".into(),
+            "claude-custom".into(),
+        ];
+        assert_eq!(
+            next_sequential_window_name(&existing, AgentKind::Claude),
+            "claude-4"
+        );
+        assert_eq!(
+            next_sequential_window_name(&existing, AgentKind::Agy),
+            "agy-2"
+        );
+        assert_eq!(
+            next_sequential_window_name(&existing, AgentKind::Codex),
+            "codex-1"
+        );
     }
 }

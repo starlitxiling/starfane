@@ -65,6 +65,7 @@ pub fn router(core: Core) -> Router {
         .route("/api/slash-commands", get(slash_commands))
         .route("/api/events", get(events))
         .route("/api/sessions", get(sessions))
+        .route("/api/tmux/sessions", get(tmux_sessions))
         .route("/api/sessions/spawn", post(spawn_session))
         .route("/api/sessions/{id}/focus", post(focus))
         .route("/api/sessions/{id}/ack", post(ack_session))
@@ -566,11 +567,21 @@ async fn pane_preview(
     respond(r)
 }
 
+async fn tmux_sessions(State(core): State<Core>) -> Response {
+    let r = core
+        .list_tmux_sessions()
+        .await
+        .map(|sessions| serde_json::json!({ "sessions": sessions }));
+    respond(r)
+}
+
 #[derive(Deserialize)]
 struct SpawnSessionBody {
     agent: AgentKind,
     #[serde(default)]
     project_root: Option<String>,
+    #[serde(default)]
+    tmux_session: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
@@ -591,8 +602,16 @@ async fn spawn_session(State(core): State<Core>, body: Bytes) -> Response {
             ),
             None => None,
         };
-        core.spawn_direct_session(b.agent, b.project_root, b.model, effort, b.prompt, b.name)
-            .await
+        core.spawn_direct_session(
+            b.agent,
+            b.project_root,
+            b.tmux_session,
+            b.model,
+            effort,
+            b.prompt,
+            b.name,
+        )
+        .await
     };
     respond(r.await)
 }

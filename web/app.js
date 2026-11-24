@@ -149,7 +149,7 @@ localStorage.setItem(GROUPS_INIT_KEY, '1');
 const S = {
 conn: 'connecting', healthFails: 0, version: '', uptimeMs: null, lastSeq: 0, lastLoad: 0,
 loaded: false, loadError: null, authEnabled: true, authNeeded: false, retry: 0, es: null, reconnectTimer: 0,
-sessions: new Map(), pipelines: new Map(), attention: [], models: null,
+sessions: new Map(), pipelines: new Map(), attention: [], models: null, tmuxSessions: [],
 slashCmds: new Map(), slashFetching: new Set(),
 reviews: new Map(), reviewsState: 'idle', reviewsErr: null,
 precision: null, precisionState: 'idle', precisionErr: null,
@@ -951,6 +951,12 @@ const data = await api('GET', '/api/models');
 if (data && typeof data === 'object') { S.models = data; schedule(); }
 } catch (e) { console.warn('GET /api/models fallback', e); }
 }
+async function loadTmuxSessions() {
+try {
+const data = await api('GET', '/api/tmux/sessions');
+if (Array.isArray(data?.sessions)) { S.tmuxSessions = data.sessions; schedule(); }
+} catch (e) { console.warn('GET /api/tmux/sessions failed', e); }
+}
 async function loadSlashCommands(agent) {
 const ag = AGENTS.includes(agent) ? agent : 'claude';
 if (S.slashCmds.has(ag) || S.slashFetching.has(ag)) return;
@@ -1000,6 +1006,7 @@ return found && Array.isArray(found.efforts) ? found.efforts : (mInfo.efforts ||
 }
 function openSpawnModal() {
 loadModels();
+loadTmuxSessions();
 const prefs = loadSpawnPrefs();
 const ag = prefs.last_agent || 'claude';
 UI.drafts.set('sp:agent', ag);
@@ -3458,6 +3465,12 @@ UI.drafts.set(effKey, curEff);
 const modelOpts = [...mInfo.models.map((m) => [m.id, m.label]), ['__custom__', '自定义模型…']];
 const effortOpts = fixedEffort ? [['', '固定配置']] : effs.map((e) => [e, EFFORT_LABEL[e] || e]);
 const dlId = 'sp-projects';
+const sessDlId = 'sp-sessions';
+const sessionCandidates = [...new Set([
+'agent-session',
+...(S.tmuxSessions || []),
+...[...S.sessions.values()].filter((s) => isTmuxSession(s)).map((s) => tmuxGroupOf(s)).filter((g) => g && g !== NON_TMUX_GROUP && g !== 'tmux'),
+])];
 const persistCurrent = (ag, mSel, eSel) => {
 const modelVal = mSel === '__custom__' ? draft('sp:modelCustom').trim() : String(mSel || '').trim();
 saveSpawnPrefs(ag, { model: modelVal || undefined, effort: eSel || '' });
@@ -3470,9 +3483,11 @@ const model = picked === '__custom__' ? draft('sp:modelCustom').trim() : String(
 const availEffs = effortsForModel(info, picked);
 const pickedEff = availEffs.length ? (UI.drafts.get(`sp:effort:${ag}`) || info.default_effort || availEffs[0]) : '';
 const proj = draft('sp:dir', curDir).trim();
+const tmuxSess = draft('sp:session').trim();
 const payload = {
 agent: ag,
 project_root: proj || undefined,
+tmux_session: tmuxSess || undefined,
 model: model || undefined,
 effort: pickedEff || undefined,
 name: draft('sp:name').trim() || undefined,
@@ -3480,7 +3495,7 @@ prompt: draft('sp:prompt').trim() || undefined,
 };
 const r = await api('POST', '/api/sessions/spawn', payload);
 saveSpawnPrefs(ag, { model: model || undefined, effort: pickedEff || '' });
-['sp:dir', 'sp:name', 'sp:prompt'].forEach((k) => UI.drafts.delete(k));
+['sp:dir', 'sp:session', 'sp:name', 'sp:prompt'].forEach((k) => UI.drafts.delete(k));
 UI.modal = null;
 await loadAll();
 if (r?.session_id) openSession(r.session_id);
@@ -3508,6 +3523,7 @@ if (customModelInp) customModelInp.addEventListener('input', () => persistCurren
 return h('div', { class: 'stack' },
 h('div', { class: 'modal-head' }, h('h3', null, '新建交互会话'), btn('关闭', { cls: 'ghost sm', onclick: closeModal })),
 h('datalist', { id: dlId }, projects.map((p) => h('option', { value: p }))),
+h('datalist', { id: sessDlId }, sessionCandidates.map((s) => h('option', { value: s }))),
 h('div', null,
 h('label', { class: 'lbl' }, '选择 Agent'),
 h('div', { class: 'chips' }, AGENTS.map((a) => h('button', {
@@ -3529,11 +3545,14 @@ customModelInp),
 h('div', { class: 'stack-xs' },
 h('label', { class: 'lbl', style: 'margin:0' }, '思考强度'),
 effortSelect)),
-h('div', { class: 'opt-grid' },
-h('div', null, h('label', { class: 'lbl' }, '工作目录（默认 ~/.agent_session）'),
+h('div', null,
+h('label', { class: 'lbl' }, '工作目录（默认 ~/.agent_session）'),
 field('sp:dir', { class: 'inp mono', list: dlId, placeholder: '留空默认 ~/.agent_session', autocomplete: 'off' }, curDir)),
-h('div', null, h('label', { class: 'lbl' }, 'tmux 窗口名（选填）'),
-field('sp:name', { class: 'inp', placeholder: '默认自动命名', autocomplete: 'off' }))),
+h('div', { class: 'opt-grid' },
+h('div', null, h('label', { class: 'lbl' }, 'tmux 会话（Session，选填）'),
+field('sp:session', { class: 'inp mono', list: sessDlId, placeholder: '留空默认 agent-session（无则自动创建）', autocomplete: 'off' })),
+h('div', null, h('label', { class: 'lbl' }, 'tmux 窗口名（Window，选填）'),
+field('sp:name', { class: 'inp mono', placeholder: `留空顺延命名（如 ${agent}-1）`, autocomplete: 'off' }))),
 h('div', null, h('label', { class: 'lbl' }, '首条消息（选填）'),
 field('sp:prompt', { tag: 'textarea', rows: 2, class: 'inp', placeholder: '留空则仅打开干净的交互式会话…' })),
 h('div', { class: 'row', style: 'justify-content:flex-end' },

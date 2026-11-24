@@ -764,6 +764,7 @@ fn invalid_requests_are_rejected_before_spawning() {
     ));
     let mk = |argv: Vec<&str>, env: Vec<(&str, &str)>, session: Option<&str>| SpawnWindow {
         target_session: session.map(String::from),
+        create_session: false,
         window_name: "w".into(),
         cwd: PathBuf::from("/tmp"),
         env: env.into_iter().map(|(a, b)| (a.into(), b.into())).collect(),
@@ -858,6 +859,7 @@ fn spawn_sh(sb: &Sandbox, name: &str, script: &str, bind: &str) -> PaneId {
     sb.tmux
         .spawn_window(&SpawnWindow {
             target_session: None,
+            create_session: true,
             window_name: name.into(),
             cwd: sb.dir.clone(),
             env: vec![("BATON_BIND".into(), bind.into())],
@@ -886,14 +888,16 @@ fn sandbox_spawn_list_inject_status() {
     let pane_a = spawn_sh(&sb, "agent-a", &script_a, "B-TESTTOKEN");
     wait_exists(&ready, "pane A ready");
 
-    // BATON_BIND reached the child; default detached session "baton" was created.
+    // BATON_BIND reached the child; default detached session "agent-session" was created directly on window 0.
     assert_eq!(wait_for(&bind_out, "BATON_BIND"), b"B-TESTTOKEN");
     let panes = sb.tmux.list_panes().expect("list_panes");
     let a = panes
         .iter()
         .find(|p| p.pane_id == pane_a)
         .expect("pane A listed");
-    assert_eq!(a.session_name, "baton");
+    assert_eq!(a.session_name, baton_tmux::DEFAULT_DETACHED_SESSION);
+    assert_eq!(a.window_name, "agent-a");
+    assert_eq!(panes.len(), 1, "no stray shell window created: {panes:?}");
     assert!(!a.dead && !a.in_mode && !a.synchronized);
     assert!(a.pane_pid > 1);
     assert_eq!(
@@ -1051,9 +1055,10 @@ fn sandbox_spawn_list_inject_status() {
     );
     assert_eq!(r.failed_checks(), vec![GateCheck::PaneAlive]);
 
-    // Explicit, non-existent target session is an error (not silently created).
+    // Explicit, non-existent target session with create_session=false is an error.
     let err = sb.tmux.spawn_window(&SpawnWindow {
         target_session: Some("nope".into()),
+        create_session: false,
         window_name: "x".into(),
         cwd: sb.dir.clone(),
         env: vec![],
@@ -1061,11 +1066,48 @@ fn sandbox_spawn_list_inject_status() {
     });
     assert!(matches!(err, Err(TmuxError::Command { .. })), "{err:?}");
 
+    // Explicit non-existent target session with create_session=true auto-creates the session cleanly.
+    let p_custom = sb
+        .tmux
+        .spawn_window(&SpawnWindow {
+            target_session: Some("custom-auto".into()),
+            create_session: true,
+            window_name: "win-0".into(),
+            cwd: sb.dir.clone(),
+            env: vec![],
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        })
+        .unwrap();
+    let custom_panes: Vec<_> = sb
+        .tmux
+        .list_panes()
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.session_name == "custom-auto")
+        .collect();
+    assert_eq!(custom_panes.len(), 1);
+    assert_eq!(custom_panes[0].pane_id, p_custom);
+    assert_eq!(custom_panes[0].window_name, "win-0");
+    assert_eq!(
+        sb.tmux.list_sessions().unwrap(),
+        vec![
+            baton_tmux::DEFAULT_DETACHED_SESSION.to_string(),
+            "custom-auto".to_string()
+        ]
+    );
+
+    // Focusing a detached pane selects its window/pane without requiring an attached client.
+    let focus_res = sb.tmux.focus_pane(&p_custom).unwrap();
+    assert_eq!(focus_res.pane_id, p_custom);
+    assert_eq!(focus_res.session_name, "custom-auto");
+    assert!(focus_res.switched_client.is_none());
+
     // Explicit existing session works.
     let p2 = sb
         .tmux
         .spawn_window(&SpawnWindow {
-            target_session: Some("baton".into()),
+            target_session: Some(baton_tmux::DEFAULT_DETACHED_SESSION.into()),
+            create_session: false,
             window_name: "again".into(),
             cwd: sb.dir.clone(),
             env: vec![],

@@ -796,6 +796,7 @@ impl Core {
             });
             core.inner.tmux.spawn_window(&baton_tmux::SpawnWindow {
                 target_session,
+                create_session: true,
                 window_name: window.name,
                 cwd: PathBuf::from(window.cwd),
                 env: vec![(paths::ENV_BIND.to_string(), window.token.0.clone())],

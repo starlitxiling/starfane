@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const DEFAULT_DETACHED_SESSION: &str = "baton";
+pub const DEFAULT_DETACHED_SESSION: &str = "agent-session";
 
 /// Pane user options written by [`Tmux::set_status`].
 pub const OPT_STATE: &str = "@baton_state";
@@ -64,8 +64,10 @@ pub struct FocusOutcome {
 
 #[derive(Debug, Clone)]
 pub struct SpawnWindow {
-    /// `None` → use (or create) the detached session [`DEFAULT_DETACHED_SESSION`].
+    /// `None` → use (or create) [`DEFAULT_DETACHED_SESSION`] (`"agent-session"`).
     pub target_session: Option<String>,
+    /// Create `target_session` automatically if it does not already exist (always `true` when `target_session` is `None`).
+    pub create_session: bool,
     pub window_name: String,
     pub cwd: PathBuf,
     /// e.g. `("BATON_BIND", "B-…")`.
@@ -167,6 +169,20 @@ impl Tmux {
         }
     }
 
+    /// Names of all sessions on the server. A missing tmux server yields an empty list.
+    pub fn list_sessions(&self) -> Result<Vec<String>, TmuxError> {
+        match self.run(&["list-sessions", "-F", "#{session_name}"], None) {
+            Ok(out) => Ok(out
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()),
+            Err(e) if e.is_no_server() => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Text of screen line `cursor_y` of the pane (trailing blanks are trimmed by tmux).
     pub fn cursor_line(&self, pane: &PaneId, cursor_y: u32) -> Result<String, TmuxError> {
         valid_pane(pane)?;
@@ -263,30 +279,74 @@ impl Tmux {
         }
         let cwd = req.cwd.to_string_lossy().into_owned();
         let target = format!("={session}:");
-        self.ensure_session(&session, &cwd, req.target_session.is_none())?;
-
-        let mut args = vec![
-            s("new-window"),
-            s("-d"),
-            s("-P"),
-            s("-F"),
-            s("#{pane_id}"),
-            s("-n"),
-            req.window_name.clone(),
-            s("-c"),
-            cwd,
-        ];
-        for (k, v) in &req.env {
-            args.push(s("-e"));
-            args.push(format!("{k}={v}"));
+        let may_create = req.create_session || req.target_session.is_none();
+        let has = self.output(&[s("has-session"), s("-t"), format!("={session}")], None)?;
+        if !has.success && !may_create {
+            return Err(TmuxError::Command {
+                args: format!("has-session -t ={session}"),
+                code: has.code,
+                stderr: has.stderr,
+            });
         }
-        args.push(s("-t"));
-        args.push(target);
-        args.push(s("--"));
-        args.extend(req.argv.iter().cloned());
-        let out = self.run_owned(&args, None)?;
+
+        let new_window_args = || {
+            let mut args = vec![
+                s("new-window"),
+                s("-d"),
+                s("-P"),
+                s("-F"),
+                s("#{pane_id}"),
+                s("-n"),
+                req.window_name.clone(),
+                s("-c"),
+                cwd.clone(),
+            ];
+            for (k, v) in &req.env {
+                args.push(s("-e"));
+                args.push(format!("{k}={v}"));
+            }
+            args.push(s("-t"));
+            args.push(target.clone());
+            args.push(s("--"));
+            args.extend(req.argv.iter().cloned());
+            args
+        };
+
+        let out = if has.success {
+            self.run_owned(&new_window_args(), None)?
+        } else {
+            let mut new_sess_args = vec![
+                s("new-session"),
+                s("-d"),
+                s("-P"),
+                s("-F"),
+                s("#{pane_id}"),
+                s("-s"),
+                session.clone(),
+                s("-n"),
+                req.window_name.clone(),
+                s("-c"),
+                cwd.clone(),
+            ];
+            for (k, v) in &req.env {
+                new_sess_args.push(s("-e"));
+                new_sess_args.push(format!("{k}={v}"));
+            }
+            new_sess_args.push(s("--"));
+            new_sess_args.extend(req.argv.iter().cloned());
+            match self.run_owned(&new_sess_args, None) {
+                Ok(out) => out,
+                // Lost a creation race with another spawner: append window to the existing session.
+                Err(TmuxError::Command { ref stderr, .. })
+                    if stderr.contains("duplicate session") =>
+                {
+                    self.run_owned(&new_window_args(), None)?
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let pane = PaneId::new(out.trim());
-        valid_pane(&pane).map_err(|_| TmuxError::Parse(format!("new-window printed {out:?}")))?;
+        valid_pane(&pane).map_err(|_| TmuxError::Parse(format!("tmux spawn printed {out:?}")))?;
 
         // Keep a crashed agent's pane (and its error output) around for diagnosis.
         if let Err(e) = self.run(
@@ -316,31 +376,6 @@ impl Tmux {
             eprintln!("baton-tmux: remain-on-exit failed not applied to {pane}: {e}");
         }
         Ok(pane)
-    }
-
-    /// Make sure `session` exists. An explicit target session that is missing is an error
-    /// unless it is the default detached one, which is created on demand.
-    fn ensure_session(&self, session: &str, cwd: &str, may_create: bool) -> Result<(), TmuxError> {
-        let exact = format!("={session}");
-        let has = self.output(&[s("has-session"), s("-t"), exact], None)?;
-        if has.success {
-            return Ok(());
-        }
-        if !may_create {
-            return Err(TmuxError::Command {
-                args: format!("has-session -t ={session}"),
-                code: has.code,
-                stderr: has.stderr,
-            });
-        }
-        match self.run(&["new-session", "-d", "-s", session, "-c", cwd], None) {
-            Ok(_) => Ok(()),
-            // Lost a creation race with another spawner: the session exists now.
-            Err(TmuxError::Command { stderr, .. }) if stderr.contains("duplicate session") => {
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
     }
 
     /// Publish agent state on the pane as user options (`@baton_state`, `@baton_role`,
