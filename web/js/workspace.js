@@ -150,11 +150,18 @@ export function collectUserPrompts(s) {
   const out = [];
   let uIdx = 0;
   for (const m of msgs) {
-    if (m.role === 'user') {
-      uIdx++;
-      const preview = String(m.text || '').replace(/\s+/g, ' ').trim();
-      out.push({ idx: uIdx, text: preview || '（空消息）', ts_ms: m.ts_ms || null });
+    if (m.role !== 'user') continue;
+    const preview = String(m.text || '').replace(/\s+/g, ' ').trim();
+    if (
+      preview.startsWith('[后台任务')
+      || preview.startsWith('[Swarm 通知]')
+      || /^\[来自 [^\]]+ 消息\]/.test(preview)
+      || preview.startsWith('Task id "')
+    ) {
+      continue;
     }
+    uIdx++;
+    out.push({ idx: uIdx, text: preview || '（空消息）', ts_ms: m.ts_ms || null });
   }
   return out;
 }
@@ -309,7 +316,42 @@ function buildHistoryBar(s, tr) {
       })));
 }
 
+function parseSystemCardText(rawText) {
+  const txt = String(rawText || '').trim();
+  const nl = txt.indexOf('\n');
+  const firstLine = (nl >= 0 ? txt.slice(0, nl) : txt).trim();
+  const rest = (nl >= 0 ? txt.slice(nl + 1) : '').trim();
+  let tag = '系统消息';
+  let body = txt;
+  if (firstLine.startsWith('[后台任务') && firstLine.endsWith(']')) {
+    tag = firstLine.slice(1, -1);
+    body = rest || txt;
+  } else if (firstLine === '[Swarm 通知]') {
+    tag = 'Swarm 通知';
+    body = rest || txt;
+  } else {
+    const m = /^\[来自 ([^\]]+) 消息\]$/.exec(firstLine);
+    if (m) {
+      tag = `Agent · ${m[1]}`;
+      body = rest || txt;
+    }
+  }
+  const preview = body.replace(/\s+/g, ' ').trim();
+  return { tag, preview, body };
+}
+
 function renderMessageCard(s, msg, idx, userIdx = null) {
+  if (msg.role === 'system') {
+    const sysKey = `sys:${s.session_id}:${idx}:${msg.ts_ms || 0}`;
+    const { tag, preview, body } = parseSystemCardText(msg.text);
+    return h('article', { class: 'msg-card system' },
+      h('details', { class: 'msg-sys-details', 'data-k': sysKey, open: UI.open.has(sysKey) },
+        h('summary', { class: 'msg-sys-summary' },
+          span('msg-sys-tag', tag),
+          span('msg-sys-preview trunc grow', preview || '系统通知'),
+          msg.ts_ms ? span('tabular dim', clock(msg.ts_ms)) : null),
+        body ? h('div', { class: 'msg-sys-body' }, renderMarkdown(body)) : null));
+  }
   const isUser = msg.role === 'user';
   const tools = Array.isArray(msg.tools) ? msg.tools.filter(Boolean) : [];
   const tKey = `tools:${s.session_id}:${idx}:${msg.ts_ms || 0}`;

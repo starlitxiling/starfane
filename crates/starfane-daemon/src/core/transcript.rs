@@ -64,6 +64,7 @@ impl TranscriptQuery {
 pub enum TranscriptRole {
     User,
     Assistant,
+    System,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,10 +459,12 @@ impl TranscriptIndex {
                     || normalize_ws_for_dedup(&last.msg.text) == normalize_ws_for_dedup(&msg.text));
             let allow_dedup = match msg.role {
                 TranscriptRole::Assistant => true,
-                TranscriptRole::User => match (last.msg.ts_ms, msg.ts_ms) {
-                    (Some(a), Some(b)) => a.abs_diff(b) <= 2_000,
-                    _ => true,
-                },
+                TranscriptRole::User | TranscriptRole::System => {
+                    match (last.msg.ts_ms, msg.ts_ms) {
+                        (Some(a), Some(b)) => a.abs_diff(b) <= 2_000,
+                        _ => true,
+                    }
+                }
             };
             if same_text && allow_dedup {
                 merge_tools(&mut last.msg.tools, &msg.tools);
@@ -663,7 +666,7 @@ impl TranscriptIndex {
                         == normalize_ws_for_dedup(&item.msg.text));
             let allow_dedup = match item.msg.role {
                 TranscriptRole::Assistant => true,
-                TranscriptRole::User => {
+                TranscriptRole::User | TranscriptRole::System => {
                     item.step_index.is_some() && last.step_index == item.step_index
                 }
             };
@@ -775,7 +778,7 @@ impl TranscriptIndex {
                             step_index.is_some() && agy_needs_content_hydration(obj, raw);
                         self.push_agy_turn(IndexedTurn {
                             msg: TranscriptMessage {
-                                role: TranscriptRole::User,
+                                role: TranscriptRole::System,
                                 text: truncate_utf8(&msg_text, MAX_MESSAGE_BYTES),
                                 ts_ms,
                                 tools: Vec::new(),
@@ -844,6 +847,11 @@ impl TranscriptIndex {
             if it.needs_content_hydration {
                 if let Some(full_raw) = full_obj.get("content").and_then(Value::as_str) {
                     match it.msg.role {
+                        TranscriptRole::System => {
+                            if let Some(clean) = extract_agy_interagent_message(full_raw) {
+                                it.msg.text = truncate_utf8(&clean, MAX_MESSAGE_BYTES);
+                            }
+                        }
                         TranscriptRole::User => {
                             if full_obj.get("type").and_then(Value::as_str)
                                 == Some("SYSTEM_MESSAGE")
@@ -1551,6 +1559,15 @@ fn extract_agy_interagent_message(raw: &str) -> Option<String> {
     if content.is_empty() {
         return None;
     }
+    if let Some(task_id) = sender.rsplit('/').next().filter(|s| s.starts_with("task-")) {
+        return Some(format!("[后台任务 {task_id}]\n{content}"));
+    }
+    if content.starts_with("Task id \"") {
+        return Some(format!("[后台任务]\n{content}"));
+    }
+    if content.starts_with("[swarm]") {
+        return Some(format!("[Swarm 通知]\n{content}"));
+    }
     let short_sender = super::util::short_id(sender);
     Some(format!("[来自 {short_sender} 消息]\n{content}"))
 }
@@ -2186,9 +2203,46 @@ not valid json at all
         std::fs::write(&agy_full, &full_text).unwrap();
         let agy_msgs = parse_agy_jsonl_with_hydration(&compact_text, Some(&agy_compact), 10);
         assert_eq!(agy_msgs.len(), 3, "{agy_msgs:?}");
+        assert_eq!(agy_msgs[0].role, TranscriptRole::System);
         assert!(agy_msgs[0].text.contains("done verifying"));
+        assert_eq!(agy_msgs[1].role, TranscriptRole::Assistant);
         assert_eq!(agy_msgs[1].text, "# Full Hydrated Plan");
+        assert_eq!(agy_msgs[2].role, TranscriptRole::Assistant);
         assert!(agy_msgs[2].text.contains("HTTP 400 failed"));
+
+        // Task id background completion & [swarm] notifications stay System, only USER_INPUT is User.
+        let sys_jsonl = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "step_index": 0,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-24T11:28:32Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-24T11:28:32Z sender=86fb4e44-53af-4234-977f-c96b9e91e3a1/task-2865 priority=HIGH content=Task id \"86fb4e44-53af-4234-977f-c96b9e91e3a1/task-2865\" finished with result: ok\n</SYSTEM_MESSAGE>"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-24T11:29:00Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-24T11:29:00Z sender=14036bd2-a40d-480a-97de-a307ce75577a priority=HIGH content=[swarm] new board message #154\n</SYSTEM_MESSAGE>"
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-11-24T11:30:00Z",
+                "content": "<USER_REQUEST>\n真正的用户提问\n</USER_REQUEST>"
+            }),
+        );
+        let sys_msgs = parse_agy_jsonl_with_hydration(&sys_jsonl, None, 10);
+        assert_eq!(sys_msgs.len(), 3, "{sys_msgs:?}");
+        assert_eq!(sys_msgs[0].role, TranscriptRole::System);
+        assert!(sys_msgs[0].text.starts_with("[后台任务 task-2865]\n"));
+        assert_eq!(sys_msgs[1].role, TranscriptRole::System);
+        assert!(sys_msgs[1].text.starts_with("[Swarm 通知]\n"));
+        assert_eq!(sys_msgs[2].role, TranscriptRole::User);
+        assert_eq!(sys_msgs[2].text, "真正的用户提问");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -126,7 +126,8 @@ export function sessionNeedsLiveTail(s, tr) {
   if (!s) return false;
   if (['error', 'needs_permission', 'needs_input'].includes(s.state)) return true;
   if (!tr || tr.state !== 'ok' || tr.source !== 'transcript' || !tr.messages.length) return true;
-  return tr.messages[tr.messages.length - 1]?.role === 'user';
+  const r = tr.messages[tr.messages.length - 1]?.role;
+  return r === 'user' || r === 'system';
 }
 
 let stateSyncBusy = false;
