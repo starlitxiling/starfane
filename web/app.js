@@ -3466,11 +3466,13 @@ const modelOpts = [...mInfo.models.map((m) => [m.id, m.label]), ['__custom__', '
 const effortOpts = fixedEffort ? [['', '固定配置']] : effs.map((e) => [e, EFFORT_LABEL[e] || e]);
 const dlId = 'sp-projects';
 const sessDlId = 'sp-sessions';
-const sessionCandidates = [...new Set([
-'agent-session',
-...(S.tmuxSessions || []),
-...[...S.sessions.values()].filter((s) => isTmuxSession(s)).map((s) => tmuxGroupOf(s)).filter((g) => g && g !== NON_TMUX_GROUP && g !== 'tmux'),
-])];
+const activeSessionGroups = (S.tmuxSessions || []).length
+? S.tmuxSessions
+: [...S.sessions.values()]
+.filter((s) => s.state !== 'ended' && isTmuxSession(s))
+.map((s) => tmuxGroupOf(s))
+.filter((g) => g && g !== NON_TMUX_GROUP && g !== 'tmux');
+const sessionCandidates = [...new Set(['agent-session', ...activeSessionGroups])];
 const persistCurrent = (ag, mSel, eSel) => {
 const modelVal = mSel === '__custom__' ? draft('sp:modelCustom').trim() : String(mSel || '').trim();
 saveSpawnPrefs(ag, { model: modelVal || undefined, effort: eSel || '' });
@@ -3550,7 +3552,7 @@ h('label', { class: 'lbl' }, '工作目录（默认 ~/.agent_session）'),
 field('sp:dir', { class: 'inp mono', list: dlId, placeholder: '留空默认 ~/.agent_session', autocomplete: 'off' }, curDir)),
 h('div', { class: 'opt-grid' },
 h('div', null, h('label', { class: 'lbl' }, 'tmux 会话（Session，选填）'),
-field('sp:session', { class: 'inp mono', list: sessDlId, placeholder: '留空默认 agent-session（无则自动创建）', autocomplete: 'off' })),
+field('sp:session', { class: 'inp mono', list: sessDlId, placeholder: '默认 agent-session（自动创建）', autocomplete: 'off' })),
 h('div', null, h('label', { class: 'lbl' }, 'tmux 窗口名（Window，选填）'),
 field('sp:name', { class: 'inp mono', placeholder: `留空顺延命名（如 ${agent}-1）`, autocomplete: 'off' }))),
 h('div', null, h('label', { class: 'lbl' }, '首条消息（选填）'),
