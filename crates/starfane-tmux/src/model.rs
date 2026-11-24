@@ -7,12 +7,14 @@ use starfane_proto::{PaneId, PipelineId, SessionState, StageKind};
 /// Field separator used in every `-F` format (ASCII Unit Separator).
 pub const FIELD_SEP: char = '\x1f';
 
-pub(crate) const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_name}\x1f#{window_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{pane_active}\x1f#{window_active}\x1f#{session_attached}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{pane_synchronized}\x1f#{alternate_on}\x1f#{cursor_x}\x1f#{cursor_y}\x1f#{window_name}";
-const PANE_FIELDS: usize = 18;
+pub const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_name}\x1f#{window_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{pane_active}\x1f#{window_active}\x1f#{session_attached}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{pane_synchronized}\x1f#{alternate_on}\x1f#{cursor_x}\x1f#{cursor_y}\x1f#{window_name}\x1f#{session_group}\x1f#{history_size}\x1f#{pane_height}";
+const LEGACY_PANE_FIELDS: usize = 18;
+const PANE_FIELDS: usize = 21;
 
 pub(crate) const CLIENT_FORMAT: &str =
-    "#{client_tty}\x1f#{client_session}\x1f#{client_activity}\x1f#{client_flags}";
-const CLIENT_FIELDS: usize = 4;
+    "#{client_tty}\x1f#{client_session}\x1f#{client_activity}\x1f#{client_flags}\x1f#{session_group}\x1f#{window_id}";
+const LEGACY_CLIENT_FIELDS: usize = 4;
+const CLIENT_FIELDS: usize = 6;
 
 pub(crate) const WINDOW_FORMAT: &str =
     "#{session_name}\x1f#{window_index}\x1f#{window_name}\x1f#{window_layout}\x1f#{window_active}";
@@ -38,6 +40,15 @@ pub struct PaneInfo {
     pub cursor_x: u32,
     pub cursor_y: u32,
     pub window_name: String,
+    /// `#{session_group}` (empty when ungrouped).
+    #[serde(default)]
+    pub session_group: String,
+    /// `#{history_size}`: lines currently held in scrollback above the visible screen.
+    #[serde(default)]
+    pub history_size: u32,
+    /// `#{pane_height}`: visible row count of the pane.
+    #[serde(default)]
+    pub pane_height: u32,
 }
 
 impl PaneInfo {
@@ -50,6 +61,14 @@ impl PaneInfo {
             format!("{}-{win}", self.session_name)
         }
     }
+
+    /// True when `client` is attached to this pane's session or shares its non-empty `session_group`.
+    pub fn same_session_or_group(&self, client: &ClientInfo) -> bool {
+        client.session_name == self.session_name
+            || (!self.session_group.is_empty()
+                && !client.session_group.is_empty()
+                && client.session_group == self.session_group)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -59,6 +78,12 @@ pub struct ClientInfo {
     /// `client_activity`: Unix seconds of the client's last keyboard/mouse activity.
     pub activity_s: u64,
     pub flags: String,
+    /// `#{session_group}` of the client's attached session (empty when ungrouped).
+    #[serde(default)]
+    pub session_group: String,
+    /// `#{window_id}` currently displayed by this client (empty in legacy 4-field format).
+    #[serde(default)]
+    pub window_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -95,18 +120,33 @@ fn parse_flag(field: &str, name: &str, line: &str) -> Result<bool, TmuxError> {
     }
 }
 
-/// Parse a single `list-panes -a -F PANE_FORMAT` line.
+/// Parse a single `list-panes -a -F PANE_FORMAT` line (accepts both 21-field extended and 18-field legacy lines).
 pub fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     let f: Vec<&str> = line.split(FIELD_SEP).collect();
-    if f.len() != PANE_FIELDS {
+    if f.len() != PANE_FIELDS && f.len() != LEGACY_PANE_FIELDS {
         return Err(TmuxError::Parse(format!(
-            "expected {PANE_FIELDS} fields, got {} in line {line:?}",
+            "expected {PANE_FIELDS} (or {LEGACY_PANE_FIELDS}) fields, got {} in line {line:?}",
             f.len()
         )));
     }
     if !f[0].starts_with('%') {
         return Err(TmuxError::Parse(format!("bad pane_id {:?}", f[0])));
     }
+    let (session_group, history_size, pane_height) = if f.len() == PANE_FIELDS {
+        let hs = if f[19].trim().is_empty() {
+            0
+        } else {
+            parse_num(f[19], "history_size", line)?
+        };
+        let ph = if f[20].trim().is_empty() {
+            0
+        } else {
+            parse_num(f[20], "pane_height", line)?
+        };
+        (f[18].to_string(), hs, ph)
+    } else {
+        (String::new(), 0, 0)
+    };
     Ok(PaneInfo {
         pane_id: PaneId::new(f[0]),
         session_name: f[1].to_string(),
@@ -126,6 +166,9 @@ pub fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
         cursor_x: parse_num(f[15], "cursor_x", line)?,
         cursor_y: parse_num(f[16], "cursor_y", line)?,
         window_name: f[17].to_string(),
+        session_group,
+        history_size,
+        pane_height,
     })
 }
 
@@ -137,20 +180,27 @@ pub fn parse_panes(out: &str) -> Result<Vec<PaneInfo>, TmuxError> {
         .collect()
 }
 
-/// Parse a single `list-clients -F CLIENT_FORMAT` line.
+/// Parse a single `list-clients -F CLIENT_FORMAT` line (accepts both 6-field extended and 4-field legacy lines).
 pub fn parse_client_line(line: &str) -> Result<ClientInfo, TmuxError> {
     let f: Vec<&str> = line.split(FIELD_SEP).collect();
-    if f.len() != CLIENT_FIELDS {
+    if f.len() != CLIENT_FIELDS && f.len() != LEGACY_CLIENT_FIELDS {
         return Err(TmuxError::Parse(format!(
-            "expected {CLIENT_FIELDS} fields, got {} in line {line:?}",
+            "expected {CLIENT_FIELDS} (or {LEGACY_CLIENT_FIELDS}) fields, got {} in line {line:?}",
             f.len()
         )));
     }
+    let (session_group, window_id) = if f.len() == CLIENT_FIELDS {
+        (f[4].to_string(), f[5].to_string())
+    } else {
+        (String::new(), String::new())
+    };
     Ok(ClientInfo {
         tty: f[0].to_string(),
         session_name: f[1].to_string(),
         activity_s: parse_num(f[2], "client_activity", line)?,
         flags: f[3].to_string(),
+        session_group,
+        window_id,
     })
 }
 

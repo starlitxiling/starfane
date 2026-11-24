@@ -70,15 +70,18 @@ pub fn doctor_checks(env: &DoctorEnv) -> Vec<DoctorFinding> {
     // 2. Codex config.toml notify coexistence & [hooks.state] trust hash check
     check_codex_trust_and_notify(env, &mut findings);
 
-    // 3. tmux
+    // 3. tmux (+ scrollback history-limit advisory)
     match resolve_bin("tmux", env) {
-        Some(bin) => findings.push(DoctorFinding {
-            id: "bin.tmux".into(),
-            agent: None,
-            level: Level::Ok,
-            message: format!("found tmux at {}", bin.display()),
-            fix_hint: None,
-        }),
+        Some(bin) => {
+            findings.push(DoctorFinding {
+                id: "bin.tmux".into(),
+                agent: None,
+                level: Level::Ok,
+                message: format!("found tmux at {}", bin.display()),
+                fix_hint: None,
+            });
+            check_tmux_history_limit(&bin, &env.home, &mut findings);
+        }
         None => findings.push(DoctorFinding {
             id: "bin.tmux".into(),
             agent: None,
@@ -87,6 +90,9 @@ pub fn doctor_checks(env: &DoctorEnv) -> Vec<DoctorFinding> {
             fix_hint: Some("install tmux (e.g. `brew install tmux`)".into()),
         }),
     }
+
+    // 3b. zellij (optional >= 0.44 multiplexer backend)
+    check_zellij_version(env, &mut findings);
 
     // 4. lark-cli (optional Feishu channel)
     match resolve_bin("lark-cli", env) {
@@ -336,6 +342,120 @@ fn count_codex_starfane_hooks(hooks_path: &Path, starfane_bin: &Path) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+fn check_tmux_history_limit(tmux_bin: &Path, home: &Path, findings: &mut Vec<DoctorFinding>) {
+    let live_limit = Command::new(tmux_bin)
+        .args(["show-options", "-gv", "history-limit"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
+        });
+
+    let conf_limit = [home.join(".tmux.conf"), home.join(".config/tmux/tmux.conf")]
+        .into_iter()
+        .find_map(|p| fs::read_to_string(p).ok())
+        .and_then(|text| {
+            text.lines().rev().find_map(|line| {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') || !trimmed.contains("history-limit") {
+                    return None;
+                }
+                trimmed
+                    .split_whitespace()
+                    .last()
+                    .and_then(|tok| tok.parse::<u64>().ok())
+            })
+        });
+
+    let effective = live_limit.or(conf_limit);
+    match effective {
+        Some(n) if n >= 10_000 => findings.push(DoctorFinding {
+            id: "tmux.history_limit".into(),
+            agent: None,
+            level: Level::Ok,
+            message: format!("tmux history-limit is {n} lines"),
+            fix_hint: None,
+        }),
+        Some(n) => findings.push(DoctorFinding {
+            id: "tmux.history_limit".into(),
+            agent: None,
+            level: Level::Warn,
+            message: format!(
+                "tmux history-limit is only {n} lines (older terminal scrollback is discarded by tmux)"
+            ),
+            fix_hint: Some("add `set -g history-limit 50000` to ~/.tmux.conf for deep Web terminal history".into()),
+        }),
+        None => {}
+    }
+}
+
+fn parse_semver_minor(version_out: &str) -> Option<(u32, u32, u32)> {
+    let tok = version_out
+        .split_whitespace()
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let mut parts = tok.trim_start_matches('v').split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts
+        .next()
+        .and_then(|p| p.split('-').next())
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+fn check_zellij_version(env: &DoctorEnv, findings: &mut Vec<DoctorFinding>) {
+    let Some(bin) = resolve_bin("zellij", env) else {
+        findings.push(DoctorFinding {
+            id: "bin.zellij".into(),
+            agent: None,
+            level: Level::Ok,
+            message: "zellij not installed (optional; tmux backend active)".into(),
+            fix_hint: Some(
+                "optional: `brew install zellij` (>= 0.44) to enable Zellij panes".into(),
+            ),
+        });
+        return;
+    };
+    let ver_str = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    match parse_semver_minor(&ver_str) {
+        Some((maj, min, _)) if maj > 0 || min >= 44 => findings.push(DoctorFinding {
+            id: "bin.zellij".into(),
+            agent: None,
+            level: Level::Ok,
+            message: format!("found {ver_str} at {} (>= 0.44 supported)", bin.display()),
+            fix_hint: None,
+        }),
+        Some((maj, min, patch)) => findings.push(DoctorFinding {
+            id: "bin.zellij".into(),
+            agent: None,
+            level: Level::Warn,
+            message: format!(
+                "zellij {maj}.{min}.{patch} at {} is older than 0.44 (Zellij backend will skip gracefully)",
+                bin.display()
+            ),
+            fix_hint: Some("upgrade to Zellij >= 0.44 (`brew upgrade zellij`) for CLI JSON/pane-id support".into()),
+        }),
+        None => findings.push(DoctorFinding {
+            id: "bin.zellij".into(),
+            agent: None,
+            level: Level::Warn,
+            message: format!("found zellij at {} but could not parse version ({ver_str:?})", bin.display()),
+            fix_hint: Some("ensure zellij >= 0.44 is installed".into()),
+        }),
+    }
 }
 
 fn check_disk_space(path: &Path, findings: &mut Vec<DoctorFinding>) {

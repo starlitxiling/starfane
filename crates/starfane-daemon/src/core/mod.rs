@@ -13,28 +13,43 @@ pub(crate) mod slash;
 pub(crate) mod state;
 mod tasks;
 pub(crate) mod transcript;
+pub use transcript::TranscriptQuery;
 pub(crate) mod uploads;
 pub(crate) mod util;
 
-use crate::config::StarfaneConfig;
+use crate::access::AccessGate;
+use crate::config::{StarfaneConfig, TeamConfig};
+use crate::nodes::{build_remote_providers, LocalMuxPool, NodeProvider};
 use crate::notice::{FeishuSender, Notice, NoticeKind};
+use crate::notify::{NotifyRouteContext, NotifyRouter};
 use crate::store::{write_private, Store};
 use crate::{DaemonConfig, DaemonError};
 use starfane_proto::*;
 use state::State;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
-const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
 const SPOOL_INTERVAL: Duration = Duration::from_secs(5);
 const DISCOVER_INTERVAL: Duration = Duration::from_secs(3);
+const REMOTE_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const EVENT_CHANNEL: usize = 1024;
 const FEISHU_RATE_WINDOW_MS: u64 = 60_000;
 const MAX_FEISHU_NOTICES_PER_WINDOW: usize = 6;
+
+/// Off-state IO caches (SQLite, `lsof`, transcript telemetry) kept outside `Mutex<State>`
+/// so blocking disk/subprocess queries never contend with control-plane reads/writes.
+#[derive(Debug, Default)]
+pub(crate) struct TelemetryCaches {
+    pub cc_switch_cache: metrics::CcSwitchCache,
+    pub codex_threads_cache: metrics::CodexThreadCache,
+    pub agy_convs_cache: metrics::AgyConvCache,
+    pub agy_presence_cache: metrics::AgyPresenceCache,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeishuRateDecision {
@@ -85,13 +100,21 @@ pub(crate) struct Inner {
     pub notice_rx: Mutex<Option<mpsc::UnboundedReceiver<Notice>>>,
     pub feishu: RwLock<Option<Arc<dyn FeishuSender>>>,
     pub tmux: starfane_tmux::Tmux,
+    pub mux: LocalMuxPool,
+    pub access_gate: AccessGate,
+    pub notify_router: NotifyRouter,
+    pub remote_nodes: HashMap<HostId, Arc<dyn NodeProvider>>,
     pub store: Store,
     pub acks: Mutex<HashMap<SessionId, Vec<oneshot::Sender<()>>>>,
     pub dirty: AtomicBool,
+    pub snapshot_in_flight: AtomicBool,
     pub shutdown: Notify,
     pub last_attention: Mutex<Vec<AttentionItem>>,
     pub model_catalog: Mutex<Option<models::ModelCatalog>>,
     pub slash_cache: Mutex<slash::SlashCache>,
+    pub telemetry: Mutex<TelemetryCaches>,
+    pub transcript_index: Mutex<transcript::TranscriptIndexCache>,
+    pub discovery_cache: Mutex<discover::DiscoveryScanCache>,
 }
 
 /// Lock helper: a poisoned mutex means a panic happened while mutating state;
@@ -190,6 +213,63 @@ impl Core {
             PathBuf::from(cfg.config.tmux_bin()),
             cfg.config.tmux_socket(),
         );
+        let mux = LocalMuxPool::new(
+            tmux.clone(),
+            PathBuf::from(cfg.config.zellij_bin()),
+            cfg.config.zellij.enabled,
+        );
+        let access_gate = AccessGate::from_config(&cfg.config.web);
+        let notify_router = NotifyRouter::from_config(&cfg.config);
+        let remote_nodes = build_remote_providers(&cfg.config.nodes, &cfg.state_dir);
+
+        // Seed runtime host registry (local + configured remote hosts).
+        let local_id = HostId::new(LOCAL_HOST_ID);
+        let local_display = state
+            .host_display_names
+            .get(&local_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                let d = cfg.config.node.display_name.trim();
+                if d.is_empty() {
+                    "Local".to_string()
+                } else {
+                    d.to_string()
+                }
+            });
+        state.hosts.insert(
+            local_id.clone(),
+            HostRecord {
+                id: local_id,
+                display_name: local_display,
+                kind: HostKind::Local,
+                status: HostStatus::Online,
+                active_endpoint: None,
+                last_seen_ms: Some(startup_now),
+                error: None,
+                session_count: 0,
+            },
+        );
+        for (hid, provider) in &remote_nodes {
+            let display = state
+                .host_display_names
+                .get(hid)
+                .cloned()
+                .unwrap_or_else(|| provider.default_display_name().to_string());
+            state.hosts.insert(
+                hid.clone(),
+                HostRecord {
+                    id: hid.clone(),
+                    display_name: display,
+                    kind: provider.kind(),
+                    status: HostStatus::Offline,
+                    active_endpoint: None,
+                    last_seen_ms: None,
+                    error: None,
+                    session_count: 0,
+                },
+            );
+        }
+
         let web_token = id::new_id("W").to_lowercase().replace('-', "");
         Ok(Core {
             inner: Arc::new(Inner {
@@ -206,13 +286,21 @@ impl Core {
                 notice_rx: Mutex::new(Some(notice_rx)),
                 feishu: RwLock::new(None),
                 tmux,
+                mux,
+                access_gate,
+                notify_router,
+                remote_nodes,
                 store,
                 acks: Mutex::new(HashMap::new()),
                 dirty: AtomicBool::new(purged_any),
+                snapshot_in_flight: AtomicBool::new(false),
                 shutdown: Notify::new(),
                 last_attention: Mutex::new(Vec::new()),
                 model_catalog: Mutex::new(None),
                 slash_cache: Mutex::new(slash::SlashCache::default()),
+                telemetry: Mutex::new(TelemetryCaches::default()),
+                transcript_index: Mutex::new(transcript::TranscriptIndexCache::default()),
+                discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
             }),
         })
     }
@@ -223,6 +311,12 @@ impl Core {
 
     pub fn config(&self) -> &StarfaneConfig {
         &self.inner.cfg
+    }
+    pub fn access_gate(&self) -> &AccessGate {
+        &self.inner.access_gate
+    }
+    pub fn notify_router(&self) -> &NotifyRouter {
+        &self.inner.notify_router
     }
     pub fn started_ms(&self) -> u64 {
         self.inner.started_ms
@@ -504,15 +598,36 @@ impl Core {
         }
     }
 
-    /// Focus the pane's tmux window/pane and switch the appropriate client without hijacking other sessions.
+    /// Focus the pane's tmux/zellij window/pane (local or federated remote host).
     pub async fn focus_session(&self, id: &SessionId) -> Result<serde_json::Value, ApiError> {
-        let pane = lock(&self.inner.state)
-            .sessions
-            .get(id)
-            .and_then(|s| s.pane.clone())
-            .ok_or_else(|| ApiError::not_found(format!("session {id} has no known pane")))?;
+        let (pane, host_id) = {
+            let st = lock(&self.inner.state);
+            let s = st
+                .sessions
+                .get(id)
+                .ok_or_else(|| ApiError::not_found(format!("session {id}")))?;
+            let pane = s
+                .pane
+                .clone()
+                .ok_or_else(|| ApiError::not_found(format!("session {id} has no known pane")))?;
+            (pane, HostId::new(s.effective_host_id()))
+        };
+        if host_id.as_str() != LOCAL_HOST_ID {
+            if let Some(provider) = self.inner.remote_nodes.get(&host_id).cloned() {
+                let (_, local_pane) = starfane_tmux::split_host_prefix(pane.as_str());
+                let remote_sid = id
+                    .as_str()
+                    .strip_prefix(&format!("{}:", host_id.as_str()))
+                    .map(SessionId::new)
+                    .unwrap_or_else(|| id.clone());
+                return provider
+                    .focus_pane(&remote_sid, &PaneId::new(local_pane))
+                    .await;
+            }
+        }
+        let is_zellij = LocalMuxPool::is_zellij_pane(&pane);
         let core = self.clone();
-        let outcome = tokio::task::spawn_blocking(move || core.inner.tmux.focus_pane(&pane))
+        let outcome = tokio::task::spawn_blocking(move || core.inner.mux.focus_pane(&pane))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
             .map_err(|e| ApiError::new(ErrorCode::Unavailable, e.to_string()))?;
@@ -520,18 +635,288 @@ impl Core {
             .map_err(|e| ApiError::internal(format!("serialize focus outcome: {e}")))?;
         if outcome.switched_client.is_none() {
             if let Some(obj) = payload.as_object_mut() {
-                obj.insert(
-                    "attach_command".into(),
-                    serde_json::Value::String(format!("tmux attach -t {}", outcome.session_name)),
-                );
+                let attach = if is_zellij {
+                    format!("zellij attach {}", outcome.session_name)
+                } else {
+                    format!("tmux attach -t {}", outcome.session_name)
+                };
+                obj.insert("attach_command".into(), serde_json::Value::String(attach));
             }
         }
         Ok(payload)
     }
 
-    /// State snapshot as JSON (always includes `feishu_muted_until_ms` for the Web UI).
-    pub fn state_json(&self) -> serde_json::Value {
+    /// Return all known hosts (local + federated remote hosts) with live session counts.
+    pub fn hosts(&self) -> Vec<HostRecord> {
+        let st = lock(&self.inner.state);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for s in st.sessions.values() {
+            if !s.is_subagent && s.state != SessionState::Ended {
+                *counts.entry(s.effective_host_id().to_string()).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<HostRecord> = st
+            .hosts
+            .values()
+            .cloned()
+            .map(|mut h| {
+                h.session_count = counts.get(h.id.as_str()).copied().unwrap_or(0);
+                h
+            })
+            .collect();
+        // Ensure any host seen only on persisted/seeded sessions is also represented.
+        let seen: HashSet<String> = out.iter().map(|h| h.id.0.clone()).collect();
+        for (hid, count) in counts {
+            if !seen.contains(&hid) {
+                let display = st
+                    .host_display_names
+                    .get(&HostId::new(&hid))
+                    .cloned()
+                    .unwrap_or_else(|| hid.clone());
+                out.push(HostRecord {
+                    id: HostId::new(hid),
+                    display_name: display,
+                    kind: HostKind::Peer,
+                    status: HostStatus::Online,
+                    active_endpoint: None,
+                    last_seen_ms: None,
+                    error: None,
+                    session_count: count,
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            let a_local = a.id.as_str() == LOCAL_HOST_ID;
+            let b_local = b.id.as_str() == LOCAL_HOST_ID;
+            b_local.cmp(&a_local).then_with(|| a.id.cmp(&b.id))
+        });
+        out
+    }
+
+    /// Rename a host's mutable human-friendly display name (immutable `HostId` stays stable).
+    pub fn rename_host(
+        &self,
+        host_id: &HostId,
+        display_name: &str,
+    ) -> Result<HostRecord, ApiError> {
+        let clean = display_name.trim();
+        if clean.is_empty() || clean.chars().count() > 64 || clean.chars().any(char::is_control) {
+            return Err(ApiError::bad_request(
+                "display_name must be 1..=64 printable characters",
+            ));
+        }
+        let (record, updated_sessions) = {
+            let mut st = lock(&self.inner.state);
+            let known = st.hosts.contains_key(host_id)
+                || st
+                    .sessions
+                    .values()
+                    .any(|s| s.effective_host_id() == host_id.as_str());
+            if !known {
+                return Err(ApiError::not_found(format!("unknown host {host_id}")));
+            }
+            st.host_display_names
+                .insert(host_id.clone(), clean.to_string());
+            if let Some(h) = st.hosts.get_mut(host_id) {
+                h.display_name = clean.to_string();
+            }
+            let mut updated_sessions = Vec::new();
+            for s in st.sessions.values_mut() {
+                if s.effective_host_id() == host_id.as_str() {
+                    s.host_display_name = Some(clean.to_string());
+                    updated_sessions.push(s.clone());
+                }
+            }
+            let count = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    !s.is_subagent
+                        && s.state != SessionState::Ended
+                        && s.effective_host_id() == host_id.as_str()
+                })
+                .count();
+            let mut rec = st
+                .hosts
+                .get(host_id)
+                .cloned()
+                .unwrap_or_else(|| HostRecord {
+                    id: host_id.clone(),
+                    display_name: clean.to_string(),
+                    kind: if host_id.as_str() == LOCAL_HOST_ID {
+                        HostKind::Local
+                    } else {
+                        HostKind::Peer
+                    },
+                    status: HostStatus::Online,
+                    active_endpoint: None,
+                    last_seen_ms: Some(id::now_ms()),
+                    error: None,
+                    session_count: count,
+                });
+            rec.session_count = count;
+            (rec, updated_sessions)
+        };
+        self.mark_dirty();
+        self.publish_host(record.clone());
+        for s in updated_sessions {
+            self.publish_session(s);
+        }
+        Ok(record)
+    }
+
+    /// Sync all configured remote hosts (`SshMuxNodeProvider` & `PeerDaemonNodeProvider`) concurrently.
+    /// Offline or timed-out hosts degrade gracefully to `HostStatus::Degraded` without marking sessions `Ended`.
+    pub async fn sync_remote_nodes(&self) {
+        if self.inner.remote_nodes.is_empty() {
+            return;
+        }
+        let entries: Vec<(HostId, String, Arc<dyn NodeProvider>)> = {
+            let st = lock(&self.inner.state);
+            self.inner
+                .remote_nodes
+                .iter()
+                .map(|(hid, prov)| {
+                    let display = st
+                        .host_display_names
+                        .get(hid)
+                        .cloned()
+                        .unwrap_or_else(|| prov.default_display_name().to_string());
+                    (hid.clone(), display, prov.clone())
+                })
+                .collect()
+        };
+
+        let mut handles = Vec::with_capacity(entries.len());
+        for (hid, display, prov) in entries {
+            handles.push(tokio::spawn(async move {
+                let res = prov.sync(&display).await;
+                (hid, display, prov.kind(), res)
+            }));
+        }
+
+        let mut updated_sessions = Vec::new();
+        let mut updated_hosts = Vec::new();
+        let mut changed = false;
+        for h in handles {
+            let Ok((hid, display, kind, res)) = h.await else {
+                continue;
+            };
+            let mut st = lock(&self.inner.state);
+            match res {
+                Ok(snap) => {
+                    let live_ids: HashSet<SessionId> =
+                        snap.sessions.iter().map(|s| s.session_id.clone()).collect();
+                    for mut s in snap.sessions {
+                        // Zero-install SSH discovery stamps `now_ms` on every poll; preserve
+                        // stable timestamps when meaningful session fields did not change so
+                        // we never trigger endless fsync/SSE floods or reset idle timers.
+                        if kind == HostKind::Ssh {
+                            if let Some(prev) = st.sessions.get(&s.session_id) {
+                                if prev.state == s.state {
+                                    s.state_since_ms = prev.state_since_ms;
+                                    let same_meta = prev.agent == s.agent
+                                        && prev.pane == s.pane
+                                        && prev.cwd == s.cwd
+                                        && prev.model == s.model
+                                        && prev.effort == s.effort
+                                        && prev.tmux_target == s.tmux_target
+                                        && prev.tmux_label == s.tmux_label
+                                        && prev.host_display_name == s.host_display_name
+                                        && prev.mux_kind == s.mux_kind;
+                                    if same_meta {
+                                        s.last_event_ms = prev.last_event_ms;
+                                    }
+                                }
+                            }
+                        }
+                        let prev = st.sessions.get(&s.session_id);
+                        if prev != Some(&s) {
+                            st.sessions.insert(s.session_id.clone(), s.clone());
+                            updated_sessions.push(s);
+                            changed = true;
+                        }
+                    }
+                    // Prune remote sessions that disappeared from a HEALTHY remote host.
+                    let gone: Vec<SessionId> = st
+                        .sessions
+                        .iter()
+                        .filter(|(sid, s)| {
+                            s.effective_host_id() == hid.as_str() && !live_ids.contains(*sid)
+                        })
+                        .map(|(sid, _)| sid.clone())
+                        .collect();
+                    for sid in gone {
+                        if let Some(mut old) = st.sessions.remove(&sid) {
+                            old.state = SessionState::Ended;
+                            updated_sessions.push(old);
+                            changed = true;
+                        }
+                    }
+                    let prev_host = st.hosts.get(&hid);
+                    let host_diff = prev_host.is_none_or(|p| {
+                        p.status != snap.host.status
+                            || p.error != snap.host.error
+                            || p.active_endpoint != snap.host.active_endpoint
+                            || p.display_name != snap.host.display_name
+                            || p.session_count != snap.host.session_count
+                    });
+                    if host_diff {
+                        updated_hosts.push(snap.host.clone());
+                    }
+                    st.hosts.insert(hid, snap.host);
+                }
+                Err(err) => {
+                    // Graceful degradation: mark host Degraded, NEVER mark existing remote sessions Ended!
+                    log::debug!("remote host {hid} sync degraded: {err}");
+                    let prev = st.hosts.get(&hid).cloned();
+                    let count = st
+                        .sessions
+                        .values()
+                        .filter(|s| {
+                            !s.is_subagent
+                                && s.state != SessionState::Ended
+                                && s.effective_host_id() == hid.as_str()
+                        })
+                        .count();
+                    let degraded = HostRecord {
+                        id: hid.clone(),
+                        display_name: display,
+                        kind,
+                        status: HostStatus::Degraded,
+                        active_endpoint: prev.as_ref().and_then(|p| p.active_endpoint.clone()),
+                        last_seen_ms: prev.as_ref().and_then(|p| p.last_seen_ms),
+                        error: Some(err),
+                        session_count: count,
+                    };
+                    if prev.as_ref().is_none_or(|p| {
+                        p.status != degraded.status
+                            || p.error != degraded.error
+                            || p.session_count != degraded.session_count
+                    }) {
+                        updated_hosts.push(degraded.clone());
+                    }
+                    st.hosts.insert(hid, degraded);
+                }
+            }
+        }
+        if changed {
+            self.mark_dirty();
+            for s in updated_sessions {
+                self.publish_session(s);
+            }
+            self.refresh_attention();
+        }
+        for host in updated_hosts {
+            self.publish_host(host);
+        }
+    }
+
+    /// State snapshot as JSON (includes `feishu_muted_until_ms`, `hosts`, and `terminal_font`).
+    pub async fn state_json(&self) -> serde_json::Value {
         let snap = self.snapshot();
+        let hosts = self.hosts();
+        let has_user_font = crate::web::has_user_term_font().await;
         let mut v = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = v.as_object_mut() {
             let val = self
@@ -539,6 +924,20 @@ impl Core {
                 .map(serde_json::Value::from)
                 .unwrap_or(serde_json::Value::Null);
             obj.insert("feishu_muted_until_ms".into(), val);
+            obj.insert(
+                "hosts".into(),
+                serde_json::to_value(&hosts).unwrap_or(serde_json::Value::Array(Vec::new())),
+            );
+            if !self.inner.cfg.web.terminal_font.trim().is_empty() {
+                obj.insert(
+                    "terminal_font".into(),
+                    serde_json::Value::String(self.inner.cfg.web.terminal_font.trim().to_string()),
+                );
+            }
+            obj.insert(
+                "has_user_term_font".into(),
+                serde_json::Value::Bool(has_user_font),
+            );
         }
         v
     }
@@ -588,6 +987,10 @@ impl Core {
         self.publish(|seq| DaemonEvent::Session { seq, session: s });
     }
 
+    pub(crate) fn publish_host(&self, host: HostRecord) {
+        self.publish(|seq| DaemonEvent::Host { seq, host });
+    }
+
     pub(crate) fn publish_pipeline(&self, p: PipelineSpec) {
         self.persist_pipeline(&p);
         self.publish(|seq| DaemonEvent::Pipeline { seq, pipeline: p });
@@ -610,9 +1013,80 @@ impl Core {
         }
     }
 
-    /// Queue a Feishu notice (dropped while muted; burst-limited globally; Web is unaffected).
+    /// Route & deliver an outbound notification through `NotifyRouter` (opt-in pluggable channels
+    /// + legacy Card 2.0 `feishu-default`), enforcing Split Ownership and `.starfane/team.toml` routes.
     pub(crate) fn notify(&self, notice: Notice) {
-        if !self.inner.cfg.feishu.enabled || self.feishu_muted_until().is_some() {
+        if self.feishu_muted_until().is_some() {
+            return;
+        }
+        let (node, is_local_host, cwd, git_root, agent) = {
+            let st = lock(&self.inner.state);
+            match notice
+                .session_id
+                .as_ref()
+                .and_then(|sid| st.sessions.get(sid))
+            {
+                Some(s) => (
+                    s.effective_host_id().to_string(),
+                    s.is_local_host(),
+                    s.cwd.clone(),
+                    s.git_root.clone(),
+                    Some(s.agent),
+                ),
+                None => (LOCAL_HOST_ID.to_string(), true, None, None, None),
+            }
+        };
+        let node_ownership = if is_local_host {
+            crate::config::NotifyOwnership::NodeLocal
+        } else {
+            self.inner
+                .remote_nodes
+                .get(&HostId::new(&node))
+                .map(|p| p.notify_ownership())
+                .unwrap_or(crate::config::NotifyOwnership::NodeLocal)
+        };
+        let team_routes = if is_local_host {
+            git_root
+                .as_deref()
+                .or(cwd.as_deref())
+                .and_then(|root| TeamConfig::load(Path::new(root)).ok())
+                .map(|t| t.notify_routes)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let ctx = NotifyRouteContext::from_notice(
+            &notice,
+            node,
+            is_local_host,
+            node_ownership,
+            cwd,
+            git_root,
+            agent,
+        );
+
+        // 1. Fan out to opt-in pluggable notifiers (Telegram, Webhook, macOS, extra Feishu profiles).
+        if self.inner.notify_router.has_pluggable_notifiers() {
+            let core = self.clone();
+            let notice_clone = notice.clone();
+            let ctx_clone = ctx.clone();
+            let tr_clone = team_routes.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    core.inner
+                        .notify_router
+                        .dispatch_pluggable(&notice_clone, &ctx_clone, &tr_clone)
+                        .await;
+                });
+            }
+        }
+
+        // 2. Deliver primary interactive Feishu Card 2.0 when enabled and matched by router.
+        if !self
+            .inner
+            .notify_router
+            .should_deliver_primary_feishu(&ctx, &team_routes)
+        {
             return;
         }
         let now_ms = id::now_ms();
@@ -685,12 +1159,43 @@ impl Core {
         }
     }
 
-    fn flush_snapshot(&self) {
+    /// Clone persisted state in microseconds under `Mutex<State>`, then write + fsync on `spawn_blocking`.
+    async fn flush_snapshot_async(&self) {
+        if !self.inner.dirty.load(Ordering::SeqCst) {
+            return;
+        }
+        if self
+            .inner
+            .snapshot_in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        self.inner.dirty.store(false, Ordering::SeqCst);
+        let snap = lock(&self.inner.state).persistent_snapshot();
+        let store = self.inner.store.clone();
+        let res = tokio::task::spawn_blocking(move || store.save_snapshot(&snap)).await;
+        self.inner.snapshot_in_flight.store(false, Ordering::SeqCst);
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::error!("snapshot write failed: {e}");
+                self.inner.dirty.store(true, Ordering::SeqCst);
+            }
+            Err(e) => {
+                log::error!("snapshot task failed: {e}");
+                self.inner.dirty.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn flush_snapshot_sync(&self) {
         if !self.inner.dirty.swap(false, Ordering::SeqCst) {
             return;
         }
-        let st = lock(&self.inner.state);
-        if let Err(e) = self.inner.store.save_snapshot(&*st) {
+        let snap = lock(&self.inner.state).persistent_snapshot();
+        if let Err(e) = self.inner.store.save_snapshot(&snap) {
             log::error!("snapshot write failed: {e}");
             self.inner.dirty.store(true, Ordering::SeqCst);
         }
@@ -720,7 +1225,7 @@ impl Core {
         use DaemonCommand as C;
         let r = match cmd {
             C::Ping => Ok(serde_json::json!({"pong": true, "version": VERSION})),
-            C::GetState => Ok(self.state_json()),
+            C::GetState => Ok(self.state_json().await),
             C::ListSessions {
                 project,
                 include_subagents,
@@ -1047,13 +1552,23 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
             }
         });
     }
+    if !core.inner.remote_nodes.is_empty() {
+        let c = core.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(REMOTE_SYNC_INTERVAL);
+            loop {
+                tick.tick().await;
+                c.sync_remote_nodes().await;
+            }
+        });
+    }
     {
         let c = core.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
             loop {
                 tick.tick().await;
-                c.flush_snapshot();
+                c.flush_snapshot_async().await;
             }
         });
     }
@@ -1083,7 +1598,7 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         _ = term.recv() => log::info!("SIGTERM received"),
     }
     core.mark_dirty();
-    core.flush_snapshot();
+    core.flush_snapshot_sync();
     if core.config().tmux.backup.enabled {
         if let Err(e) = core.backup_tmux(false).await {
             log::warn!("shutdown tmux backup failed: {}", e.message);

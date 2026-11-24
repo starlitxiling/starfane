@@ -38,8 +38,10 @@ id_newtype!(
     EventId,
     /// Root: agent session id / agy conversationId. Sub: `<root>/<agent_id>`.
     SessionId,
-    /// tmux pane id, e.g. `%12`.
+    /// tmux or zellij pane id, e.g. `%12`, `zj:work/1`, or host-prefixed `tencent:%1`.
     PaneId,
+    /// Immutable host identifier, e.g. `"local"`, `"tencent"`, `"mac-xiling"`.
+    HostId,
     /// `P-…`
     PipelineId,
     /// `H-…`

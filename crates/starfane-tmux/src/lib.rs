@@ -11,7 +11,9 @@ mod error;
 mod exec;
 mod gate;
 mod model;
+mod mux;
 mod resolve;
+mod zellij;
 
 pub use backup::{
     build_resume_command, build_snapshot, list_snapshots, load_latest_snapshot, load_snapshot_file,
@@ -20,24 +22,37 @@ pub use backup::{
     SnapshotSummary, TmuxBackupSnapshot, BACKUP_VERSION,
 };
 pub use discover::{
-    capture_pane_tail, classify_panes, classify_panes_with, discover_agent_panes,
-    trim_and_cap_tail, DiscoverOptions, DiscoveredPane, PanePreview, MAX_CAPTURE_BYTES,
-    MAX_CAPTURE_LINES,
+    cap_page_bytes, capture_pane_tail, classify_panes, classify_panes_with,
+    classify_panes_with_git_lookup, discover_agent_panes, trim_and_cap_tail, CaptureRequest,
+    DiscoverOptions, DiscoveredPane, PanePreview, MAX_CAPTURE_BYTES, MAX_CAPTURE_LINES,
+    MAX_FULL_CAPTURE_BYTES, MAX_FULL_CAPTURE_LINES,
 };
 pub use error::TmuxError;
+pub use exec::{ExecOutput, ExecTransport, LocalExec, SshExec, DEFAULT_SSH_TIMEOUT};
 pub use gate::{
     check_injection_gate, check_interactive_gate, is_bare_slash_command, is_user_watching,
     validate_interactive_text, validate_pointer_text, GateConfig,
 };
 pub use model::{
     parse_client_line, parse_clients, parse_pane_line, parse_panes, parse_window_line,
-    parse_windows, ClientInfo, PaneInfo, PaneStatus, WindowInfo, FIELD_SEP,
+    parse_windows, ClientInfo, PaneInfo, PaneStatus, WindowInfo, FIELD_SEP, PANE_FORMAT,
+};
+pub use mux::{
+    is_tmux_pane_id, pane_mux_kind, parse_zellij_pane_id, qualify_host_pane, qualify_host_session,
+    split_host_prefix, GateProbe, MuxCapabilities, MuxKind, TerminalMux,
 };
 pub use resolve::{pid_ancestors, resolve_pane, PaneHint};
+pub use zellij::{
+    parse_zellij_clients_text, parse_zellij_panes_json, parse_zellij_sessions,
+    parse_zellij_tabs_json, parse_zellij_version, slice_zellij_dump, ZellijMux, ZellijTabInfo,
+    MIN_ZELLIJ_VERSION,
+};
 
 use starfane_proto::{PaneId, SessionState};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +73,7 @@ pub struct Tmux {
     pub bin: PathBuf,
     /// `tmux -L <name>` socket (tests use `starfane-test…`); `None` = the user's default server.
     pub socket_name: Option<String>,
+    pub(crate) transport: Arc<dyn ExecTransport>,
 }
 
 /// Outcome of focusing a tmux pane across single-client, multi-client, or detached servers.
@@ -117,7 +133,27 @@ fn new_buffer_name() -> String {
 
 impl Tmux {
     pub fn new(bin: PathBuf, socket_name: Option<String>) -> Self {
-        Tmux { bin, socket_name }
+        Tmux {
+            bin,
+            socket_name,
+            transport: Arc::new(LocalExec::default()),
+        }
+    }
+
+    pub fn with_transport(
+        bin: PathBuf,
+        socket_name: Option<String>,
+        transport: Arc<dyn ExecTransport>,
+    ) -> Self {
+        Tmux {
+            bin,
+            socket_name,
+            transport,
+        }
+    }
+
+    pub fn transport(&self) -> &Arc<dyn ExecTransport> {
+        &self.transport
     }
 
     fn base_args(&self) -> Vec<String> {
@@ -130,7 +166,7 @@ impl Tmux {
     fn output(&self, args: &[String], stdin: Option<&[u8]>) -> Result<exec::Output, TmuxError> {
         let mut full = self.base_args();
         full.extend_from_slice(args);
-        exec::run(&self.bin, &full, stdin)
+        self.transport.run(&self.bin, &full, stdin)
     }
 
     /// Run a tmux subcommand and return stdout; non-zero exit becomes [`TmuxError::Command`].
@@ -154,7 +190,8 @@ impl Tmux {
 
     /// Is the tmux binary runnable (`tmux -V` succeeds)?
     pub fn available(&self) -> bool {
-        exec::run(&self.bin, &[s("-V")], None)
+        self.transport
+            .run(&self.bin, &[s("-V")], None)
             .map(|o| o.success)
             .unwrap_or(false)
     }
@@ -220,10 +257,10 @@ impl Tmux {
         Ok(out.trim_end_matches(['\n', '\r']).to_string())
     }
 
-    /// Paste `text` into `pane` as one bracketed paste, wait for the TUI's paste-burst
-    /// detector to settle, then press Enter. **Does not run the gate**: callers must call
-    /// [`check_injection_gate`] first. Never uses `send-keys -l`, `C-u` or `C-c`.
-    pub fn inject_pointer(
+    /// Paste validated pointer `text` into `pane` using bracketed paste (`paste-buffer -d -p`)
+    /// without blocking for the settle pause or sending Enter. Callers on async runtimes should
+    /// pair this with `tokio::time::sleep(cfg.paste_settle_ms)` followed by [`Tmux::submit_enter`].
+    pub fn paste_pointer_text(
         &self,
         pane: &PaneId,
         text: &str,
@@ -231,6 +268,25 @@ impl Tmux {
     ) -> Result<(), TmuxError> {
         valid_pane(pane)?;
         validate_pointer_text(text, cfg)?;
+        self.paste_raw_bracketed(pane, text)
+    }
+
+    /// Paste validated interactive `text` into `pane` using bracketed paste (`paste-buffer -d -p`)
+    /// without blocking for the settle pause or sending Enter.
+    pub fn paste_interactive_text(&self, pane: &PaneId, text: &str) -> Result<(), TmuxError> {
+        valid_pane(pane)?;
+        validate_interactive_text(text)?;
+        self.paste_raw_bracketed(pane, text)
+    }
+
+    /// Press Enter (`C-m`) in `pane` after an asynchronous paste-settle delay.
+    pub fn submit_enter(&self, pane: &PaneId) -> Result<(), TmuxError> {
+        valid_pane(pane)?;
+        self.run(&["send-keys", "-t", pane.as_str(), "C-m"], None)?;
+        Ok(())
+    }
+
+    fn paste_raw_bracketed(&self, pane: &PaneId, text: &str) -> Result<(), TmuxError> {
         let buf = new_buffer_name();
         self.run(&["load-buffer", "-b", &buf, "-"], Some(text.as_bytes()))?;
         if let Err(e) = self.run(
@@ -242,9 +298,21 @@ impl Tmux {
             let _ = self.run(&["delete-buffer", "-b", &buf], None);
             return Err(e);
         }
-        thread::sleep(Duration::from_millis(cfg.paste_settle_ms));
-        self.run(&["send-keys", "-t", pane.as_str(), "C-m"], None)?;
         Ok(())
+    }
+
+    /// Paste `text` into `pane` as one bracketed paste, wait for the TUI's paste-burst
+    /// detector to settle, then press Enter. **Does not run the gate**: callers must call
+    /// [`check_injection_gate`] first. Never uses `send-keys -l`, `C-u` or `C-c`.
+    pub fn inject_pointer(
+        &self,
+        pane: &PaneId,
+        text: &str,
+        cfg: &GateConfig,
+    ) -> Result<(), TmuxError> {
+        self.paste_pointer_text(pane, text, cfg)?;
+        thread::sleep(Duration::from_millis(cfg.paste_settle_ms));
+        self.submit_enter(pane)
     }
 
     /// Inject explicit interactive user input via bracketed paste (`paste-buffer -d -p`) +
@@ -256,20 +324,9 @@ impl Tmux {
         text: &str,
         cfg: &GateConfig,
     ) -> Result<(), TmuxError> {
-        valid_pane(pane)?;
-        validate_interactive_text(text)?;
-        let buf = new_buffer_name();
-        self.run(&["load-buffer", "-b", &buf, "-"], Some(text.as_bytes()))?;
-        if let Err(e) = self.run(
-            &["paste-buffer", "-d", "-p", "-b", &buf, "-t", pane.as_str()],
-            None,
-        ) {
-            let _ = self.run(&["delete-buffer", "-b", &buf], None);
-            return Err(e);
-        }
+        self.paste_interactive_text(pane, text)?;
         thread::sleep(Duration::from_millis(cfg.paste_settle_ms));
-        self.run(&["send-keys", "-t", pane.as_str(), "C-m"], None)?;
-        Ok(())
+        self.submit_enter(pane)
     }
 
     /// Open a new window running `req.argv` (no shell) and return its pane id.
@@ -426,9 +483,12 @@ impl Tmux {
     }
 
     /// Ring the terminal bell for the pane (marks its window with the bell flag) by writing
-    /// BEL to the pane's tty.
+    /// BEL to the pane's tty. No-op on remote SSH transports.
     pub fn ring_bell(&self, pane: &PaneId) -> Result<(), TmuxError> {
         valid_pane(pane)?;
+        if !self.transport.is_local() {
+            return Ok(());
+        }
         let tty = self.run(
             &["display-message", "-p", "-t", pane.as_str(), "#{pane_tty}"],
             None,
@@ -447,27 +507,80 @@ impl Tmux {
             })
     }
 
+    /// Rank a tmux client for focus selection:
+    /// - Prefers clients already viewing `target_window_id` (if given).
+    /// - Honors `active-pane` client flag.
+    /// - Only trusts `focused` when the client's activity is within 60s of the freshest client
+    ///   in the candidate set, preventing stale `focused` flags (when `focus-events` is off) from
+    ///   beating a freshly active terminal.
+    fn focus_client_rank(
+        c: &ClientInfo,
+        max_activity_s: u64,
+        target_window_id: Option<&str>,
+    ) -> (bool, bool, bool, u64) {
+        const STALE_FOCUS_LAG_SECS: u64 = 60;
+        let on_window = target_window_id.is_some_and(|w| !w.is_empty() && c.window_id == w);
+        let active_pane = c.flags.split(',').any(|f| f.trim() == "active-pane");
+        let fresh_focused = c.flags.split(',').any(|f| f.trim() == "focused")
+            && max_activity_s.saturating_sub(c.activity_s) <= STALE_FOCUS_LAG_SECS;
+        (on_window, active_pane, fresh_focused, c.activity_s)
+    }
+
     /// Pick the best client to receive focus for `target_session`:
-    /// prefers clients already attached to `target_session` (by focused flag, then latest
-    /// activity) so sibling multi-client terminals are not hijacked, then falls back to the
-    /// most recently active/focused attached client overall.
+    /// prefers clients already attached to `target_session` (by `active-pane`, non-stale
+    /// `focused`, then latest activity) so sibling multi-client terminals are not hijacked,
+    /// then falls back to the most recently active/focused attached client overall.
     pub fn pick_focus_client<'a>(
         clients: &'a [ClientInfo],
         target_session: &str,
     ) -> Option<&'a ClientInfo> {
-        let rank = |c: &ClientInfo| {
-            let focused = c.flags.split(',').any(|f| f.trim() == "focused");
-            (focused, c.activity_s)
-        };
-        clients
+        let same: Vec<&ClientInfo> = clients
             .iter()
             .filter(|c| c.session_name == target_session)
-            .max_by_key(|c| rank(c))
-            .or_else(|| clients.iter().max_by_key(|c| rank(c)))
+            .collect();
+        if !same.is_empty() {
+            let max_act = same.iter().map(|c| c.activity_s).max().unwrap_or(0);
+            return same
+                .into_iter()
+                .max_by_key(|c| Self::focus_client_rank(c, max_act, None));
+        }
+        let max_act = clients.iter().map(|c| c.activity_s).max().unwrap_or(0);
+        clients
+            .iter()
+            .max_by_key(|c| Self::focus_client_rank(c, max_act, None))
     }
 
-    /// Select `pane`'s window and pane, and switch an appropriate attached client without
-    /// hijacking other sessions' terminals. Succeeds cleanly even when all sessions are detached.
+    /// Pick the best attached client for focusing `pane`, honoring `#{session_group}`,
+    /// client `#{window_id}`, `active-pane`, and non-stale `focused`.
+    /// When `allow_cross_session_switch` is `false`, returns `None` for detached sessions
+    /// instead of hijacking an unrelated terminal client.
+    pub fn pick_focus_client_for_pane<'a>(
+        clients: &'a [ClientInfo],
+        pane: &PaneInfo,
+        allow_cross_session_switch: bool,
+    ) -> Option<&'a ClientInfo> {
+        let same: Vec<&ClientInfo> = clients
+            .iter()
+            .filter(|c| pane.same_session_or_group(c))
+            .collect();
+        if !same.is_empty() {
+            let max_act = same.iter().map(|c| c.activity_s).max().unwrap_or(0);
+            return same.into_iter().max_by_key(|c| {
+                Self::focus_client_rank(c, max_act, Some(pane.window_id.as_str()))
+            });
+        }
+        if !allow_cross_session_switch {
+            return None;
+        }
+        let max_act = clients.iter().map(|c| c.activity_s).max().unwrap_or(0);
+        clients
+            .iter()
+            .max_by_key(|c| Self::focus_client_rank(c, max_act, None))
+    }
+
+    /// Select `pane`'s window and pane, and focus an attached client in the same session
+    /// or `session_group` without hijacking unrelated sessions' terminals. Succeeds cleanly
+    /// even when the target session is detached (returning `switched_client: None`).
     pub fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError> {
         valid_pane(pane)?;
         let panes = self.list_panes()?;
@@ -479,33 +592,34 @@ impl Tmux {
                 code: Some(1),
                 stderr: format!("pane {pane} not found"),
             })?;
-        self.run(&["select-window", "-t", pane.as_str()], None)?;
-        self.run(&["select-pane", "-t", pane.as_str()], None)?;
         let tmux_target = format!(
             "{}:{}.{}",
             info.session_name, info.window_index, info.pane_index
         );
         let clients = self.list_clients()?;
-        let (switched_client, already_in_session) =
-            match Self::pick_focus_client(&clients, &info.session_name) {
-                Some(client) if client.session_name == info.session_name => {
-                    (Some(client.tty.clone()), true)
-                }
-                Some(client) => {
-                    self.run(
-                        &[
-                            "switch-client",
-                            "-c",
-                            client.tty.as_str(),
-                            "-t",
-                            pane.as_str(),
-                        ],
-                        None,
-                    )?;
-                    (Some(client.tty.clone()), false)
-                }
-                None => (None, false),
-            };
+        let matched = Self::pick_focus_client_for_pane(&clients, &info, false);
+        let (switched_client, already_in_session) = match matched {
+            Some(client) if client.session_name == info.session_name => {
+                self.run(&["select-window", "-t", pane.as_str()], None)?;
+                self.run(&["select-pane", "-t", pane.as_str()], None)?;
+                (Some(client.tty.clone()), true)
+            }
+            Some(client) => {
+                // Grouped session sharing windows: select the window on the attached sibling
+                // session so the user's client displays this window without leaving its group.
+                let group_win = format!("={}:{}", client.session_name, info.window_index);
+                self.run(&["select-window", "-t", &group_win], None)?;
+                self.run(&["select-pane", "-t", pane.as_str()], None)?;
+                (Some(client.tty.clone()), true)
+            }
+            None => {
+                // Target session is detached: pre-select window & pane inside that session without
+                // hijacking clients attached to other unrelated sessions (e.g. `agent-session`).
+                self.run(&["select-window", "-t", pane.as_str()], None)?;
+                self.run(&["select-pane", "-t", pane.as_str()], None)?;
+                (None, false)
+            }
+        };
         Ok(FocusOutcome {
             pane_id: pane.clone(),
             session_name: info.session_name,
@@ -528,6 +642,101 @@ impl Tmux {
             Err(e) if e.is_no_server() => Ok(()),
             Err(e) => Err(e),
         }
+    }
+}
+
+impl TerminalMux for Tmux {
+    fn kind(&self) -> MuxKind {
+        MuxKind::Tmux
+    }
+
+    fn capabilities(&self) -> MuxCapabilities {
+        MuxCapabilities {
+            bracketed_paste_native: true,
+            client_activity_ts: true,
+            pane_user_options: true,
+            full_scrollback: true,
+            layout_snapshot: true,
+        }
+    }
+
+    fn available(&self) -> bool {
+        Tmux::available(self)
+    }
+
+    fn list_sessions(&self) -> Result<Vec<String>, TmuxError> {
+        Tmux::list_sessions(self)
+    }
+
+    fn list_panes(&self) -> Result<Vec<PaneInfo>, TmuxError> {
+        Tmux::list_panes(self)
+    }
+
+    fn list_clients(&self) -> Result<Vec<ClientInfo>, TmuxError> {
+        Tmux::list_clients(self)
+    }
+
+    fn discover_panes_from(
+        &self,
+        panes: &[PaneInfo],
+        opts: DiscoverOptions,
+    ) -> Vec<DiscoveredPane> {
+        Tmux::discover_panes_from(self, panes, opts)
+    }
+
+    fn capture_pane(&self, pane: &PaneId, req: &CaptureRequest) -> Result<PanePreview, TmuxError> {
+        Tmux::capture_pane(self, pane, req)
+    }
+
+    fn capture_panes_tail_batch(&self, targets: &[(&PaneId, usize)]) -> HashMap<PaneId, String> {
+        Tmux::capture_panes_tail_batch(self, targets)
+    }
+
+    fn cursor_line(&self, pane: &PaneId, cursor_y: u32) -> Result<String, TmuxError> {
+        Tmux::cursor_line(self, pane, cursor_y)
+    }
+
+    fn paste_pointer_text(
+        &self,
+        pane: &PaneId,
+        text: &str,
+        cfg: &GateConfig,
+    ) -> Result<(), TmuxError> {
+        Tmux::paste_pointer_text(self, pane, text, cfg)
+    }
+
+    fn paste_interactive_text(&self, pane: &PaneId, text: &str) -> Result<(), TmuxError> {
+        Tmux::paste_interactive_text(self, pane, text)
+    }
+
+    fn submit_enter(&self, pane: &PaneId) -> Result<(), TmuxError> {
+        Tmux::submit_enter(self, pane)
+    }
+
+    fn spawn_window(&self, req: &SpawnWindow) -> Result<PaneId, TmuxError> {
+        Tmux::spawn_window(self, req)
+    }
+
+    fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError> {
+        Tmux::focus_pane(self, pane)
+    }
+
+    fn set_status(&self, pane: &PaneId, st: &PaneStatus) -> Result<(), TmuxError> {
+        Tmux::set_status(self, pane, st)
+    }
+
+    fn clear_status(&self, pane: &PaneId) -> Result<(), TmuxError> {
+        Tmux::clear_status(self, pane)
+    }
+
+    fn dump_layout(&self, session: &str) -> Result<String, TmuxError> {
+        let windows = self.list_windows()?;
+        let lines: Vec<String> = windows
+            .into_iter()
+            .filter(|w| w.session_name == session)
+            .map(|w| format!("{}:{} {}", w.window_index, w.window_name, w.window_layout))
+            .collect();
+        Ok(lines.join("\n"))
     }
 }
 
@@ -556,7 +765,88 @@ mod tests {
             session_name: session.into(),
             activity_s,
             flags: flags.into(),
+            session_group: String::new(),
+            window_id: String::new(),
         }
+    }
+
+    #[test]
+    fn pick_focus_client_for_pane_handles_groups_stale_focus_active_pane_and_detached() {
+        let pane_grouped = PaneInfo {
+            pane_id: PaneId::new("%7"),
+            session_name: "work".into(),
+            window_id: "@2".into(),
+            window_index: 2,
+            pane_index: 0,
+            pane_pid: 100,
+            current_command: "claude".into(),
+            current_path: "/repo".into(),
+            pane_active: true,
+            window_active: true,
+            session_attached: 1,
+            in_mode: false,
+            dead: false,
+            synchronized: false,
+            alternate_on: false,
+            cursor_x: 0,
+            cursor_y: 0,
+            window_name: "w".into(),
+            session_group: "grp-work".into(),
+            history_size: 10,
+            pane_height: 24,
+        };
+
+        // 1. Stale `focused` (500s older) loses to freshly active client without `focused`.
+        let clients = vec![
+            ClientInfo {
+                tty: "/dev/ttys001".into(),
+                session_name: "work-2".into(),
+                activity_s: 1_000,
+                flags: "attached,focused".into(),
+                session_group: "grp-work".into(),
+                window_id: "@1".into(),
+            },
+            ClientInfo {
+                tty: "/dev/ttys002".into(),
+                session_name: "work-3".into(),
+                activity_s: 1_500,
+                flags: "attached".into(),
+                session_group: "grp-work".into(),
+                window_id: "@1".into(),
+            },
+        ];
+        let picked = Tmux::pick_focus_client_for_pane(&clients, &pane_grouped, false).unwrap();
+        assert_eq!(picked.tty, "/dev/ttys002");
+
+        // 2. Client with `active-pane` flag beats equal-window sibling.
+        let clients_ap = vec![
+            ClientInfo {
+                tty: "/dev/ttys010".into(),
+                session_name: "work".into(),
+                activity_s: 2_000,
+                flags: "attached,focused".into(),
+                session_group: "grp-work".into(),
+                window_id: "@2".into(),
+            },
+            ClientInfo {
+                tty: "/dev/ttys011".into(),
+                session_name: "work-2".into(),
+                activity_s: 1_995,
+                flags: "attached,active-pane".into(),
+                session_group: "grp-work".into(),
+                window_id: "@2".into(),
+            },
+        ];
+        let picked_ap =
+            Tmux::pick_focus_client_for_pane(&clients_ap, &pane_grouped, false).unwrap();
+        assert_eq!(picked_ap.tty, "/dev/ttys011");
+
+        // 3. Detached independent session (`agent-session`) must NOT hijack clients on other sessions.
+        let mut detached_pane = pane_grouped.clone();
+        detached_pane.session_name = "agent-session".into();
+        detached_pane.session_group = String::new();
+        detached_pane.session_attached = 0;
+        assert!(Tmux::pick_focus_client_for_pane(&clients_ap, &detached_pane, false).is_none());
     }
 
     #[test]

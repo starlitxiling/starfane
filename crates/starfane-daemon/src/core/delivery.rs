@@ -250,10 +250,36 @@ impl Core {
     ) -> Result<DeliveryReport, ApiError> {
         let (session_id, pane, discovered_only) = self.resolve_interactive_target(target)?;
 
+        // Remote SSH or Peer host interactive dispatch proxy.
+        let (host_opt, local_pane) = starfane_tmux::split_host_prefix(pane.as_str());
+        if let Some(host) = host_opt {
+            let hid = HostId::new(host);
+            let provider = self
+                .inner
+                .remote_nodes
+                .get(&hid)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(format!("unknown remote host {host}")))?;
+            let remote_sid = session_id
+                .as_ref()
+                .and_then(|s| s.as_str().strip_prefix(&format!("{host}:")))
+                .map(SessionId::new);
+            let settle_ms = self.gate_config().paste_settle_ms;
+            let clean_text = text.replace('\r', "");
+            return provider
+                .dispatch_interactive(
+                    remote_sid.as_ref(),
+                    &PaneId::new(local_pane),
+                    &clean_text,
+                    settle_ms,
+                )
+                .await;
+        }
+
         let core = self.clone();
         let pane_for_gate = pane.clone();
         let gate = tokio::task::spawn_blocking(move || {
-            let panes = core.inner.tmux.list_panes().map_err(|e| e.to_string())?;
+            let panes = core.inner.mux.list_all_panes().map_err(|e| e.to_string())?;
             let info = panes
                 .into_iter()
                 .find(|p| p.pane_id == pane_for_gate)
@@ -277,17 +303,32 @@ impl Core {
             });
         }
 
-        let core = self.clone();
-        let pane_for_inject = pane.clone();
+        let core_paste = self.clone();
+        let pane_for_paste = pane.clone();
         let clean_text = text.replace('\r', "");
-        let cfg = self.gate_config();
-        let injected = tokio::task::spawn_blocking(move || {
-            core.inner
-                .tmux
-                .inject_interactive(&pane_for_inject, &clean_text, &cfg)
+        let settle_ms = self.gate_config().paste_settle_ms;
+        let pasted = tokio::task::spawn_blocking(move || {
+            core_paste
+                .inner
+                .mux
+                .paste_interactive_text(&pane_for_paste, &clean_text)
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+        let injected = match pasted {
+            Ok(()) => {
+                tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+                let core_enter = self.clone();
+                let pane_for_enter = pane.clone();
+                tokio::task::spawn_blocking(move || {
+                    core_enter.inner.mux.submit_enter(&pane_for_enter)
+                })
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?
+            }
+            Err(e) => Err(e),
+        };
 
         match injected {
             Ok(()) => {
@@ -499,12 +540,28 @@ impl Core {
                 let gate = self.check_gate(&session, &pane).await;
                 if gate.passed {
                     let ack = self.register_ack(session_id);
-                    let core = self.clone();
-                    let (p, text, cfg) = (pane.clone(), line.to_string(), self.gate_config());
-                    let injected = tokio::task::spawn_blocking(move || {
-                        core.inner.tmux.inject_pointer(&p, &text, &cfg)
+                    let core_paste = self.clone();
+                    let (p_paste, text, cfg) = (pane.clone(), line.to_string(), self.gate_config());
+                    let settle_ms = cfg.paste_settle_ms;
+                    let pasted = tokio::task::spawn_blocking(move || {
+                        core_paste
+                            .inner
+                            .mux
+                            .paste_pointer_text(&p_paste, &text, &cfg)
                     })
                     .await;
+                    let injected = match pasted {
+                        Ok(Ok(())) => {
+                            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+                            let core_enter = self.clone();
+                            let p_enter = pane.clone();
+                            tokio::task::spawn_blocking(move || {
+                                core_enter.inner.mux.submit_enter(&p_enter)
+                            })
+                            .await
+                        }
+                        other => other,
+                    };
                     match injected {
                         Ok(Ok(())) => {
                             if session.discovered_only {
@@ -573,15 +630,19 @@ impl Core {
             self.gate_config(),
         );
         tokio::task::spawn_blocking(move || {
-            let panes = core.inner.tmux.list_panes().map_err(|e| e.to_string())?;
-            let clients = core.inner.tmux.list_clients().map_err(|e| e.to_string())?;
+            let panes = core.inner.mux.list_all_panes().map_err(|e| e.to_string())?;
+            let clients = core
+                .inner
+                .mux
+                .list_all_clients()
+                .map_err(|e| e.to_string())?;
             let info = panes
                 .into_iter()
                 .find(|p| p.pane_id == pane)
                 .ok_or_else(|| format!("pane {pane} not found"))?;
             let line = core
                 .inner
-                .tmux
+                .mux
                 .cursor_line(&pane, info.cursor_y)
                 .map_err(|e| e.to_string())?;
             Ok::<_, String>(starfane_tmux::check_injection_gate(

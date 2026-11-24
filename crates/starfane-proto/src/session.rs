@@ -2,9 +2,44 @@
 
 use crate::agent::AgentKind;
 use crate::event::{Confidence, EventKind};
-use crate::id::{EventId, PaneId, PipelineId, SessionId};
+use crate::id::{EventId, HostId, PaneId, PipelineId, SessionId};
 use crate::pipeline::StageKind;
 use serde::{Deserialize, Serialize};
+
+pub const LOCAL_HOST_ID: &str = "local";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    Local,
+    Ssh,
+    Peer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostStatus {
+    Online,
+    Degraded,
+    Offline,
+}
+
+/// Summary of a local or federated host exposed in `/api/state` and `/api/hosts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostRecord {
+    pub id: HostId,
+    pub display_name: String,
+    pub kind: HostKind,
+    pub status: HostStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub session_count: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,13 +105,14 @@ impl SessionState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneResolution {
     BindToken,
     Env,
     PidTree,
     CwdMatch,
+    #[default]
     Unknown,
 }
 
@@ -119,6 +155,7 @@ pub struct SessionRecord {
     pub agent: AgentKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<PaneId>,
+    #[serde(default)]
     pub pane_resolution: PaneResolution,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -130,9 +167,11 @@ pub struct SessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     pub state: SessionState,
+    #[serde(default)]
     pub state_since_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_event_id: Option<EventId>,
+    #[serde(default)]
     pub last_event_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
@@ -154,6 +193,7 @@ pub struct SessionRecord {
     #[serde(default)]
     pub unread_inbox: u32,
     /// Heuristic for agy folded subagents.
+    #[serde(default)]
     pub confidence: Confidence,
     /// tmux target label, e.g. `"prome:4.1"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,6 +210,31 @@ pub struct SessionRecord {
     /// Live context-window & generation-speed (TPS) telemetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<SessionMetrics>,
+    /// Immutable host id (`None` is treated as `"local"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<HostId>,
+    /// Human-friendly mutable host label (resolved from config/state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_display_name: Option<String>,
+    /// Terminal multiplexer kind (`"tmux"`, `"zellij"`, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mux_kind: Option<String>,
+}
+
+impl SessionRecord {
+    /// Effective host id (defaults to `"local"` when unset).
+    pub fn effective_host_id(&self) -> &str {
+        self.host_id
+            .as_ref()
+            .map(HostId::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(LOCAL_HOST_ID)
+    }
+
+    /// True if this session belongs to the local host.
+    pub fn is_local_host(&self) -> bool {
+        self.effective_host_id() == LOCAL_HOST_ID
+    }
 }
 
 /// Build a claude/codex subagent session id: `<root>/<agent_id>`.

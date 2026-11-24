@@ -6,11 +6,12 @@ use crate::api::{AttentionItem, DeliveryReport, DispatchTarget};
 use crate::event::NormalizedEvent;
 use crate::id::{ArtifactId, PipelineId, ReviewId};
 use crate::pipeline::{ArtifactKind, PipelineSpec};
-use crate::session::SessionRecord;
+use crate::session::{HostRecord, SessionRecord};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum DaemonEvent {
     Event {
         seq: u64,
@@ -44,6 +45,10 @@ pub enum DaemonEvent {
         seq: u64,
         items: Vec<AttentionItem>,
     },
+    Host {
+        seq: u64,
+        host: HostRecord,
+    },
 }
 
 impl DaemonEvent {
@@ -55,7 +60,8 @@ impl DaemonEvent {
             | DaemonEvent::Artifact { seq, .. }
             | DaemonEvent::Review { seq, .. }
             | DaemonEvent::Delivery { seq, .. }
-            | DaemonEvent::Attention { seq, .. } => *seq,
+            | DaemonEvent::Attention { seq, .. }
+            | DaemonEvent::Host { seq, .. } => *seq,
         }
     }
 
@@ -69,6 +75,7 @@ impl DaemonEvent {
             DaemonEvent::Review { .. } => "review",
             DaemonEvent::Delivery { .. } => "delivery",
             DaemonEvent::Attention { .. } => "attention",
+            DaemonEvent::Host { .. } => "host",
         }
     }
 

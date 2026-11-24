@@ -44,11 +44,26 @@ impl Default for GateConfig {
     }
 }
 
-/// Newest `activity_s` among clients attached to `session`, or `None` if there are none.
-fn newest_activity(clients: &[ClientInfo], session: &str) -> Option<u64> {
+/// True when `client` is attached to `pane`'s session (or shared `session_group`) AND
+/// currently viewing `pane`'s window. Falls back to `pane.window_active` when `client.window_id`
+/// is empty (legacy 4-field client records).
+fn client_viewing_pane_window(client: &ClientInfo, pane: &PaneInfo) -> bool {
+    if !pane.same_session_or_group(client) {
+        return false;
+    }
+    if !client.window_id.is_empty() {
+        client.window_id == pane.window_id
+    } else {
+        pane.window_active
+    }
+}
+
+/// Newest `activity_s` among clients viewing `pane`'s window (same session or session group),
+/// or `None` if no client is currently viewing that window.
+fn newest_activity_for_pane(clients: &[ClientInfo], pane: &PaneInfo) -> Option<u64> {
     clients
         .iter()
-        .filter(|c| c.session_name == session)
+        .filter(|c| client_viewing_pane_window(c, pane))
         .map(|c| c.activity_s)
         .max()
 }
@@ -60,25 +75,31 @@ fn idle_for(now_s: u64, activity_s: u64) -> u64 {
 
 /// Is a human plausibly looking at this pane right now?
 ///
-/// Requires the pane to be visible (`session_attached > 0 && window_active && pane_active`)
-/// AND the *newest* `client_activity` among clients of the pane's session to be younger than
-/// `watch_window_secs`. Using the newest client (and ignoring clients of other sessions)
-/// handles `focus-events off` setups where a stale attached client would otherwise make a
-/// visible pane look watched forever. If the session is attached but no client record is
-/// available we cannot prove the user is away, so we answer `true` (conservative).
+/// Requires the pane to be visible (`session_attached > 0 && pane_active` and either
+/// `window_active` or a grouped-session client displaying `pane.window_id`) AND the *newest*
+/// `client_activity` among clients viewing that window to be younger than `watch_window_secs`.
+/// Background windows in an attached session are never falsely treated as watched.
+/// If the session is attached and visible (`window_active && pane_active`) but no client
+/// records were supplied at all (`clients.is_empty()`), we cannot prove the user is away,
+/// so we answer `true` (conservative).
 pub fn is_user_watching(
     pane: &PaneInfo,
     clients: &[ClientInfo],
     now_s: u64,
     watch_window_secs: u64,
 ) -> bool {
-    let visible = pane.session_attached > 0 && pane.window_active && pane.pane_active;
-    if !visible {
+    if pane.session_attached == 0 || !pane.pane_active {
         return false;
     }
-    match newest_activity(clients, &pane.session_name) {
+    let has_group_window_viewer = clients.iter().any(|c| {
+        pane.same_session_or_group(c) && !c.window_id.is_empty() && c.window_id == pane.window_id
+    });
+    if !pane.window_active && !has_group_window_viewer {
+        return false;
+    }
+    match newest_activity_for_pane(clients, pane) {
         Some(act) => idle_for(now_s, act) < watch_window_secs,
-        None => true,
+        None => clients.is_empty(),
     }
 }
 
@@ -135,7 +156,7 @@ pub fn check_injection_gate(
         notes.push(format!("agent state is {state:?}, not Idle"));
     }
 
-    let user_inactive = match newest_activity(clients, &pane.session_name) {
+    let user_inactive = match newest_activity_for_pane(clients, pane) {
         Some(act) => {
             let quiet = idle_for(now_s, act);
             if quiet <= cfg.user_inactive_secs {
@@ -300,6 +321,9 @@ mod tests {
             cursor_x: 0,
             cursor_y: 0,
             window_name: "code".into(),
+            session_group: String::new(),
+            history_size: 0,
+            pane_height: 24,
         }
     }
 

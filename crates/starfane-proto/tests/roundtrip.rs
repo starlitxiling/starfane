@@ -241,6 +241,9 @@ fn state_snapshot_and_sse_roundtrip() {
             source: "transcript".into(),
             updated_ms: 1234,
         }),
+        host_id: Some(HostId::new("local")),
+        host_display_name: Some("Local".into()),
+        mux_kind: Some("tmux".into()),
     };
     let snap = StateSnapshot {
         v: 1,

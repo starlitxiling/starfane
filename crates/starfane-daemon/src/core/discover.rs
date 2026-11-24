@@ -2,19 +2,57 @@
 //! detection for legacy (`discovered_only`) panes, pane preview, and direct L4 spawn.
 
 use super::metrics::{
-    cached_transcript_telemetry, canonical_external_session_id, extract_agy_effort_from_model,
-    infer_session_effort, merge_cc_switch_with_fallback, metrics_meaningfully_equal,
-    parse_status_line_metrics, query_lsof_agy_presence_all, resolve_agy_transcript_by_id,
-    resolve_claude_transcript_by_pids, resolve_codex_transcript_by_id,
+    canonical_external_session_id, extract_agy_effort_from_model, infer_session_effort,
+    merge_cc_switch_with_fallback, metrics_meaningfully_equal, parse_status_line_metrics,
+    query_lsof_agy_presence_all, resolve_agy_transcript_by_id, resolve_claude_transcript_by_pids,
+    resolve_codex_transcript_by_id, AgyDiscoveredChild,
 };
 use super::state::{is_subagent_active, PaneWatch, State};
 use super::transcript::resolve_transcript_path;
 use super::{lock, util, Core};
 use starfane_proto::*;
-use starfane_tmux::{DiscoveredPane, PanePreview};
+use starfane_tmux::{CaptureRequest, DiscoveredPane, PanePreview};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+/// Force a fresh `ps -eo` sweep every N discovery ticks (~30s at 3s interval) even when pane
+/// fingerprints look static, so deeply nested child launches inside unchanged shells are still caught.
+const PS_FORCE_REFRESH_TICKS: u32 = 10;
+/// Maximum consecutive ticks to serve a cached tail capture before re-probing (ensures panes
+/// whose `history_size` is saturated at `history-limit` or update in-place still detect activity).
+const TAIL_CACHE_MAX_TICKS: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneFingerprint {
+    pane_id: PaneId,
+    pane_pid: u32,
+    current_command: String,
+    current_path: String,
+    dead: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TailCacheEntry {
+    history_size: u32,
+    cursor_x: u32,
+    cursor_y: u32,
+    in_mode: bool,
+    current_command: String,
+    ticks_cached: u8,
+    tail: String,
+}
+
+/// Off-state cache eliminating redundant `ps -eo` and `tmux capture-pane` subprocesses during
+/// steady-state 3-second discovery ticks.
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveryScanCache {
+    panes_sig: Vec<PaneFingerprint>,
+    include_shell_panes: bool,
+    cached_discovered: Vec<DiscoveredPane>,
+    ticks_since_ps: u32,
+    tail_cache: HashMap<PaneId, TailCacheEntry>,
+}
 
 /// Number of unchanged 3-second polling ticks (~9s) before a `Working` legacy pane is
 /// considered `Idle` (heuristic `TurnComplete`).
@@ -25,9 +63,13 @@ const LEGACY_HASH_LINES: usize = 20;
 /// the agent CLI is still launching in the pane.
 const LEGACY_SPAWN_GRACE_MS: u64 = 15_000;
 
-/// Deterministic session ID assigned to a tmux-discovered pane before any hook arrives.
+/// Deterministic session ID assigned to a tmux/zellij-discovered pane before any hook arrives.
 pub(crate) fn legacy_session_id(pane: &PaneId) -> SessionId {
-    SessionId::new(format!("tmux-{}", pane.as_str()))
+    if pane.as_str().starts_with("zj:") {
+        SessionId::new(pane.as_str())
+    } else {
+        SessionId::new(format!("tmux-{}", pane.as_str()))
+    }
 }
 
 /// Skip background `capture-pane` while a pane is in tmux `copy-mode` (`pane_in_mode`)
@@ -123,14 +165,18 @@ pub(crate) fn reconcile_discovered_panes(
         if dp.pane_dead {
             continue;
         }
-        // Check if a real (hook-backed) live root session of the same agent is already bound to this pane.
+        // Check if a real (hook-backed) live root session is already bound to this pane.
+        // For Shell panes (when `include_shell_panes = true`), any live real agent session on
+        // the same pane (e.g. a wrapped/scripted agent whose foreground process is `python3`)
+        // prevents creating a duplicate `discovered_only` Shell entry on that pane.
         let real_id = st
             .sessions
             .values()
             .filter(|s| {
                 !s.is_subagent
                     && !s.discovered_only
-                    && s.agent == dp.agent
+                    && s.is_local_host()
+                    && (s.agent == dp.agent || dp.agent.is_shell())
                     && s.pane.as_ref() == Some(&dp.pane_id)
                     && s.state != SessionState::Ended
             })
@@ -286,6 +332,13 @@ pub(crate) fn reconcile_discovered_panes(
                     discovered_only: true,
                     transcript_path: None,
                     metrics: None,
+                    host_id: None,
+                    host_display_name: None,
+                    mux_kind: Some(if dp.pane_id.as_str().starts_with("zj:") {
+                        "zellij".to_string()
+                    } else {
+                        "tmux".to_string()
+                    }),
                 };
                 st.sessions.insert(leg_id.clone(), rec.clone());
                 changed = true;
@@ -306,7 +359,7 @@ pub(crate) fn reconcile_discovered_panes(
         .sessions
         .iter()
         .filter(|(_, s)| {
-            if !s.discovered_only {
+            if !s.discovered_only || !s.is_local_host() {
                 return false;
             }
             match s.pane.as_ref() {
@@ -347,7 +400,11 @@ pub(crate) fn reconcile_discovered_panes(
             .sessions
             .iter()
             .filter(|(_, s)| {
-                if s.discovered_only || s.is_subagent || s.state == SessionState::Ended {
+                if s.discovered_only
+                    || s.is_subagent
+                    || s.state == SessionState::Ended
+                    || !s.is_local_host()
+                {
                     return false;
                 }
                 match s.pane.as_ref() {
@@ -396,6 +453,7 @@ pub(crate) fn reconcile_discovered_panes(
     for rec in st.sessions.values_mut() {
         if !rec.discovered_only
             && !rec.is_subagent
+            && rec.is_local_host()
             && rec.state != SessionState::Ended
             && rec.pane.is_none()
             && (rec.tmux_target.is_some()
@@ -567,18 +625,78 @@ where
 
 impl Core {
     /// Scan tmux for existing agent panes, sync into `State`, and run heuristic completion checks.
+    ///
+    /// Hot-path guarantees:
+    /// - Skips `ps -eo` when pane fingerprints are unchanged (refreshing periodically every 30s).
+    /// - Skips `capture-pane` when `(history_size, cursor_x, cursor_y, in_mode, current_command)`
+    ///   did not change, and batches all changed panes into a single `tmux` invocation.
+    /// - Runs ALL SQLite (`cc-switch`, `codex`, `agy`), `lsof`, and O(delta) JSONL reads outside
+    ///   `Mutex<State>` so control-plane lock hold times stay sub-millisecond.
     pub async fn sync_discovered_panes(&self) {
         let core = self.clone();
         let include_shell_panes = core.inner.cfg.discovery.include_shell_panes;
         let scan = tokio::task::spawn_blocking(move || {
-            let panes = core.inner.tmux.list_panes()?;
+            let panes = core.inner.mux.list_all_panes()?;
             let live_ids: HashSet<PaneId> = panes.iter().map(|p| p.pane_id.clone()).collect();
-            let discovered = core.inner.tmux.discover_panes_from(
-                &panes,
-                starfane_tmux::DiscoverOptions {
-                    include_shell_panes,
-                },
-            );
+            let mut sig: Vec<PaneFingerprint> = panes
+                .iter()
+                .map(|p| PaneFingerprint {
+                    pane_id: p.pane_id.clone(),
+                    pane_pid: p.pane_pid,
+                    current_command: p.current_command.clone(),
+                    current_path: p.current_path.clone(),
+                    dead: p.dead,
+                })
+                .collect();
+            sig.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+
+            let reused = {
+                let mut dc = lock(&core.inner.discovery_cache);
+                if !panes.is_empty()
+                    && dc.include_shell_panes == include_shell_panes
+                    && dc.panes_sig == sig
+                    && dc.ticks_since_ps < PS_FORCE_REFRESH_TICKS
+                {
+                    dc.ticks_since_ps += 1;
+                    let by_id: HashMap<&PaneId, &starfane_tmux::PaneInfo> =
+                        panes.iter().map(|p| (&p.pane_id, p)).collect();
+                    let mut updated = dc.cached_discovered.clone();
+                    for dp in &mut updated {
+                        if let Some(p) = by_id.get(&dp.pane_id) {
+                            dp.tmux_target =
+                                format!("{}:{}.{}", p.session_name, p.window_index, p.pane_index);
+                            dp.tmux_label = p.tmux_label();
+                            dp.pane_in_mode = p.in_mode;
+                            dp.pane_dead = p.dead;
+                            dp.history_size = p.history_size;
+                            dp.cursor_x = p.cursor_x;
+                            dp.cursor_y = p.cursor_y;
+                        }
+                    }
+                    Some(updated)
+                } else {
+                    None
+                }
+            };
+
+            let discovered = match reused {
+                Some(d) => d,
+                None => {
+                    let fresh = core.inner.mux.discover_panes_from(
+                        &panes,
+                        starfane_tmux::DiscoverOptions {
+                            include_shell_panes,
+                        },
+                    );
+                    let mut dc = lock(&core.inner.discovery_cache);
+                    dc.panes_sig = sig;
+                    dc.include_shell_panes = include_shell_panes;
+                    dc.cached_discovered = fresh.clone();
+                    dc.ticks_since_ps = 0;
+                    dc.tail_cache.retain(|pid, _| live_ids.contains(pid));
+                    fresh
+                }
+            };
             Ok::<_, starfane_tmux::TmuxError>((discovered, live_ids))
         })
         .await;
@@ -596,9 +714,50 @@ impl Core {
         };
 
         let now = id::now_ms();
-        let delta = {
+        let (delta, resolved_panes, claimed_codex_entries, claimed_agy_ids_init) = {
             let mut st = lock(&self.inner.state);
-            reconcile_discovered_panes(&mut st, &discovered, &live_ids, now)
+            let delta = reconcile_discovered_panes(&mut st, &discovered, &live_ids, now);
+            let resolved_panes: HashSet<PaneId> = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    !s.is_subagent
+                        && s.is_local_host()
+                        && s.state != SessionState::Ended
+                        && s.transcript_path.is_some()
+                        && s.metrics.is_some()
+                })
+                .filter_map(|s| s.pane.clone())
+                .collect();
+            let claimed_codex_entries: Vec<(String, Option<PaneId>)> = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    s.agent == AgentKind::Codex
+                        && !s.is_subagent
+                        && s.is_local_host()
+                        && s.state != SessionState::Ended
+                })
+                .filter_map(|s| canonical_external_session_id(s).map(|id| (id, s.pane.clone())))
+                .collect();
+            let claimed_agy_ids_init: HashSet<String> = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    s.agent == AgentKind::Agy
+                        && !s.is_subagent
+                        && !s.discovered_only
+                        && s.is_local_host()
+                        && s.state != SessionState::Ended
+                })
+                .map(|s| s.session_id.0.clone())
+                .collect();
+            (
+                delta,
+                resolved_panes,
+                claimed_codex_entries,
+                claimed_agy_ids_init,
+            )
         };
 
         if delta.changed {
@@ -609,24 +768,8 @@ impl Core {
             self.refresh_attention();
         }
 
-        // Panes whose active root session already resolved both transcript & metrics skip
-        // periodic `capture-pane` unless still `discovered_only` (`is_legacy`).
-        let resolved_panes: HashSet<PaneId> = {
-            let st = lock(&self.inner.state);
-            st.sessions
-                .values()
-                .filter(|s| {
-                    !s.is_subagent
-                        && s.state != SessionState::Ended
-                        && s.transcript_path.is_some()
-                        && s.metrics.is_some()
-                })
-                .filter_map(|s| s.pane.clone())
-                .collect()
-        };
-
-        // Exact PID-subtree / resume-UUID transcript resolution (Claude `~/.claude/sessions/<pid>.json`,
-        // Codex `resume <uuid>`) + capture last 20 lines for legacy panes, Codex title matching & status-line hints.
+        // Exact PID-subtree / resume-UUID transcript resolution + batched/fingerprint-cached
+        // tail captures + off-lock SQLite & `lsof` queries.
         struct PaneScanTarget {
             pane: PaneId,
             agent: AgentKind,
@@ -636,6 +779,10 @@ impl Core {
             is_legacy: bool,
             pane_in_mode: bool,
             needs_tail_fallback: bool,
+            history_size: u32,
+            cursor_x: u32,
+            cursor_y: u32,
+            current_command: String,
         }
         let legacy_set: HashSet<PaneId> =
             delta.active_legacy.iter().map(|(_, p)| p.clone()).collect();
@@ -655,182 +802,256 @@ impl Core {
                     d.agent_pid.into_iter().collect()
                 },
                 resume_id: d.codex_resume_id.clone(),
+                history_size: d.history_size,
+                cursor_x: d.cursor_x,
+                cursor_y: d.cursor_y,
+                current_command: d.pane_current_command.clone(),
             })
             .collect();
 
-        // Check which AGY PIDs need a fresh `lsof` presence-lock lookup (30s TTL cache).
         let now_inst = std::time::Instant::now();
-        let all_agy_pids: Vec<u32> = pane_targets
-            .iter()
-            .filter(|t| t.agent == AgentKind::Agy)
-            .flat_map(|t| t.subtree_pids.iter().copied())
-            .collect();
-        let stale_agy_pids = if all_agy_pids.is_empty() {
-            Vec::new()
-        } else {
-            lock(&self.inner.state)
-                .agy_presence_cache
-                .stale_pids(&all_agy_pids, now_inst)
-        };
-
+        let poll_now = id::now_ms();
         let core_cap = self.clone();
-        let stale_for_lsof = stale_agy_pids.clone();
-        let scan_extra = tokio::task::spawn_blocking(move || {
+
+        struct OffLockScanResult {
+            tails: HashMap<PaneId, String>,
+            exact_paths: HashMap<PaneId, PathBuf>,
+            authoritative_panes: HashSet<PaneId>,
+            agy_lock_conv_by_pane: HashMap<PaneId, String>,
+        }
+
+        let off_lock = tokio::task::spawn_blocking(move || {
             let mut tails: HashMap<PaneId, String> = HashMap::new();
             let mut exact_paths: HashMap<PaneId, PathBuf> = HashMap::new();
             let mut codex_needing_match: Vec<(PaneId, String)> = Vec::new();
             let mut agy_targets: Vec<(PaneId, String, Vec<u32>)> = Vec::new();
-            let lsof_map = if stale_for_lsof.is_empty() {
+            let mut batch_capture_targets: Vec<(PaneId, usize)> = Vec::new();
+            let mut target_meta: HashMap<PaneId, (u32, u32, u32, bool, String)> = HashMap::new();
+
+            let all_agy_pids: Vec<u32> = pane_targets
+                .iter()
+                .filter(|t| t.agent == AgentKind::Agy)
+                .flat_map(|t| t.subtree_pids.iter().copied())
+                .collect();
+            let stale_agy_pids = if all_agy_pids.is_empty() {
+                Vec::new()
+            } else {
+                lock(&core_cap.inner.telemetry)
+                    .agy_presence_cache
+                    .stale_pids(&all_agy_pids, now_inst)
+            };
+            let lsof_map = if stale_agy_pids.is_empty() {
                 HashMap::new()
             } else {
-                query_lsof_agy_presence_all(&stale_for_lsof)
+                query_lsof_agy_presence_all(&stale_agy_pids)
             };
-            for t in pane_targets {
-                if t.agent == AgentKind::Claude {
-                    if let Some((_, p)) = resolve_claude_transcript_by_pids(&t.subtree_pids) {
-                        exact_paths.insert(t.pane.clone(), p);
-                    }
-                } else if t.agent == AgentKind::Codex {
-                    if let Some(p) = t
-                        .resume_id
-                        .as_deref()
-                        .and_then(resolve_codex_transcript_by_id)
-                    {
-                        exact_paths.insert(t.pane.clone(), p);
-                    } else {
-                        codex_needing_match.push((t.pane.clone(), t.cwd.clone()));
-                    }
-                } else if t.agent == AgentKind::Agy {
-                    agy_targets.push((t.pane.clone(), t.cwd.clone(), t.subtree_pids.clone()));
-                }
-                if should_capture_tail_for_scan(
-                    t.pane_in_mode,
-                    t.is_legacy,
-                    t.agent,
-                    t.needs_tail_fallback,
-                ) {
-                    if let Ok(tail) = core_cap
-                        .inner
-                        .tmux
-                        .capture_pane_tail(&t.pane, LEGACY_HASH_LINES)
-                    {
-                        tails.insert(t.pane, tail);
-                    }
-                }
-            }
-            (
-                tails,
-                exact_paths,
-                codex_needing_match,
-                agy_targets,
-                lsof_map,
-            )
-        })
-        .await
-        .unwrap_or_default();
-        let (tails, mut exact_paths, codex_needing_match, agy_targets, lsof_map) = scan_extra;
 
-        let poll_now = id::now_ms();
-        let mut transitions = Vec::new();
-        let mut metrics_updated = Vec::new();
-        {
-            let mut st = lock(&self.inner.state);
-
-            // 0. Update AGY presence-lock cache and refresh cached read-only SQLite indices.
-            if !stale_agy_pids.is_empty() {
-                st.agy_presence_cache
-                    .update_all(&stale_agy_pids, &lsof_map, now_inst);
-            }
-            if !codex_needing_match.is_empty() {
-                st.codex_threads_cache.refresh_if_needed();
-                let claimed_codex_entries: Vec<(String, Option<PaneId>)> = st
-                    .sessions
-                    .values()
-                    .filter(|s| {
-                        s.agent == AgentKind::Codex
-                            && !s.is_subagent
-                            && s.state != SessionState::Ended
-                    })
-                    .filter_map(|s| canonical_external_session_id(s).map(|id| (id, s.pane.clone())))
-                    .collect();
-                let mut newly_claimed_codex_ids: HashSet<String> = HashSet::new();
-                for (pane, cwd) in &codex_needing_match {
-                    if let Some(tail) = tails.get(pane) {
-                        let mut exclude: HashSet<String> = claimed_codex_entries
-                            .iter()
-                            .filter(|(_, p)| p.as_ref() != Some(pane))
-                            .map(|(id, _)| id.clone())
-                            .collect();
-                        exclude.extend(newly_claimed_codex_ids.iter().cloned());
-                        if let Some((cid, p)) =
-                            st.codex_threads_cache.match_pane(cwd, tail, &exclude)
+            {
+                let mut dc = lock(&core_cap.inner.discovery_cache);
+                for t in &pane_targets {
+                    if t.agent == AgentKind::Claude {
+                        if let Some((_, p)) = resolve_claude_transcript_by_pids(&t.subtree_pids) {
+                            exact_paths.insert(t.pane.clone(), p);
+                        }
+                    } else if t.agent == AgentKind::Codex {
+                        if let Some(p) = t
+                            .resume_id
+                            .as_deref()
+                            .and_then(resolve_codex_transcript_by_id)
                         {
-                            newly_claimed_codex_ids.insert(cid);
-                            exact_paths.insert(pane.clone(), p);
+                            exact_paths.insert(t.pane.clone(), p);
+                        } else {
+                            codex_needing_match.push((t.pane.clone(), t.cwd.clone()));
+                        }
+                    } else if t.agent == AgentKind::Agy {
+                        agy_targets.push((t.pane.clone(), t.cwd.clone(), t.subtree_pids.clone()));
+                    }
+                    if should_capture_tail_for_scan(
+                        t.pane_in_mode,
+                        t.is_legacy,
+                        t.agent,
+                        t.needs_tail_fallback,
+                    ) {
+                        // Zellij does not report `history_size`, and tmux scrollback can saturate
+                        // at `history-limit` or update in-place: bound cache reuse to `TAIL_CACHE_MAX_TICKS`.
+                        let is_zellij = t.pane.as_str().starts_with("zj:");
+                        let cached_tail = if is_zellij {
+                            None
+                        } else {
+                            dc.tail_cache.get_mut(&t.pane).and_then(|c| {
+                                if c.history_size == t.history_size
+                                    && c.cursor_x == t.cursor_x
+                                    && c.cursor_y == t.cursor_y
+                                    && c.in_mode == t.pane_in_mode
+                                    && c.current_command == t.current_command
+                                    && c.ticks_cached < TAIL_CACHE_MAX_TICKS
+                                {
+                                    c.ticks_cached = c.ticks_cached.saturating_add(1);
+                                    Some(c.tail.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        };
+                        if let Some(hit_tail) = cached_tail {
+                            tails.insert(t.pane.clone(), hit_tail);
+                        } else {
+                            batch_capture_targets.push((t.pane.clone(), LEGACY_HASH_LINES));
+                            target_meta.insert(
+                                t.pane.clone(),
+                                (
+                                    t.history_size,
+                                    t.cursor_x,
+                                    t.cursor_y,
+                                    t.pane_in_mode,
+                                    t.current_command.clone(),
+                                ),
+                            );
                         }
                     }
                 }
             }
+
+            // Capture ALL changed panes in ONE single batched `tmux` invocation!
+            if !batch_capture_targets.is_empty() {
+                let refs: Vec<(&PaneId, usize)> =
+                    batch_capture_targets.iter().map(|(p, n)| (p, *n)).collect();
+                let fresh_tails = core_cap.inner.mux.capture_panes_tail_batch(&refs);
+                let mut dc = lock(&core_cap.inner.discovery_cache);
+                for (pid, text) in fresh_tails {
+                    if let Some((hs, cx, cy, im, cmd)) = target_meta.remove(&pid) {
+                        dc.tail_cache.insert(
+                            pid.clone(),
+                            TailCacheEntry {
+                                history_size: hs,
+                                cursor_x: cx,
+                                cursor_y: cy,
+                                in_mode: im,
+                                current_command: cmd,
+                                ticks_cached: 0,
+                                tail: text.clone(),
+                            },
+                        );
+                    }
+                    tails.insert(pid, text);
+                }
+            }
+
+            // Refresh SQLite caches + presence cache completely outside `Mutex<State>`.
             let mut agy_lock_conv_by_pane: HashMap<PaneId, String> = HashMap::new();
             let mut authoritative_panes: HashSet<PaneId> = exact_paths.keys().cloned().collect();
-            if !agy_targets.is_empty() {
-                st.agy_convs_cache.refresh_if_needed();
-                let mut claimed_agy_ids: HashSet<String> = st
-                    .sessions
-                    .values()
-                    .filter(|s| {
-                        s.agent == AgentKind::Agy
-                            && !s.is_subagent
-                            && !s.discovered_only
-                            && s.state != SessionState::Ended
-                    })
-                    .map(|s| s.session_id.0.clone())
-                    .collect();
-                let mut unmatched_agy: Vec<(PaneId, String)> = Vec::new();
-                for (pane, cwd, pids) in &agy_targets {
-                    if let Some(conv_id) = st
-                        .agy_presence_cache
-                        .find_for_pids_preferring_roots(pids, &st.agy_convs_cache)
-                    {
-                        claimed_agy_ids.insert(conv_id.clone());
-                        agy_lock_conv_by_pane.insert(pane.clone(), conv_id.clone());
-                        if let Some(p) = resolve_agy_transcript_by_id(&conv_id) {
-                            exact_paths.insert(pane.clone(), p);
-                            authoritative_panes.insert(pane.clone());
-                        }
-                    } else {
-                        unmatched_agy.push((pane.clone(), cwd.clone()));
-                    }
+            {
+                let mut tc = lock(&core_cap.inner.telemetry);
+                if !stale_agy_pids.is_empty() {
+                    tc.agy_presence_cache
+                        .update_all(&stale_agy_pids, &lsof_map, now_inst);
                 }
-                if !unmatched_agy.is_empty() {
-                    let mut unclaimed_cwd_counts: HashMap<String, usize> = HashMap::new();
-                    for (_, cwd) in &unmatched_agy {
-                        *unclaimed_cwd_counts
-                            .entry(cwd.trim_end_matches('/').to_string())
-                            .or_insert(0) += 1;
-                    }
-                    for (pane, cwd) in &unmatched_agy {
-                        let unique = unclaimed_cwd_counts
-                            .get(cwd.trim_end_matches('/'))
-                            .copied()
-                            .unwrap_or(0)
-                            == 1;
-                        if let Some((cid, p)) = st.agy_convs_cache.match_unique_cwd_excluding(
-                            cwd,
-                            unique,
-                            &claimed_agy_ids,
-                        ) {
-                            claimed_agy_ids.insert(cid);
-                            exact_paths.entry(pane.clone()).or_insert(p);
+                if !codex_needing_match.is_empty() {
+                    tc.codex_threads_cache.refresh_if_needed();
+                    let mut newly_claimed_codex_ids: HashSet<String> = HashSet::new();
+                    for (pane, cwd) in &codex_needing_match {
+                        if let Some(tail) = tails.get(pane) {
+                            let mut exclude: HashSet<String> = claimed_codex_entries
+                                .iter()
+                                .filter(|(_, p)| p.as_ref() != Some(pane))
+                                .map(|(id, _)| id.clone())
+                                .collect();
+                            exclude.extend(newly_claimed_codex_ids.iter().cloned());
+                            if let Some((cid, p)) =
+                                tc.codex_threads_cache.match_pane(cwd, tail, &exclude)
+                            {
+                                newly_claimed_codex_ids.insert(cid);
+                                exact_paths.insert(pane.clone(), p);
+                            }
                         }
                     }
                 }
+                if !agy_targets.is_empty() {
+                    tc.agy_convs_cache.refresh_if_needed();
+                    let mut claimed_agy_ids = claimed_agy_ids_init;
+                    let mut unmatched_agy: Vec<(PaneId, String)> = Vec::new();
+                    for (pane, cwd, pids) in &agy_targets {
+                        if let Some(conv_id) = tc
+                            .agy_presence_cache
+                            .find_for_pids_preferring_roots(pids, &tc.agy_convs_cache)
+                        {
+                            claimed_agy_ids.insert(conv_id.clone());
+                            agy_lock_conv_by_pane.insert(pane.clone(), conv_id.clone());
+                            if let Some(p) = resolve_agy_transcript_by_id(&conv_id) {
+                                exact_paths.insert(pane.clone(), p);
+                                authoritative_panes.insert(pane.clone());
+                            }
+                        } else {
+                            unmatched_agy.push((pane.clone(), cwd.clone()));
+                        }
+                    }
+                    if !unmatched_agy.is_empty() {
+                        let mut unclaimed_cwd_counts: HashMap<String, usize> = HashMap::new();
+                        for (_, cwd) in &unmatched_agy {
+                            *unclaimed_cwd_counts
+                                .entry(cwd.trim_end_matches('/').to_string())
+                                .or_insert(0) += 1;
+                        }
+                        for (pane, cwd) in &unmatched_agy {
+                            let unique = unclaimed_cwd_counts
+                                .get(cwd.trim_end_matches('/'))
+                                .copied()
+                                .unwrap_or(0)
+                                == 1;
+                            if let Some((cid, p)) = tc.agy_convs_cache.match_unique_cwd_excluding(
+                                cwd,
+                                unique,
+                                &claimed_agy_ids,
+                            ) {
+                                claimed_agy_ids.insert(cid);
+                                exact_paths.entry(pane.clone()).or_insert(p);
+                            }
+                        }
+                    }
+                }
+                tc.cc_switch_cache.refresh_if_needed(poll_now);
             }
-            st.cc_switch_cache.refresh_if_needed(poll_now);
 
-            // 0.5. Self-heal any AGY root conversation mistakenly folded as a subagent
-            //      when `presence/<conv_id>.lock` proves it is the live root of that pane,
-            //      and evict any rival non-Ended AGY root (e.g. CwdMatch hijackers) on that pane.
+            OffLockScanResult {
+                tails,
+                exact_paths,
+                authoritative_panes,
+                agy_lock_conv_by_pane,
+            }
+        })
+        .await;
+
+        let Ok(OffLockScanResult {
+            tails,
+            exact_paths,
+            authoritative_panes,
+            agy_lock_conv_by_pane,
+        }) = off_lock
+        else {
+            return;
+        };
+
+        // Short State mutation #1: promote AGY roots, backfill exact transcript paths, apply legacy
+        // tail-hash transitions, and collect lightweight snapshots for off-lock AGY-child + telemetry IO.
+        struct AgyRootRef {
+            sid: SessionId,
+            cwd: Option<String>,
+            git_root: Option<String>,
+            ext_id: String,
+        }
+        struct RootMetricsInput {
+            sid: SessionId,
+            agent: AgentKind,
+            pane: Option<PaneId>,
+            tp: Option<PathBuf>,
+            ext_sid: Option<String>,
+        }
+
+        let mut transitions = Vec::new();
+        let mut metrics_updated = Vec::new();
+        let (agy_roots, live_roots) = {
+            let mut st = lock(&self.inner.state);
+
             for (pane, conv_id) in &agy_lock_conv_by_pane {
                 let leg_id = legacy_session_id(pane);
                 let real_id = SessionId::new(conv_id.clone());
@@ -867,9 +1088,6 @@ impl Core {
                 }
             }
 
-            // 1. Backfill exact transcript paths onto matching live sessions, and bidirectionally
-            //    merge any split `(tmux-%N, hook session with pane=None)` pair that shares the
-            //    same transcript path or rollout UUID (e.g. Codex hooks via shared app-server).
             let discovered_by_pane: HashMap<PaneId, &DiscoveredPane> = discovered
                 .iter()
                 .filter(|d| !d.pane_dead)
@@ -879,9 +1097,6 @@ impl Core {
                 let path_str = path.to_string_lossy().into_owned();
                 let pane_agent = discovered_by_pane.get(pane).map(|d| d.agent);
                 let leg_id = legacy_session_id(pane);
-
-                // Check if a real (hook-backed) live or authoritatively revivable root session
-                // matches this transcript/UUID.
                 let allow_revive = authoritative_panes.contains(pane);
                 if let Some((real_id, revived)) = find_matching_or_revivable_real_session(
                     &st,
@@ -958,7 +1173,6 @@ impl Core {
                 }
             }
 
-            // 2. Legacy heuristic tail-hash transitions.
             for (sid, pane) in &delta.active_legacy {
                 if let Some(tail) = tails.get(pane) {
                     if let Some(tr) = apply_legacy_tail_hash(&mut st, sid, pane, tail, poll_now) {
@@ -967,181 +1181,35 @@ impl Core {
                 }
             }
 
-            // 3.5. Sync AGY Swarm / subagent child conversations from `conversation_summaries.db`
-            //      so users can click any Swarm worker in the Web UI and read its full transcript.
-            struct AgyRootRef {
-                sid: SessionId,
-                pane: Option<PaneId>,
-                cwd: Option<String>,
-                git_root: Option<String>,
-                ext_id: String,
-            }
             let agy_roots: Vec<AgyRootRef> = st
                 .sessions
                 .values()
                 .filter(|s| {
-                    !s.is_subagent && s.agent == AgentKind::Agy && s.state != SessionState::Ended
+                    !s.is_subagent
+                        && s.is_local_host()
+                        && s.agent == AgentKind::Agy
+                        && s.state != SessionState::Ended
                 })
                 .filter_map(|s| {
                     let ext_id = canonical_external_session_id(s)?;
                     Some(AgyRootRef {
                         sid: s.session_id.clone(),
-                        pane: s.pane.clone(),
                         cwd: s.cwd.clone(),
                         git_root: s.git_root.clone(),
                         ext_id,
                     })
                 })
                 .collect();
-            for root in agy_roots {
-                let AgyRootRef {
-                    sid: root_sid,
-                    pane,
-                    cwd,
-                    git_root,
-                    ext_id,
-                } = root;
-                let kids = st.agy_convs_cache.children_of(&ext_id);
-                if kids.is_empty() {
-                    continue;
-                }
-                let mut total_kids: u32 = 0;
-                let mut active_kids: u32 = 0;
-                for kid in kids {
-                    total_kids += 1;
-                    if is_subagent_active(kid.state) {
-                        active_kids += 1;
-                    }
-                    let ksid = SessionId::new(kid.conversation_id);
-                    let tr_str = kid.transcript_path.to_string_lossy().into_owned();
-                    match st.sessions.get_mut(&ksid) {
-                        Some(existing) => {
-                            let mut c = false;
-                            if existing.parent_session_id.as_ref() != Some(&root_sid) {
-                                existing.parent_session_id = Some(root_sid.clone());
-                                c = true;
-                            }
-                            if !existing.is_subagent {
-                                existing.is_subagent = true;
-                                c = true;
-                            }
-                            if existing.transcript_path.as_deref() != Some(tr_str.as_str()) {
-                                existing.transcript_path = Some(tr_str);
-                                c = true;
-                            }
-                            if let Some(name) = kid.agent_name {
-                                if existing.tmux_label.as_deref() != Some(name.as_str()) {
-                                    existing.tmux_label = Some(name);
-                                    c = true;
-                                }
-                            }
-                            if existing.discovered_only && existing.state != kid.state {
-                                existing.state = kid.state;
-                                existing.state_since_ms = poll_now;
-                                c = true;
-                            }
-                            if c {
-                                metrics_updated.push(existing.clone());
-                            }
-                        }
-                        None => {
-                            let _ = pane;
-                            let rec = SessionRecord {
-                                session_id: ksid.clone(),
-                                agent: AgentKind::Agy,
-                                pane: None,
-                                pane_resolution: PaneResolution::Unknown,
-                                cwd: cwd.clone(),
-                                git_root: git_root.clone(),
-                                model: None,
-                                effort: None,
-                                state: kid.state,
-                                state_since_ms: poll_now,
-                                last_event_id: None,
-                                last_event_ms: poll_now,
-                                last_message: None,
-                                last_error: None,
-                                parent_session_id: Some(root_sid.clone()),
-                                is_subagent: true,
-                                subagent_count: 0,
-                                active_subagents: 0,
-                                stage: None,
-                                unread_inbox: 0,
-                                confidence: Confidence::Heuristic,
-                                tmux_target: None,
-                                tmux_label: kid.agent_name,
-                                discovered_only: true,
-                                transcript_path: Some(tr_str),
-                                metrics: None,
-                            };
-                            st.sessions.insert(ksid, rec.clone());
-                            metrics_updated.push(rec);
-                        }
-                    }
-                }
-                let root_is_idle = st.agy_convs_cache.root_is_idle(&ext_id);
-                if let Some(parent) = st.sessions.get_mut(&root_sid) {
-                    let mut pchanged = false;
-                    if parent.subagent_count < total_kids || parent.active_subagents != active_kids
-                    {
-                        parent.subagent_count = parent.subagent_count.max(total_kids);
-                        parent.active_subagents = active_kids;
-                        pchanged = true;
-                    }
-                    if parent.state == SessionState::Working
-                        && poll_now.saturating_sub(parent.last_event_ms) >= 10_000
-                        && parent.active_subagents == 0
-                        && root_is_idle
-                    {
-                        parent.state = SessionState::Idle;
-                        parent.state_since_ms = poll_now;
-                        pchanged = true;
-                    }
-                    if pchanged {
-                        metrics_updated.push(parent.clone());
-                    }
-                }
-            }
 
-            // Also heal any childless AGY root stuck in `Working` when conversation_summaries reports IDLE.
-            let stale_agy_roots: Vec<(SessionId, String)> = st
+            let live_roots: Vec<RootMetricsInput> = st
                 .sessions
                 .values()
                 .filter(|s| {
                     !s.is_subagent
-                        && s.agent == AgentKind::Agy
-                        && s.state == SessionState::Working
-                        && poll_now.saturating_sub(s.last_event_ms) >= 10_000
-                        && s.active_subagents == 0
+                        && s.is_local_host()
+                        && !s.agent.is_shell()
+                        && s.state != SessionState::Ended
                 })
-                .filter_map(|s| {
-                    let ext = canonical_external_session_id(s)?;
-                    st.agy_convs_cache
-                        .root_is_idle(&ext)
-                        .then(|| (s.session_id.clone(), ext))
-                })
-                .collect();
-            for (sid, _) in stale_agy_roots {
-                if let Some(rec) = st.sessions.get_mut(&sid) {
-                    rec.state = SessionState::Idle;
-                    rec.state_since_ms = poll_now;
-                    metrics_updated.push(rec.clone());
-                }
-            }
-
-            // 4. Cached `cc-switch.db` + `(mtime, len)` transcript + status-line metrics refresh
-            //    for all live root sessions.
-            struct RootMetricsInput {
-                sid: SessionId,
-                agent: AgentKind,
-                pane: Option<PaneId>,
-                tp: Option<PathBuf>,
-                ext_sid: Option<String>,
-            }
-            let live_roots: Vec<RootMetricsInput> = st
-                .sessions
-                .values()
-                .filter(|s| !s.is_subagent && !s.agent.is_shell() && s.state != SessionState::Ended)
                 .map(|s| RootMetricsInput {
                     sid: s.session_id.clone(),
                     agent: s.agent,
@@ -1151,20 +1219,61 @@ impl Core {
                 })
                 .collect();
 
-            let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+            (agy_roots, live_roots)
+        };
+
+        // Off-lock pass #2: fetch AGY child summaries + O(delta) transcript telemetry + cc-switch lookup
+        // completely outside `Mutex<State>`.
+        struct ComputedRootMetrics {
+            sid: SessionId,
+            agent: AgentKind,
+            cc_model: Option<String>,
+            tr_model: Option<String>,
+            tr_effort: Option<String>,
+            combined: Option<SessionMetrics>,
+        }
+        struct AgyChildrenBatch {
+            root_sid: SessionId,
+            cwd: Option<String>,
+            git_root: Option<String>,
+            kids: Vec<AgyDiscoveredChild>,
+            root_is_idle: bool,
+        }
+
+        let core_tel = self.clone();
+        let (agy_batches, computed_metrics) = tokio::task::spawn_blocking(move || {
+            let agy_batches: Vec<AgyChildrenBatch> = {
+                let tc = lock(&core_tel.inner.telemetry);
+                agy_roots
+                    .into_iter()
+                    .map(|r| {
+                        let kids = tc.agy_convs_cache.children_of(&r.ext_id);
+                        let root_is_idle = tc.agy_convs_cache.root_is_idle(&r.ext_id);
+                        AgyChildrenBatch {
+                            root_sid: r.sid,
+                            cwd: r.cwd,
+                            git_root: r.git_root,
+                            kids,
+                            root_is_idle,
+                        }
+                    })
+                    .collect()
+            };
+
+            let mut computed = Vec::with_capacity(live_roots.len());
             for item in live_roots {
-                let cc_entry = item
-                    .ext_sid
-                    .as_deref()
-                    .and_then(|eid| st.cc_switch_cache.get(eid))
-                    .cloned();
+                let cc_entry = item.ext_sid.as_deref().and_then(|eid| {
+                    lock(&core_tel.inner.telemetry)
+                        .cc_switch_cache
+                        .get(eid)
+                        .cloned()
+                });
                 let cc_metrics = cc_entry.as_ref().map(|e| e.metrics.clone());
                 let cc_model = cc_entry.and_then(|e| e.model);
 
                 let (tr_metrics, tr_model, tr_effort) = match item.tp.as_deref() {
-                    Some(p) => {
-                        cached_transcript_telemetry(&mut st.metrics_cache, item.agent, p, poll_now)
-                    }
+                    Some(p) => lock(&core_tel.inner.transcript_index)
+                        .sync_and_telemetry(item.agent, p, poll_now),
                     None => (None, None, None),
                 };
                 let st_metrics = item
@@ -1173,9 +1282,151 @@ impl Core {
                     .and_then(|p| tails.get(p))
                     .and_then(|t| parse_status_line_metrics(item.agent, t, poll_now));
                 let combined = merge_cc_switch_with_fallback(cc_metrics, tr_metrics, st_metrics);
+                computed.push(ComputedRootMetrics {
+                    sid: item.sid,
+                    agent: item.agent,
+                    cc_model,
+                    tr_model,
+                    tr_effort,
+                    combined,
+                });
+            }
+            (agy_batches, computed)
+        })
+        .await
+        .unwrap_or_default();
+
+        // Short State mutation #2: apply precomputed AGY subagent & metrics updates in microseconds.
+        {
+            let mut st = lock(&self.inner.state);
+            let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+
+            for batch in agy_batches {
+                let AgyChildrenBatch {
+                    root_sid,
+                    cwd,
+                    git_root,
+                    kids,
+                    root_is_idle,
+                } = batch;
+                if !kids.is_empty() {
+                    let mut total_kids: u32 = 0;
+                    let mut active_kids: u32 = 0;
+                    for kid in kids {
+                        total_kids += 1;
+                        if is_subagent_active(kid.state) {
+                            active_kids += 1;
+                        }
+                        let ksid = SessionId::new(kid.conversation_id);
+                        let tr_str = kid.transcript_path.to_string_lossy().into_owned();
+                        match st.sessions.get_mut(&ksid) {
+                            Some(existing) => {
+                                let mut c = false;
+                                if existing.parent_session_id.as_ref() != Some(&root_sid) {
+                                    existing.parent_session_id = Some(root_sid.clone());
+                                    c = true;
+                                }
+                                if !existing.is_subagent {
+                                    existing.is_subagent = true;
+                                    c = true;
+                                }
+                                if existing.transcript_path.as_deref() != Some(tr_str.as_str()) {
+                                    existing.transcript_path = Some(tr_str);
+                                    c = true;
+                                }
+                                if let Some(name) = kid.agent_name {
+                                    if existing.tmux_label.as_deref() != Some(name.as_str()) {
+                                        existing.tmux_label = Some(name);
+                                        c = true;
+                                    }
+                                }
+                                if existing.discovered_only && existing.state != kid.state {
+                                    existing.state = kid.state;
+                                    existing.state_since_ms = poll_now;
+                                    c = true;
+                                }
+                                if c {
+                                    metrics_updated.push(existing.clone());
+                                }
+                            }
+                            None => {
+                                let rec = SessionRecord {
+                                    session_id: ksid.clone(),
+                                    agent: AgentKind::Agy,
+                                    pane: None,
+                                    pane_resolution: PaneResolution::Unknown,
+                                    cwd: cwd.clone(),
+                                    git_root: git_root.clone(),
+                                    model: None,
+                                    effort: None,
+                                    state: kid.state,
+                                    state_since_ms: poll_now,
+                                    last_event_id: None,
+                                    last_event_ms: poll_now,
+                                    last_message: None,
+                                    last_error: None,
+                                    parent_session_id: Some(root_sid.clone()),
+                                    is_subagent: true,
+                                    subagent_count: 0,
+                                    active_subagents: 0,
+                                    stage: None,
+                                    unread_inbox: 0,
+                                    confidence: Confidence::Heuristic,
+                                    tmux_target: None,
+                                    tmux_label: kid.agent_name,
+                                    discovered_only: true,
+                                    transcript_path: Some(tr_str),
+                                    metrics: None,
+                                    host_id: None,
+                                    host_display_name: None,
+                                    mux_kind: None,
+                                };
+                                st.sessions.insert(ksid, rec.clone());
+                                metrics_updated.push(rec);
+                            }
+                        }
+                    }
+                    if let Some(parent) = st.sessions.get_mut(&root_sid) {
+                        let mut pchanged = false;
+                        if parent.subagent_count < total_kids
+                            || parent.active_subagents != active_kids
+                        {
+                            parent.subagent_count = parent.subagent_count.max(total_kids);
+                            parent.active_subagents = active_kids;
+                            pchanged = true;
+                        }
+                        if parent.state == SessionState::Working
+                            && poll_now.saturating_sub(parent.last_event_ms) >= 10_000
+                            && parent.active_subagents == 0
+                            && root_is_idle
+                        {
+                            parent.state = SessionState::Idle;
+                            parent.state_since_ms = poll_now;
+                            pchanged = true;
+                        }
+                        if pchanged {
+                            metrics_updated.push(parent.clone());
+                        }
+                    }
+                } else if root_is_idle {
+                    if let Some(rec) = st.sessions.get_mut(&root_sid) {
+                        if rec.state == SessionState::Working
+                            && poll_now.saturating_sub(rec.last_event_ms) >= 10_000
+                            && rec.active_subagents == 0
+                        {
+                            rec.state = SessionState::Idle;
+                            rec.state_since_ms = poll_now;
+                            metrics_updated.push(rec.clone());
+                        }
+                    }
+                }
+            }
+
+            for item in computed_metrics {
                 if let Some(rec) = st.sessions.get_mut(&item.sid) {
                     let mut changed_rec = false;
-                    let valid_tr = tr_model
+                    let valid_tr = item
+                        .tr_model
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| {
@@ -1185,7 +1436,8 @@ impl Core {
                                     && *s == "gemini-flash-worker-agy")
                         })
                         .map(str::to_string);
-                    let valid_cc = cc_model
+                    let valid_cc = item
+                        .cc_model
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| {
@@ -1211,8 +1463,9 @@ impl Core {
                             changed_rec = true;
                         }
                     }
-                    let next_effort = if item.agent == AgentKind::Codex && tr_effort.is_some() {
-                        tr_effort
+                    let next_effort = if item.agent == AgentKind::Codex && item.tr_effort.is_some()
+                    {
+                        item.tr_effort
                     } else if item.agent == AgentKind::Agy {
                         rec.model
                             .as_deref()
@@ -1225,7 +1478,7 @@ impl Core {
                             item.agent,
                             rec.model.as_deref(),
                             None,
-                            tr_effort.as_deref(),
+                            item.tr_effort.as_deref(),
                             home_dir.as_deref(),
                         )
                     };
@@ -1233,8 +1486,10 @@ impl Core {
                         rec.effort = next_effort;
                         changed_rec = true;
                     }
-                    if combined.is_some() && !metrics_meaningfully_equal(&rec.metrics, &combined) {
-                        rec.metrics = combined;
+                    if item.combined.is_some()
+                        && !metrics_meaningfully_equal(&rec.metrics, &item.combined)
+                    {
+                        rec.metrics = item.combined;
                         changed_rec = true;
                     }
                     if changed_rec {
@@ -1246,8 +1501,6 @@ impl Core {
 
         if !metrics_updated.is_empty() {
             self.mark_dirty();
-            // Deduplicate keeping the LAST (freshest) snapshot per session_id so SSE never
-            // drops newer fields (e.g. effort/metrics updated after transcript backfill).
             let mut latest_by_sid: Vec<SessionRecord> = Vec::with_capacity(metrics_updated.len());
             let mut seen = HashSet::new();
             for s in metrics_updated.into_iter().rev() {
@@ -1278,6 +1531,7 @@ impl Core {
     }
 
     /// Lightweight cached metrics refresh for a single session (called on Hook Stop/Start).
+    /// Runs SQLite & JSONL IO completely outside `Mutex<State>`.
     pub async fn refresh_session_metrics(&self, sid: &SessionId) {
         let snap = lock(&self.inner.state).sessions.get(sid).cloned();
         let Some(session) = snap else { return };
@@ -1292,20 +1546,30 @@ impl Core {
         let agent = session.agent;
         let now_ms = id::now_ms();
         let core = self.clone();
-        let sid_clone = sid.clone();
-        let updated = tokio::task::spawn_blocking(move || {
-            let mut st = lock(&core.inner.state);
-            st.cc_switch_cache.refresh_if_needed(now_ms);
-            let cc = ext_sid
-                .as_deref()
-                .and_then(|eid| st.cc_switch_cache.get(eid))
-                .map(|e| e.metrics.clone());
+        let (cc, tr, tr_model, tr_effort) = tokio::task::spawn_blocking(move || {
+            let cc = {
+                let mut tc = lock(&core.inner.telemetry);
+                tc.cc_switch_cache.refresh_if_needed(now_ms);
+                ext_sid
+                    .as_deref()
+                    .and_then(|eid| tc.cc_switch_cache.get(eid))
+                    .map(|e| e.metrics.clone())
+            };
             let (tr, tr_model, tr_effort) = match path.as_deref() {
-                Some(p) => cached_transcript_telemetry(&mut st.metrics_cache, agent, p, now_ms),
+                Some(p) => lock(&core.inner.transcript_index).sync_and_telemetry(agent, p, now_ms),
                 None => (None, None, None),
             };
+            (cc, tr, tr_model, tr_effort)
+        })
+        .await
+        .unwrap_or((None, None, None, None));
+
+        let updated = {
             let home_dir = std::env::var_os("HOME").map(PathBuf::from);
-            let rec = st.sessions.get_mut(&sid_clone)?;
+            let mut st = lock(&self.inner.state);
+            let Some(rec) = st.sessions.get_mut(sid) else {
+                return;
+            };
             let mut changed = false;
             if rec.model.is_none() && tr_model.is_some() {
                 rec.model = tr_model;
@@ -1339,10 +1603,7 @@ impl Core {
                 changed = true;
             }
             changed.then(|| rec.clone())
-        })
-        .await
-        .ok()
-        .flatten();
+        };
 
         if let Some(s) = updated {
             self.mark_dirty();
@@ -1350,11 +1611,24 @@ impl Core {
         }
     }
 
-    /// Fetch live terminal tail preview for `pane`.
-    pub async fn preview_pane(&self, pane: &PaneId, lines: usize) -> Result<PanePreview, ApiError> {
+    /// Fetch live terminal output (tail, cursor-paginated scrollback, or full `-S -`) for `pane`
+    /// across local tmux/zellij or federated SSH/Peer hosts.
+    pub async fn capture_pane(
+        &self,
+        pane: &PaneId,
+        req: CaptureRequest,
+    ) -> Result<PanePreview, ApiError> {
+        let (host_opt, local_pane) = starfane_tmux::split_host_prefix(pane.as_str());
+        if let Some(host) = host_opt {
+            let hid = HostId::new(host);
+            if let Some(provider) = self.inner.remote_nodes.get(&hid).cloned() {
+                return provider.capture_pane(&PaneId::new(local_pane), &req).await;
+            }
+            return Err(ApiError::not_found(format!("unknown remote host {host}")));
+        }
         let core = self.clone();
         let pane = pane.clone();
-        tokio::task::spawn_blocking(move || core.inner.tmux.preview_pane(&pane, lines))
+        tokio::task::spawn_blocking(move || core.inner.mux.capture_pane(&pane, &req))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
             .map_err(|e| match e {
@@ -1366,6 +1640,11 @@ impl Core {
                 }
                 other => ApiError::new(ErrorCode::Unavailable, other.to_string()),
             })
+    }
+
+    /// Fetch live terminal tail preview for `pane`.
+    pub async fn preview_pane(&self, pane: &PaneId, lines: usize) -> Result<PanePreview, ApiError> {
+        self.capture_pane(pane, CaptureRequest::tail(lines)).await
     }
 
     /// Resolve the working directory for direct interactive spawns (`~/.agent_session` by default,
@@ -1591,6 +1870,13 @@ impl Core {
             discovered_only: true,
             transcript_path: None,
             metrics: None,
+            host_id: None,
+            host_display_name: None,
+            mux_kind: Some(if pane.as_str().starts_with("zj:") {
+                "zellij".to_string()
+            } else {
+                "tmux".to_string()
+            }),
         };
         lock(&self.inner.state)
             .sessions
@@ -1720,6 +2006,9 @@ mod tests {
             pane_in_mode: false,
             pane_dead: false,
             pane_current_command: agent.as_str().into(),
+            history_size: 0,
+            cursor_x: 0,
+            cursor_y: 0,
         }
     }
 
@@ -1787,6 +2076,9 @@ mod tests {
                 discovered_only: false,
                 transcript_path: None,
                 metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: None,
             },
         );
 
@@ -1844,6 +2136,9 @@ mod tests {
                 discovered_only: true,
                 transcript_path: None,
                 metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: None,
             },
         );
 
@@ -2125,6 +2420,9 @@ mod tests {
                 discovered_only: false,
                 transcript_path: Some(rollout_path.clone()),
                 metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: None,
             },
         );
         st.feishu_session_threads
@@ -2158,6 +2456,9 @@ mod tests {
                 discovered_only: true,
                 transcript_path: Some(rollout_path.clone()),
                 metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: None,
             },
         );
 
@@ -2277,5 +2578,101 @@ mod tests {
         assert!(d3.changed);
         assert_eq!(st.sessions[&sid].agent, AgentKind::Codex);
         assert_eq!(st.sessions[&sid].model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn shell_discovery_does_not_duplicate_live_real_agent_on_same_pane_or_touch_remote_sessions() {
+        let mut st = State::default();
+        let pane = PaneId::new("%77");
+        let real_sid = SessionId::new("real-claude-77");
+        st.sessions.insert(
+            real_sid.clone(),
+            SessionRecord {
+                session_id: real_sid.clone(),
+                agent: AgentKind::Claude,
+                pane: Some(pane.clone()),
+                pane_resolution: PaneResolution::Env,
+                cwd: Some("/tmp".into()),
+                git_root: None,
+                model: Some("opus".into()),
+                effort: None,
+                state: SessionState::Idle,
+                state_since_ms: 1000,
+                last_event_id: None,
+                last_event_ms: 1000,
+                last_message: None,
+                last_error: None,
+                parent_session_id: None,
+                is_subagent: false,
+                subagent_count: 0,
+                active_subagents: 0,
+                stage: None,
+                unread_inbox: 0,
+                confidence: Confidence::Exact,
+                tmux_target: Some("dev:0.0".into()),
+                tmux_label: Some("dev-claude".into()),
+                discovered_only: false,
+                transcript_path: None,
+                metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: Some("tmux".into()),
+            },
+        );
+        // Also seed a remote peer session with `pane: None` and `tmux_label: Some(...)`.
+        let remote_sid = SessionId::new("mac-xiling:s1");
+        st.sessions.insert(
+            remote_sid.clone(),
+            SessionRecord {
+                session_id: remote_sid.clone(),
+                agent: AgentKind::Claude,
+                pane: None,
+                pane_resolution: PaneResolution::Env,
+                cwd: Some("/Users/xiling/app".into()),
+                git_root: None,
+                model: None,
+                effort: None,
+                state: SessionState::Idle,
+                state_since_ms: 1000,
+                last_event_id: None,
+                last_event_ms: 1000,
+                last_message: None,
+                last_error: None,
+                parent_session_id: None,
+                is_subagent: false,
+                subagent_count: 0,
+                active_subagents: 0,
+                stage: None,
+                unread_inbox: 0,
+                confidence: Confidence::Exact,
+                tmux_target: Some("work:0.0".into()),
+                tmux_label: Some("work-app".into()),
+                discovered_only: false,
+                transcript_path: None,
+                metrics: None,
+                host_id: Some(HostId::new("mac-xiling")),
+                host_display_name: Some("Mac Xiling".into()),
+                mux_kind: Some("tmux".into()),
+            },
+        );
+
+        let live: HashSet<PaneId> = [pane.clone()].into_iter().collect();
+        // Shell discovery sees `python3` in `%77` -> must NOT create a duplicate `tmux-%77` Shell session!
+        reconcile_discovered_panes(
+            &mut st,
+            &[mk_dp("%77", "dev:0.0", AgentKind::Shell, Some("python3"))],
+            &live,
+            2_000,
+        );
+        assert!(
+            !st.sessions.contains_key(&legacy_session_id(&pane)),
+            "must not duplicate live real agent on %77 with a discovered_only Shell placeholder"
+        );
+        assert!(st.sessions.contains_key(&real_sid));
+        // Remote session's tmux metadata must remain completely untouched by local discovery.
+        assert_eq!(
+            st.sessions[&remote_sid].tmux_label.as_deref(),
+            Some("work-app")
+        );
     }
 }

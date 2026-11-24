@@ -39,6 +39,9 @@ fn pane(id: &str) -> PaneInfo {
         cursor_x: 2,
         cursor_y: 10,
         window_name: "code".into(),
+        session_group: String::new(),
+        history_size: 0,
+        pane_height: 24,
     }
 }
 
@@ -48,6 +51,8 @@ fn client(session: &str, activity: u64) -> ClientInfo {
         session_name: session.into(),
         activity_s: activity,
         flags: "attached,focused".into(),
+        session_group: String::new(),
+        window_id: String::new(),
     }
 }
 
@@ -1290,4 +1295,152 @@ fn sandbox_backup_and_restore_layout_idempotently() {
     assert_eq!(rep2.skipped_sessions, vec!["spot", "work"]);
     assert_eq!(rep2.restored_windows, 0);
     assert_eq!(rep2.restored_panes, 0);
+}
+
+#[test]
+fn gate_and_watching_ignore_background_window_and_respect_session_group() {
+    // Active client viewing window @1 must NOT block injection into background window @2 of the same session.
+    let mut bg = pane("%9");
+    bg.window_id = "@2".into();
+    bg.window_active = false;
+    let mut active_client = client("work", NOW - 1);
+    active_client.window_id = "@1".into();
+
+    let r = gate(
+        &bg,
+        &[active_client.clone()],
+        SessionState::Idle,
+        AgentKind::Claude,
+        "> ",
+    );
+    assert!(r.passed, "background window should not be blocked: {r:?}");
+    assert!(!is_user_watching(&bg, &[active_client], NOW, 30));
+
+    // Client in a grouped sibling session viewing window @2 MUST be detected as watching & active.
+    bg.session_group = "grp-work".into();
+    let grouped_client = ClientInfo {
+        tty: "/dev/ttys009".into(),
+        session_name: "work-mirror".into(),
+        activity_s: NOW - 2,
+        flags: "attached,focused".into(),
+        session_group: "grp-work".into(),
+        window_id: "@2".into(),
+    };
+    assert!(is_user_watching(
+        &bg,
+        std::slice::from_ref(&grouped_client),
+        NOW,
+        30
+    ));
+    let r_grp = gate(
+        &bg,
+        &[grouped_client],
+        SessionState::Idle,
+        AgentKind::Claude,
+        "> ",
+    );
+    assert_eq!(r_grp.failed_checks(), vec![GateCheck::UserInactive]);
+}
+
+#[test]
+fn parse_extended_pane_and_client_lines() {
+    let mut ext_pane = GOOD_PANE.to_vec();
+    ext_pane.extend(["grp-main", "1234", "48"]);
+    let p = parse_pane_line(&pane_line(&ext_pane)).unwrap();
+    assert_eq!(p.session_group, "grp-main");
+    assert_eq!(p.history_size, 1234);
+    assert_eq!(p.pane_height, 48);
+
+    let ext_client = pane_line(&[
+        "/dev/ttys004",
+        "work",
+        "1700000123",
+        "attached,active-pane",
+        "grp-main",
+        "@7",
+    ]);
+    let c = parse_client_line(&ext_client).unwrap();
+    assert_eq!(c.session_group, "grp-main");
+    assert_eq!(c.window_id, "@7");
+}
+
+#[test]
+#[ignore = "needs tmux; run with `cargo test -p starfane-tmux -- --ignored`"]
+fn sandbox_batch_capture_and_paginated_scrollback() {
+    use starfane_tmux::CaptureRequest;
+    let Some(sb) = Sandbox::new() else {
+        return;
+    };
+    let p1 = sb
+        .tmux
+        .spawn_window(&SpawnWindow {
+            target_session: Some("scroll".into()),
+            create_session: true,
+            window_name: "w1".into(),
+            cwd: sb.dir.clone(),
+            env: Vec::new(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "i=1; while [ $i -le 120 ]; do echo LINE_$i; i=$((i+1)); done; sleep 10".into(),
+            ],
+        })
+        .unwrap();
+    let p2 = sb
+        .tmux
+        .spawn_window(&SpawnWindow {
+            target_session: Some("scroll".into()),
+            create_session: false,
+            window_name: "w2".into(),
+            cwd: sb.dir.clone(),
+            env: Vec::new(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo PANE_TWO_MARKER; sleep 10".into(),
+            ],
+        })
+        .unwrap();
+
+    // Poll until LINE_120 appears in p1.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(t) = sb.tmux.capture_pane_tail(&p1, 20) {
+            if t.contains("LINE_120") {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for LINE_120");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // 1. Batched capture captures both panes in one tmux invocation.
+    let batch = sb.tmux.capture_panes_tail_batch(&[(&p1, 10), (&p2, 10)]);
+    assert!(batch.get(&p1).is_some_and(|t| t.contains("LINE_120")));
+    assert!(batch
+        .get(&p2)
+        .is_some_and(|t| t.contains("PANE_TWO_MARKER")));
+
+    // 2. Tail capture reports has_more + next_before_line, and paging backwards reaches LINE_1 without gaps.
+    let tail = sb
+        .tmux
+        .capture_pane(&p1, &CaptureRequest::tail(40))
+        .unwrap();
+    assert!(tail.text.contains("LINE_120"));
+    assert!(tail.has_more, "expected scrollback history: {tail:?}");
+    let cursor = tail.next_before_line.expect("next_before_line");
+    let earlier = sb
+        .tmux
+        .capture_pane(&p1, &CaptureRequest::page_before(cursor, 200))
+        .unwrap();
+    assert!(earlier.text.contains("LINE_1"), "earlier: {}", earlier.text);
+    assert!(!earlier.has_more);
+    assert_eq!(earlier.start_line, 0);
+
+    // 3. Full capture (`all = true`) returns from LINE_1 through LINE_120.
+    let full = sb.tmux.capture_pane(&p1, &CaptureRequest::full()).unwrap();
+    assert!(full.text.contains("LINE_1"));
+    assert!(full.text.contains("LINE_120"));
+    assert!(!full.has_more);
+    assert_eq!(full.start_line, 0);
 }

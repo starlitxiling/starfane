@@ -39,10 +39,11 @@ impl EventKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Confidence {
     Exact,
+    #[default]
     Heuristic,
 }
 
@@ -55,6 +56,12 @@ pub struct EnvCtx {
     /// `$TMUX`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux: Option<String>,
+    /// `$ZELLIJ_SESSION_NAME`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zellij_session_name: Option<String>,
+    /// `$ZELLIJ_PANE_ID`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zellij_pane_id: Option<String>,
     /// pid of the emit process itself.
     #[serde(default)]
     pub pid: u32,
@@ -80,6 +87,8 @@ impl EnvCtx {
         EnvCtx {
             tmux_pane: get("TMUX_PANE"),
             tmux: get("TMUX"),
+            zellij_session_name: get("ZELLIJ_SESSION_NAME"),
+            zellij_pane_id: get("ZELLIJ_PANE_ID"),
             pid: std::process::id(),
             ppid: std::os::unix::process::parent_id(),
             cwd: std::env::current_dir()
@@ -87,6 +96,51 @@ impl EnvCtx {
                 .unwrap_or_default(),
             bind_token: get(ENV_BIND).or_else(|| get("BATON_BIND")).map(BindToken),
         }
+    }
+
+    /// Canonical pane identifier derived from mux environment variables:
+    /// prefers `$TMUX_PANE`, then falls back to `zj:<ZELLIJ_SESSION_NAME>/<ZELLIJ_PANE_ID>`.
+    pub fn pane_id(&self) -> Option<PaneId> {
+        if let Some(p) = self
+            .tmux_pane
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(PaneId::new(p));
+        }
+        let sess = self
+            .zellij_session_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let raw_id = self
+            .zellij_pane_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let numeric = raw_id.strip_prefix("terminal_").unwrap_or(raw_id);
+        if numeric.is_empty() {
+            return None;
+        }
+        Some(PaneId::new(format!("zj:{sess}/{numeric}")))
+    }
+
+    /// True if either tmux or Zellij environment variables are present.
+    pub fn has_mux_env(&self) -> bool {
+        self.tmux.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || self
+                .tmux_pane
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            || self
+                .zellij_session_name
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            || self
+                .zellij_pane_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
     }
 }
 
@@ -169,10 +223,21 @@ mod tests {
         let map: HashMap<&str, &str> = [("TMUX_PANE", "%7"), (ENV_BIND, "B-1")].into();
         let env = EnvCtx::capture_with(&|k| map.get(k).map(|v| v.to_string()));
         assert_eq!(env.tmux_pane.as_deref(), Some("%7"));
+        assert_eq!(env.pane_id(), Some(PaneId::new("%7")));
+        assert!(env.has_mux_env());
         assert_eq!(env.bind_token, Some(BindToken::new("B-1")));
         assert_eq!(env.pid, std::process::id());
         assert!(env.ppid > 0);
         assert!(!env.cwd.is_empty());
+
+        let zj_map: HashMap<&str, &str> = [
+            ("ZELLIJ_SESSION_NAME", "work"),
+            ("ZELLIJ_PANE_ID", "terminal_12"),
+        ]
+        .into();
+        let zj_env = EnvCtx::capture_with(&|k| zj_map.get(k).map(|v| v.to_string()));
+        assert_eq!(zj_env.pane_id(), Some(PaneId::new("zj:work/12")));
+        assert!(zj_env.has_mux_env());
     }
 
     #[test]

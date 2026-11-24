@@ -115,6 +115,12 @@ pub(crate) struct State {
     pub feishu_session_thread_order: Vec<SessionId>,
     #[serde(default)]
     pub unconfirmed: Vec<AttentionItem>,
+    /// Persisted mutable host display names (`HostId -> display_name`).
+    #[serde(default)]
+    pub host_display_names: HashMap<HostId, String>,
+    /// Live runtime status table for local + federated remote hosts.
+    #[serde(skip)]
+    pub hosts: HashMap<HostId, HostRecord>,
     /// (session, kind) → last notice ms.
     #[serde(skip)]
     pub cooldown: HashMap<(SessionId, EventKind), u64>,
@@ -128,25 +134,6 @@ pub(crate) struct State {
     /// Per-pane output hash tracker for `discovered_only` legacy sessions.
     #[serde(skip)]
     pub pane_watch: HashMap<PaneId, PaneWatch>,
-    /// File `(mtime_ns, len)` cache for transcript-derived `SessionMetrics` (zero disk re-read when unchanged).
-    #[serde(skip)]
-    pub metrics_cache: HashMap<std::path::PathBuf, crate::core::metrics::CachedFileMetrics>,
-    /// Cached read-only snapshot of `~/.cc-switch/cc-switch.db` latest per-session metrics.
-    #[serde(skip)]
-    pub cc_switch_cache: crate::core::metrics::CcSwitchCache,
-    /// Cached read-only snapshot of `~/.codex/state_5.sqlite` threads for exact pane-title matching.
-    #[serde(skip)]
-    pub codex_threads_cache: crate::core::metrics::CodexThreadCache,
-    /// Cached read-only snapshot of `~/.gemini/antigravity-cli/conversation_summaries.db` root sessions.
-    #[serde(skip)]
-    pub agy_convs_cache: crate::core::metrics::AgyConvCache,
-    /// Cached PID -> AGY `conversation_id` mapping derived from open `presence/<uuid>.lock` handles.
-    /// Cached read-only snapshot of `~/.gemini/antigravity-cli/presence/<uuid>.lock` PIDs.
-    #[serde(skip)]
-    pub agy_presence_cache: crate::core::metrics::AgyPresenceCache,
-    /// File `(mtime_ns, len)` cache for parsed session transcripts (avoids re-parsing huge JSONLs).
-    #[serde(skip)]
-    pub transcript_cache: HashMap<std::path::PathBuf, crate::core::transcript::CachedTranscript>,
     /// Deduplication cache for `mirror_tmux_status` (`@starfane_state` / `@agent_state` etc.).
     #[serde(skip)]
     pub last_mirrored_tmux: HashMap<PaneId, (SessionState, Option<StageKind>, Option<PipelineId>)>,
@@ -162,6 +149,28 @@ pub(crate) struct State {
     /// Timestamp (ms) when a rate-limit summary notice was last emitted for the current window.
     #[serde(skip)]
     pub feishu_rate_warned_window_ms: Option<u64>,
+}
+
+/// Lightweight clone of ONLY the serialized fields of `State` so snapshot serialization and
+/// `fsync` run on `spawn_blocking` without holding `Mutex<State>`.
+#[derive(Debug, Serialize)]
+pub(crate) struct PersistentStateSnapshot {
+    pub sessions: BTreeMap<SessionId, SessionRecord>,
+    pub pipelines: BTreeMap<PipelineId, PipelineSpec>,
+    pub handoffs: BTreeMap<HandoffId, HandoffPacket>,
+    pub inbox: BTreeMap<SessionId, Vec<InboxEntry>>,
+    pub artifacts: BTreeMap<ArtifactId, StoredArtifact>,
+    pub reviews: BTreeMap<ReviewId, StoredReview>,
+    pub binds: BTreeMap<BindToken, PendingBind>,
+    pub worktrees: BTreeMap<PipelineId, WorktreeInfo>,
+    pub feishu_muted_until: Option<u64>,
+    pub feishu_msgs: BTreeMap<String, PipelineId>,
+    pub feishu_session_msgs: BTreeMap<String, crate::notice::SessionReplyTarget>,
+    pub feishu_session_msg_order: Vec<String>,
+    pub feishu_session_threads: BTreeMap<SessionId, String>,
+    pub feishu_session_thread_order: Vec<SessionId>,
+    pub unconfirmed: Vec<AttentionItem>,
+    pub host_display_names: HashMap<HostId, String>,
 }
 
 /// True when a subagent session is actively running or awaiting interaction (`Ended`/`Idle`/`Error` are inactive).
@@ -192,6 +201,28 @@ pub(crate) fn clear_tmux_binding(rec: &mut SessionRecord) {
 }
 
 impl State {
+    /// Clone ONLY persisted fields for lock-free disk serialization on `spawn_blocking`.
+    pub fn persistent_snapshot(&self) -> PersistentStateSnapshot {
+        PersistentStateSnapshot {
+            sessions: self.sessions.clone(),
+            pipelines: self.pipelines.clone(),
+            handoffs: self.handoffs.clone(),
+            inbox: self.inbox.clone(),
+            artifacts: self.artifacts.clone(),
+            reviews: self.reviews.clone(),
+            binds: self.binds.clone(),
+            worktrees: self.worktrees.clone(),
+            feishu_muted_until: self.feishu_muted_until,
+            feishu_msgs: self.feishu_msgs.clone(),
+            feishu_session_msgs: self.feishu_session_msgs.clone(),
+            feishu_session_msg_order: self.feishu_session_msg_order.clone(),
+            feishu_session_threads: self.feishu_session_threads.clone(),
+            feishu_session_thread_order: self.feishu_session_thread_order.clone(),
+            unconfirmed: self.unconfirmed.clone(),
+            host_display_names: self.host_display_names.clone(),
+        }
+    }
+
     /// Inbox key for a spawned session whose id is not known yet.
     pub fn bind_inbox_key(token: &BindToken) -> SessionId {
         SessionId(format!("bind:{}", token.0))
@@ -589,6 +620,9 @@ mod tests {
             discovered_only,
             transcript_path: None,
             metrics: None,
+            host_id: None,
+            host_display_name: None,
+            mux_kind: None,
         }
     }
 

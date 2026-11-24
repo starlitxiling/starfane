@@ -4,27 +4,47 @@
 use serde::{Deserialize, Serialize};
 use starfane_proto::{PipelineOptions, PlaybookKind, ReviewDepth, StageBinding, StageKind};
 use std::collections::BTreeMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 pub const DEFAULT_EASYTIER_CIDR: &str = "10.144.144.0/24";
+
+/// Optional extra scoped API token (e.g. read-only viewer or peer federation client).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScopedTokenConfig {
+    pub label: String,
+    pub token: String,
+    pub token_env: String,
+    pub read_only: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
     pub bind: String,
     pub port: u16,
-    /// When `true` (default), every `/api/*` route requires the per-start token.
-    /// When `false`, token checks are skipped and connections are strictly gated to
-    /// loopback (`127.0.0.0/8`, `::1`), EasyTier (`easytier_cidrs` when `allow_easytier`),
-    /// and Tailscale CGNAT (`100.64.0.0/10` when `allow_tailscale`).
+    /// When `true` (default), every `/api/*` route requires the per-start token (or a configured scoped token).
+    /// When `false`, token checks are skipped and connections are strictly gated by `AccessGate`
+    /// (loopback + `allowed_cidrs` + enabled presets).
     pub auth_enabled: bool,
-    /// Allow EasyTier peer IPs and `Host`/`Origin` headers matching `easytier_cidrs`.
+    /// Legacy preset flag: allow EasyTier peer IPs and `Host`/`Origin` headers matching `easytier_cidrs`.
     pub allow_easytier: bool,
     /// Allowed EasyTier IPv4 CIDRs (defaults to `["10.144.144.0/24"]`).
     pub easytier_cidrs: Vec<String>,
-    /// Allow Tailscale CGNAT (`100.64.0.0/10`) peer IPs and `*.ts.net` hosts.
+    /// Legacy preset flag: allow Tailscale (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, `*.ts.net`).
     pub allow_tailscale: bool,
+    /// Network-agnostic peer IP CIDRs (IPv4 and IPv6, e.g. `"10.144.144.0/24"`, `"fd00::/8"`).
+    pub allowed_cidrs: Vec<String>,
+    /// Network-agnostic allowed `Host`/`Origin` hostnames or `*.suffix` wildcards
+    /// (e.g. `"console.example.com"`, `"*.ts.net"`). Supports reverse-proxy ports (80/443/omitted).
+    pub allowed_hosts: Vec<String>,
+    /// Named network presets (`"easytier"`, `"tailscale"`).
+    pub presets: Vec<String>,
+    /// Optional extra scoped tokens (supports `read_only = true` viewer tokens or peer tokens).
+    pub scoped_tokens: Vec<ScopedTokenConfig>,
+    /// Optional terminal monospace font family prepended in the Web console (e.g. `"JetBrainsMono Nerd Font"`).
+    pub terminal_font: String,
 }
 impl Default for WebConfig {
     fn default() -> Self {
@@ -35,12 +55,17 @@ impl Default for WebConfig {
             allow_easytier: true,
             easytier_cidrs: vec![DEFAULT_EASYTIER_CIDR.into()],
             allow_tailscale: false,
+            allowed_cidrs: Vec::new(),
+            allowed_hosts: Vec::new(),
+            presets: Vec::new(),
+            scoped_tokens: Vec::new(),
+            terminal_font: String::new(),
         }
     }
 }
 
-/// Parse an IPv4 CIDR (`"10.144.144.0/24"`) or bare IPv4 address (`"10.144.144.3"` → `/32`).
-pub fn parse_ipv4_cidr(raw: &str) -> Result<(Ipv4Addr, u8), String> {
+/// Parse an IPv4 or IPv6 CIDR (or bare IP address → `/32` or `/128`).
+pub fn parse_ip_cidr(raw: &str) -> Result<(IpAddr, u8), String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("CIDR cannot be empty".into());
@@ -48,21 +73,39 @@ pub fn parse_ipv4_cidr(raw: &str) -> Result<(Ipv4Addr, u8), String> {
     if let Some((ip_str, prefix_str)) = trimmed.split_once('/') {
         let ip = ip_str
             .trim()
-            .parse::<Ipv4Addr>()
-            .map_err(|e| format!("invalid IPv4 address {ip_str:?}: {e}"))?;
+            .parse::<IpAddr>()
+            .map_err(|e| format!("invalid IP address {ip_str:?}: {e}"))?;
         let prefix = prefix_str
             .trim()
             .parse::<u8>()
             .map_err(|e| format!("invalid CIDR prefix {prefix_str:?}: {e}"))?;
-        if prefix > 32 {
-            return Err(format!("CIDR prefix {prefix} out of range (0..=32)"));
+        let max_prefix = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix > max_prefix {
+            return Err(format!(
+                "CIDR prefix {prefix} out of range (0..={max_prefix})"
+            ));
         }
         Ok((ip, prefix))
     } else {
         let ip = trimmed
-            .parse::<Ipv4Addr>()
-            .map_err(|e| format!("invalid IPv4 address {trimmed:?}: {e}"))?;
-        Ok((ip, 32))
+            .parse::<IpAddr>()
+            .map_err(|e| format!("invalid IP address {trimmed:?}: {e}"))?;
+        let max_prefix = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        Ok((ip, max_prefix))
+    }
+}
+
+/// Parse an IPv4 CIDR (`"10.144.144.0/24"`) or bare IPv4 address (`"10.144.144.3"` → `/32`).
+pub fn parse_ipv4_cidr(raw: &str) -> Result<(Ipv4Addr, u8), String> {
+    match parse_ip_cidr(raw)? {
+        (IpAddr::V4(ip), prefix) => Ok((ip, prefix)),
+        (IpAddr::V6(_), _) => Err(format!("expected IPv4 CIDR, got IPv6 {raw:?}")),
     }
 }
 
@@ -82,12 +125,41 @@ pub fn ipv4_in_cidrs(ip: Ipv4Addr, cidrs: &[String]) -> bool {
     })
 }
 
+/// True when `ip` matches an IPv6 CIDR `(net, prefix)`.
+pub fn ipv6_in_cidr(ip: Ipv6Addr, net: Ipv6Addr, prefix: u8) -> bool {
+    let mask = if prefix == 0 {
+        0u128
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    (u128::from(ip) & mask) == (u128::from(net) & mask)
+}
+
 impl WebConfig {
-    /// Validate `web` config fields (`easytier_cidrs`, etc.).
+    /// Validate `web` config fields (`easytier_cidrs`, `allowed_cidrs`, `presets`, `allowed_hosts`).
     pub fn validate(&self) -> Result<(), String> {
         for cidr in &self.easytier_cidrs {
             parse_ipv4_cidr(cidr)
                 .map_err(|e| format!("invalid web.easytier_cidrs entry {cidr:?}: {e}"))?;
+        }
+        for cidr in &self.allowed_cidrs {
+            parse_ip_cidr(cidr)
+                .map_err(|e| format!("invalid web.allowed_cidrs entry {cidr:?}: {e}"))?;
+        }
+        for preset in &self.presets {
+            let p = preset.trim().to_ascii_lowercase();
+            if !matches!(p.as_str(), "easytier" | "tailscale") {
+                return Err(format!(
+                    "unknown web.presets entry {preset:?} (supported: easytier, tailscale)"
+                ));
+            }
+        }
+        for host in &self.allowed_hosts {
+            let h = host.trim();
+            if h.is_empty() || h.contains('/') || h.contains('@') || h.contains(char::is_whitespace)
+            {
+                return Err(format!("invalid web.allowed_hosts entry {host:?}"));
+            }
         }
         Ok(())
     }
@@ -159,6 +231,207 @@ pub struct PathsConfig {
     pub codex: String,
     pub agy: String,
     pub tmux: String,
+    pub zellij: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ZellijConfig {
+    /// Auto-discover and operate Zellij (>= 0.44) sessions alongside tmux (gracefully skipped if absent).
+    pub enabled: bool,
+}
+
+impl Default for ZellijConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Ownership scope for notification delivery (Split Ownership model).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyOwnership {
+    /// Only deliver notifications for sessions local to this daemon (default; keeps work credentials isolated).
+    #[default]
+    NodeLocal,
+    /// Deliver on the hub (for SSH zero-install hosts or explicitly hub-routed sessions).
+    Hub,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifierKind {
+    Feishu,
+    Telegram,
+    Webhook,
+    Macos,
+}
+
+/// Opt-in pluggable notification channel configured in `~/.config/starfane/config.toml` (`[[notifiers]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifierConfig {
+    pub id: String,
+    pub kind: NotifierKind,
+    pub enabled: bool,
+    pub ownership: NotifyOwnership,
+    /// Optional `lark-cli --profile <name>` profile for multi-tenant Feishu accounts.
+    pub profile: String,
+    pub lark_cli: String,
+    pub chat_id: String,
+    pub allow_open_ids: Vec<String>,
+    pub allow_chat_ids: Vec<String>,
+    /// Telegram bot token (prefer `bot_token_env` so tokens stay out of config files).
+    pub bot_token: String,
+    pub bot_token_env: String,
+    /// Webhook endpoint URL.
+    pub url: String,
+    /// Env var holding an optional webhook Bearer/secret header value.
+    pub secret_env: String,
+    /// Optional macOS notification sound name (e.g. `"Glass"`).
+    pub sound: String,
+}
+
+impl Default for NotifierConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: NotifierKind::Webhook,
+            enabled: true,
+            ownership: NotifyOwnership::NodeLocal,
+            profile: String::new(),
+            lark_cli: "lark-cli".into(),
+            chat_id: String::new(),
+            allow_open_ids: Vec::new(),
+            allow_chat_ids: Vec::new(),
+            bot_token: String::new(),
+            bot_token_env: String::new(),
+            url: String::new(),
+            secret_env: String::new(),
+            sound: String::new(),
+        }
+    }
+}
+
+/// Differential routing rule mapping `(node, project, cwd, agent, event_kinds)` -> logical notifier IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyRouteConfig {
+    pub notifiers: Vec<String>,
+    pub node: Option<String>,
+    pub project: Option<String>,
+    pub cwd: Option<String>,
+    pub agent: Option<String>,
+    pub event_kinds: Vec<String>,
+    pub ownership: Option<NotifyOwnership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalNodeConfig {
+    pub id: String,
+    pub display_name: String,
+}
+
+impl Default for LocalNodeConfig {
+    fn default() -> Self {
+        Self {
+            id: starfane_proto::LOCAL_HOST_ID.to_string(),
+            display_name: "Local".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeKindConfig {
+    Ssh,
+    Peer,
+}
+
+/// Remote federated host entry (`[[nodes]]`) supporting mixed zero-install SSH and peer `starfaned`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodeConfig {
+    /// Immutable host identifier (e.g. `"tencent"`, `"mac-xiling"`). Used in pane prefixes `<id>:%1`.
+    pub id: String,
+    /// Optional human-friendly mutable display name (overridable at runtime via `/api/hosts/{id}/rename`).
+    pub display_name: Option<String>,
+    pub kind: NodeKindConfig,
+    pub enabled: bool,
+    /// SSH target (`user@host` or `~/.ssh/config` alias) when `kind = "ssh"`.
+    pub ssh_target: String,
+    pub ssh_args: Vec<String>,
+    pub tmux_bin: String,
+    pub tmux_socket: String,
+    pub include_shell_panes: bool,
+    /// Candidate outbound HTTP(S) base URLs tried in priority order when `kind = "peer"`.
+    pub endpoints: Vec<String>,
+    /// Peer auth token (prefer `token_env`).
+    pub token: String,
+    pub token_env: String,
+    /// Defaults to `hub` for `ssh` and `node_local` (Split Ownership) for `peer`.
+    pub notify_ownership: Option<NotifyOwnership>,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            display_name: None,
+            kind: NodeKindConfig::Ssh,
+            enabled: true,
+            ssh_target: String::new(),
+            ssh_args: Vec::new(),
+            tmux_bin: "tmux".into(),
+            tmux_socket: String::new(),
+            include_shell_panes: false,
+            endpoints: Vec::new(),
+            token: String::new(),
+            token_env: String::new(),
+            notify_ownership: None,
+        }
+    }
+}
+
+impl NodeConfig {
+    pub fn effective_ownership(&self) -> NotifyOwnership {
+        self.notify_ownership.unwrap_or(match self.kind {
+            NodeKindConfig::Ssh => NotifyOwnership::Hub,
+            NodeKindConfig::Peer => NotifyOwnership::NodeLocal,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let id = self.id.trim();
+        if id.is_empty()
+            || id == starfane_proto::LOCAL_HOST_ID
+            || id == "zj"
+            || id.contains([':', '/', ' ', '\t'])
+        {
+            return Err(format!(
+                "invalid nodes[].id {id:?} (must be non-empty, not 'local'/'zj', and contain no ':', '/', or spaces)"
+            ));
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        match self.kind {
+            NodeKindConfig::Ssh => {
+                if self.ssh_target.trim().is_empty() {
+                    return Err(format!("ssh node {id:?} requires non-empty ssh_target"));
+                }
+            }
+            NodeKindConfig::Peer => {
+                if self.endpoints.is_empty() || self.endpoints.iter().any(|u| u.trim().is_empty()) {
+                    return Err(format!(
+                        "peer node {id:?} requires at least one non-empty URL in endpoints"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -232,7 +505,12 @@ pub struct StarfaneConfig {
     pub feishu: FeishuConfig,
     pub paths: PathsConfig,
     pub tmux: TmuxConfig,
+    pub zellij: ZellijConfig,
     pub discovery: DiscoveryConfig,
+    pub notifiers: Vec<NotifierConfig>,
+    pub notify_routes: Vec<NotifyRouteConfig>,
+    pub node: LocalNodeConfig,
+    pub nodes: Vec<NodeConfig>,
 }
 
 impl StarfaneConfig {
@@ -242,18 +520,36 @@ impl StarfaneConfig {
             Ok(text) => {
                 let cfg: StarfaneConfig =
                     toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-                cfg.web
-                    .validate()
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                cfg.tmux
-                    .backup
-                    .validate()
+                cfg.validate()
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 Ok(cfg)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(StarfaneConfig::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.web.validate()?;
+        self.tmux.backup.validate()?;
+        let mut seen_notifiers = std::collections::HashSet::new();
+        for n in &self.notifiers {
+            let id = n.id.trim();
+            if id.is_empty() {
+                return Err("notifiers[].id cannot be empty".into());
+            }
+            if !seen_notifiers.insert(id.to_string()) {
+                return Err(format!("duplicate notifiers[].id {id:?}"));
+            }
+        }
+        let mut seen_nodes = std::collections::HashSet::new();
+        for node in &self.nodes {
+            node.validate()?;
+            if !seen_nodes.insert(node.id.trim().to_string()) {
+                return Err(format!("duplicate nodes[].id {:?}", node.id));
+            }
+        }
+        Ok(())
     }
 
     pub fn tmux_socket(&self) -> Option<String> {
@@ -263,6 +559,10 @@ impl StarfaneConfig {
 
     pub fn tmux_bin(&self) -> String {
         non_empty(&self.paths.tmux).unwrap_or_else(|| "tmux".into())
+    }
+
+    pub fn zellij_bin(&self) -> String {
+        non_empty(&self.paths.zellij).unwrap_or_else(|| "zellij".into())
     }
 
     pub fn agent_bin(&self, agent: starfane_proto::AgentKind) -> String {
@@ -285,6 +585,16 @@ fn non_empty(s: &str) -> Option<String> {
 // team.toml
 // ---------------------------------------------------------------------------
 
+/// Project-scoped notification route in `.starfane/team.toml` referencing ONLY logical notifier IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TeamNotifyRoute {
+    pub notifiers: Vec<String>,
+    pub node: Option<String>,
+    pub agent: Option<String>,
+    pub event_kinds: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TeamConfig {
     pub feature: BTreeMap<StageKind, StageBinding>,
@@ -292,6 +602,7 @@ pub struct TeamConfig {
     pub options: PipelineOptions,
     pub aliases: BTreeMap<String, String>,
     pub spawn_args: BTreeMap<starfane_proto::AgentKind, Vec<String>>,
+    pub notify_routes: Vec<TeamNotifyRoute>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -300,6 +611,7 @@ struct RawTeam {
     playbooks: RawPlaybooks,
     models: RawModels,
     spawn: RawSpawn,
+    notify: Option<toml::Value>,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -338,6 +650,7 @@ impl TeamConfig {
             options: PipelineOptions::default(),
             aliases: BTreeMap::new(),
             spawn_args: BTreeMap::new(),
+            notify_routes: Vec::new(),
         }
     }
 
@@ -391,6 +704,9 @@ impl TeamConfig {
         team.spawn_args.insert(A::Claude, raw.spawn.claude_args);
         team.spawn_args.insert(A::Codex, raw.spawn.codex_args);
         team.spawn_args.insert(A::Agy, raw.spawn.agy_args);
+        if let Some(notify_val) = raw.notify {
+            team.notify_routes = parse_team_notify_routes(&notify_val)?;
+        }
         Ok(team)
     }
 
@@ -400,6 +716,73 @@ impl TeamConfig {
             PlaybookKind::Debug => &self.debug,
         }
     }
+}
+
+fn reject_secret_keys_in_team_notify(val: &toml::Value) -> Result<(), String> {
+    const FORBIDDEN_KEYS: &[&str] = &[
+        "token",
+        "bot_token",
+        "secret",
+        "secret_env",
+        "app_secret",
+        "webhook",
+        "url",
+        "password",
+        "api_key",
+        "chat_id",
+        "profile",
+    ];
+    match val {
+        toml::Value::Table(tbl) => {
+            for (k, v) in tbl {
+                let lower = k.to_ascii_lowercase();
+                if FORBIDDEN_KEYS.iter().any(|bad| lower == *bad) {
+                    return Err(format!(
+                        ".starfane/team.toml [notify] must not contain credential/channel key {k:?}; define channels in ~/.config/starfane/config.toml [[notifiers]] and reference logical ids only"
+                    ));
+                }
+                reject_secret_keys_in_team_notify(v)?;
+            }
+        }
+        toml::Value::Array(arr) => {
+            for item in arr {
+                reject_secret_keys_in_team_notify(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn parse_team_notify_routes(val: &toml::Value) -> Result<Vec<TeamNotifyRoute>, String> {
+    reject_secret_keys_in_team_notify(val)?;
+    let tbl = val
+        .as_table()
+        .ok_or_else(|| "[notify] must be a TOML table".to_string())?;
+    let mut routes = Vec::new();
+    // Shorthand: `[notify] notifiers = ["feishu-work"]`
+    if let Some(arr) = tbl.get("notifiers") {
+        let ids: Vec<String> = arr
+            .clone()
+            .try_into()
+            .map_err(|e| format!("[notify].notifiers: {e}"))?;
+        if !ids.is_empty() {
+            routes.push(TeamNotifyRoute {
+                notifiers: ids,
+                node: None,
+                agent: None,
+                event_kinds: Vec::new(),
+            });
+        }
+    }
+    if let Some(raw_routes) = tbl.get("routes") {
+        let parsed: Vec<TeamNotifyRoute> = raw_routes
+            .clone()
+            .try_into()
+            .map_err(|e| format!("[notify].routes: {e}"))?;
+        routes.extend(parsed);
+    }
+    Ok(routes)
 }
 
 fn insert_binding(

@@ -282,14 +282,17 @@ impl Core {
 
     /// Pane visible + recent client activity (focus-events-off safe).
     pub(crate) async fn user_watching(&self, session: &SessionRecord) -> bool {
+        if !session.is_local_host() {
+            return false;
+        }
         let Some(pane) = session.pane.clone() else {
             return false;
         };
         let core = self.clone();
         let window = self.inner.cfg.notify.watch_window_secs;
         tokio::task::spawn_blocking(move || {
-            let panes = core.inner.tmux.list_panes().ok()?;
-            let clients = core.inner.tmux.list_clients().ok()?;
+            let panes = core.inner.mux.list_all_panes().ok()?;
+            let clients = core.inner.mux.list_all_clients().ok()?;
             let info = panes.into_iter().find(|p| p.pane_id == pane)?;
             Some(starfane_tmux::is_user_watching(
                 &info,
@@ -305,6 +308,9 @@ impl Core {
     }
 
     pub(crate) fn mirror_tmux_status(&self, session: &SessionRecord) {
+        if !session.is_local_host() {
+            return;
+        }
         let Some(pane) = session.pane.clone() else {
             return;
         };
@@ -321,8 +327,8 @@ impl Core {
         }
         let core = self.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = core.inner.tmux.set_status(&pane, &status) {
-                log::debug!("tmux set_status {pane}: {e}");
+            if let Err(e) = core.inner.mux.set_status(&pane, &status) {
+                log::debug!("mux set_status {pane}: {e}");
             }
         });
     }
@@ -386,8 +392,12 @@ impl Core {
         let pane = session.pane.clone()?;
         let core = self.clone();
         tokio::task::spawn_blocking(move || {
-            let raw = core.inner.tmux.capture_pane_tail(&pane, 40).ok()?;
-            clean_terminal_tail_for_card(&raw)
+            let cap = core
+                .inner
+                .mux
+                .capture_pane(&pane, &starfane_tmux::CaptureRequest::tail(40))
+                .ok()?;
+            clean_terminal_tail_for_card(&cap.text)
         })
         .await
         .ok()
@@ -659,6 +669,9 @@ mod tests {
             discovered_only: id.starts_with("tmux-"),
             transcript_path: None,
             metrics: None,
+            host_id: None,
+            host_display_name: None,
+            mux_kind: None,
         }
     }
 

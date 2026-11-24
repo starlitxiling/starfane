@@ -31,7 +31,8 @@ pub use artifact::*;
 pub use error::*;
 pub use event::*;
 pub use id::{
-    ArtifactId, BindToken, EventId, FindingId, HandoffId, PaneId, PipelineId, ReviewId, SessionId,
+    ArtifactId, BindToken, EventId, FindingId, HandoffId, HostId, PaneId, PipelineId, ReviewId,
+    SessionId,
 };
 pub use mcp::mcp_tool_schemas;
 pub use pipeline::*;

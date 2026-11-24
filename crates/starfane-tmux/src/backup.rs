@@ -826,6 +826,9 @@ mod tests {
             cursor_x: 0,
             cursor_y: 0,
             window_name: wname.into(),
+            session_group: String::new(),
+            history_size: 0,
+            pane_height: 24,
         }
     }
 
@@ -850,6 +853,8 @@ mod tests {
             session_name: "work".into(),
             activity_s: 500,
             flags: "attached".into(),
+            session_group: String::new(),
+            window_id: String::new(),
         }];
         let mut hints = HashMap::new();
         hints.insert(

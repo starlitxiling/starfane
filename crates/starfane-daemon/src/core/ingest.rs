@@ -140,7 +140,7 @@ impl Core {
         ev: &NormalizedEvent,
         env: &EnvCtx,
     ) -> (Option<PaneId>, PaneResolution) {
-        let claimed_panes: HashSet<PaneId> = {
+        let (existing_cwd_pane, claimed_panes): (Option<PaneId>, HashSet<PaneId>) = {
             let st = lock(&self.inner.state);
             if let Some(tok) = &ev.bind_token {
                 if let Some(b) = st.binds.get(tok) {
@@ -152,27 +152,44 @@ impl Core {
             if let Some(p) = &ev.pane {
                 return (Some(p.clone()), PaneResolution::Env);
             }
+            let mut existing_cwd_pane = None;
             if let Some(s) = st.sessions.get(&ev.session_id) {
-                if s.pane.is_some() {
+                if s.pane.is_some() && is_exact_pane_resolution(s.pane_resolution) {
                     return (s.pane.clone(), s.pane_resolution);
                 }
+                if s.pane.is_some() {
+                    existing_cwd_pane = s.pane.clone();
+                }
             }
-            st.sessions
+            let claimed = st
+                .sessions
                 .values()
                 .filter(|s| {
-                    s.session_id != ev.session_id
-                        && !s.is_subagent
-                        && !s.discovered_only
-                        && s.state != SessionState::Ended
+                    if s.session_id == ev.session_id
+                        || s.is_subagent
+                        || s.state == SessionState::Ended
+                    {
+                        return false;
+                    }
+                    if !s.discovered_only {
+                        return true;
+                    }
+                    // Prevent `CwdMatch` from stealing a `discovered_only` placeholder pane that
+                    // belongs to a different agent or already holds a different session's transcript.
+                    s.agent != ev.agent
+                        || (s.transcript_path.is_some()
+                            && !super::state::transcript_matches_session(
+                                ev.agent,
+                                &ev.session_id,
+                                ev.transcript_path.as_deref(),
+                                s.transcript_path.as_deref(),
+                            ))
                 })
                 .filter_map(|s| s.pane.clone())
-                .collect()
+                .collect();
+            (existing_cwd_pane, claimed)
         };
-        let has_tmux_env = env.tmux.as_deref().is_some_and(|s| !s.trim().is_empty())
-            || env
-                .tmux_pane
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
+        let has_mux_env = env.has_mux_env();
         let core = self.clone();
         let hint = starfane_tmux::PaneHint {
             agent: ev.agent,
@@ -183,11 +200,16 @@ impl Core {
         let ppid = env.ppid;
         let agent = ev.agent;
         tokio::task::spawn_blocking(move || {
-            let panes = match core.inner.tmux.list_panes() {
+            let panes = match core.inner.mux.list_all_panes() {
                 Ok(p) => p,
                 Err(e) => {
                     log::debug!("pane resolution skipped: {e}");
-                    return (None, PaneResolution::Unknown);
+                    return match existing_cwd_pane {
+                        Some(p) if !claimed_panes.contains(&p) => {
+                            (Some(p), PaneResolution::CwdMatch)
+                        }
+                        _ => (None, PaneResolution::Unknown),
+                    };
                 }
             };
             let mut hint = hint;
@@ -196,11 +218,20 @@ impl Core {
             }
             let (pane, res) = starfane_tmux::resolve_pane(&panes, &hint);
             if res == PaneResolution::CwdMatch {
-                if matches!(agent, AgentKind::Claude | AgentKind::Agy) && !has_tmux_env {
+                if matches!(agent, AgentKind::Claude | AgentKind::Agy) && !has_mux_env {
                     return (None, PaneResolution::Unknown);
                 }
                 if pane.as_ref().is_some_and(|p| claimed_panes.contains(p)) {
                     return (None, PaneResolution::Unknown);
+                }
+            }
+            if pane.is_none() {
+                if let Some(prev) = existing_cwd_pane {
+                    if !claimed_panes.contains(&prev)
+                        && panes.iter().any(|p| !p.dead && p.pane_id == prev)
+                    {
+                        return (Some(prev), PaneResolution::CwdMatch);
+                    }
                 }
             }
             (pane, res)
@@ -249,6 +280,13 @@ fn new_record(
         None,
         home.as_deref(),
     );
+    let mux_kind = pane.as_ref().map(|p| {
+        if p.as_str().starts_with("zj:") {
+            "zellij".to_string()
+        } else {
+            "tmux".to_string()
+        }
+    });
     SessionRecord {
         session_id,
         agent: ev.agent,
@@ -276,6 +314,9 @@ fn new_record(
         discovered_only: false,
         transcript_path: canonical_event_transcript_path(ev.agent, ev.transcript_path.as_deref()),
         metrics: None,
+        host_id: None,
+        host_display_name: None,
+        mux_kind,
     }
 }
 
@@ -574,7 +615,27 @@ fn apply_event(
     let mut matched_legacy_id: Option<SessionId> = pane
         .as_ref()
         .map(super::discover::legacy_session_id)
-        .filter(|leg| leg != &root_id && st.sessions.contains_key(leg));
+        .filter(|leg| {
+            if leg == &root_id {
+                return false;
+            }
+            let Some(legacy) = st.sessions.get(leg) else {
+                return false;
+            };
+            if is_exact_pane_resolution(resolution) {
+                return true;
+            }
+            // Under speculative `CwdMatch`, never steal a discovered-only pane that already
+            // belongs to a different agent or a non-matching transcript file.
+            legacy.agent == ev.agent
+                && (legacy.transcript_path.is_none()
+                    || super::state::transcript_matches_session(
+                        ev.agent,
+                        &root_id,
+                        ev.transcript_path.as_deref(),
+                        legacy.transcript_path.as_deref(),
+                    ))
+        });
 
     if matched_legacy_id.is_none() {
         matched_legacy_id = st
@@ -646,15 +707,14 @@ fn apply_event(
     rec.discovered_only = false;
     if rec.pane.is_none() && pane.is_none() {
         super::state::clear_tmux_binding(rec);
-    } else if rec.pane.is_some()
-        && pane.is_some()
-        && rec.pane != pane
-        && is_exact_pane_resolution(resolution)
-    {
+    } else if rec.pane.is_some() && pane.is_some() && is_exact_pane_resolution(resolution) {
+        let pane_changed = rec.pane != pane;
         rec.pane = pane;
         rec.pane_resolution = resolution;
-        rec.tmux_target = inherited_target.take();
-        rec.tmux_label = inherited_label.take();
+        if pane_changed {
+            rec.tmux_target = inherited_target.take();
+            rec.tmux_label = inherited_label.take();
+        }
     } else if rec.pane.is_none() && pane.is_some() {
         rec.pane = pane;
         rec.pane_resolution = resolution;
@@ -762,6 +822,9 @@ mod tests {
                 discovered_only: false,
                 transcript_path: None,
                 metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: None,
             },
         );
 
@@ -790,5 +853,60 @@ mod tests {
         assert_eq!(revived.pane_resolution, PaneResolution::Unknown);
         assert!(revived.tmux_target.is_none());
         assert!(revived.tmux_label.is_none());
+    }
+
+    #[test]
+    fn exact_resolution_on_same_pane_upgrades_cwd_match_and_protects_discovered_placeholder() {
+        let mut st = State::default();
+        let pane = PaneId::new("%55");
+
+        // 1. Session initially attaches via CwdMatch on %55.
+        let ev1 = mk_agy_idle_event("sess-upgrade", 100);
+        apply_event(
+            &mut st,
+            &ev1,
+            None,
+            Some(pane.clone()),
+            PaneResolution::CwdMatch,
+        );
+        assert_eq!(
+            st.sessions[&SessionId::new("sess-upgrade")].pane_resolution,
+            PaneResolution::CwdMatch
+        );
+
+        // 2. Subsequent hook reports exact `Env` (or `PidTree`) on the SAME pane %55 -> MUST upgrade!
+        let ev2 = mk_agy_idle_event("sess-upgrade", 200);
+        apply_event(&mut st, &ev2, None, Some(pane.clone()), PaneResolution::Env);
+        let upgraded = &st.sessions[&SessionId::new("sess-upgrade")];
+        assert_eq!(upgraded.pane.as_ref(), Some(&pane));
+        assert_eq!(upgraded.pane_resolution, PaneResolution::Env);
+
+        // 3. A `discovered_only` placeholder on %66 with another session's transcript must NOT be stolen by CwdMatch.
+        let p66 = PaneId::new("%66");
+        let leg66 = SessionId::new("tmux-%66");
+        let mut ph = new_record(
+            leg66.clone(),
+            &mk_agy_idle_event("tmux-%66", 300),
+            Some(p66.clone()),
+            PaneResolution::Env,
+            None,
+        );
+        ph.discovered_only = true;
+        ph.transcript_path =
+            Some("/home/.gemini/antigravity-cli/brain/other-conv/.system_generated/logs/transcript.jsonl".into());
+        st.sessions.insert(leg66.clone(), ph);
+
+        let rival_ev = mk_agy_idle_event("unrelated-conv", 400);
+        apply_event(
+            &mut st,
+            &rival_ev,
+            None,
+            Some(p66),
+            PaneResolution::CwdMatch,
+        );
+        assert!(
+            st.sessions.contains_key(&leg66),
+            "CwdMatch must not hijack discovered_only placeholder with a different transcript"
+        );
     }
 }

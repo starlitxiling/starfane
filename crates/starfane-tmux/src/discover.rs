@@ -5,25 +5,65 @@
 //! alongside a single `ps -eo pid=,ppid=,args=` snapshot.
 
 use crate::error::TmuxError;
-use crate::exec;
 use crate::model::PaneInfo;
 use crate::{valid_pane, Tmux};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use starfane_proto::{AgentKind, PaneId};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
-/// Hard cap on captured preview text (256 KiB).
+/// Hard cap on captured preview text for standard tail requests (256 KiB).
 pub const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+/// Hard cap on captured preview text for full/paginated history requests (4 MiB).
+pub const MAX_FULL_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
 const MIN_CAPTURE_LINES: usize = 1;
-/// Hard cap on lines requested via `tmux capture-pane`.
+/// Default cap on lines for standard tail requests.
 pub const MAX_CAPTURE_LINES: usize = 2000;
+/// Hard cap on lines for full/paginated history requests.
+pub const MAX_FULL_CAPTURE_LINES: usize = 50_000;
 
 /// Options controlling live tmux pane discovery.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiscoverOptions {
     /// Also include non-agent panes (plain shells, training processes, monitors) as `AgentKind::Shell`.
     pub include_shell_panes: bool,
+}
+
+/// Request parameters for pane scrollback capture (tail, full `-S -`, or cursor-paginated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureRequest {
+    /// Number of lines to return.
+    pub lines: usize,
+    /// When `true`, fetch full scrollback (`-S -`, up to [`MAX_FULL_CAPTURE_LINES`] / [`MAX_FULL_CAPTURE_BYTES`]).
+    pub all: bool,
+    /// Optional 0-based line cursor (`0` = oldest scrollback line): return up to `lines` ending strictly before this line.
+    pub before_line: Option<usize>,
+}
+
+impl CaptureRequest {
+    pub fn tail(lines: usize) -> Self {
+        Self {
+            lines,
+            all: false,
+            before_line: None,
+        }
+    }
+
+    pub fn full() -> Self {
+        Self {
+            lines: MAX_FULL_CAPTURE_LINES,
+            all: true,
+            before_line: None,
+        }
+    }
+
+    pub fn page_before(before_line: usize, lines: usize) -> Self {
+        Self {
+            lines,
+            all: false,
+            before_line: Some(before_line),
+        }
+    }
 }
 
 /// Metadata for an active coding-agent pane discovered in tmux.
@@ -55,16 +95,37 @@ pub struct DiscoveredPane {
     pub pane_in_mode: bool,
     pub pane_dead: bool,
     pub pane_current_command: String,
+    #[serde(default)]
+    pub history_size: u32,
+    #[serde(default)]
+    pub cursor_x: u32,
+    #[serde(default)]
+    pub cursor_y: u32,
 }
 
-/// Captured tail of a pane returned by preview endpoints.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Captured slice of a pane returned by preview endpoints (tail, paginated, or full history).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PanePreview {
     pub pane_id: PaneId,
     pub lines: usize,
     pub text: String,
     pub in_mode: bool,
     pub dead: bool,
+    /// Total lines currently held by the multiplexer (scrollback + visible screen).
+    #[serde(default)]
+    pub total_lines: usize,
+    /// 0-based index of the first returned line (`0` = oldest scrollback line).
+    #[serde(default)]
+    pub start_line: usize,
+    /// True when older lines exist before `start_line`.
+    #[serde(default)]
+    pub has_more: bool,
+    /// Cursor to pass as `before_line` to load earlier lines without overlap or gaps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_line: Option<usize>,
+    /// True when the response hit the line or byte safety fuse.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Standalone helper: discover all running agent panes on `socket` (`None` = default tmux server).
@@ -99,15 +160,17 @@ impl Tmux {
         if panes.is_empty() {
             return Vec::new();
         }
-        let ps_out = exec::run(
-            Path::new("ps"),
-            &["-eo".to_string(), "pid=,ppid=,args=".to_string()],
-            None,
-        )
-        .map(|o| if o.success { o.stdout } else { String::new() })
-        .unwrap_or_default();
+        let ps_out = self
+            .transport
+            .run(
+                Path::new("ps"),
+                &["-eo".to_string(), "pid=,ppid=,args=".to_string()],
+                None,
+            )
+            .map(|o| if o.success { o.stdout } else { String::new() })
+            .unwrap_or_default();
 
-        classify_panes_with(panes, &ps_out, opts)
+        classify_panes_with_git_lookup(panes, &ps_out, opts, self.transport.is_local())
     }
 
     /// Discover running `claude`, `codex`, and `agy` panes from an already-fetched pane list.
@@ -127,27 +190,216 @@ impl Tmux {
         Ok(trim_and_cap_tail(&raw, clamped, MAX_CAPTURE_BYTES))
     }
 
+    /// Capture multiple panes' tails in a single batched `tmux` invocation using `;` separators.
+    /// Falls back to per-pane capture only if the batched command fails (e.g. a pane exited mid-call).
+    pub fn capture_panes_tail_batch(
+        &self,
+        targets: &[(&PaneId, usize)],
+    ) -> HashMap<PaneId, String> {
+        let mut out = HashMap::new();
+        if targets.is_empty() {
+            return out;
+        }
+        if targets.len() == 1 {
+            let (pid, lines) = targets[0];
+            if let Ok(text) = self.capture_pane_tail(pid, lines) {
+                out.insert(pid.clone(), text);
+            }
+            return out;
+        }
+
+        // Nonce marker contains no `%` or `#` so tmux `display-message -p` prints it verbatim.
+        let marker = format!("__SF_CAP_END_{}__", std::process::id());
+        let mut args: Vec<String> = Vec::with_capacity(targets.len() * 10);
+        let mut valid_targets: Vec<(&PaneId, usize)> = Vec::with_capacity(targets.len());
+        for &(pid, lines) in targets {
+            if valid_pane(pid).is_err() {
+                continue;
+            }
+            let clamped = lines.clamp(MIN_CAPTURE_LINES, MAX_CAPTURE_LINES);
+            if !args.is_empty() {
+                args.push(";".into());
+            }
+            args.extend([
+                "capture-pane".into(),
+                "-p".into(),
+                "-t".into(),
+                pid.as_str().to_string(),
+                "-S".into(),
+                format!("-{clamped}"),
+                ";".into(),
+                "display-message".into(),
+                "-p".into(),
+                marker.clone(),
+            ]);
+            valid_targets.push((pid, clamped));
+        }
+        if valid_targets.is_empty() {
+            return out;
+        }
+
+        if let Ok(raw) = self.run_owned(&args, None) {
+            let segments = split_batch_capture(&raw, &marker);
+            if segments.len() == valid_targets.len() {
+                for ((pid, clamped), seg) in valid_targets.into_iter().zip(segments) {
+                    out.insert(
+                        pid.clone(),
+                        trim_and_cap_tail(&seg, clamped, MAX_CAPTURE_BYTES),
+                    );
+                }
+                return out;
+            }
+        }
+
+        // Resilient fallback if a pane died during the batched call.
+        for &(pid, lines) in targets {
+            if let Ok(text) = self.capture_pane_tail(pid, lines) {
+                out.insert(pid.clone(), text);
+            }
+        }
+        out
+    }
+
+    /// Fetch pane preview (tail, paginated scrollback, or full `-S -`) together with pane flags and cursor metadata.
+    pub fn capture_pane(
+        &self,
+        pane_id: &PaneId,
+        req: &CaptureRequest,
+    ) -> Result<PanePreview, TmuxError> {
+        valid_pane(pane_id)?;
+        let meta_raw = self.run(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                pane_id.as_str(),
+                "#{history_size}\x1f#{pane_height}\x1f#{pane_in_mode}\x1f#{pane_dead}",
+            ],
+            None,
+        )?;
+        let meta_line = meta_raw.trim_end_matches(['\r', '\n']);
+        let parts: Vec<&str> = meta_line.split(crate::model::FIELD_SEP).collect();
+        if parts.len() != 4 {
+            return Err(TmuxError::Parse(format!(
+                "unexpected capture meta for {pane_id}: {meta_line:?}"
+            )));
+        }
+        let history_size = parts[0].trim().parse::<usize>().unwrap_or(0);
+        let pane_height = parts[1].trim().parse::<usize>().unwrap_or(0);
+        let in_mode = parts[2].trim() == "1";
+        let dead = parts[3].trim() == "1";
+        let total_lines = history_size.saturating_add(pane_height);
+
+        if let Some(before) = req.before_line {
+            let limit = req.lines.clamp(MIN_CAPTURE_LINES, MAX_FULL_CAPTURE_LINES);
+            let end_excl = before.min(total_lines);
+            if end_excl == 0 {
+                return Ok(PanePreview {
+                    pane_id: pane_id.clone(),
+                    lines: limit,
+                    text: String::new(),
+                    in_mode,
+                    dead,
+                    total_lines,
+                    start_line: 0,
+                    has_more: false,
+                    next_before_line: None,
+                    truncated: false,
+                });
+            }
+            let start_idx = end_excl.saturating_sub(limit);
+            let tmux_start = (start_idx as isize) - (history_size as isize);
+            let tmux_end = ((end_excl - 1) as isize) - (history_size as isize);
+            let s_arg = tmux_start.to_string();
+            let e_arg = tmux_end.to_string();
+            let raw = self.run(
+                &[
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    pane_id.as_str(),
+                    "-S",
+                    &s_arg,
+                    "-E",
+                    &e_arg,
+                ],
+                None,
+            )?;
+            let (text, dropped_top, byte_truncated) =
+                cap_page_bytes(&raw, limit, MAX_FULL_CAPTURE_BYTES, false);
+            let eff_start = start_idx.saturating_add(dropped_top).min(end_excl);
+            let has_more = eff_start > 0;
+            return Ok(PanePreview {
+                pane_id: pane_id.clone(),
+                lines: limit,
+                text,
+                in_mode,
+                dead,
+                total_lines,
+                start_line: eff_start,
+                has_more,
+                next_before_line: has_more.then_some(eff_start),
+                truncated: byte_truncated,
+            });
+        }
+
+        let (limit, max_bytes) = if req.all {
+            let lim = if req.lines == 0 {
+                MAX_FULL_CAPTURE_LINES
+            } else {
+                req.lines.clamp(MIN_CAPTURE_LINES, MAX_FULL_CAPTURE_LINES)
+            };
+            (lim, MAX_FULL_CAPTURE_BYTES)
+        } else {
+            let lim = req.lines.clamp(MIN_CAPTURE_LINES, MAX_FULL_CAPTURE_LINES);
+            let bytes = if lim > MAX_CAPTURE_LINES {
+                MAX_FULL_CAPTURE_BYTES
+            } else {
+                MAX_CAPTURE_BYTES
+            };
+            (lim, bytes)
+        };
+
+        let (start_idx, start_arg) = if total_lines <= limit {
+            (0usize, "-".to_string())
+        } else {
+            let s_idx = total_lines.saturating_sub(limit);
+            let tmux_start = (s_idx as isize) - (history_size as isize);
+            (s_idx, tmux_start.to_string())
+        };
+
+        let raw = self.run(
+            &[
+                "capture-pane",
+                "-p",
+                "-t",
+                pane_id.as_str(),
+                "-S",
+                &start_arg,
+            ],
+            None,
+        )?;
+        let (text, dropped_top, byte_truncated) = cap_page_bytes(&raw, limit, max_bytes, true);
+        let eff_start = start_idx.saturating_add(dropped_top).min(total_lines);
+        let has_more = eff_start > 0;
+        let truncated = byte_truncated || (req.all && has_more);
+        Ok(PanePreview {
+            pane_id: pane_id.clone(),
+            lines: limit,
+            text,
+            in_mode,
+            dead,
+            total_lines,
+            start_line: eff_start,
+            has_more,
+            next_before_line: has_more.then_some(eff_start),
+            truncated,
+        })
+    }
+
     /// Fetch pane preview together with `in_mode` and `dead` flags.
     pub fn preview_pane(&self, pane_id: &PaneId, lines: usize) -> Result<PanePreview, TmuxError> {
-        valid_pane(pane_id)?;
-        let clamped = lines.clamp(MIN_CAPTURE_LINES, MAX_CAPTURE_LINES);
-        let panes = self.list_panes()?;
-        let info = panes
-            .into_iter()
-            .find(|p| &p.pane_id == pane_id)
-            .ok_or_else(|| TmuxError::Command {
-                args: format!("capture-pane -t {pane_id}"),
-                code: Some(1),
-                stderr: format!("pane {pane_id} not found"),
-            })?;
-        let text = self.capture_pane_tail(pane_id, clamped)?;
-        Ok(PanePreview {
-            pane_id: info.pane_id,
-            lines: clamped,
-            text,
-            in_mode: info.in_mode,
-            dead: info.dead,
-        })
+        self.capture_pane(pane_id, &CaptureRequest::tail(lines))
     }
 }
 
@@ -161,6 +413,17 @@ pub fn classify_panes_with(
     panes: &[PaneInfo],
     ps_output: &str,
     opts: DiscoverOptions,
+) -> Vec<DiscoveredPane> {
+    classify_panes_with_git_lookup(panes, ps_output, opts, true)
+}
+
+/// Pure classifier combining `list-panes` rows with `ps` output, optionally skipping local `.git` traversal
+/// (e.g. for remote SSH panes where paths belong to a remote filesystem).
+pub fn classify_panes_with_git_lookup(
+    panes: &[PaneInfo],
+    ps_output: &str,
+    opts: DiscoverOptions,
+    resolve_local_git: bool,
 ) -> Vec<DiscoveredPane> {
     let mut by_pid: HashMap<u32, String> = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -190,8 +453,16 @@ pub fn classify_panes_with(
             pane.session_name, pane.window_index, pane.pane_index
         );
         if let Some(det) = detect_pane_agent(pane, &by_pid, &children) {
-            let git_root = find_git_root(Path::new(&pane.current_path));
-            let subtree_pids = collect_subtree_pids(pane.pane_pid, &children, 4);
+            let git_root = if resolve_local_git && !pane.current_path.is_empty() {
+                find_git_root(Path::new(&pane.current_path))
+            } else {
+                None
+            };
+            let subtree_pids = if pane.pane_pid > 0 {
+                collect_subtree_pids(pane.pane_pid, &children, 4)
+            } else {
+                Vec::new()
+            };
             out.push(DiscoveredPane {
                 pane_id: pane.pane_id.clone(),
                 tmux_target,
@@ -207,12 +478,23 @@ pub fn classify_panes_with(
                 pane_in_mode: pane.in_mode,
                 pane_dead: pane.dead,
                 pane_current_command: pane.current_command.clone(),
+                history_size: pane.history_size,
+                cursor_x: pane.cursor_x,
+                cursor_y: pane.cursor_y,
             });
         } else if opts.include_shell_panes && !pane.dead {
             let cmd = pane.current_command.trim();
             let model = (!cmd.is_empty()).then(|| cmd.to_string());
-            let git_root = find_git_root(Path::new(&pane.current_path));
-            let subtree_pids = collect_subtree_pids(pane.pane_pid, &children, 4);
+            let git_root = if resolve_local_git && !pane.current_path.is_empty() {
+                find_git_root(Path::new(&pane.current_path))
+            } else {
+                None
+            };
+            let subtree_pids = if pane.pane_pid > 0 {
+                collect_subtree_pids(pane.pane_pid, &children, 4)
+            } else {
+                Vec::new()
+            };
             out.push(DiscoveredPane {
                 pane_id: pane.pane_id.clone(),
                 tmux_target,
@@ -222,12 +504,15 @@ pub fn classify_panes_with(
                 git_root,
                 model,
                 effort: None,
-                agent_pid: Some(pane.pane_pid),
+                agent_pid: (pane.pane_pid > 0).then_some(pane.pane_pid),
                 subtree_pids,
                 codex_resume_id: None,
                 pane_in_mode: pane.in_mode,
                 pane_dead: pane.dead,
                 pane_current_command: pane.current_command.clone(),
+                history_size: pane.history_size,
+                cursor_x: pane.cursor_x,
+                cursor_y: pane.cursor_y,
             });
         }
     }
@@ -318,8 +603,25 @@ fn detect_pane_agent(
         }
     }
 
-    // Fallback: inspect `pane_current_command` directly (covers versioned Claude binaries like `2.1.299`).
+    // Fallback: inspect `pane_current_command` directly (covers versioned Claude binaries like `2.1.299`
+    // and Zellij panes whose `current_command` carries the full command line).
     let cmd = pane.current_command.trim();
+    if let Some(agent) = classify_cmdline(cmd) {
+        let model = extract_model_flag(cmd);
+        let effort = extract_effort_flag(agent, cmd);
+        let codex_resume_id = if agent == AgentKind::Codex {
+            extract_codex_resume_id(cmd)
+        } else {
+            None
+        };
+        return Some(DetectedAgent {
+            agent,
+            model,
+            effort,
+            pid: None,
+            codex_resume_id,
+        });
+    }
     if let Some(agent) = classify_command_name(cmd) {
         return Some(DetectedAgent {
             agent,
@@ -510,6 +812,65 @@ fn find_git_root(dir: &Path) -> Option<String> {
     None
 }
 
+/// Split batched `capture-pane ... ; display-message -p <marker>` stdout into per-pane segments.
+pub(crate) fn split_batch_capture(raw: &str, marker: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        if line == marker {
+            segments.push(current.join("\n"));
+            current.clear();
+        } else {
+            current.push(line);
+        }
+    }
+    segments
+}
+
+/// Cap captured output to at most `max_lines` newest lines and `max_bytes`, returning
+/// `(text, dropped_leading_lines, truncated_by_bytes)`.
+pub fn cap_page_bytes(
+    raw: &str,
+    max_lines: usize,
+    max_bytes: usize,
+    trim_trailing_blanks: bool,
+) -> (String, usize, bool) {
+    let mut lines: Vec<&str> = raw.lines().collect();
+    if trim_trailing_blanks {
+        while lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.pop();
+        }
+    }
+    let mut dropped_top = 0usize;
+    if lines.len() > max_lines {
+        let drop_n = lines.len() - max_lines;
+        lines.drain(0..drop_n);
+        dropped_top += drop_n;
+    }
+    let joined = lines.join("\n");
+    if joined.len() <= max_bytes {
+        return (joined, dropped_top, false);
+    }
+    let mut start = joined.len() - max_bytes;
+    while start < joined.len() && !joined.is_char_boundary(start) {
+        start += 1;
+    }
+    // Prefer snapping to the next newline boundary when possible so pagination stays line-aligned.
+    if let Some(nl) = joined[start..].find('\n') {
+        if start + nl + 1 < joined.len() {
+            let cut = start + nl + 1;
+            let extra_dropped = joined[..cut].bytes().filter(|&b| b == b'\n').count();
+            return (joined[cut..].to_string(), dropped_top + extra_dropped, true);
+        }
+    }
+    let extra_dropped = joined[..start].bytes().filter(|&b| b == b'\n').count();
+    (
+        joined[start..].to_string(),
+        dropped_top + extra_dropped,
+        true,
+    )
+}
+
 /// Strip trailing empty lines, keep at most `max_lines` newest lines, and cap UTF-8 byte length at `max_bytes`.
 pub fn trim_and_cap_tail(raw: &str, max_lines: usize, max_bytes: usize) -> String {
     let mut lines: Vec<&str> = raw.lines().collect();
@@ -563,6 +924,9 @@ mod tests {
             cursor_x: 2,
             cursor_y: 10,
             window_name: format!("win{win}"),
+            session_group: String::new(),
+            history_size: 0,
+            pane_height: 24,
         }
     }
 

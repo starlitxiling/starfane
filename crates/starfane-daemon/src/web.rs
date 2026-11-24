@@ -5,6 +5,9 @@
 //! `X-Starfane-Token` or `Authorization: Bearer`). Host is checked against
 //! loopback names (DNS rebinding) and POST Origin must be same-origin.
 
+#[cfg(test)]
+use crate::access::ct_eq;
+use crate::access::{AccessGate, TokenAccess};
 use crate::core::Core;
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
@@ -19,7 +22,7 @@ use serde::Deserialize;
 use starfane_proto::*;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::{broadcast, mpsc};
@@ -28,6 +31,68 @@ const INDEX_HTML: &[u8] = include_bytes!("../../../web/index.html");
 const APP_JS: &[u8] = include_bytes!("../../../web/app.js");
 const APP_CSS: &[u8] = include_bytes!("../../../web/app.css");
 const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
+
+const EMBEDDED_ASSETS: &[(&str, &[u8], &str)] = &[
+    ("index.html", INDEX_HTML, "text/html; charset=utf-8"),
+    ("app.js", APP_JS, "text/javascript; charset=utf-8"),
+    ("app.css", APP_CSS, "text/css; charset=utf-8"),
+    ("logo.svg", LOGO_SVG, "image/svg+xml"),
+    (
+        "js/constants.js",
+        include_bytes!("../../../web/js/constants.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/store.js",
+        include_bytes!("../../../web/js/store.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/dom.js",
+        include_bytes!("../../../web/js/dom.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/markdown.js",
+        include_bytes!("../../../web/js/markdown.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/terminal.js",
+        include_bytes!("../../../web/js/terminal.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/api.js",
+        include_bytes!("../../../web/js/api.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/topbar.js",
+        include_bytes!("../../../web/js/topbar.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/composer.js",
+        include_bytes!("../../../web/js/composer.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/workspace.js",
+        include_bytes!("../../../web/js/workspace.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/views.js",
+        include_bytes!("../../../web/js/views.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "js/overlays.js",
+        include_bytes!("../../../web/js/overlays.js"),
+        "text/javascript; charset=utf-8",
+    ),
+];
 const COOKIE: &str = "starfane_token";
 
 pub async fn serve(core: Core) -> Result<(), String> {
@@ -98,11 +163,15 @@ pub fn router(core: Core) -> Router {
         .route("/api/uploads/{id}", get(get_upload))
         .route("/api/feishu/test", post(feishu_test))
         .route("/api/feishu/mute", post(feishu_mute))
+        .route("/api/hosts", get(list_hosts))
+        .route("/api/hosts/{id}/rename", post(rename_host))
+        .route("/api/notifiers", get(list_notifiers))
+        .route("/api/notifiers/{id}/test", post(test_notifier))
         .layer(middleware::from_fn_with_state(core.clone(), auth));
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
-        .route("/assets/{file}", get(asset))
+        .route("/assets/{*path}", get(asset))
         .route("/auth", get(auth_route))
         .route("/api/health", get(health))
         .merge(api)
@@ -155,12 +224,8 @@ async fn not_found() -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Auth middleware
+// Auth & precompiled AccessGate middleware
 // ---------------------------------------------------------------------------
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
 
 #[cfg(test)]
 fn cookie_token(headers: &HeaderMap) -> Option<String> {
@@ -174,14 +239,19 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
         .map(|(_, v)| v.trim().to_string())
 }
 
-fn has_valid_cookie(headers: &HeaderMap, expected: &[u8]) -> bool {
+fn cookie_access(headers: &HeaderMap, core: &Core) -> Option<TokenAccess> {
+    let primary = core.web_token().as_bytes();
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|kv| kv.trim().split_once('='))
-        .any(|(k, v)| k.trim() == COOKIE && ct_eq(v.trim().as_bytes(), expected))
+        .filter(|(k, _)| k.trim() == COOKIE)
+        .find_map(|(_, v)| {
+            core.access_gate()
+                .authorize_token(v.trim().as_bytes(), primary)
+        })
 }
 
 fn header_token(headers: &HeaderMap) -> Option<String> {
@@ -198,110 +268,25 @@ fn header_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-/// True when `ip` is a Tailscale CGNAT IPv4 (`100.64.0.0/10`: `100.64.0.0`–`100.127.255.255`).
-fn is_tailscale_ipv4(ip: Ipv4Addr) -> bool {
-    let oct = ip.octets();
-    oct[0] == 100 && (oct[1] & 0b1100_0000) == 64
-}
-
-fn is_allowed_peer_v4(v4: Ipv4Addr, web: &crate::config::WebConfig) -> bool {
-    v4.is_loopback()
-        || (web.allow_easytier && crate::config::ipv4_in_cidrs(v4, &web.easytier_cidrs))
-        || (web.allow_tailscale && is_tailscale_ipv4(v4))
-}
-
-/// True when peer `ip` is permitted to access the Web console:
-/// always allows loopback (`127.0.0.0/8`, `::1`, `::ffff:127.x.x.x`), allows
-/// EasyTier CIDRs (`web.easytier_cidrs`) when `allow_easytier` is true, and allows
-/// Tailscale CGNAT (`100.64.0.0/10`, `::ffff:100.64.0.0/106`) when `allow_tailscale` is true.
-/// Rejects LAN (`192.168.x.x`, `10.17.x.x`, `172.16.x.x`) and public IPs.
+/// True when peer `ip` is permitted by loopback, `allowed_cidrs`, or enabled presets (`easytier`/`tailscale`).
 pub fn is_allowed_peer_ip(ip: IpAddr, web: &crate::config::WebConfig) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_allowed_peer_v4(v4, web),
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_allowed_peer_v4(v4, web))
-        }
-    }
+    AccessGate::from_config(web).is_allowed_peer_ip(ip)
 }
 
-/// Global peer-IP gate applied to every route when `auth_enabled == false` or binding `0.0.0.0`.
+/// Global unconditional peer-IP gate applied to every route (loopback is always allowed;
+/// non-loopback peers must match `AccessGate`).
 async fn peer_ip_gate(State(core): State<Core>, req: Request, next: Next) -> Response {
-    let web = &core.config().web;
-    if !web.auth_enabled || web.bind == "0.0.0.0" || web.bind == "::" {
-        if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-            if !is_allowed_peer_ip(addr.ip(), web) {
-                log::warn!("web: rejected peer IP {}", addr.ip());
-                return forbidden("peer IP not allowed");
-            }
+    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        if !core.access_gate().is_allowed_peer_ip(addr.ip()) {
+            log::warn!("web: rejected peer IP {}", addr.ip());
+            return forbidden("peer IP not allowed");
         }
     }
     next.run(req).await
 }
 
-fn split_host_port(host: &str) -> Option<(&str, Option<u16>)> {
-    let h = host.trim();
-    if h.is_empty() || h.contains('/') || h.contains('@') {
-        return None;
-    }
-    if let Some(after_open) = h.strip_prefix('[') {
-        let close = after_open.find(']')?;
-        let host_only = &h[..=close + 1];
-        let rest = &after_open[close + 1..];
-        if rest.is_empty() {
-            return Some((host_only, None));
-        }
-        let port = rest.strip_prefix(':')?.parse::<u16>().ok()?;
-        return Some((host_only, Some(port)));
-    }
-    if let Some((host_only, port_str)) = h.rsplit_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return (!host_only.is_empty()).then_some((host_only, Some(port)));
-        }
-    }
-    Some((h, None))
-}
-
 pub fn is_allowed_host(core: &Core, host: &str) -> bool {
-    let web = &core.config().web;
-    let Some((host_only, port_opt)) = split_host_port(host) else {
-        return false;
-    };
-    if web.allow_tailscale {
-        let lower = host_only.to_ascii_lowercase();
-        if lower.ends_with(".ts.net")
-            && lower.len() > ".ts.net".len()
-            && port_opt.is_none_or(|p| p == web.port || p == 80 || p == 443)
-        {
-            return true;
-        }
-    }
-    if port_opt != Some(web.port) {
-        return false;
-    }
-    if matches!(host_only, "127.0.0.1" | "localhost" | "[::1]") {
-        return true;
-    }
-    if web.bind != "127.0.0.1" && web.bind != "0.0.0.0" && web.bind != "::" {
-        let bracketed_bind = if web.bind.contains(':') && !web.bind.starts_with('[') {
-            format!("[{}]", web.bind)
-        } else {
-            web.bind.clone()
-        };
-        if host_only == web.bind || host_only == bracketed_bind {
-            return true;
-        }
-    }
-    if let Ok(v4) = host_only.parse::<Ipv4Addr>() {
-        if (web.allow_easytier && crate::config::ipv4_in_cidrs(v4, &web.easytier_cidrs))
-            || (web.allow_tailscale && is_tailscale_ipv4(v4))
-        {
-            return true;
-        }
-    }
-    false
+    core.access_gate().is_allowed_host(host)
 }
 
 fn host_ok(core: &Core, headers: &HeaderMap) -> bool {
@@ -346,81 +331,188 @@ async fn auth(State(core): State<Core>, req: Request, next: Next) -> Response {
     if !core.config().web.auth_enabled {
         return next.run(req).await;
     }
-    let expected = core.web_token().as_bytes().to_vec();
-    let from_cookie = has_valid_cookie(headers, &expected);
-    let from_header = header_token(headers).is_some_and(|t| ct_eq(t.as_bytes(), &expected));
-    if !from_cookie && !from_header {
+    let primary = core.web_token().as_bytes();
+    let cookie_acc = cookie_access(headers, &core);
+    let hdr_tok = header_token(headers);
+    let header_acc = hdr_tok
+        .as_deref()
+        .and_then(|t| core.access_gate().authorize_token(t.as_bytes(), primary));
+
+    let Some(access) = header_acc.or(cookie_acc) else {
         return json_response(
             StatusCode::UNAUTHORIZED,
             serde_json::json!({"ok": false, "error": {"code": "unauthorized",
                 "message": "missing or invalid token; open the URL printed by `starfane web`"}}),
         );
+    };
+    if access == TokenAccess::ReadOnly && req.method() != Method::GET {
+        return forbidden("read-only token cannot perform write operations");
     }
     let mut resp = next.run(req).await;
     // EventSource cannot send headers: hand out the cookie on header-auth success.
-    if from_header && !from_cookie {
-        resp.headers_mut()
-            .append(header::SET_COOKIE, session_cookie(core.web_token()));
+    if header_acc.is_some() && cookie_acc.is_none() {
+        if let Some(tok) = hdr_tok {
+            resp.headers_mut()
+                .append(header::SET_COOKIE, session_cookie(&tok));
+        }
     }
     resp
 }
 
 // ---------------------------------------------------------------------------
-// Static
+// Static assets (zero-copy `Bytes::from_static` + FNV-1a ETag `304`)
 // ---------------------------------------------------------------------------
 
-fn static_response(bytes: Vec<u8>, ctype: &'static str) -> Response {
+fn fnv1a_etag(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("\"{h:016x}-{}\"", bytes.len())
+}
+
+fn static_response(req_headers: &HeaderMap, bytes: Bytes, ctype: &'static str) -> Response {
+    let etag = fnv1a_etag(&bytes);
+    let csp = HeaderValue::from_static(
+        "default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'",
+    );
+    if req_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|inm| {
+            inm.split(',')
+                .any(|part| part.trim().trim_start_matches("W/") == etag)
+        })
+    {
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::NOT_MODIFIED;
+        if let Ok(ev) = HeaderValue::from_str(&etag) {
+            resp.headers_mut().insert(header::ETAG, ev);
+        }
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        resp.headers_mut().insert("content-security-policy", csp);
+        return resp;
+    }
+
     let mut resp = Response::new(Body::from(bytes));
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    resp.headers_mut().insert(
-        "content-security-policy",
-        HeaderValue::from_static(
-            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'",
-        ),
-    );
+    if let Ok(ev) = HeaderValue::from_str(&etag) {
+        resp.headers_mut().insert(header::ETAG, ev);
+    }
+    resp.headers_mut().insert("content-security-policy", csp);
     resp
 }
 
-fn load_asset(core: &Core, name: &str) -> Option<(Vec<u8>, &'static str)> {
-    let ctype = if name.ends_with(".js") || name.ends_with(".mjs") {
+fn safe_relative_asset_path(name: &str) -> Option<&str> {
+    let clean = name.trim_start_matches('/');
+    if clean.is_empty()
+        || clean.contains('\\')
+        || clean.contains('\0')
+        || clean
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    Some(clean)
+}
+
+const MAX_USER_FONT_BYTES: usize = 16 * 1024 * 1024;
+
+fn user_term_font_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".config").join("starfane").join("fonts"))
+}
+
+async fn has_user_term_font_in_dir(font_dir: &std::path::Path) -> bool {
+    for f in ["terminal.woff2", "terminal.ttf"] {
+        if tokio::fs::metadata(font_dir.join(f))
+            .await
+            .is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() <= MAX_USER_FONT_BYTES as u64)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) async fn has_user_term_font() -> bool {
+    let Some(font_dir) = user_term_font_dir() else {
+        return false;
+    };
+    has_user_term_font_in_dir(&font_dir).await
+}
+
+async fn load_user_term_font_from_dir(font_dir: &std::path::Path) -> Option<(Bytes, &'static str)> {
+    for (file, mime) in [
+        ("terminal.woff2", "font/woff2"),
+        ("terminal.ttf", "font/ttf"),
+    ] {
+        let path = font_dir.join(file);
+        let Ok(meta) = tokio::fs::metadata(&path).await else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_USER_FONT_BYTES as u64 {
+            continue;
+        }
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            if !bytes.is_empty() && bytes.len() <= MAX_USER_FONT_BYTES {
+                return Some((Bytes::from(bytes), mime));
+            }
+        }
+    }
+    None
+}
+
+async fn load_user_term_font() -> Option<(Bytes, &'static str)> {
+    let font_dir = user_term_font_dir()?;
+    load_user_term_font_from_dir(&font_dir).await
+}
+
+async fn load_asset(core: &Core, name: &str) -> Option<(Bytes, &'static str)> {
+    let clean = safe_relative_asset_path(name)?;
+    if clean == "user-term-font.woff2" {
+        return load_user_term_font().await;
+    }
+    let ctype = if clean.ends_with(".js") || clean.ends_with(".mjs") {
         "text/javascript; charset=utf-8"
-    } else if name.ends_with(".css") {
+    } else if clean.ends_with(".css") {
         "text/css; charset=utf-8"
-    } else if name.ends_with(".html") {
+    } else if clean.ends_with(".html") {
         "text/html; charset=utf-8"
-    } else if name.ends_with(".svg") {
+    } else if clean.ends_with(".svg") {
         "image/svg+xml"
+    } else if clean.ends_with(".woff2") {
+        "font/woff2"
     } else {
         "application/octet-stream"
     };
     if let Some(dir) = core.web_dir() {
-        if name.contains("..") || name.contains('/') || name.contains('\\') {
-            return None;
-        }
-        return std::fs::read(dir.join(name))
-            .ok()
-            .or_else(|| (name == "logo.svg").then(|| LOGO_SVG.to_vec()))
-            .map(|b| (b, ctype));
+        return match tokio::fs::read(dir.join(clean)).await {
+            Ok(b) => Some((Bytes::from(b), ctype)),
+            Err(_) => {
+                (clean == "logo.svg").then(|| (Bytes::from_static(LOGO_SVG), "image/svg+xml"))
+            }
+        };
     }
-    let bytes = match name {
-        "index.html" => INDEX_HTML,
-        "app.js" => APP_JS,
-        "app.css" => APP_CSS,
-        "logo.svg" => LOGO_SVG,
-        _ => return None,
-    };
-    Some((bytes.to_vec(), ctype))
+    EMBEDDED_ASSETS
+        .iter()
+        .find(|(k, _, _)| *k == clean)
+        .map(|(_, data, mime)| (Bytes::from_static(data), *mime))
 }
 
 async fn index(State(core): State<Core>, headers: HeaderMap) -> Response {
     if !host_ok(&core, &headers) {
         return forbidden("host not allowed");
     }
-    match load_asset(&core, "index.html") {
-        Some((b, t)) => static_response(b, t),
+    match load_asset(&core, "index.html").await {
+        Some((b, t)) => static_response(&headers, b, t),
         None => respond(Err(ApiError::not_found("index.html"))),
     }
 }
@@ -429,8 +521,8 @@ async fn asset(State(core): State<Core>, headers: HeaderMap, Path(file): Path<St
     if !host_ok(&core, &headers) {
         return forbidden("host not allowed");
     }
-    match load_asset(&core, &file) {
-        Some((b, t)) => static_response(b, t),
+    match load_asset(&core, &file).await {
+        Some((b, t)) => static_response(&headers, b, t),
         None => respond(Err(ApiError::not_found(format!("asset {file}")))),
     }
 }
@@ -443,21 +535,24 @@ async fn auth_route(
     if !host_ok(&core, &headers) {
         return forbidden("host not allowed");
     }
-    let ok = q
-        .get("token")
-        .is_some_and(|t| ct_eq(t.as_bytes(), core.web_token().as_bytes()));
-    if !ok {
+    let primary = core.web_token().as_bytes();
+    let authorized = q.get("token").filter(|t| {
+        core.access_gate()
+            .authorize_token(t.as_bytes(), primary)
+            .is_some()
+    });
+    let Some(tok) = authorized else {
         return json_response(
             StatusCode::UNAUTHORIZED,
             serde_json::json!({"ok": false, "error": {"code": "unauthorized", "message": "bad token"}}),
         );
-    }
+    };
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = StatusCode::FOUND;
     resp.headers_mut()
         .insert(header::LOCATION, HeaderValue::from_static("/"));
     resp.headers_mut()
-        .insert(header::SET_COOKIE, session_cookie(core.web_token()));
+        .insert(header::SET_COOKIE, session_cookie(tok));
     resp
 }
 
@@ -478,7 +573,7 @@ async fn health(State(core): State<Core>, headers: HeaderMap) -> Response {
 }
 
 async fn state(State(core): State<Core>) -> Response {
-    respond(Ok(core.state_json()))
+    respond(Ok(core.state_json().await))
 }
 
 async fn models(State(core): State<Core>) -> Response {
@@ -541,13 +636,21 @@ async fn session_transcript(
     Path(id): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    let all = flag(&q, "all");
+    let before = q.get("before").and_then(|s| s.parse::<usize>().ok());
+    let default_limit = if all {
+        crate::core::transcript::MAX_TRANSCRIPT_LIMIT
+    } else {
+        crate::core::transcript::DEFAULT_TRANSCRIPT_LIMIT
+    };
     let limit = q
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(crate::core::transcript::DEFAULT_TRANSCRIPT_LIMIT)
+        .unwrap_or(default_limit)
         .clamp(1, crate::core::transcript::MAX_TRANSCRIPT_LIMIT);
+    let query = crate::core::transcript::TranscriptQuery { limit, before, all };
     let r = core
-        .session_transcript(&SessionId(id), limit)
+        .session_transcript(&SessionId(id), query)
         .await
         .and_then(|t| serde_json::to_value(t).map_err(|e| ApiError::internal(e.to_string())));
     respond(r)
@@ -558,13 +661,28 @@ async fn pane_preview(
     Path(pane_id): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    let all = flag(&q, "all");
+    let before_line = q.get("before_line").and_then(|s| s.parse::<usize>().ok());
+    let default_lines = if all {
+        starfane_tmux::MAX_FULL_CAPTURE_LINES
+    } else if before_line.is_some() {
+        1000
+    } else {
+        200
+    };
     let lines = q
         .get("lines")
+        .or_else(|| q.get("limit"))
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(200)
-        .clamp(1, starfane_tmux::MAX_CAPTURE_LINES);
+        .unwrap_or(default_lines)
+        .clamp(1, starfane_tmux::MAX_FULL_CAPTURE_LINES);
+    let req = starfane_tmux::CaptureRequest {
+        lines,
+        all,
+        before_line,
+    };
     let r = core
-        .preview_pane(&PaneId(pane_id), lines)
+        .capture_pane(&PaneId(pane_id), req)
         .await
         .and_then(|p| serde_json::to_value(p).map_err(|e| ApiError::internal(e.to_string())));
     respond(r)
@@ -701,13 +819,13 @@ async fn list_pipelines(
 }
 
 /// Accept a project name / prefix, an absolute directory, or empty (auto fallback).
-fn resolve_root_or_default(core: &Core, root: Option<&str>) -> Result<String, ApiError> {
+async fn resolve_root_or_default(core: &Core, root: Option<&str>) -> Result<String, ApiError> {
     let trimmed = root.unwrap_or("").trim();
     if trimmed.is_empty() {
         return Ok(core.default_project_root());
     }
     let p = std::path::Path::new(trimmed);
-    if p.is_absolute() && p.is_dir() {
+    if p.is_absolute() && tokio::fs::metadata(p).await.is_ok_and(|m| m.is_dir()) {
         return Ok(trimmed.to_string());
     }
     core.find_project(trimmed)
@@ -761,7 +879,7 @@ async fn create_pipeline(State(core): State<Core>, body: Bytes) -> Response {
         let auto_confirm = outer_auto
             .or(raw.auto_confirm)
             .unwrap_or_else(default_auto_confirm);
-        let root = resolve_root_or_default(&core, raw.project_root.as_deref())?;
+        let root = resolve_root_or_default(&core, raw.project_root.as_deref()).await?;
         let mut bindings = raw.bindings;
         let utterance = raw
             .utterance
@@ -873,7 +991,7 @@ struct DebugBody {
 async fn create_debug(State(core): State<Core>, body: Bytes) -> Response {
     let r = async {
         let b: DebugBody = parse_body(&body)?;
-        let root = resolve_root_or_default(&core, b.project_root.as_deref())?;
+        let root = resolve_root_or_default(&core, b.project_root.as_deref()).await?;
         let text = b
             .utterance
             .clone()
@@ -1177,6 +1295,48 @@ async fn feishu_test(State(core): State<Core>, body: Bytes) -> Response {
     respond(r.await)
 }
 
+async fn list_hosts(State(core): State<Core>) -> Response {
+    let hosts = core.hosts();
+    respond(serde_json::to_value(hosts).map_err(|e| ApiError::internal(e.to_string())))
+}
+
+#[derive(Deserialize)]
+struct RenameHostBody {
+    display_name: String,
+}
+
+async fn rename_host(State(core): State<Core>, Path(id): Path<String>, body: Bytes) -> Response {
+    let r = async {
+        let b: RenameHostBody = parse_body(&body)?;
+        let host = core.rename_host(&HostId::new(id), &b.display_name)?;
+        serde_json::to_value(host).map_err(|e| ApiError::internal(e.to_string()))
+    };
+    respond(r.await)
+}
+
+async fn list_notifiers(State(core): State<Core>) -> Response {
+    let ids = core.notify_router().list_ids();
+    respond(Ok(serde_json::json!({ "notifiers": ids })))
+}
+
+async fn test_notifier(State(core): State<Core>, Path(id): Path<String>, body: Bytes) -> Response {
+    let r = async {
+        let b: TextBody = parse_body(&body)?;
+        if id == crate::notify::DEFAULT_FEISHU_NOTIFIER_ID {
+            return core
+                .handle(DaemonCommand::FeishuTest { text: b.text })
+                .await;
+        }
+        let notifier = core
+            .notify_router()
+            .get(&id)
+            .ok_or_else(|| ApiError::not_found(format!("unknown notifier {id}")))?;
+        let res = notifier.send_test(&b.text).await?;
+        Ok(serde_json::json!({ "id": id, "result": res }))
+    };
+    respond(r.await)
+}
+
 /// Maximum custom Feishu mute duration: 7 days (10,080 minutes).
 pub const MAX_MUTE_MINUTES: u64 = 10_080;
 const MAX_MUTE_MS: u64 = MAX_MUTE_MINUTES * 60_000;
@@ -1335,6 +1495,24 @@ mod tests {
         assert!(!APP_JS.is_empty());
         assert!(!APP_CSS.is_empty());
         assert!(LOGO_SVG.starts_with(b"<svg"));
+        for (path, bytes, _) in EMBEDDED_ASSETS {
+            assert!(!bytes.is_empty(), "embedded asset {path} is empty");
+        }
+        // Traversal protection on relative asset paths
+        assert!(safe_relative_asset_path("js/terminal.js").is_some());
+        assert!(safe_relative_asset_path("../secret").is_none());
+        assert!(safe_relative_asset_path("js/../secret").is_none());
+        assert!(safe_relative_asset_path("a\\b").is_none());
+        // ETag 304 conditional response works
+        let etag = fnv1a_etag(APP_JS);
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let resp = static_response(
+            &hdrs,
+            Bytes::from_static(APP_JS),
+            "text/javascript; charset=utf-8",
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     }
 
     #[test]
@@ -1416,5 +1594,69 @@ mod tests {
         assert!(resolve_mute_until(None, Some(now - 1), now).is_err());
         assert!(resolve_mute_until(None, Some(now + MAX_MUTE_MS + 1), now).is_err());
         assert!(resolve_mute_until(None, None, now).is_err());
+    }
+
+    #[tokio::test]
+    async fn async_user_font_and_web_dir_asset_loading() {
+        let root = std::env::temp_dir().join(format!("starfane-web-fs-{}", id::new_id("T")));
+        let font_dir = root.join("fonts");
+        let web_dir = root.join("web");
+        tokio::fs::create_dir_all(&font_dir).await.unwrap();
+        tokio::fs::create_dir_all(web_dir.join("js")).await.unwrap();
+
+        // Empty font dir -> false / None
+        assert!(!has_user_term_font_in_dir(&font_dir).await);
+        assert!(load_user_term_font_from_dir(&font_dir).await.is_none());
+
+        // Empty file ignored by both probe and loader; valid ttf loaded; woff2 takes precedence over ttf.
+        tokio::fs::write(font_dir.join("terminal.woff2"), b"")
+            .await
+            .unwrap();
+        assert!(!has_user_term_font_in_dir(&font_dir).await);
+        assert!(load_user_term_font_from_dir(&font_dir).await.is_none());
+
+        tokio::fs::write(font_dir.join("terminal.ttf"), b"TTFDATA")
+            .await
+            .unwrap();
+        assert!(has_user_term_font_in_dir(&font_dir).await);
+        let (bytes, mime) = load_user_term_font_from_dir(&font_dir).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"TTFDATA");
+        assert_eq!(mime, "font/ttf");
+
+        tokio::fs::write(font_dir.join("terminal.woff2"), b"WOFF2DATA")
+            .await
+            .unwrap();
+        let (bytes, mime) = load_user_term_font_from_dir(&font_dir).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"WOFF2DATA");
+        assert_eq!(mime, "font/woff2");
+
+        // `--web-dir` async load_asset: custom file served, missing logo.svg falls back to embedded, missing file -> None
+        tokio::fs::write(web_dir.join("js/custom.js"), b"export const ok = 1;")
+            .await
+            .unwrap();
+        let mut cfg = crate::config::StarfaneConfig::default();
+        cfg.paths.tmux = "/usr/bin/false".into();
+        cfg.zellij.enabled = false;
+        let core = Core::new(&crate::DaemonConfig {
+            state_dir: root.join("state"),
+            socket: root.join("state/starfaned.sock"),
+            config: cfg,
+            web_dir: Some(web_dir.clone()),
+            foreground: true,
+        })
+        .unwrap();
+
+        let (js_bytes, js_mime) = load_asset(&core, "js/custom.js").await.unwrap();
+        assert_eq!(js_bytes.as_ref(), b"export const ok = 1;");
+        assert_eq!(js_mime, "text/javascript; charset=utf-8");
+
+        let (logo_bytes, logo_mime) = load_asset(&core, "logo.svg").await.unwrap();
+        assert_eq!(logo_bytes.as_ref(), LOGO_SVG);
+        assert_eq!(logo_mime, "image/svg+xml");
+
+        assert!(load_asset(&core, "missing.js").await.is_none());
+        assert!(load_asset(&core, "../fonts/terminal.woff2").await.is_none());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

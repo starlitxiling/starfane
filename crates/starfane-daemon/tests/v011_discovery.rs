@@ -755,6 +755,7 @@ async fn auth_free_easytier_only_mode_allows_easytier_and_blocks_tailscale_and_l
             allow_easytier: true,
             easytier_cidrs: vec!["10.144.144.0/24".into()],
             allow_tailscale: false,
+            ..starfane_daemon::config::WebConfig::default()
         },
         ..StarfaneConfig::default()
     };

@@ -6,7 +6,9 @@
 //!   `conversation_summaries.db` unique-cwd root conversation).
 //! - Transcript JSONL metrics with `(mtime, len)` file caching + status-line fallback.
 
-use super::transcript::{parse_iso8601_ms, read_tail_utf8, MAX_TRANSCRIPT_READ_BYTES};
+use super::transcript::parse_iso8601_ms;
+#[cfg(test)]
+use super::transcript::{read_tail_utf8, MAX_TRANSCRIPT_READ_BYTES};
 use serde::Deserialize;
 use serde_json::Value;
 use starfane_proto::{AgentKind, SessionMetrics, SessionRecord};
@@ -42,12 +44,44 @@ pub(crate) fn file_signature(path: &Path) -> Option<(u128, u64)> {
     Some((mtime_ns, meta.len()))
 }
 
+#[cfg(unix)]
+pub(crate) fn file_identity(path: &Path) -> Option<(u64, u64, u128, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((meta.dev(), meta.ino(), mtime_ns, meta.len()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_identity(path: &Path) -> Option<(u64, u64, u128, u64)> {
+    let (mtime_ns, len) = file_signature(path)?;
+    Some((0, 0, mtime_ns, len))
+}
+
 fn db_signature(db_path: &Path) -> DbSig {
     let mut wal_os = db_path.as_os_str().to_os_string();
     wal_os.push("-wal");
     DbSig {
         db: file_signature(db_path),
         wal: file_signature(Path::new(&wal_os)),
+    }
+}
+
+fn normalize_sqlite_json_stdout(stdout: Vec<u8>) -> Option<String> {
+    let s = String::from_utf8(stdout).ok()?;
+    if s.trim().is_empty() {
+        // `sqlite3 -json` outputs an empty stdout (not `[]`) when a SELECT returns zero rows.
+        Some("[]".to_string())
+    } else {
+        Some(s)
     }
 }
 
@@ -63,7 +97,7 @@ fn run_sqlite_json(db_path: &Path, sql: &str) -> Option<String> {
         .output()
         .ok()?;
     if out.status.success() {
-        return String::from_utf8(out.stdout).ok();
+        return normalize_sqlite_json_stdout(out.stdout);
     }
     // Retry via immutable URI in case the DB lives on a lock-restricted directory (e.g. AGY summaries DB).
     let uri = format!("file:{}?immutable=1", db_path.display());
@@ -76,13 +110,14 @@ fn run_sqlite_json(db_path: &Path, sql: &str) -> Option<String> {
     if !retry.status.success() {
         return None;
     }
-    String::from_utf8(retry.stdout).ok()
+    normalize_sqlite_json_stdout(retry.stdout)
 }
 
 // ---------------------------------------------------------------------------
 // File-level `(mtime, len)` cache for JSONL transcript metrics
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct CachedFileMetrics {
     pub mtime_ns: u128,
@@ -94,6 +129,7 @@ pub(crate) struct CachedFileMetrics {
 
 /// Return transcript-derived `(metrics, model, effort)` for `path`, hitting the in-memory
 /// `(mtime, len)` cache whenever the file has not changed (zero disk reads on cache hit).
+#[cfg(test)]
 pub(crate) fn cached_transcript_telemetry(
     cache: &mut HashMap<PathBuf, CachedFileMetrics>,
     agent: AgentKind,
@@ -111,17 +147,9 @@ pub(crate) fn cached_transcript_telemetry(
     let Ok(tail) = read_tail_utf8(path, MAX_TRANSCRIPT_READ_BYTES) else {
         return (None, None, None);
     };
-    let metrics = extract_transcript_metrics(agent, &tail, now_ms);
-    let (model, effort) = match agent {
-        AgentKind::Codex => extract_codex_turn_context(&tail),
-        AgentKind::Agy => {
-            let m = extract_agy_latest_model(&tail);
-            let e = m.as_deref().and_then(extract_agy_effort_from_model);
-            (m, e)
-        }
-        AgentKind::Claude => (extract_claude_latest_model(&tail), None),
-        AgentKind::Shell => (None, None),
-    };
+    let mut fold = TelemetryFold::new(agent);
+    fold.feed_text(&tail);
+    let (metrics, model, effort) = fold.snapshot(now_ms);
     cache.insert(
         path.to_path_buf(),
         CachedFileMetrics {
@@ -174,103 +202,13 @@ pub(crate) fn extract_agy_effort_from_model(model: &str) -> Option<String> {
     None
 }
 
-/// Scan AGY `transcript.jsonl` `PLANNER_RESPONSE` entries (keeping the latest) for `model`.
-pub(crate) fn extract_agy_latest_model(text: &str) -> Option<String> {
-    let mut latest: Option<String> = None;
-    for line in text.lines() {
-        let t = line.trim();
-        if !t.starts_with('{') || !t.contains("\"PLANNER_RESPONSE\"") || !t.contains("\"model\"") {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(t) else {
-            continue;
-        };
-        if obj.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
-            continue;
-        }
-        if let Some(m) = obj
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            latest = Some(m.to_string());
-        }
-    }
-    latest
-}
-
-/// Scan Claude JSONL `assistant` messages (keeping the latest) for `message.model`.
-fn extract_claude_latest_model(text: &str) -> Option<String> {
-    let mut latest: Option<String> = None;
-    for line in text.lines() {
-        let t = line.trim();
-        if !t.starts_with('{') || !t.contains("\"assistant\"") || !t.contains("\"model\"") {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(t) else {
-            continue;
-        };
-        if obj.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if let Some(m) = obj
-            .get("message")
-            .and_then(|msg| msg.get("model"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            latest = Some(m.to_string());
-        }
-    }
-    latest
-}
-
 /// Scan Codex rollout JSONL `turn_context` entries (keeping the latest) for `(model, effort)`.
+#[cfg(test)]
 pub(crate) fn extract_codex_turn_context(text: &str) -> (Option<String>, Option<String>) {
-    let mut latest_model: Option<String> = None;
-    let mut latest_effort: Option<String> = None;
-    for line in text.lines() {
-        let t = line.trim();
-        if !t.starts_with('{') || !t.contains("\"turn_context\"") {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(t) else {
-            continue;
-        };
-        if obj.get("type").and_then(Value::as_str) != Some("turn_context") {
-            continue;
-        }
-        let Some(payload) = obj.get("payload") else {
-            continue;
-        };
-        if let Some(m) = payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            latest_model = Some(m.to_string());
-        }
-        let eff = payload
-            .get("effort")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                payload
-                    .get("collaboration_mode")
-                    .and_then(|c| c.get("settings"))
-                    .and_then(|s| s.get("reasoning_effort"))
-                    .and_then(Value::as_str)
-            })
-            .or_else(|| payload.get("reasoning_effort").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(e) = eff {
-            latest_effort = Some(e.to_ascii_lowercase());
-        }
-    }
-    (latest_model, latest_effort)
+    let mut fold = TelemetryFold::new(AgentKind::Codex);
+    fold.feed_text(text);
+    let (_, model, effort) = fold.snapshot(0);
+    (model, effort)
 }
 
 /// Read default `model_reasoning_effort` from `<home>/.codex/config.toml`.
@@ -372,36 +310,156 @@ pub(crate) struct CcSwitchRow {
     pub total_output_tokens: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CcSwitchRawRow {
+    pub rowid: i64,
+    pub session_id: String,
+    #[serde(default)]
+    pub app_type: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub first_token_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub input_token_semantics: i64,
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CcSwitchSeedRow {
+    #[serde(flatten)]
+    row: CcSwitchRow,
+    #[serde(default)]
+    best_rowid: i64,
+    #[serde(default)]
+    max_rowid: i64,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CcSwitchEntry {
     pub metrics: SessionMetrics,
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CcSwitchAcc {
+    best_rank: (u8, u64, i64),
+    best_row: CcSwitchRow,
+    entry: CcSwitchEntry,
+}
+
+fn cc_switch_model_rank(model: Option<&str>) -> u8 {
+    let lower = model.unwrap_or("").to_ascii_lowercase();
+    if lower.contains("haiku") || lower.contains("flash-worker") {
+        0
+    } else {
+        1
+    }
+}
+
+fn cc_switch_row_input_total(row: &CcSwitchRawRow) -> u64 {
+    if row.input_token_semantics == 1 {
+        row.input_tokens
+    } else {
+        row.input_tokens
+            .saturating_add(row.cache_read_tokens)
+            .saturating_add(row.cache_creation_tokens)
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct CcSwitchCache {
     sig: Option<DbSig>,
+    db_ino: Option<(u64, u64)>,
+    last_max_rowid: i64,
     codex_default_window: Option<u64>,
-    by_session: HashMap<String, CcSwitchEntry>,
+    by_session: HashMap<String, CcSwitchAcc>,
 }
 
 impl CcSwitchCache {
     /// Refresh from `~/.cc-switch/cc-switch.db` only when DB or WAL `(mtime, len)` changed.
+    /// Uses incremental `WHERE rowid > last_max_rowid` queries after initial seed to avoid
+    /// full-table `ROW_NUMBER()` + `GROUP BY` scans on every WAL flush.
     pub(crate) fn refresh_if_needed(&mut self, now_ms: u64) {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             return;
         };
         let db_path = home.join(".cc-switch/cc-switch.db");
-        let sig = db_signature(&db_path);
+        if self.codex_default_window.is_none() {
+            self.codex_default_window = read_codex_default_context_window(&home);
+        }
+        self.refresh_from_path(&db_path, now_ms);
+    }
+
+    pub(crate) fn refresh_from_path(&mut self, db_path: &Path, now_ms: u64) {
+        let sig = db_signature(db_path);
         if sig.db.is_none() {
             return;
         }
         if self.sig.as_ref() == Some(&sig) {
             return;
         }
-        if self.codex_default_window.is_none() {
-            self.codex_default_window = read_codex_default_context_window(&home);
+        let cur_ino = file_identity(db_path).map(|(d, i, _, _)| (d, i));
+        let prev_db_len = self.sig.as_ref().and_then(|s| s.db).map(|(_, l)| l);
+        let cur_db_len = sig.db.map(|(_, l)| l);
+        let db_replaced_or_shrunk = (self.db_ino.is_some() && cur_ino != self.db_ino)
+            || match (prev_db_len, cur_db_len) {
+                (Some(prev), Some(cur)) => cur < prev,
+                _ => false,
+            };
+
+        if db_replaced_or_shrunk || self.last_max_rowid == 0 {
+            if self.seed_full(db_path, now_ms) {
+                self.sig = Some(sig);
+                self.db_ino = cur_ino;
+            }
+            return;
         }
+
+        // Incremental cursor query: B-tree seek on `rowid > last_max_rowid`.
+        let sql = format!(
+            "SELECT rowid, session_id, app_type, model, \
+                    COALESCE(input_tokens, 0) AS input_tokens, \
+                    COALESCE(output_tokens, 0) AS output_tokens, \
+                    COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
+                    COALESCE(cache_creation_tokens, 0) AS cache_creation_tokens, \
+                    latency_ms, first_token_ms, duration_ms, \
+                    COALESCE(input_token_semantics, 0) AS input_token_semantics, \
+                    COALESCE(created_at, 0) AS created_at \
+             FROM proxy_request_logs \
+             WHERE rowid > {} \
+               AND status_code = 200 \
+               AND session_id IS NOT NULL \
+               AND session_id != '' \
+               AND (COALESCE(input_tokens, 0) > 0 OR COALESCE(output_tokens, 0) > 0) \
+             ORDER BY rowid ASC;",
+            self.last_max_rowid
+        );
+        let Some(json_out) = run_sqlite_json(db_path, &sql) else {
+            return;
+        };
+        let Ok(delta_rows) = serde_json::from_str::<Vec<CcSwitchRawRow>>(&json_out) else {
+            return;
+        };
+        self.merge_incremental_rows(delta_rows, now_ms);
+        self.sig = Some(sig);
+        self.db_ino = cur_ino;
+    }
+
+    fn seed_full(&mut self, db_path: &Path, now_ms: u64) -> bool {
         let sql = r#"
 WITH valid AS (
   SELECT rowid, session_id, app_type, model,
@@ -438,25 +496,33 @@ totals AS (
          SUM(output_tokens) AS total_output_tokens
   FROM valid
   GROUP BY session_id
+),
+hi AS (
+  SELECT COALESCE(MAX(rowid), 0) AS max_rowid FROM proxy_request_logs
 )
 SELECT r.session_id, r.app_type, r.model,
        r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens,
        r.latency_ms, r.first_token_ms, r.duration_ms,
        r.input_token_semantics, r.created_at,
-       t.total_input_tokens, t.total_output_tokens
+       t.total_input_tokens, t.total_output_tokens,
+       r.rowid AS best_rowid, hi.max_rowid
 FROM ranked r
 JOIN totals t ON r.session_id = t.session_id
+CROSS JOIN hi
 WHERE r.rn = 1;
 "#;
-        let Some(json_out) = run_sqlite_json(&db_path, sql) else {
-            return;
+        let Some(json_out) = run_sqlite_json(db_path, sql) else {
+            return false;
         };
-        let Ok(rows) = serde_json::from_str::<Vec<CcSwitchRow>>(&json_out) else {
-            return;
+        let Ok(rows) = serde_json::from_str::<Vec<CcSwitchSeedRow>>(&json_out) else {
+            return false;
         };
         let mut map = HashMap::with_capacity(rows.len());
+        let mut max_rowid = 0i64;
         let cx_win = self.codex_default_window;
-        for row in rows {
+        for seed in rows {
+            max_rowid = max_rowid.max(seed.max_rowid).max(seed.best_rowid);
+            let row = seed.row;
             let model = row
                 .model
                 .as_deref()
@@ -464,14 +530,121 @@ WHERE r.rn = 1;
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
             let metrics = cc_switch_row_to_metrics(&row, cx_win, now_ms);
-            map.insert(row.session_id, CcSwitchEntry { metrics, model });
+            let rank = (
+                cc_switch_model_rank(row.model.as_deref()),
+                row.created_at,
+                seed.best_rowid,
+            );
+            let sid = row.session_id.clone();
+            map.insert(
+                sid,
+                CcSwitchAcc {
+                    best_rank: rank,
+                    best_row: row,
+                    entry: CcSwitchEntry { metrics, model },
+                },
+            );
         }
         self.by_session = map;
-        self.sig = Some(sig);
+        self.last_max_rowid = max_rowid;
+        true
+    }
+
+    /// Merge newly inserted `proxy_request_logs` rows incrementally into the cached map.
+    pub(crate) fn merge_incremental_rows(&mut self, rows: Vec<CcSwitchRawRow>, now_ms: u64) {
+        let cx_win = self.codex_default_window;
+        for raw in rows {
+            if raw.rowid > self.last_max_rowid {
+                self.last_max_rowid = raw.rowid;
+            }
+            let add_in = cc_switch_row_input_total(&raw);
+            let add_out = raw.output_tokens;
+            let cand_rank = (
+                cc_switch_model_rank(raw.model.as_deref()),
+                raw.created_at,
+                raw.rowid,
+            );
+            let sid = raw.session_id.clone();
+            match self.by_session.get_mut(&sid) {
+                Some(acc) => {
+                    let next_total_in = acc.best_row.total_input_tokens.saturating_add(add_in);
+                    let next_total_out = acc.best_row.total_output_tokens.saturating_add(add_out);
+                    if cand_rank >= acc.best_rank {
+                        acc.best_rank = cand_rank;
+                        acc.best_row = CcSwitchRow {
+                            session_id: raw.session_id,
+                            app_type: raw.app_type,
+                            model: raw.model,
+                            input_tokens: raw.input_tokens,
+                            output_tokens: raw.output_tokens,
+                            cache_read_tokens: raw.cache_read_tokens,
+                            cache_creation_tokens: raw.cache_creation_tokens,
+                            latency_ms: raw.latency_ms,
+                            first_token_ms: raw.first_token_ms,
+                            duration_ms: raw.duration_ms,
+                            input_token_semantics: raw.input_token_semantics,
+                            created_at: raw.created_at,
+                            total_input_tokens: next_total_in,
+                            total_output_tokens: next_total_out,
+                        };
+                    } else {
+                        acc.best_row.total_input_tokens = next_total_in;
+                        acc.best_row.total_output_tokens = next_total_out;
+                    }
+                    let model = acc
+                        .best_row
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let metrics = cc_switch_row_to_metrics(&acc.best_row, cx_win, now_ms);
+                    acc.entry = CcSwitchEntry { metrics, model };
+                }
+                None => {
+                    let row = CcSwitchRow {
+                        session_id: raw.session_id,
+                        app_type: raw.app_type,
+                        model: raw.model,
+                        input_tokens: raw.input_tokens,
+                        output_tokens: raw.output_tokens,
+                        cache_read_tokens: raw.cache_read_tokens,
+                        cache_creation_tokens: raw.cache_creation_tokens,
+                        latency_ms: raw.latency_ms,
+                        first_token_ms: raw.first_token_ms,
+                        duration_ms: raw.duration_ms,
+                        input_token_semantics: raw.input_token_semantics,
+                        created_at: raw.created_at,
+                        total_input_tokens: add_in,
+                        total_output_tokens: add_out,
+                    };
+                    let model = row
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let metrics = cc_switch_row_to_metrics(&row, cx_win, now_ms);
+                    self.by_session.insert(
+                        sid,
+                        CcSwitchAcc {
+                            best_rank: cand_rank,
+                            best_row: row,
+                            entry: CcSwitchEntry { metrics, model },
+                        },
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn get(&self, session_id: &str) -> Option<&CcSwitchEntry> {
-        self.by_session.get(session_id)
+        self.by_session.get(session_id).map(|acc| &acc.entry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_max_rowid(&self) -> i64 {
+        self.last_max_rowid
     }
 }
 
@@ -1224,7 +1397,7 @@ pub(crate) fn extract_session_id_from_transcript_path(
     }
 }
 
-fn encode_claude_project_dir(path: &str) -> String {
+pub(crate) fn encode_claude_project_dir(path: &str) -> String {
     path.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
@@ -1237,20 +1410,505 @@ fn encode_claude_project_dir(path: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Single-pass incremental `TelemetryFold` (shared by TranscriptIndex & metrics)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct ClaudeMsgStats {
+    first_ts: Option<u64>,
+    last_ts: Option<u64>,
+    prev_ts: Option<u64>,
+    context_tokens: u64,
+    output_tokens: u64,
+    model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClaudeFold {
+    order: Vec<String>,
+    by_msg: HashMap<String, ClaudeMsgStats>,
+    prev_event_ts: Option<u64>,
+    latest_event_ts: Option<u64>,
+    latest_model: Option<String>,
+    seq: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexFold {
+    ctx_used: Option<u64>,
+    ctx_window: Option<u64>,
+    total_in: Option<u64>,
+    total_out: Option<u64>,
+    call_start_ts: Option<u64>,
+    latest_event_ts: Option<u64>,
+    last_tps: Option<(f32, u64, u64)>,
+    prev_total_out: Option<u64>,
+    latest_model: Option<String>,
+    latest_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgyFold {
+    latest_ctx: Option<u64>,
+    latest_model: Option<String>,
+    total_in: u64,
+    total_out: u64,
+    last_tps: Option<(f32, u64, u64)>,
+    pending_pr: Option<(u64, u64)>,
+    latest_event_ts: Option<u64>,
+}
+
+/// Single-pass, append-only telemetry accumulator for JSONL transcripts.
+/// Eliminates redundant second scans of JSONL files for metrics/model/effort extraction.
+#[derive(Debug, Clone)]
+pub(crate) struct TelemetryFold {
+    agent: AgentKind,
+    claude: ClaudeFold,
+    codex: CodexFold,
+    agy: AgyFold,
+}
+
+impl TelemetryFold {
+    pub(crate) fn new(agent: AgentKind) -> Self {
+        Self {
+            agent,
+            claude: ClaudeFold::default(),
+            codex: CodexFold::default(),
+            agy: AgyFold::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn feed_text(&mut self, text: &str) {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            if let Ok(obj) = serde_json::from_str::<Value>(trimmed) {
+                self.feed_obj(&obj);
+            }
+        }
+    }
+
+    pub(crate) fn feed_obj(&mut self, obj: &Value) {
+        match self.agent {
+            AgentKind::Claude => self.feed_claude(obj),
+            AgentKind::Codex => self.feed_codex(obj),
+            AgentKind::Agy => self.feed_agy(obj),
+            AgentKind::Shell => {}
+        }
+    }
+
+    fn feed_claude(&mut self, obj: &Value) {
+        let f = &mut self.claude;
+        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let ts_ms = obj
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_ms);
+        if let Some(t) = ts_ms {
+            f.latest_event_ts = Some(f.latest_event_ts.map_or(t, |cur| cur.max(t)));
+        }
+
+        if kind == "assistant" {
+            if let Some(msg) = obj.get("message") {
+                let model = msg
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("");
+                if !model.is_empty() {
+                    f.latest_model = Some(model.to_string());
+                }
+                if model != "<synthetic>" {
+                    if let Some(u) = msg.get("usage") {
+                        let inp = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        let cache_r = u
+                            .get("cache_read_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let cache_w = u
+                            .get("cache_creation_input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let out = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                        let ctx = inp.saturating_add(cache_r).saturating_add(cache_w);
+                        if ctx > 0 || out > 0 {
+                            let id = msg
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| {
+                                    f.seq += 1;
+                                    format!("anon-{}", f.seq)
+                                });
+                            let entry = f.by_msg.entry(id.clone()).or_insert_with(|| {
+                                f.order.push(id);
+                                ClaudeMsgStats {
+                                    first_ts: ts_ms,
+                                    last_ts: ts_ms,
+                                    prev_ts: f.prev_event_ts,
+                                    context_tokens: 0,
+                                    output_tokens: 0,
+                                    model: (!model.is_empty()).then(|| model.to_string()),
+                                }
+                            });
+                            if entry.first_ts.is_none() {
+                                entry.first_ts = ts_ms;
+                            }
+                            if let Some(t) = ts_ms {
+                                entry.last_ts = Some(entry.last_ts.map_or(t, |cur| cur.max(t)));
+                            }
+                            entry.context_tokens = entry.context_tokens.max(ctx);
+                            entry.output_tokens = entry.output_tokens.max(out);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(t) = ts_ms {
+            if matches!(kind, "user" | "assistant" | "system") {
+                f.prev_event_ts = Some(t);
+            }
+        }
+    }
+
+    fn feed_codex(&mut self, obj: &Value) {
+        let f = &mut self.codex;
+        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let ts_ms = obj
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_ms);
+        if let Some(t) = ts_ms {
+            f.latest_event_ts = Some(f.latest_event_ts.map_or(t, |cur| cur.max(t)));
+        }
+        let payload = obj.get("payload");
+        if kind == "turn_context" {
+            if let Some(p) = payload {
+                if let Some(m) = p
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    f.latest_model = Some(m.to_string());
+                }
+                let eff = p
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        p.get("collaboration_mode")
+                            .and_then(|c| c.get("settings"))
+                            .and_then(|s| s.get("reasoning_effort"))
+                            .and_then(Value::as_str)
+                    })
+                    .or_else(|| p.get("reasoning_effort").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(e) = eff {
+                    f.latest_effort = Some(e.to_ascii_lowercase());
+                }
+            }
+            return;
+        }
+        let ptype = payload
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        match (kind, ptype) {
+            ("response_item", "message") => {
+                if payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("user") {
+                    if let Some(t) = ts_ms {
+                        f.call_start_ts = Some(t);
+                    }
+                }
+            }
+            ("response_item", "custom_tool_call_output" | "function_call_output") => {
+                if let Some(t) = ts_ms {
+                    f.call_start_ts = Some(t);
+                }
+            }
+            ("event_msg", "token_count") => {
+                let Some(info) = payload
+                    .and_then(|p| p.get("info"))
+                    .filter(|v| v.is_object())
+                else {
+                    return;
+                };
+                if let Some(win) = info.get("model_context_window").and_then(Value::as_u64) {
+                    if win > 0 {
+                        f.ctx_window = Some(win);
+                    }
+                }
+                if let Some(tot) = info.get("total_token_usage") {
+                    if let Some(v) = tot.get("input_tokens").and_then(Value::as_u64) {
+                        f.total_in = Some(v);
+                    }
+                    if let Some(v) = tot.get("output_tokens").and_then(Value::as_u64) {
+                        f.total_out = Some(v);
+                    }
+                }
+                if let Some(last) = info.get("last_token_usage") {
+                    let used = last
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .or_else(|| last.get("total_tokens").and_then(Value::as_u64));
+                    if let Some(u) = used.filter(|&u| u > 0) {
+                        f.ctx_used = Some(u);
+                    }
+                    let out_tok = last
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let changed = f.total_out != f.prev_total_out;
+                    if changed && out_tok > 0 {
+                        if let (Some(start), Some(end)) = (f.call_start_ts, ts_ms) {
+                            let dur = end.saturating_sub(start);
+                            if let Some(tps) = compute_tps(out_tok, dur) {
+                                f.last_tps = Some((tps, out_tok, dur));
+                            }
+                        }
+                    }
+                    f.prev_total_out = f.total_out;
+                    if let Some(t) = ts_ms {
+                        f.call_start_ts = Some(t);
+                    }
+                }
+            }
+            ("event_msg", "task_complete") if f.last_tps.is_none() => {
+                if let (Some(dur), Some(out_tok)) = (
+                    payload
+                        .and_then(|p| p.get("duration_ms"))
+                        .and_then(Value::as_u64),
+                    f.total_out.filter(|&v| v > 0),
+                ) {
+                    if let Some(tps) = compute_tps(out_tok, dur) {
+                        f.last_tps = Some((tps, out_tok, dur));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn feed_agy(&mut self, obj: &Value) {
+        let f = &mut self.agy;
+        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let ts_ms = obj
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_ms);
+        if let Some(t) = ts_ms {
+            f.latest_event_ts = Some(f.latest_event_ts.map_or(t, |cur| cur.max(t)));
+        }
+
+        if let (Some((pr_start, pr_out)), Some(next_ts)) = (f.pending_pr.take(), ts_ms) {
+            if kind != "USER_INPUT" {
+                let dur = next_ts.saturating_sub(pr_start);
+                if let Some(tps) = compute_tps(pr_out, dur) {
+                    f.last_tps = Some((tps, pr_out, dur));
+                }
+            }
+        }
+
+        if kind == "PLANNER_RESPONSE" {
+            if let Some(m) = obj
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                f.latest_model = Some(m.to_string());
+            }
+            let inp = obj.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+            let cache_r = obj
+                .get("cache_read_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let out = obj
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let ctx = inp.saturating_add(cache_r);
+            if ctx > 0 {
+                f.latest_ctx = Some(ctx);
+                f.total_in = f.total_in.saturating_add(ctx);
+            }
+            if out > 0 {
+                f.total_out = f.total_out.saturating_add(out);
+                if let Some(t) = ts_ms {
+                    f.pending_pr = Some((t, out));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+        now_ms: u64,
+    ) -> (Option<SessionMetrics>, Option<String>, Option<String>) {
+        match self.agent {
+            AgentKind::Claude => {
+                let metrics = self.snapshot_claude_metrics(now_ms);
+                (metrics, self.claude.latest_model.clone(), None)
+            }
+            AgentKind::Codex => {
+                let metrics = self.snapshot_codex_metrics(now_ms);
+                (
+                    metrics,
+                    self.codex.latest_model.clone(),
+                    self.codex.latest_effort.clone(),
+                )
+            }
+            AgentKind::Agy => {
+                let metrics = self.snapshot_agy_metrics(now_ms);
+                let model = self.agy.latest_model.clone();
+                let effort = model.as_deref().and_then(extract_agy_effort_from_model);
+                (metrics, model, effort)
+            }
+            AgentKind::Shell => (None, None, None),
+        }
+    }
+
+    fn snapshot_claude_metrics(&self, now_ms: u64) -> Option<SessionMetrics> {
+        let f = &self.claude;
+        if f.order.is_empty() {
+            return None;
+        }
+        let mut total_in: u64 = 0;
+        let mut total_out: u64 = 0;
+        let mut latest_ctx: Option<u64> = None;
+        let mut latest_model: Option<String> = None;
+        let mut best_tps: Option<(f32, u64, u64)> = None;
+
+        for id in &f.order {
+            let Some(m) = f.by_msg.get(id) else { continue };
+            total_in = total_in.saturating_add(m.context_tokens);
+            total_out = total_out.saturating_add(m.output_tokens);
+            if m.context_tokens > 0 {
+                latest_ctx = Some(m.context_tokens);
+                if m.model.is_some() {
+                    latest_model = m.model.clone();
+                }
+            }
+            if m.output_tokens > 0 {
+                let chunk_span = match (m.first_ts, m.last_ts) {
+                    (Some(a), Some(b)) if b > a => b - a,
+                    _ => 0,
+                };
+                let call_span = match (m.prev_ts, m.last_ts) {
+                    (Some(a), Some(b)) if b > a => b - a,
+                    _ => 0,
+                };
+                let dur = if (MIN_TPS_DURATION_MS..=MAX_TPS_DURATION_MS).contains(&call_span) {
+                    call_span
+                } else {
+                    chunk_span
+                };
+                if let Some(tps) = compute_tps(m.output_tokens, dur) {
+                    best_tps = Some((tps, m.output_tokens, dur));
+                }
+            }
+        }
+
+        let ctx_window =
+            infer_context_window(AgentKind::Claude, latest_model.as_deref(), latest_ctx, None);
+        let ctx_pct = match (latest_ctx, ctx_window) {
+            (Some(u), Some(w)) => pct_1dp(u, w),
+            _ => None,
+        };
+
+        Some(SessionMetrics {
+            context_used_tokens: latest_ctx,
+            context_window_tokens: ctx_window,
+            context_used_pct: ctx_pct,
+            tps: best_tps.map(|x| x.0),
+            ttft_ms: None,
+            last_output_tokens: best_tps.map(|x| x.1),
+            last_duration_ms: best_tps.map(|x| x.2),
+            total_input_tokens: (total_in > 0).then_some(total_in),
+            total_output_tokens: (total_out > 0).then_some(total_out),
+            source: "transcript".into(),
+            updated_ms: f.latest_event_ts.unwrap_or(now_ms),
+        })
+    }
+
+    fn snapshot_codex_metrics(&self, now_ms: u64) -> Option<SessionMetrics> {
+        let f = &self.codex;
+        if f.ctx_used.is_none()
+            && f.ctx_window.is_none()
+            && f.total_in.is_none()
+            && f.last_tps.is_none()
+        {
+            return None;
+        }
+        let ctx_pct = match (f.ctx_used, f.ctx_window) {
+            (Some(u), Some(w)) => pct_1dp(u, w),
+            _ => None,
+        };
+        Some(SessionMetrics {
+            context_used_tokens: f.ctx_used,
+            context_window_tokens: f.ctx_window,
+            context_used_pct: ctx_pct,
+            tps: f.last_tps.map(|x| x.0),
+            ttft_ms: None,
+            last_output_tokens: f.last_tps.map(|x| x.1),
+            last_duration_ms: f.last_tps.map(|x| x.2),
+            total_input_tokens: f.total_in,
+            total_output_tokens: f.total_out,
+            source: "transcript".into(),
+            updated_ms: f.latest_event_ts.unwrap_or(now_ms),
+        })
+    }
+
+    fn snapshot_agy_metrics(&self, now_ms: u64) -> Option<SessionMetrics> {
+        let f = &self.agy;
+        if f.latest_ctx.is_none() && f.total_out == 0 && f.last_tps.is_none() {
+            return None;
+        }
+        let ctx_window = infer_context_window(
+            AgentKind::Agy,
+            f.latest_model.as_deref(),
+            f.latest_ctx,
+            None,
+        );
+        let ctx_pct = match (f.latest_ctx, ctx_window) {
+            (Some(u), Some(w)) => pct_1dp(u, w),
+            _ => None,
+        };
+        Some(SessionMetrics {
+            context_used_tokens: f.latest_ctx,
+            context_window_tokens: ctx_window,
+            context_used_pct: ctx_pct,
+            tps: f.last_tps.map(|x| x.0),
+            ttft_ms: None,
+            last_output_tokens: f.last_tps.map(|x| x.1),
+            last_duration_ms: f.last_tps.map(|x| x.2),
+            total_input_tokens: (f.total_in > 0).then_some(f.total_in),
+            total_output_tokens: (f.total_out > 0).then_some(f.total_out),
+            source: "transcript".into(),
+            updated_ms: f.latest_event_ts.unwrap_or(now_ms),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core JSONL metrics extraction (pure, zero IO)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 pub(crate) fn extract_transcript_metrics(
     agent: AgentKind,
     text: &str,
     now_ms: u64,
 ) -> Option<SessionMetrics> {
-    match agent {
-        AgentKind::Claude => extract_claude_metrics(text, now_ms),
-        AgentKind::Codex => extract_codex_metrics(text, now_ms),
-        AgentKind::Agy => extract_agy_metrics(text, now_ms),
-        AgentKind::Shell => None,
-    }
+    let mut fold = TelemetryFold::new(agent);
+    fold.feed_text(text);
+    fold.snapshot(now_ms).0
 }
 
 fn compute_tps(output_tokens: u64, duration_ms: u64) -> Option<f32> {
@@ -1280,395 +1938,6 @@ fn round_1dp(v: f32) -> Option<f32> {
         return None;
     }
     Some((v * 10.0).round() / 10.0)
-}
-
-// ---------------------------------------------------------------------------
-// Claude JSONL metrics
-// ---------------------------------------------------------------------------
-
-struct ClaudeMsgStats {
-    first_ts: Option<u64>,
-    last_ts: Option<u64>,
-    prev_ts: Option<u64>,
-    context_tokens: u64,
-    output_tokens: u64,
-    model: Option<String>,
-}
-
-fn extract_claude_metrics(text: &str, now_ms: u64) -> Option<SessionMetrics> {
-    let mut order: Vec<String> = Vec::new();
-    let mut by_msg: HashMap<String, ClaudeMsgStats> = HashMap::new();
-    let mut prev_event_ts: Option<u64> = None;
-    let mut latest_event_ts: Option<u64> = None;
-    let mut seq: u64 = 0;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-        let ts_ms = obj
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_iso8601_ms);
-        if let Some(t) = ts_ms {
-            latest_event_ts = Some(latest_event_ts.map_or(t, |cur| cur.max(t)));
-        }
-
-        if kind == "assistant" {
-            if let Some(msg) = obj.get("message") {
-                let model = msg.get("model").and_then(Value::as_str).unwrap_or("");
-                if model != "<synthetic>" {
-                    if let Some(u) = msg.get("usage") {
-                        let inp = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        let cache_r = u
-                            .get("cache_read_input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        let cache_w = u
-                            .get("cache_creation_input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        let out = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
-                        let ctx = inp.saturating_add(cache_r).saturating_add(cache_w);
-                        if ctx > 0 || out > 0 {
-                            let id = msg
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| {
-                                    seq += 1;
-                                    format!("anon-{seq}")
-                                });
-                            let entry = by_msg.entry(id.clone()).or_insert_with(|| {
-                                order.push(id);
-                                ClaudeMsgStats {
-                                    first_ts: ts_ms,
-                                    last_ts: ts_ms,
-                                    prev_ts: prev_event_ts,
-                                    context_tokens: 0,
-                                    output_tokens: 0,
-                                    model: (!model.is_empty()).then(|| model.to_string()),
-                                }
-                            });
-                            if entry.first_ts.is_none() {
-                                entry.first_ts = ts_ms;
-                            }
-                            if let Some(t) = ts_ms {
-                                entry.last_ts = Some(entry.last_ts.map_or(t, |cur| cur.max(t)));
-                            }
-                            entry.context_tokens = entry.context_tokens.max(ctx);
-                            entry.output_tokens = entry.output_tokens.max(out);
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(t) = ts_ms {
-            if matches!(kind, "user" | "assistant" | "system") {
-                prev_event_ts = Some(t);
-            }
-        }
-    }
-
-    if order.is_empty() {
-        return None;
-    }
-
-    let mut total_in: u64 = 0;
-    let mut total_out: u64 = 0;
-    let mut latest_ctx: Option<u64> = None;
-    let mut latest_model: Option<String> = None;
-    let mut best_tps: Option<(f32, u64, u64)> = None;
-
-    for id in &order {
-        let Some(m) = by_msg.get(id) else { continue };
-        total_in = total_in.saturating_add(m.context_tokens);
-        total_out = total_out.saturating_add(m.output_tokens);
-        if m.context_tokens > 0 {
-            latest_ctx = Some(m.context_tokens);
-            if m.model.is_some() {
-                latest_model = m.model.clone();
-            }
-        }
-        if m.output_tokens > 0 {
-            let chunk_span = match (m.first_ts, m.last_ts) {
-                (Some(a), Some(b)) if b > a => b - a,
-                _ => 0,
-            };
-            let call_span = match (m.prev_ts, m.last_ts) {
-                (Some(a), Some(b)) if b > a => b - a,
-                _ => 0,
-            };
-            let dur = if (MIN_TPS_DURATION_MS..=MAX_TPS_DURATION_MS).contains(&call_span) {
-                call_span
-            } else {
-                chunk_span
-            };
-            if let Some(tps) = compute_tps(m.output_tokens, dur) {
-                best_tps = Some((tps, m.output_tokens, dur));
-            }
-        }
-    }
-
-    let ctx_window =
-        infer_context_window(AgentKind::Claude, latest_model.as_deref(), latest_ctx, None);
-    let ctx_pct = match (latest_ctx, ctx_window) {
-        (Some(u), Some(w)) => pct_1dp(u, w),
-        _ => None,
-    };
-
-    Some(SessionMetrics {
-        context_used_tokens: latest_ctx,
-        context_window_tokens: ctx_window,
-        context_used_pct: ctx_pct,
-        tps: best_tps.map(|x| x.0),
-        ttft_ms: None,
-        last_output_tokens: best_tps.map(|x| x.1),
-        last_duration_ms: best_tps.map(|x| x.2),
-        total_input_tokens: (total_in > 0).then_some(total_in),
-        total_output_tokens: (total_out > 0).then_some(total_out),
-        source: "transcript".into(),
-        updated_ms: latest_event_ts.unwrap_or(now_ms),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Codex JSONL metrics
-// ---------------------------------------------------------------------------
-
-fn extract_codex_metrics(text: &str, now_ms: u64) -> Option<SessionMetrics> {
-    let mut ctx_used: Option<u64> = None;
-    let mut ctx_window: Option<u64> = None;
-    let mut total_in: Option<u64> = None;
-    let mut total_out: Option<u64> = None;
-
-    let mut call_start_ts: Option<u64> = None;
-    let mut latest_event_ts: Option<u64> = None;
-    let mut last_tps: Option<(f32, u64, u64)> = None;
-    let mut prev_total_out: Option<u64> = None;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-        let ts_ms = obj
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_iso8601_ms);
-        if let Some(t) = ts_ms {
-            latest_event_ts = Some(latest_event_ts.map_or(t, |cur| cur.max(t)));
-        }
-        let payload = obj.get("payload");
-        let ptype = payload
-            .and_then(|p| p.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-
-        match (kind, ptype) {
-            ("response_item", "message") => {
-                if payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("user") {
-                    if let Some(t) = ts_ms {
-                        call_start_ts = Some(t);
-                    }
-                }
-            }
-            ("response_item", "custom_tool_call_output" | "function_call_output") => {
-                if let Some(t) = ts_ms {
-                    call_start_ts = Some(t);
-                }
-            }
-            ("event_msg", "token_count") => {
-                let Some(info) = payload
-                    .and_then(|p| p.get("info"))
-                    .filter(|v| v.is_object())
-                else {
-                    continue;
-                };
-                if let Some(win) = info.get("model_context_window").and_then(Value::as_u64) {
-                    if win > 0 {
-                        ctx_window = Some(win);
-                    }
-                }
-                if let Some(tot) = info.get("total_token_usage") {
-                    if let Some(v) = tot.get("input_tokens").and_then(Value::as_u64) {
-                        total_in = Some(v);
-                    }
-                    if let Some(v) = tot.get("output_tokens").and_then(Value::as_u64) {
-                        total_out = Some(v);
-                    }
-                }
-                if let Some(last) = info.get("last_token_usage") {
-                    let used = last
-                        .get("input_tokens")
-                        .and_then(Value::as_u64)
-                        .or_else(|| last.get("total_tokens").and_then(Value::as_u64));
-                    if let Some(u) = used.filter(|&u| u > 0) {
-                        ctx_used = Some(u);
-                    }
-                    let out_tok = last
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let changed = total_out != prev_total_out;
-                    if changed && out_tok > 0 {
-                        if let (Some(start), Some(end)) = (call_start_ts, ts_ms) {
-                            let dur = end.saturating_sub(start);
-                            if let Some(tps) = compute_tps(out_tok, dur) {
-                                last_tps = Some((tps, out_tok, dur));
-                            }
-                        }
-                    }
-                    prev_total_out = total_out;
-                    if let Some(t) = ts_ms {
-                        call_start_ts = Some(t);
-                    }
-                }
-            }
-            ("event_msg", "task_complete") if last_tps.is_none() => {
-                if let (Some(dur), Some(out_tok)) = (
-                    payload
-                        .and_then(|p| p.get("duration_ms"))
-                        .and_then(Value::as_u64),
-                    total_out.filter(|&v| v > 0),
-                ) {
-                    if let Some(tps) = compute_tps(out_tok, dur) {
-                        last_tps = Some((tps, out_tok, dur));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if ctx_used.is_none() && ctx_window.is_none() && total_in.is_none() && last_tps.is_none() {
-        return None;
-    }
-
-    let ctx_pct = match (ctx_used, ctx_window) {
-        (Some(u), Some(w)) => pct_1dp(u, w),
-        _ => None,
-    };
-
-    Some(SessionMetrics {
-        context_used_tokens: ctx_used,
-        context_window_tokens: ctx_window,
-        context_used_pct: ctx_pct,
-        tps: last_tps.map(|x| x.0),
-        ttft_ms: None,
-        last_output_tokens: last_tps.map(|x| x.1),
-        last_duration_ms: last_tps.map(|x| x.2),
-        total_input_tokens: total_in,
-        total_output_tokens: total_out,
-        source: "transcript".into(),
-        updated_ms: latest_event_ts.unwrap_or(now_ms),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// AGY transcript.jsonl metrics
-// ---------------------------------------------------------------------------
-
-fn extract_agy_metrics(text: &str, now_ms: u64) -> Option<SessionMetrics> {
-    let mut latest_ctx: Option<u64> = None;
-    let mut latest_model: Option<String> = None;
-    let mut total_in: u64 = 0;
-    let mut total_out: u64 = 0;
-    let mut last_tps: Option<(f32, u64, u64)> = None;
-    let mut pending_pr: Option<(u64, u64)> = None;
-    let mut latest_event_ts: Option<u64> = None;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-        let ts_ms = obj
-            .get("created_at")
-            .and_then(Value::as_str)
-            .and_then(parse_iso8601_ms);
-        if let Some(t) = ts_ms {
-            latest_event_ts = Some(latest_event_ts.map_or(t, |cur| cur.max(t)));
-        }
-
-        if let (Some((pr_start, pr_out)), Some(next_ts)) = (pending_pr.take(), ts_ms) {
-            if kind != "USER_INPUT" {
-                let dur = next_ts.saturating_sub(pr_start);
-                if let Some(tps) = compute_tps(pr_out, dur) {
-                    last_tps = Some((tps, pr_out, dur));
-                }
-            }
-        }
-
-        if kind == "PLANNER_RESPONSE" {
-            if let Some(m) = obj
-                .get("model")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                latest_model = Some(m.to_string());
-            }
-            let inp = obj.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
-            let cache_r = obj
-                .get("cache_read_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let out = obj
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let ctx = inp.saturating_add(cache_r);
-            if ctx > 0 {
-                latest_ctx = Some(ctx);
-                total_in = total_in.saturating_add(ctx);
-            }
-            if out > 0 {
-                total_out = total_out.saturating_add(out);
-                if let Some(t) = ts_ms {
-                    pending_pr = Some((t, out));
-                }
-            }
-        }
-    }
-
-    if latest_ctx.is_none() && total_out == 0 && last_tps.is_none() {
-        return None;
-    }
-
-    let ctx_window =
-        infer_context_window(AgentKind::Agy, latest_model.as_deref(), latest_ctx, None);
-    let ctx_pct = match (latest_ctx, ctx_window) {
-        (Some(u), Some(w)) => pct_1dp(u, w),
-        _ => None,
-    };
-
-    Some(SessionMetrics {
-        context_used_tokens: latest_ctx,
-        context_window_tokens: ctx_window,
-        context_used_pct: ctx_pct,
-        tps: last_tps.map(|x| x.0),
-        ttft_ms: None,
-        last_output_tokens: last_tps.map(|x| x.1),
-        last_duration_ms: last_tps.map(|x| x.2),
-        total_input_tokens: (total_in > 0).then_some(total_in),
-        total_output_tokens: (total_out > 0).then_some(total_out),
-        source: "transcript".into(),
-        updated_ms: latest_event_ts.unwrap_or(now_ms),
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2408,5 +2677,164 @@ n/Users/demo/.gemini/antigravity-cli/brain/other/file.txt
         assert_eq!(m2.context_used_pct, Some(50.0));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn cc_switch_incremental_merge_matches_full_scan_and_deprioritizes_workers() {
+        let mut cache = CcSwitchCache::default();
+        cache.merge_incremental_rows(
+            vec![
+                CcSwitchRawRow {
+                    rowid: 1,
+                    session_id: "s1".into(),
+                    app_type: "claude".into(),
+                    model: Some("claude-opus-5-5".into()),
+                    input_tokens: 10_000,
+                    output_tokens: 200,
+                    cache_read_tokens: 40_000,
+                    cache_creation_tokens: 0,
+                    latency_ms: Some(3000),
+                    first_token_ms: Some(1000),
+                    duration_ms: Some(3000),
+                    input_token_semantics: 0,
+                    created_at: 1_760_000_100,
+                },
+                // Newer haiku worker row should NOT replace opus as best_row, only add to totals!
+                CcSwitchRawRow {
+                    rowid: 2,
+                    session_id: "s1".into(),
+                    app_type: "claude".into(),
+                    model: Some("claude-haiku-4-5".into()),
+                    input_tokens: 2_000,
+                    output_tokens: 50,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    latency_ms: Some(500),
+                    first_token_ms: Some(100),
+                    duration_ms: Some(500),
+                    input_token_semantics: 0,
+                    created_at: 1_760_000_200,
+                },
+            ],
+            5000,
+        );
+        assert_eq!(cache.last_max_rowid(), 2);
+        let e = cache.get("s1").unwrap();
+        assert_eq!(e.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(e.metrics.context_used_tokens, Some(50_000));
+        assert_eq!(e.metrics.total_input_tokens, Some(52_000));
+        assert_eq!(e.metrics.total_output_tokens, Some(250));
+
+        // Newer primary row updates best_row AND accumulates totals.
+        cache.merge_incremental_rows(
+            vec![CcSwitchRawRow {
+                rowid: 3,
+                session_id: "s1".into(),
+                app_type: "claude".into(),
+                model: Some("claude-opus-5-5".into()),
+                input_tokens: 20_000,
+                output_tokens: 400,
+                cache_read_tokens: 60_000,
+                cache_creation_tokens: 0,
+                latency_ms: Some(5000),
+                first_token_ms: Some(1000),
+                duration_ms: Some(5000),
+                input_token_semantics: 0,
+                created_at: 1_760_000_300,
+            }],
+            6000,
+        );
+        assert_eq!(cache.last_max_rowid(), 3);
+        let e2 = cache.get("s1").unwrap();
+        assert_eq!(e2.metrics.context_used_tokens, Some(80_000));
+        assert_eq!(e2.metrics.total_input_tokens, Some(132_000));
+        assert_eq!(e2.metrics.total_output_tokens, Some(650));
+        assert_eq!(e2.metrics.tps, Some(100.0));
+    }
+
+    #[test]
+    fn cc_switch_refresh_from_real_sqlite_handles_empty_delta_and_incremental_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "sf-ccswitch-sqlite-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("cc-switch.db");
+        let init_sql = "
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE proxy_request_logs (
+                session_id TEXT,
+                app_type TEXT,
+                model TEXT,
+                status_code INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                cache_creation_tokens INTEGER,
+                latency_ms INTEGER,
+                first_token_ms INTEGER,
+                duration_ms INTEGER,
+                input_token_semantics INTEGER,
+                created_at INTEGER
+            );
+            INSERT INTO proxy_request_logs VALUES
+              ('sess-a', 'claude', 'claude-opus-5-5', 200, 1000, 100, 5000, 0, 2000, 500, 2000, 0, 1760000100);
+        ";
+        let ok = Command::new("sqlite3")
+            .arg(&db)
+            .arg(init_sql)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let mut cache = CcSwitchCache::default();
+        cache.refresh_from_path(&db, 1000);
+        assert_eq!(cache.last_max_rowid(), 1);
+        assert_eq!(
+            cache.get("sess-a").unwrap().metrics.total_input_tokens,
+            Some(6000)
+        );
+        let sig1 = cache.sig.clone();
+        assert!(sig1.is_some());
+
+        // Insert a status_code=500 row -> WAL changes, incremental SELECT returns 0 rows (`sqlite3 -json` prints empty stdout!).
+        // Cache MUST still advance `self.sig` instead of re-querying sqlite3 forever.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        assert!(Command::new("sqlite3")
+            .arg(&db)
+            .arg("INSERT INTO proxy_request_logs VALUES ('sess-a', 'claude', 'claude-opus-5-5', 500, 0, 0, 0, 0, 100, 0, 100, 0, 1760000200);")
+            .status()
+            .unwrap()
+            .success());
+        cache.refresh_from_path(&db, 2000);
+        assert_eq!(cache.sig, Some(db_signature(&db)));
+        assert_eq!(
+            cache.get("sess-a").unwrap().metrics.total_input_tokens,
+            Some(6000)
+        );
+
+        // Insert a second valid 200 row -> incremental query merges only the new row.
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        assert!(Command::new("sqlite3")
+            .arg(&db)
+            .arg("INSERT INTO proxy_request_logs VALUES ('sess-a', 'claude', 'claude-opus-5-5', 200, 2000, 200, 8000, 0, 3000, 500, 3000, 0, 1760000300);")
+            .status()
+            .unwrap()
+            .success());
+        cache.refresh_from_path(&db, 3000);
+        assert_eq!(cache.last_max_rowid(), 3);
+        assert_eq!(
+            cache.get("sess-a").unwrap().metrics.total_input_tokens,
+            Some(16000)
+        );
+        assert_eq!(
+            cache.get("sess-a").unwrap().metrics.total_output_tokens,
+            Some(300)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

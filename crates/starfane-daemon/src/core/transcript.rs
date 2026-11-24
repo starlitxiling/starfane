@@ -6,40 +6,57 @@
 //! by `step_index`, and skips malformed lines without ever panicking.
 
 use super::metrics::{
-    extract_transcript_metrics, file_signature, merge_metrics, resolve_codex_transcript_by_id_in,
+    encode_claude_project_dir, file_identity, merge_metrics, resolve_codex_transcript_by_id_in,
+    TelemetryFold,
 };
 use super::{lock, Core};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use starfane_proto::{AgentKind, ApiError, SessionId, SessionMetrics, SessionRecord};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// Hard cap on trailing bytes kept from any transcript file (8 MiB).
+/// Hard cap on trailing bytes kept by legacy `read_tail_utf8` helper (8 MiB).
+#[cfg(test)]
 pub const MAX_TRANSCRIPT_READ_BYTES: u64 = 8 * 1024 * 1024;
 /// Hard cap on backward scan distance when skipping giant non-message JSONL lines (32 MiB).
+#[cfg(test)]
 const MAX_TRANSCRIPT_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 /// Backward read chunk size for `read_tail_utf8`.
+#[cfg(test)]
 const TAIL_CHUNK_BYTES: usize = 512 * 1024;
 /// Hard cap on each individual message body (64 KiB).
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Default number of messages returned by `GET /api/sessions/{id}/transcript`.
 pub const DEFAULT_TRANSCRIPT_LIMIT: usize = 60;
-/// Maximum allowed `limit` query value.
-pub const MAX_TRANSCRIPT_LIMIT: usize = 500;
-/// Maximum in-memory cached transcripts.
+/// Maximum allowed `limit` query value (safety fuse for `?all=1` / cursor paging).
+pub const MAX_TRANSCRIPT_LIMIT: usize = 5_000;
+/// Maximum response text payload budget per transcript page (16 MiB safety fuse).
+pub const MAX_TRANSCRIPT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Lines exceeding 1 MiB matching `GENERIC`/`compacted` (or >4 MiB any line) are skipped in O(1) RAM.
+const STREAM_SKIP_GIANT_THRESHOLD: usize = 1024 * 1024;
+const STREAM_HARD_LINE_LIMIT: usize = 4 * 1024 * 1024;
+/// Maximum in-memory indexed transcript files.
 const MAX_CACHED_TRANSCRIPTS: usize = 256;
 
-/// File `(mtime_ns, len)` cache entry for parsed structured transcripts.
-#[derive(Debug, Clone)]
-pub(crate) struct CachedTranscript {
-    pub sig: (u128, u64),
-    pub full_sig: Option<(u128, u64)>,
+/// Cursor pagination & full-load request parameters for `GET /api/sessions/{id}/transcript`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptQuery {
     pub limit: usize,
-    pub session_metrics: Option<SessionMetrics>,
-    pub resp: TranscriptResponse,
+    pub before: Option<usize>,
+    pub all: bool,
+}
+
+impl TranscriptQuery {
+    pub fn tail(limit: usize) -> Self {
+        Self {
+            limit,
+            before: None,
+            all: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +87,12 @@ pub struct TranscriptResponse {
     pub has_more: bool,
     #[serde(default)]
     pub total_messages: usize,
+    /// 0-based index of `messages[0]` within the full transcript.
+    #[serde(default)]
+    pub start_seq: usize,
+    /// Next cursor to pass as `before=<next_before>` to fetch older messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<SessionMetrics>,
 }
@@ -82,103 +105,946 @@ impl TranscriptResponse {
             messages: Vec::new(),
             has_more: false,
             total_messages: 0,
+            start_seq: 0,
+            next_before: None,
             metrics,
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Append-only `TranscriptIndex` + sparse `AgyFullIndex` + single-pass fold
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct FullStepSpan {
+    offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AgyFullIndex {
+    dev: u64,
+    ino: u64,
+    mtime_ns: u128,
+    file_len: u64,
+    scanned_offset: u64,
+    spans: HashMap<u64, FullStepSpan>,
+}
+
+impl AgyFullIndex {
+    fn new(dev: u64, ino: u64) -> Self {
+        Self {
+            dev,
+            ino,
+            mtime_ns: 0,
+            file_len: 0,
+            scanned_offset: 0,
+            spans: HashMap::new(),
+        }
+    }
+
+    fn sync(&mut self, full_path: &Path) {
+        let Some((dev, ino, mtime_ns, file_len)) = file_identity(full_path) else {
+            return;
+        };
+        if self.dev != dev || self.ino != ino || file_len < self.scanned_offset {
+            *self = Self::new(dev, ino);
+        } else if self.file_len == file_len && self.mtime_ns == mtime_ns {
+            return;
+        }
+        let Ok(mut file) = File::open(full_path) else {
+            return;
+        };
+        if file.seek(SeekFrom::Start(self.scanned_offset)).is_err() {
+            return;
+        }
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut offset = self.scanned_offset;
+        let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+        loop {
+            match read_bounded_jsonl_line(&mut reader, &mut line_buf, STREAM_HARD_LINE_LIMIT) {
+                Ok(BoundedLine::Eof) => break,
+                Ok(BoundedLine::Skipped {
+                    bytes_consumed,
+                    terminated,
+                }) => {
+                    if !terminated {
+                        break;
+                    }
+                    // Even for giant lines, record step_index only if small enough for hydration.
+                    offset = offset.saturating_add(bytes_consumed as u64);
+                }
+                Ok(BoundedLine::Line {
+                    bytes_consumed,
+                    terminated,
+                }) => {
+                    if !terminated && offset + (bytes_consumed as u64) == file_len {
+                        // Allow valid trailing line without newline; otherwise wait for flush.
+                        let s = String::from_utf8_lossy(&line_buf);
+                        if serde_json::from_str::<Value>(s.trim()).is_err() {
+                            break;
+                        }
+                    }
+                    let line_str = String::from_utf8_lossy(&line_buf);
+                    if let Some(step_idx) = fast_extract_step_index(&line_str) {
+                        self.spans.insert(
+                            step_idx,
+                            FullStepSpan {
+                                offset,
+                                len: line_buf.len(),
+                            },
+                        );
+                    }
+                    offset = offset.saturating_add(bytes_consumed as u64);
+                }
+                Err(_) => break,
+            }
+        }
+        self.scanned_offset = offset;
+        self.mtime_ns = mtime_ns;
+        self.file_len = file_len;
+    }
+
+    fn read_step(&self, full_path: &Path, step_idx: u64) -> Option<Value> {
+        let span = self.spans.get(&step_idx)?;
+        if span.len == 0 || span.len > STREAM_HARD_LINE_LIMIT {
+            return None;
+        }
+        let mut file = File::open(full_path).ok()?;
+        file.seek(SeekFrom::Start(span.offset)).ok()?;
+        let mut buf = vec![0u8; span.len];
+        file.read_exact(&mut buf).ok()?;
+        let s = String::from_utf8_lossy(&buf);
+        let obj = serde_json::from_str::<Value>(s.trim()).ok()?;
+        (obj.get("step_index").and_then(Value::as_u64) == Some(step_idx)).then_some(obj)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedTurn {
+    msg: TranscriptMessage,
+    step_index: Option<u64>,
+    needs_content_hydration: bool,
+    needs_tools_hydration: bool,
+    hydrated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TranscriptIndex {
+    agent: AgentKind,
+    dev: u64,
+    ino: u64,
+    mtime_ns: u128,
+    file_len: u64,
+    scanned_offset: u64,
+    turns: Vec<IndexedTurn>,
+    last_claude_msg_id: Option<String>,
+    pending_tools: Vec<String>,
+    telemetry: TelemetryFold,
+    agy_full: Option<AgyFullIndex>,
+    #[cfg(test)]
+    delta_bytes_scanned: u64,
+}
+
+enum BoundedLine {
+    Eof,
+    Line {
+        bytes_consumed: usize,
+        terminated: bool,
+    },
+    Skipped {
+        bytes_consumed: usize,
+        terminated: bool,
+    },
+}
+
+/// Stream a single `\n`-delimited JSONL line without pulling giant `GENERIC`/`compacted`
+/// blobs (>1 MiB) or absurd >4 MiB lines onto the heap.
+fn read_bounded_jsonl_line<R: BufRead>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+    hard_limit: usize,
+) -> std::io::Result<BoundedLine> {
+    out.clear();
+    let mut consumed = 0usize;
+    let mut skipping = false;
+    loop {
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            return Ok(if consumed == 0 {
+                BoundedLine::Eof
+            } else if skipping {
+                BoundedLine::Skipped {
+                    bytes_consumed: consumed,
+                    terminated: false,
+                }
+            } else {
+                if out.ends_with(b"\r") {
+                    out.pop();
+                }
+                BoundedLine::Line {
+                    bytes_consumed: consumed,
+                    terminated: false,
+                }
+            });
+        }
+        if let Some(nl_pos) = avail.iter().position(|&b| b == b'\n') {
+            let take = nl_pos + 1;
+            if !skipping {
+                if out.len() + nl_pos > hard_limit {
+                    skipping = true;
+                    out.clear();
+                } else {
+                    out.extend_from_slice(&avail[..nl_pos]);
+                    if out.ends_with(b"\r") {
+                        out.pop();
+                    }
+                    if is_skippable_giant_line(out) {
+                        skipping = true;
+                        out.clear();
+                    }
+                }
+            }
+            reader.consume(take);
+            consumed += take;
+            return Ok(if skipping {
+                BoundedLine::Skipped {
+                    bytes_consumed: consumed,
+                    terminated: true,
+                }
+            } else {
+                BoundedLine::Line {
+                    bytes_consumed: consumed,
+                    terminated: true,
+                }
+            });
+        } else {
+            let chunk_len = avail.len();
+            if !skipping {
+                if out.len() + chunk_len > STREAM_SKIP_GIANT_THRESHOLD
+                    && (contains_subslice(out, b"\"type\":\"GENERIC\"")
+                        || contains_subslice(out, b"\"type\": \"GENERIC\"")
+                        || contains_subslice(out, b"\"type\":\"compacted\"")
+                        || contains_subslice(out, b"\"type\": \"compacted\"")
+                        || out.len() + chunk_len > hard_limit)
+                {
+                    skipping = true;
+                    out.clear();
+                } else {
+                    out.extend_from_slice(avail);
+                }
+            }
+            reader.consume(chunk_len);
+            consumed += chunk_len;
+        }
+    }
+}
+
+impl TranscriptIndex {
+    pub(crate) fn new(agent: AgentKind, dev: u64, ino: u64) -> Self {
+        Self {
+            agent,
+            dev,
+            ino,
+            mtime_ns: 0,
+            file_len: 0,
+            scanned_offset: 0,
+            turns: Vec::new(),
+            last_claude_msg_id: None,
+            pending_tools: Vec::new(),
+            telemetry: TelemetryFold::new(agent),
+            agy_full: None,
+            #[cfg(test)]
+            delta_bytes_scanned: 0,
+        }
+    }
+
+    /// Incrementally scan only newly appended bytes of `path` in O(delta), updating both
+    /// `turns` and `telemetry` in a single JSONL pass.
+    pub(crate) fn sync_file(&mut self, path: &Path) -> bool {
+        let Some((dev, ino, mtime_ns, file_len)) = file_identity(path) else {
+            return false;
+        };
+        if self.dev != dev || self.ino != ino || file_len < self.scanned_offset {
+            *self = Self::new(self.agent, dev, ino);
+        } else if self.file_len == file_len && self.mtime_ns == mtime_ns {
+            #[cfg(test)]
+            {
+                self.delta_bytes_scanned = 0;
+            }
+            return true;
+        }
+        let Ok(mut file) = File::open(path) else {
+            return false;
+        };
+        if file.seek(SeekFrom::Start(self.scanned_offset)).is_err() {
+            return false;
+        }
+        let start_offset = self.scanned_offset;
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut offset = self.scanned_offset;
+        let mut line_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+
+        loop {
+            match read_bounded_jsonl_line(&mut reader, &mut line_buf, STREAM_HARD_LINE_LIMIT) {
+                Ok(BoundedLine::Eof) => break,
+                Ok(BoundedLine::Skipped {
+                    bytes_consumed,
+                    terminated,
+                }) => {
+                    if !terminated {
+                        break;
+                    }
+                    offset = offset.saturating_add(bytes_consumed as u64);
+                }
+                Ok(BoundedLine::Line {
+                    bytes_consumed,
+                    terminated,
+                }) => {
+                    let s = String::from_utf8_lossy(&line_buf);
+                    let trimmed = s.trim();
+                    if trimmed.starts_with('{') {
+                        match serde_json::from_str::<Value>(trimmed) {
+                            Ok(obj) => {
+                                self.telemetry.feed_obj(&obj);
+                                self.feed_turn_obj(&obj);
+                                offset = offset.saturating_add(bytes_consumed as u64);
+                            }
+                            Err(_) => {
+                                if terminated {
+                                    // Malformed complete line: skip safely.
+                                    offset = offset.saturating_add(bytes_consumed as u64);
+                                } else {
+                                    // Possibly half-written live trailing line: retry next sync.
+                                    break;
+                                }
+                            }
+                        }
+                    } else if terminated {
+                        offset = offset.saturating_add(bytes_consumed as u64);
+                    } else {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        #[cfg(test)]
+        {
+            self.delta_bytes_scanned = offset.saturating_sub(start_offset);
+        }
+        let _ = start_offset;
+        self.scanned_offset = offset;
+        self.mtime_ns = mtime_ns;
+        self.file_len = file_len;
+        true
+    }
+
+    fn feed_turn_obj(&mut self, obj: &Value) {
+        match self.agent {
+            AgentKind::Claude => self.feed_claude_turn(obj),
+            AgentKind::Codex => self.feed_codex_turn(obj),
+            AgentKind::Agy => self.feed_agy_turn(obj),
+            AgentKind::Shell => {}
+        }
+    }
+
+    fn push_std_turn(&mut self, msg: TranscriptMessage) {
+        if let Some(last) = self.turns.last_mut() {
+            let same_text = last.msg.role == msg.role
+                && (last.msg.text == msg.text
+                    || normalize_ws_for_dedup(&last.msg.text) == normalize_ws_for_dedup(&msg.text));
+            let allow_dedup = match msg.role {
+                TranscriptRole::Assistant => true,
+                TranscriptRole::User => match (last.msg.ts_ms, msg.ts_ms) {
+                    (Some(a), Some(b)) => a.abs_diff(b) <= 2_000,
+                    _ => true,
+                },
+            };
+            if same_text && allow_dedup {
+                merge_tools(&mut last.msg.tools, &msg.tools);
+                if last.msg.ts_ms.is_none() {
+                    last.msg.ts_ms = msg.ts_ms;
+                }
+                return;
+            }
+        }
+        self.turns.push(IndexedTurn {
+            msg,
+            step_index: None,
+            needs_content_hydration: false,
+            needs_tools_hydration: false,
+            hydrated: true,
+        });
+    }
+
+    fn feed_claude_turn(&mut self, obj: &Value) {
+        if obj.get("isMeta").and_then(Value::as_bool) == Some(true)
+            || obj.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+        {
+            return;
+        }
+        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let ts_ms = obj
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_ms);
+
+        match kind {
+            "user" => {
+                let Some(content) = obj.get("message").and_then(|m| m.get("content")) else {
+                    return;
+                };
+                if let Some(clean) = extract_claude_user_text(content) {
+                    self.last_claude_msg_id = None;
+                    self.pending_tools.clear();
+                    self.push_std_turn(TranscriptMessage {
+                        role: TranscriptRole::User,
+                        text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
+                        ts_ms,
+                        tools: Vec::new(),
+                    });
+                }
+            }
+            "assistant" => {
+                let Some(msg) = obj.get("message") else {
+                    return;
+                };
+                let msg_id = msg.get("id").and_then(Value::as_str).map(str::to_string);
+                let (body, tools) = extract_claude_assistant_content(msg.get("content"));
+
+                if let (Some(id), Some(prev_id)) = (&msg_id, &self.last_claude_msg_id) {
+                    if id == prev_id {
+                        if let Some(last) = self
+                            .turns
+                            .last_mut()
+                            .filter(|t| t.msg.role == TranscriptRole::Assistant)
+                        {
+                            if !body.is_empty() {
+                                if !last.msg.text.is_empty() {
+                                    last.msg.text.push_str("\n\n");
+                                }
+                                last.msg.text.push_str(&body);
+                                last.msg.text = truncate_utf8(&last.msg.text, MAX_MESSAGE_BYTES);
+                            }
+                            merge_tools(&mut last.msg.tools, &tools);
+                            if last.msg.ts_ms.is_none() {
+                                last.msg.ts_ms = ts_ms;
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                merge_tools(&mut self.pending_tools, &tools);
+                if body.is_empty() {
+                    return;
+                }
+                let attached = std::mem::take(&mut self.pending_tools);
+                self.push_std_turn(TranscriptMessage {
+                    role: TranscriptRole::Assistant,
+                    text: truncate_utf8(&body, MAX_MESSAGE_BYTES),
+                    ts_ms,
+                    tools: attached,
+                });
+                self.last_claude_msg_id = msg_id;
+            }
+            _ => {}
+        }
+    }
+
+    fn feed_codex_turn(&mut self, obj: &Value) {
+        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let Some(payload) = obj.get("payload") else {
+            return;
+        };
+        let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let ts_ms = obj
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_ms);
+
+        match (kind, ptype) {
+            ("response_item", "message") => {
+                let role = match payload.get("role").and_then(Value::as_str) {
+                    Some("user") => TranscriptRole::User,
+                    Some("assistant") => TranscriptRole::Assistant,
+                    _ => return,
+                };
+                let (body, has_image) = extract_codex_content(payload.get("content"));
+                if role == TranscriptRole::User {
+                    self.pending_tools.clear();
+                    if let Some(clean) = clean_codex_user_text(&body, has_image) {
+                        self.push_std_turn(TranscriptMessage {
+                            role,
+                            text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
+                            ts_ms,
+                            tools: Vec::new(),
+                        });
+                    }
+                } else {
+                    let clean = strip_codex_internal_tags(&body);
+                    if clean.is_empty() {
+                        return;
+                    }
+                    let attached = std::mem::take(&mut self.pending_tools);
+                    self.push_std_turn(TranscriptMessage {
+                        role,
+                        text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
+                        ts_ms,
+                        tools: attached,
+                    });
+                }
+            }
+            ("response_item", "custom_tool_call" | "function_call") => {
+                if let Some(name) = payload.get("name").and_then(Value::as_str) {
+                    push_unique(&mut self.pending_tools, name);
+                }
+            }
+            ("event_msg", "user_message") => {
+                self.pending_tools.clear();
+                let msg = payload.get("message").and_then(Value::as_str).unwrap_or("");
+                let has_images = payload
+                    .get("images")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+                    || payload
+                        .get("local_images")
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| !a.is_empty());
+                if let Some(clean) = clean_codex_user_text(msg, has_images) {
+                    self.push_std_turn(TranscriptMessage {
+                        role: TranscriptRole::User,
+                        text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
+                        ts_ms,
+                        tools: Vec::new(),
+                    });
+                }
+            }
+            ("event_msg", "agent_message") => {
+                if let Some(msg) = payload.get("message").and_then(Value::as_str) {
+                    let clean = strip_codex_internal_tags(msg);
+                    if !clean.is_empty() {
+                        let attached = std::mem::take(&mut self.pending_tools);
+                        self.push_std_turn(TranscriptMessage {
+                            role: TranscriptRole::Assistant,
+                            text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
+                            ts_ms,
+                            tools: attached,
+                        });
+                    }
+                }
+            }
+            ("event_msg", "task_complete") => {
+                if let Some(msg) = payload.get("last_agent_message").and_then(Value::as_str) {
+                    let clean = strip_codex_internal_tags(msg);
+                    if !clean.is_empty() {
+                        let attached = std::mem::take(&mut self.pending_tools);
+                        self.push_std_turn(TranscriptMessage {
+                            role: TranscriptRole::Assistant,
+                            text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
+                            ts_ms,
+                            tools: attached,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn push_agy_turn(&mut self, item: IndexedTurn) {
+        if let Some(last) = self.turns.last_mut() {
+            let same_text = last.msg.role == item.msg.role
+                && (last.msg.text == item.msg.text
+                    || normalize_ws_for_dedup(&last.msg.text)
+                        == normalize_ws_for_dedup(&item.msg.text));
+            let allow_dedup = match item.msg.role {
+                TranscriptRole::Assistant => true,
+                TranscriptRole::User => {
+                    item.step_index.is_some() && last.step_index == item.step_index
+                }
+            };
+            if same_text && allow_dedup {
+                merge_tools(&mut last.msg.tools, &item.msg.tools);
+                if last.msg.ts_ms.is_none() {
+                    last.msg.ts_ms = item.msg.ts_ms;
+                }
+                return;
+            }
+        }
+        self.turns.push(item);
+    }
+
+    fn feed_agy_turn(&mut self, obj: &Value) {
+        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        let source = obj.get("source").and_then(Value::as_str).unwrap_or("");
+        let step_index = obj.get("step_index").and_then(Value::as_u64);
+        let ts_ms = obj
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(parse_iso8601_ms);
+
+        match kind {
+            "USER_INPUT" => {
+                if source == "SYSTEM" {
+                    return;
+                }
+                self.pending_tools.clear();
+                let raw = obj.get("content").and_then(Value::as_str).unwrap_or("");
+                let has_media = obj
+                    .get("media")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty());
+                let clean =
+                    clean_agy_user_text(raw).or_else(|| has_media.then(|| "[图片]".to_string()));
+                if let Some(clean) = clean {
+                    let needs_content_hydration = step_index.is_some()
+                        && !raw.is_empty()
+                        && agy_needs_content_hydration(obj, raw);
+                    self.push_agy_turn(IndexedTurn {
+                        msg: TranscriptMessage {
+                            role: TranscriptRole::User,
+                            text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
+                            ts_ms,
+                            tools: Vec::new(),
+                        },
+                        step_index,
+                        needs_content_hydration,
+                        needs_tools_hydration: false,
+                        hydrated: !needs_content_hydration,
+                    });
+                }
+            }
+            "PLANNER_RESPONSE" => {
+                let calls = obj.get("tool_calls").and_then(Value::as_array);
+                if let Some(calls) = calls {
+                    for tc in calls {
+                        if let Some(name) = tc.get("name").and_then(Value::as_str) {
+                            push_unique(&mut self.pending_tools, name);
+                        }
+                    }
+                }
+                let content_opt = obj
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(content) = content_opt {
+                    let attached = std::mem::take(&mut self.pending_tools);
+                    let needs_content_hydration =
+                        step_index.is_some() && agy_needs_content_hydration(obj, content);
+                    self.push_agy_turn(IndexedTurn {
+                        msg: TranscriptMessage {
+                            role: TranscriptRole::Assistant,
+                            text: truncate_utf8(content, MAX_MESSAGE_BYTES),
+                            ts_ms,
+                            tools: attached,
+                        },
+                        step_index,
+                        needs_content_hydration,
+                        needs_tools_hydration: false,
+                        hydrated: !needs_content_hydration,
+                    });
+                } else if let Some(calls) = calls {
+                    if let Some(tc_text) = extract_agy_tool_call_text(calls) {
+                        let attached = std::mem::take(&mut self.pending_tools);
+                        let needs_tools_hydration =
+                            step_index.is_some() && agy_needs_tools_hydration(obj);
+                        self.push_agy_turn(IndexedTurn {
+                            msg: TranscriptMessage {
+                                role: TranscriptRole::Assistant,
+                                text: truncate_utf8(&tc_text, MAX_MESSAGE_BYTES),
+                                ts_ms,
+                                tools: attached,
+                            },
+                            step_index,
+                            needs_content_hydration: false,
+                            needs_tools_hydration,
+                            hydrated: !needs_tools_hydration,
+                        });
+                    }
+                }
+            }
+            "SYSTEM_MESSAGE" => {
+                if let Some(raw) = obj.get("content").and_then(Value::as_str) {
+                    if let Some(msg_text) = extract_agy_interagent_message(raw) {
+                        let needs_content_hydration =
+                            step_index.is_some() && agy_needs_content_hydration(obj, raw);
+                        self.push_agy_turn(IndexedTurn {
+                            msg: TranscriptMessage {
+                                role: TranscriptRole::User,
+                                text: truncate_utf8(&msg_text, MAX_MESSAGE_BYTES),
+                                ts_ms,
+                                tools: Vec::new(),
+                            },
+                            step_index,
+                            needs_content_hydration,
+                            needs_tools_hydration: false,
+                            hydrated: !needs_content_hydration,
+                        });
+                    }
+                }
+            }
+            "ERROR_MESSAGE" => {
+                let err = obj
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .or_else(|| obj.get("content").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(err_text) = err {
+                    let attached = std::mem::take(&mut self.pending_tools);
+                    self.turns.push(IndexedTurn {
+                        msg: TranscriptMessage {
+                            role: TranscriptRole::Assistant,
+                            text: truncate_utf8(&format!("[错误] {err_text}"), MAX_MESSAGE_BYTES),
+                            ts_ms,
+                            tools: attached,
+                        },
+                        step_index,
+                        needs_content_hydration: false,
+                        needs_tools_hydration: false,
+                        hydrated: true,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn hydrate_range(&mut self, compact_path: &Path, start: usize, end: usize) {
+        if self.agent != AgentKind::Agy || start >= end {
+            return;
+        }
+        let any_unhydrated = self.turns[start..end]
+            .iter()
+            .any(|t| !t.hydrated && (t.needs_content_hydration || t.needs_tools_hydration));
+        if !any_unhydrated {
+            return;
+        }
+        let Some(full_path) = sibling_transcript_full(Some(compact_path)) else {
+            return;
+        };
+        let full_idx = self.agy_full.get_or_insert_with(|| AgyFullIndex::new(0, 0));
+        full_idx.sync(&full_path);
+        for it in &mut self.turns[start..end] {
+            if it.hydrated {
+                continue;
+            }
+            let Some(step_idx) = it.step_index else {
+                it.hydrated = true;
+                continue;
+            };
+            let Some(full_obj) = full_idx.read_step(&full_path, step_idx) else {
+                continue;
+            };
+            if it.needs_content_hydration {
+                if let Some(full_raw) = full_obj.get("content").and_then(Value::as_str) {
+                    match it.msg.role {
+                        TranscriptRole::User => {
+                            if full_obj.get("type").and_then(Value::as_str)
+                                == Some("SYSTEM_MESSAGE")
+                            {
+                                if let Some(clean) = extract_agy_interagent_message(full_raw) {
+                                    it.msg.text = truncate_utf8(&clean, MAX_MESSAGE_BYTES);
+                                }
+                            } else if let Some(clean) = clean_agy_user_text(full_raw) {
+                                it.msg.text = truncate_utf8(&clean, MAX_MESSAGE_BYTES);
+                            }
+                        }
+                        TranscriptRole::Assistant => {
+                            let trimmed = full_raw.trim();
+                            if !trimmed.is_empty() {
+                                it.msg.text = truncate_utf8(trimmed, MAX_MESSAGE_BYTES);
+                            }
+                        }
+                    }
+                }
+            } else if it.needs_tools_hydration {
+                if let Some(calls) = full_obj.get("tool_calls").and_then(Value::as_array) {
+                    if let Some(tc_text) = extract_agy_tool_call_text(calls) {
+                        it.msg.text = truncate_utf8(&tc_text, MAX_MESSAGE_BYTES);
+                    }
+                }
+            }
+            it.hydrated = true;
+        }
+    }
+
+    pub(crate) fn slice_page(
+        &mut self,
+        path: &Path,
+        query: TranscriptQuery,
+        session_metrics: Option<SessionMetrics>,
+        now_ms: u64,
+    ) -> TranscriptResponse {
+        let has_trailing_tools = !self.pending_tools.is_empty();
+        let total = self.turns.len() + usize::from(has_trailing_tools);
+        let end_excl = query.before.map(|b| b.min(total)).unwrap_or(total);
+        let max_count = if query.all {
+            MAX_TRANSCRIPT_LIMIT
+        } else {
+            query.limit.clamp(1, MAX_TRANSCRIPT_LIMIT)
+        };
+        let min_start = end_excl.saturating_sub(max_count);
+
+        // First hydrate turns in `[min_start..real_end)` so byte-budget accounting sees final sizes.
+        let real_end = end_excl.min(self.turns.len());
+        let real_min_start = min_start.min(real_end);
+        self.hydrate_range(path, real_min_start, real_end);
+
+        // Walk backwards applying the 16 MiB response safety fuse while keeping at least 1 message.
+        let mut kept_rev: Vec<TranscriptMessage> = Vec::with_capacity(end_excl - min_start);
+        let mut bytes_used = 0usize;
+        let mut cur = end_excl;
+        while cur > min_start {
+            cur -= 1;
+            let msg = if cur < self.turns.len() {
+                self.turns[cur].msg.clone()
+            } else {
+                TranscriptMessage {
+                    role: TranscriptRole::Assistant,
+                    text: String::new(),
+                    ts_ms: self.turns.last().and_then(|t| t.msg.ts_ms),
+                    tools: self.pending_tools.clone(),
+                }
+            };
+            let est_bytes = msg.text.len() + 64;
+            if !kept_rev.is_empty() && bytes_used + est_bytes > MAX_TRANSCRIPT_RESPONSE_BYTES {
+                cur += 1;
+                break;
+            }
+            bytes_used += est_bytes;
+            kept_rev.push(msg);
+        }
+        kept_rev.reverse();
+        let start_seq = cur;
+        let has_more = start_seq > 0;
+
+        let (parsed_metrics, _, _) = self.telemetry.snapshot(now_ms);
+        let metrics = if session_metrics
+            .as_ref()
+            .is_some_and(|m| m.source == "cc_switch")
+        {
+            super::metrics::merge_cc_switch_with_fallback(session_metrics, parsed_metrics, None)
+        } else {
+            merge_metrics(parsed_metrics, session_metrics)
+        };
+
+        TranscriptResponse {
+            source: "transcript".to_string(),
+            transcript_path: Some(path.to_string_lossy().into_owned()),
+            messages: kept_rev,
+            has_more,
+            total_messages: total,
+            start_seq,
+            next_before: has_more.then_some(start_seq),
+            metrics,
+        }
+    }
+
+    pub(crate) fn telemetry_snapshot(
+        &self,
+        now_ms: u64,
+    ) -> (Option<SessionMetrics>, Option<String>, Option<String>) {
+        self.telemetry.snapshot(now_ms)
+    }
+}
+
+/// Bounded in-memory cache of append-only `TranscriptIndex`es (lives outside `Mutex<State>`).
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptIndexCache {
+    entries: HashMap<PathBuf, TranscriptIndex>,
+}
+
+impl TranscriptIndexCache {
+    pub(crate) fn get_or_sync(
+        &mut self,
+        agent: AgentKind,
+        path: &Path,
+    ) -> Option<&mut TranscriptIndex> {
+        if !self.entries.contains_key(path) && self.entries.len() >= MAX_CACHED_TRANSCRIPTS {
+            self.entries.clear();
+        }
+        let idx = self
+            .entries
+            .entry(path.to_path_buf())
+            .or_insert_with(|| TranscriptIndex::new(agent, 0, 0));
+        if idx.agent != agent {
+            *idx = TranscriptIndex::new(agent, 0, 0);
+        }
+        if !idx.sync_file(path) {
+            return None;
+        }
+        Some(idx)
+    }
+
+    pub(crate) fn sync_and_telemetry(
+        &mut self,
+        agent: AgentKind,
+        path: &Path,
+        now_ms: u64,
+    ) -> (Option<SessionMetrics>, Option<String>, Option<String>) {
+        let Some(idx) = self.get_or_sync(agent, path) else {
+            return (None, None, None);
+        };
+        idx.telemetry_snapshot(now_ms)
+    }
+}
+
 impl Core {
-    /// Read and parse recent structured conversation messages for `sid`, using the
-    /// `(mtime_ns, len)` cache whenever both the compact transcript and sibling
-    /// `transcript_full.jsonl` (if any) are unchanged.
+    /// Read and paginate structured conversation messages for `sid` via the O(delta)
+    /// `TranscriptIndexCache` (never blocks `Mutex<State>` on disk IO).
     pub async fn session_transcript(
         &self,
         sid: &SessionId,
-        limit: usize,
+        query: TranscriptQuery,
     ) -> Result<TranscriptResponse, ApiError> {
-        let clamped = limit.clamp(1, MAX_TRANSCRIPT_LIMIT);
-        let (session, cached) = {
+        let session = {
             let st = lock(&self.inner.state);
-            let session = st
-                .sessions
+            st.sessions
                 .get(sid)
                 .cloned()
-                .ok_or_else(|| ApiError::not_found(format!("session {sid}")))?;
-            if session.agent.is_shell() {
-                return Ok(TranscriptResponse::none(None));
-            }
-            let cached = session
-                .transcript_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|raw| {
-                    let pb = PathBuf::from(raw);
-                    if session.agent == AgentKind::Agy {
-                        canonicalize_agy_transcript_path(&pb)
-                    } else {
-                        pb
-                    }
-                })
-                .and_then(|pb| {
-                    let sig = file_signature(&pb)?;
-                    let full_sig =
-                        sibling_transcript_full(Some(&pb)).and_then(|f| file_signature(&f));
-                    let hit = st.transcript_cache.get(&pb)?;
-                    if hit.sig == sig
-                        && hit.full_sig == full_sig
-                        && hit.limit >= clamped
-                        && hit.session_metrics == session.metrics
-                    {
-                        let mut resp = hit.resp.clone();
-                        let had_more_beyond_cache = hit.resp.has_more;
-                        if resp.messages.len() > clamped {
-                            let drop_n = resp.messages.len() - clamped;
-                            resp.messages.drain(0..drop_n);
-                            resp.has_more = true;
-                        } else {
-                            resp.has_more = had_more_beyond_cache;
-                        }
-                        Some(resp)
-                    } else {
-                        None
-                    }
-                });
-            (session, cached)
+                .ok_or_else(|| ApiError::not_found(format!("session {sid}")))?
         };
-        if let Some(resp) = cached {
-            return Ok(resp);
+        if session.agent.is_shell() {
+            return Ok(TranscriptResponse::none(None));
         }
-
-        let session_for_cache = session.metrics.clone();
-        let resp = tokio::task::spawn_blocking(move || load_session_transcript(&session, clamped))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
-
-        if resp.source == "transcript" {
-            if let Some(path_str) = resp.transcript_path.as_deref() {
-                let pb = PathBuf::from(path_str);
-                if let Some(sig) = file_signature(&pb) {
-                    let full_sig =
-                        sibling_transcript_full(Some(&pb)).and_then(|f| file_signature(&f));
-                    let mut st = lock(&self.inner.state);
-                    if st.transcript_cache.len() >= MAX_CACHED_TRANSCRIPTS {
-                        st.transcript_cache.clear();
+        if !session.is_local_host() {
+            let hid = starfane_proto::HostId::new(session.effective_host_id());
+            if let Some(provider) = self.inner.remote_nodes.get(&hid).cloned() {
+                let remote_sid = sid
+                    .as_str()
+                    .strip_prefix(&format!("{}:", hid.as_str()))
+                    .map(SessionId::new)
+                    .unwrap_or_else(|| sid.clone());
+                return match provider.fetch_transcript(&remote_sid, &query).await {
+                    Ok(resp) => Ok(resp),
+                    Err(e) if e.code == starfane_proto::ErrorCode::NotFound => {
+                        Ok(TranscriptResponse::none(session.metrics.clone()))
                     }
-                    st.transcript_cache.insert(
-                        pb,
-                        CachedTranscript {
-                            sig,
-                            full_sig,
-                            limit: clamped,
-                            session_metrics: session_for_cache,
-                            resp: resp.clone(),
-                        },
-                    );
-                }
+                    Err(e) => Err(e),
+                };
             }
+            return Ok(TranscriptResponse::none(session.metrics.clone()));
         }
-        Ok(resp)
+        let core = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(path) = resolve_transcript_path(&session) else {
+                return TranscriptResponse::none(session.metrics.clone());
+            };
+            let now_ms = starfane_proto::id::now_ms();
+            let mut tc = lock(&core.inner.transcript_index);
+            match tc.get_or_sync(session.agent, &path) {
+                Some(idx) => idx.slice_page(&path, query, session.metrics.clone(), now_ms),
+                None => TranscriptResponse::none(session.metrics.clone()),
+            }
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))
     }
 }
 
@@ -195,40 +1061,22 @@ pub(crate) fn canonicalize_agy_transcript_path(path: &Path) -> PathBuf {
 }
 
 /// Resolve transcript path (exact matches only—never guess across unrelated sessions)
-/// and parse up to `limit` trailing messages.
+/// and parse up to `limit` trailing messages using a single-pass `TranscriptIndex`.
 pub(crate) fn load_session_transcript(session: &SessionRecord, limit: usize) -> TranscriptResponse {
     let Some(path) = resolve_transcript_path(session) else {
         return TranscriptResponse::none(session.metrics.clone());
     };
-    let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let Ok(tail) = read_tail_utf8(&path, MAX_TRANSCRIPT_READ_BYTES) else {
+    let mut idx = TranscriptIndex::new(session.agent, 0, 0);
+    if !idx.sync_file(&path) {
         return TranscriptResponse::none(session.metrics.clone());
-    };
-    let (messages, total_parsed) = if session.agent == AgentKind::Agy {
-        parse_agy_jsonl_with_hydration_counted(&tail, Some(&path), limit)
-    } else {
-        parse_transcript_for_agent_counted(session.agent, &tail, limit)
-    };
-    let has_more = total_parsed > messages.len() || file_len > MAX_TRANSCRIPT_READ_BYTES;
-    let now_ms = starfane_proto::id::now_ms();
-    let parsed_metrics = extract_transcript_metrics(session.agent, &tail, now_ms);
-    let metrics = if session
-        .metrics
-        .as_ref()
-        .is_some_and(|m| m.source == "cc_switch")
-    {
-        super::metrics::merge_cc_switch_with_fallback(session.metrics.clone(), parsed_metrics, None)
-    } else {
-        merge_metrics(parsed_metrics, session.metrics.clone())
-    };
-    TranscriptResponse {
-        source: "transcript".to_string(),
-        transcript_path: Some(path.to_string_lossy().into_owned()),
-        messages,
-        has_more,
-        total_messages: total_parsed,
-        metrics,
     }
+    let now_ms = starfane_proto::id::now_ms();
+    idx.slice_page(
+        &path,
+        TranscriptQuery::tail(limit),
+        session.metrics.clone(),
+        now_ms,
+    )
 }
 
 /// Locate the transcript JSONL file for `session` using strictly exact identity matches:
@@ -335,18 +1183,6 @@ pub(crate) fn resolve_transcript_path_in(home: &Path, session: &SessionRecord) -
     }
 }
 
-fn encode_claude_project_dir(path: &str) -> String {
-    path.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -364,6 +1200,7 @@ fn is_skippable_giant_line(line: &[u8]) -> bool {
 /// Read complete trailing JSONL lines totaling at most `max_bytes`, scanning backwards in
 /// 512 KiB chunks up to 16 MiB and skipping >1 MiB `compacted` / `GENERIC` lines so huge
 /// snapshots or tool blobs never blank out recent turns.
+#[cfg(test)]
 pub(crate) fn read_tail_utf8(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
@@ -454,127 +1291,24 @@ pub(crate) fn parse_transcript_for_agent(
     text: &str,
     limit: usize,
 ) -> Vec<TranscriptMessage> {
-    parse_transcript_for_agent_counted(agent, text, limit).0
-}
-
-fn parse_transcript_for_agent_counted(
-    agent: AgentKind,
-    text: &str,
-    limit: usize,
-) -> (Vec<TranscriptMessage>, usize) {
-    let mut msgs = match agent {
-        AgentKind::Claude => parse_claude_jsonl(text),
-        AgentKind::Codex => parse_codex_jsonl(text),
-        AgentKind::Agy => parse_agy_jsonl(text),
-        AgentKind::Shell => Vec::new(),
-    };
-    let total = msgs.len();
-    if msgs.len() > limit {
-        let drop_n = msgs.len() - limit;
-        msgs.drain(0..drop_n);
-    }
-    (msgs, total)
-}
-
-// ---------------------------------------------------------------------------
-// Claude Code JSONL parser
-// ---------------------------------------------------------------------------
-
-fn parse_claude_jsonl(text: &str) -> Vec<TranscriptMessage> {
-    let mut out: Vec<TranscriptMessage> = Vec::new();
-    let mut last_assistant_msg_id: Option<String> = None;
-    let mut pending_tools: Vec<String> = Vec::new();
-
+    let mut idx = TranscriptIndex::new(agent, 0, 0);
     for line in text.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('{') {
             continue;
         }
-        let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        if obj.get("isMeta").and_then(Value::as_bool) == Some(true)
-            || obj.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
-        {
-            continue;
-        }
-        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-        let ts_ms = obj
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_iso8601_ms);
-
-        match kind {
-            "user" => {
-                let Some(content) = obj.get("message").and_then(|m| m.get("content")) else {
-                    continue;
-                };
-                if let Some(clean) = extract_claude_user_text(content) {
-                    last_assistant_msg_id = None;
-                    pending_tools.clear();
-                    push_message(
-                        &mut out,
-                        TranscriptMessage {
-                            role: TranscriptRole::User,
-                            text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
-                            ts_ms,
-                            tools: Vec::new(),
-                        },
-                    );
-                }
-            }
-            "assistant" => {
-                let Some(msg) = obj.get("message") else {
-                    continue;
-                };
-                let msg_id = msg.get("id").and_then(Value::as_str).map(str::to_string);
-                let (body, tools) = extract_claude_assistant_content(msg.get("content"));
-
-                // Merge consecutive chunks emitted for the same Claude `message.id`.
-                if let (Some(id), Some(prev_id)) = (&msg_id, &last_assistant_msg_id) {
-                    if id == prev_id {
-                        if let Some(last) = out
-                            .last_mut()
-                            .filter(|m| m.role == TranscriptRole::Assistant)
-                        {
-                            if !body.is_empty() {
-                                if !last.text.is_empty() {
-                                    last.text.push_str("\n\n");
-                                }
-                                last.text.push_str(&body);
-                                last.text = truncate_utf8(&last.text, MAX_MESSAGE_BYTES);
-                            }
-                            merge_tools(&mut last.tools, &tools);
-                            if last.ts_ms.is_none() {
-                                last.ts_ms = ts_ms;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                merge_tools(&mut pending_tools, &tools);
-                if body.is_empty() {
-                    continue;
-                }
-                let attached = std::mem::take(&mut pending_tools);
-                push_message(
-                    &mut out,
-                    TranscriptMessage {
-                        role: TranscriptRole::Assistant,
-                        text: truncate_utf8(&body, MAX_MESSAGE_BYTES),
-                        ts_ms,
-                        tools: attached,
-                    },
-                );
-                last_assistant_msg_id = msg_id;
-            }
-            _ => {}
+        if let Ok(obj) = serde_json::from_str::<Value>(trimmed) {
+            idx.feed_turn_obj(&obj);
         }
     }
-    flush_pending_tools(&mut out, &mut pending_tools);
-    out
+    let dummy = Path::new("");
+    idx.slice_page(dummy, TranscriptQuery::tail(limit), None, 0)
+        .messages
 }
+
+// ---------------------------------------------------------------------------
+// Claude Code helpers
+// ---------------------------------------------------------------------------
 
 fn extract_claude_user_text(content: &Value) -> Option<String> {
     match content {
@@ -642,137 +1376,8 @@ fn extract_claude_assistant_content(content: Option<&Value>) -> (String, Vec<Str
 }
 
 // ---------------------------------------------------------------------------
-// Codex CLI JSONL parser
+// Codex CLI helpers
 // ---------------------------------------------------------------------------
-
-fn parse_codex_jsonl(text: &str) -> Vec<TranscriptMessage> {
-    let mut out: Vec<TranscriptMessage> = Vec::new();
-    let mut pending_tools: Vec<String> = Vec::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-        let Some(payload) = obj.get("payload") else {
-            continue;
-        };
-        let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
-        let ts_ms = obj
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_iso8601_ms);
-
-        match (kind, ptype) {
-            ("response_item", "message") => {
-                let role = match payload.get("role").and_then(Value::as_str) {
-                    Some("user") => TranscriptRole::User,
-                    Some("assistant") => TranscriptRole::Assistant,
-                    _ => continue, // skip developer/system
-                };
-                let (body, has_image) = extract_codex_content(payload.get("content"));
-                if role == TranscriptRole::User {
-                    pending_tools.clear();
-                    if let Some(clean) = clean_codex_user_text(&body, has_image) {
-                        push_message(
-                            &mut out,
-                            TranscriptMessage {
-                                role,
-                                text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
-                                ts_ms,
-                                tools: Vec::new(),
-                            },
-                        );
-                    }
-                } else {
-                    let clean = strip_codex_internal_tags(&body);
-                    if clean.is_empty() {
-                        continue;
-                    }
-                    let attached = std::mem::take(&mut pending_tools);
-                    push_message(
-                        &mut out,
-                        TranscriptMessage {
-                            role,
-                            text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
-                            ts_ms,
-                            tools: attached,
-                        },
-                    );
-                }
-            }
-            ("response_item", "custom_tool_call" | "function_call") => {
-                if let Some(name) = payload.get("name").and_then(Value::as_str) {
-                    push_unique(&mut pending_tools, name);
-                }
-            }
-            ("event_msg", "user_message") => {
-                pending_tools.clear();
-                let msg = payload.get("message").and_then(Value::as_str).unwrap_or("");
-                let has_images = payload
-                    .get("images")
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| !a.is_empty())
-                    || payload
-                        .get("local_images")
-                        .and_then(Value::as_array)
-                        .is_some_and(|a| !a.is_empty());
-                if let Some(clean) = clean_codex_user_text(msg, has_images) {
-                    push_message(
-                        &mut out,
-                        TranscriptMessage {
-                            role: TranscriptRole::User,
-                            text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
-                            ts_ms,
-                            tools: Vec::new(),
-                        },
-                    );
-                }
-            }
-            ("event_msg", "agent_message") => {
-                if let Some(msg) = payload.get("message").and_then(Value::as_str) {
-                    let clean = strip_codex_internal_tags(msg);
-                    if !clean.is_empty() {
-                        let attached = std::mem::take(&mut pending_tools);
-                        push_message(
-                            &mut out,
-                            TranscriptMessage {
-                                role: TranscriptRole::Assistant,
-                                text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
-                                ts_ms,
-                                tools: attached,
-                            },
-                        );
-                    }
-                }
-            }
-            ("event_msg", "task_complete") => {
-                if let Some(msg) = payload.get("last_agent_message").and_then(Value::as_str) {
-                    let clean = strip_codex_internal_tags(msg);
-                    if !clean.is_empty() {
-                        let attached = std::mem::take(&mut pending_tools);
-                        push_message(
-                            &mut out,
-                            TranscriptMessage {
-                                role: TranscriptRole::Assistant,
-                                text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
-                                ts_ms,
-                                tools: attached,
-                            },
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    flush_pending_tools(&mut out, &mut pending_tools);
-    out
-}
 
 fn extract_codex_content(content: Option<&Value>) -> (String, bool) {
     let Some(val) = content else {
@@ -839,15 +1444,8 @@ fn clean_codex_user_text(raw: &str, has_image: bool) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Antigravity (AGY) transcript.jsonl parser
+// Antigravity (AGY) helpers
 // ---------------------------------------------------------------------------
-
-struct AgyParsedMsg {
-    msg: TranscriptMessage,
-    step_index: Option<u64>,
-    needs_content_hydration: bool,
-    needs_tools_hydration: bool,
-}
 
 fn agy_needs_content_hydration(obj: &Value, raw_content: &str) -> bool {
     let flagged = obj
@@ -978,66 +1576,6 @@ fn fast_extract_step_index(line: &str) -> Option<u64> {
     rest[..digits_len].parse::<u64>().ok()
 }
 
-/// Stream-scan `transcript_full.jsonl` once to fetch full entries for the requested `step_index`es.
-fn read_agy_full_steps(full_path: &Path, needed: &HashSet<u64>) -> HashMap<u64, Value> {
-    let mut found = HashMap::with_capacity(needed.len());
-    let Ok(file) = File::open(full_path) else {
-        return found;
-    };
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        let Some(step_idx) = fast_extract_step_index(&line) else {
-            continue;
-        };
-        if !needed.contains(&step_idx) {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        if obj.get("step_index").and_then(Value::as_u64) != Some(step_idx) {
-            continue;
-        }
-        found.insert(step_idx, obj);
-        if found.len() == needed.len() {
-            break;
-        }
-    }
-    found
-}
-
-fn push_agy_message(out: &mut Vec<AgyParsedMsg>, item: AgyParsedMsg) {
-    if let Some(last) = out.last_mut() {
-        let same_text = last.msg.role == item.msg.role
-            && (last.msg.text == item.msg.text
-                || normalize_ws_for_dedup(&last.msg.text)
-                    == normalize_ws_for_dedup(&item.msg.text));
-        let allow_dedup = match item.msg.role {
-            TranscriptRole::Assistant => true,
-            TranscriptRole::User => item.step_index.is_some() && last.step_index == item.step_index,
-        };
-        if same_text && allow_dedup {
-            merge_tools(&mut last.msg.tools, &item.msg.tools);
-            if last.msg.ts_ms.is_none() {
-                last.msg.ts_ms = item.msg.ts_ms;
-            }
-            return;
-        }
-    }
-    out.push(item);
-}
-
-fn parse_agy_jsonl(text: &str) -> Vec<TranscriptMessage> {
-    parse_agy_jsonl_with_hydration_counted(text, None, usize::MAX).0
-}
-
 /// Parse compact AGY `transcript.jsonl`, keep the trailing `limit` messages, and hydrate any
 /// truncated `content` or `tool_calls` fields from sibling `transcript_full.jsonl` by `step_index`.
 #[cfg(test)]
@@ -1046,242 +1584,19 @@ pub(crate) fn parse_agy_jsonl_with_hydration(
     transcript_path: Option<&Path>,
     limit: usize,
 ) -> Vec<TranscriptMessage> {
-    parse_agy_jsonl_with_hydration_counted(text, transcript_path, limit).0
-}
-
-fn parse_agy_jsonl_with_hydration_counted(
-    text: &str,
-    transcript_path: Option<&Path>,
-    limit: usize,
-) -> (Vec<TranscriptMessage>, usize) {
-    let mut items: Vec<AgyParsedMsg> = Vec::new();
-    let mut pending_tools: Vec<String> = Vec::new();
-
+    let mut idx = TranscriptIndex::new(AgentKind::Agy, 0, 0);
     for line in text.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('{') {
             continue;
         }
-        let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
-        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-        let source = obj.get("source").and_then(Value::as_str).unwrap_or("");
-        let step_index = obj.get("step_index").and_then(Value::as_u64);
-        let ts_ms = obj
-            .get("created_at")
-            .and_then(Value::as_str)
-            .and_then(parse_iso8601_ms);
-
-        match kind {
-            "USER_INPUT" => {
-                if source == "SYSTEM" {
-                    continue;
-                }
-                pending_tools.clear();
-                let raw = obj.get("content").and_then(Value::as_str).unwrap_or("");
-                let has_media = obj
-                    .get("media")
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| !a.is_empty());
-                let clean =
-                    clean_agy_user_text(raw).or_else(|| has_media.then(|| "[图片]".to_string()));
-                if let Some(clean) = clean {
-                    let needs_content_hydration = step_index.is_some()
-                        && !raw.is_empty()
-                        && agy_needs_content_hydration(&obj, raw);
-                    push_agy_message(
-                        &mut items,
-                        AgyParsedMsg {
-                            msg: TranscriptMessage {
-                                role: TranscriptRole::User,
-                                text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
-                                ts_ms,
-                                tools: Vec::new(),
-                            },
-                            step_index,
-                            needs_content_hydration,
-                            needs_tools_hydration: false,
-                        },
-                    );
-                }
-            }
-            "PLANNER_RESPONSE" => {
-                let calls = obj.get("tool_calls").and_then(Value::as_array);
-                if let Some(calls) = calls {
-                    for tc in calls {
-                        if let Some(name) = tc.get("name").and_then(Value::as_str) {
-                            push_unique(&mut pending_tools, name);
-                        }
-                    }
-                }
-                // Deliberately ignore `thinking`; surface visible `content`, or structured
-                // user-visible payloads inside `exit_plan_mode` / `send_message` / `post_message`.
-                let content_opt = obj
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                if let Some(content) = content_opt {
-                    let attached = std::mem::take(&mut pending_tools);
-                    let needs_content_hydration =
-                        step_index.is_some() && agy_needs_content_hydration(&obj, content);
-                    push_agy_message(
-                        &mut items,
-                        AgyParsedMsg {
-                            msg: TranscriptMessage {
-                                role: TranscriptRole::Assistant,
-                                text: truncate_utf8(content, MAX_MESSAGE_BYTES),
-                                ts_ms,
-                                tools: attached,
-                            },
-                            step_index,
-                            needs_content_hydration,
-                            needs_tools_hydration: false,
-                        },
-                    );
-                } else if let Some(calls) = calls {
-                    if let Some(tc_text) = extract_agy_tool_call_text(calls) {
-                        let attached = std::mem::take(&mut pending_tools);
-                        let needs_tools_hydration =
-                            step_index.is_some() && agy_needs_tools_hydration(&obj);
-                        push_agy_message(
-                            &mut items,
-                            AgyParsedMsg {
-                                msg: TranscriptMessage {
-                                    role: TranscriptRole::Assistant,
-                                    text: truncate_utf8(&tc_text, MAX_MESSAGE_BYTES),
-                                    ts_ms,
-                                    tools: attached,
-                                },
-                                step_index,
-                                needs_content_hydration: false,
-                                needs_tools_hydration,
-                            },
-                        );
-                    }
-                }
-            }
-            "SYSTEM_MESSAGE" => {
-                if let Some(raw) = obj.get("content").and_then(Value::as_str) {
-                    if let Some(msg_text) = extract_agy_interagent_message(raw) {
-                        let needs_content_hydration =
-                            step_index.is_some() && agy_needs_content_hydration(&obj, raw);
-                        push_agy_message(
-                            &mut items,
-                            AgyParsedMsg {
-                                msg: TranscriptMessage {
-                                    role: TranscriptRole::User,
-                                    text: truncate_utf8(&msg_text, MAX_MESSAGE_BYTES),
-                                    ts_ms,
-                                    tools: Vec::new(),
-                                },
-                                step_index,
-                                needs_content_hydration,
-                                needs_tools_hydration: false,
-                            },
-                        );
-                    }
-                }
-            }
-            "ERROR_MESSAGE" => {
-                let err = obj
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .or_else(|| obj.get("content").and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                if let Some(err_text) = err {
-                    let attached = std::mem::take(&mut pending_tools);
-                    items.push(AgyParsedMsg {
-                        msg: TranscriptMessage {
-                            role: TranscriptRole::Assistant,
-                            text: truncate_utf8(&format!("[错误] {err_text}"), MAX_MESSAGE_BYTES),
-                            ts_ms,
-                            tools: attached,
-                        },
-                        step_index,
-                        needs_content_hydration: false,
-                        needs_tools_hydration: false,
-                    });
-                }
-            }
-            _ => {} // skip GENERIC tool outputs, internal status, etc.
+        if let Ok(obj) = serde_json::from_str::<Value>(trimmed) {
+            idx.feed_turn_obj(&obj);
         }
     }
-
-    if !pending_tools.is_empty() {
-        let attached = std::mem::take(&mut pending_tools);
-        let ts_ms = items.last().and_then(|it| it.msg.ts_ms);
-        items.push(AgyParsedMsg {
-            msg: TranscriptMessage {
-                role: TranscriptRole::Assistant,
-                text: String::new(),
-                ts_ms,
-                tools: attached,
-            },
-            step_index: None,
-            needs_content_hydration: false,
-            needs_tools_hydration: false,
-        });
-    }
-
-    let total_parsed = items.len();
-    if items.len() > limit {
-        let drop_n = items.len() - limit;
-        items.drain(0..drop_n);
-    }
-
-    let needed: HashSet<u64> = items
-        .iter()
-        .filter(|it| it.needs_content_hydration || it.needs_tools_hydration)
-        .filter_map(|it| it.step_index)
-        .collect();
-
-    if !needed.is_empty() {
-        if let Some(full_path) = sibling_transcript_full(transcript_path) {
-            let full_map = read_agy_full_steps(&full_path, &needed);
-            for it in &mut items {
-                let Some(step_idx) = it.step_index else {
-                    continue;
-                };
-                let Some(full_obj) = full_map.get(&step_idx) else {
-                    continue;
-                };
-                if it.needs_content_hydration {
-                    if let Some(full_raw) = full_obj.get("content").and_then(Value::as_str) {
-                        match it.msg.role {
-                            TranscriptRole::User => {
-                                if full_obj.get("type").and_then(Value::as_str)
-                                    == Some("SYSTEM_MESSAGE")
-                                {
-                                    if let Some(clean) = extract_agy_interagent_message(full_raw) {
-                                        it.msg.text = truncate_utf8(&clean, MAX_MESSAGE_BYTES);
-                                    }
-                                } else if let Some(clean) = clean_agy_user_text(full_raw) {
-                                    it.msg.text = truncate_utf8(&clean, MAX_MESSAGE_BYTES);
-                                }
-                            }
-                            TranscriptRole::Assistant => {
-                                let trimmed = full_raw.trim();
-                                if !trimmed.is_empty() {
-                                    it.msg.text = truncate_utf8(trimmed, MAX_MESSAGE_BYTES);
-                                }
-                            }
-                        }
-                    }
-                } else if it.needs_tools_hydration {
-                    if let Some(calls) = full_obj.get("tool_calls").and_then(Value::as_array) {
-                        if let Some(tc_text) = extract_agy_tool_call_text(calls) {
-                            it.msg.text = truncate_utf8(&tc_text, MAX_MESSAGE_BYTES);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    (items.into_iter().map(|it| it.msg).collect(), total_parsed)
+    let path = transcript_path.unwrap_or_else(|| Path::new(""));
+    idx.slice_page(path, TranscriptQuery::tail(limit), None, 0)
+        .messages
 }
 
 fn clean_agy_user_text(raw: &str) -> Option<String> {
@@ -1391,46 +1706,6 @@ pub(crate) fn strip_codex_internal_tags(raw: &str) -> String {
 
 fn normalize_ws_for_dedup(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn flush_pending_tools(out: &mut Vec<TranscriptMessage>, pending_tools: &mut Vec<String>) {
-    if pending_tools.is_empty() {
-        return;
-    }
-    let attached = std::mem::take(pending_tools);
-    let ts_ms = out.last().and_then(|m| m.ts_ms);
-    out.push(TranscriptMessage {
-        role: TranscriptRole::Assistant,
-        text: String::new(),
-        ts_ms,
-        tools: attached,
-    });
-}
-
-fn push_message(out: &mut Vec<TranscriptMessage>, msg: TranscriptMessage) {
-    // Avoid consecutive duplicates (e.g. Codex emitting both response_item and event_msg,
-    // even when whitespace or trailing blank lines differ after stripping internal tags),
-    // without suppressing genuinely separate identical User prompts (> 2s apart).
-    if let Some(last) = out.last_mut() {
-        let same_text = last.role == msg.role
-            && (last.text == msg.text
-                || normalize_ws_for_dedup(&last.text) == normalize_ws_for_dedup(&msg.text));
-        let allow_dedup = match msg.role {
-            TranscriptRole::Assistant => true,
-            TranscriptRole::User => match (last.ts_ms, msg.ts_ms) {
-                (Some(a), Some(b)) => a.abs_diff(b) <= 2_000,
-                _ => true,
-            },
-        };
-        if same_text && allow_dedup {
-            merge_tools(&mut last.tools, &msg.tools);
-            if last.ts_ms.is_none() {
-                last.ts_ms = msg.ts_ms;
-            }
-            return;
-        }
-    }
-    out.push(msg);
 }
 
 fn push_unique(list: &mut Vec<String>, item: &str) {
@@ -1694,6 +1969,9 @@ not valid json at all
             discovered_only: false,
             transcript_path: None,
             metrics: None,
+            host_id: None,
+            host_display_name: None,
+            mux_kind: None,
         };
         assert_eq!(resolve_transcript_path_in(&home, &cl_rec), Some(cl_sub));
 
@@ -1959,6 +2237,9 @@ not valid json at all
             discovered_only: false,
             transcript_path: Some(file.to_string_lossy().into_owned()),
             metrics: None,
+            host_id: None,
+            host_display_name: None,
+            mux_kind: None,
         };
 
         let partial = load_session_transcript(&rec, 2);
@@ -1972,6 +2253,128 @@ not valid json at all
         assert_eq!(full.messages.len(), 5);
         assert_eq!(full.total_messages, 5);
         assert!(!full.has_more);
+        assert_eq!(full.start_seq, 0);
+        assert!(full.next_before.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_index_incremental_append_and_cursor_pagination_skip_giant_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-tr-idx-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.jsonl");
+        let mut content = String::new();
+        // Inject a >1.2 MiB giant compacted line right in the middle of history!
+        for i in 0..45 {
+            if i == 20 {
+                let giant = "x".repeat(1_200_000);
+                content.push_str(&format!(r#"{{"type":"compacted","blob":"{giant}"}}"#));
+                content.push('\n');
+            }
+            content.push_str(&format!(
+                r#"{{"type":"user","timestamp":"2026-11-24T00:00:{:02}Z","message":{{"role":"user","content":"turn-{i}"}}}}"#,
+                i % 60
+            ));
+            content.push('\n');
+        }
+        std::fs::write(&file, &content).unwrap();
+
+        let mut cache = TranscriptIndexCache::default();
+        let idx = cache.get_or_sync(AgentKind::Claude, &file).unwrap();
+        assert_eq!(idx.turns.len(), 45);
+        assert!(idx.delta_bytes_scanned > 1_200_000);
+
+        // Page 1: tail 20 -> turns 25..45
+        let p1 = idx.slice_page(&file, TranscriptQuery::tail(20), None, 1000);
+        assert_eq!(p1.total_messages, 45);
+        assert_eq!(p1.messages.len(), 20);
+        assert_eq!(p1.start_seq, 25);
+        assert_eq!(p1.next_before, Some(25));
+        assert!(p1.has_more);
+        assert_eq!(p1.messages[0].text, "turn-25");
+        assert_eq!(p1.messages[19].text, "turn-44");
+
+        // Page 2: before=25, limit=20 -> turns 5..25
+        let p2 = idx.slice_page(
+            &file,
+            TranscriptQuery {
+                limit: 20,
+                before: p1.next_before,
+                all: false,
+            },
+            None,
+            1000,
+        );
+        assert_eq!(p2.messages.len(), 20);
+        assert_eq!(p2.start_seq, 5);
+        assert_eq!(p2.next_before, Some(5));
+        assert!(p2.has_more);
+        assert_eq!(p2.messages[0].text, "turn-5");
+        assert_eq!(p2.messages[19].text, "turn-24");
+
+        // Page 3: before=5, limit=20 -> turns 0..5, reaches beginning!
+        let p3 = idx.slice_page(
+            &file,
+            TranscriptQuery {
+                limit: 20,
+                before: p2.next_before,
+                all: false,
+            },
+            None,
+            1000,
+        );
+        assert_eq!(p3.messages.len(), 5);
+        assert_eq!(p3.start_seq, 0);
+        assert!(p3.next_before.is_none());
+        assert!(!p3.has_more);
+        assert_eq!(p3.messages[0].text, "turn-0");
+        assert_eq!(p3.messages[4].text, "turn-4");
+
+        // Append 2 new lines and verify O(delta) incremental scan!
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-11-24T00:01:01Z","message":{{"role":"user","content":"turn-45"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-11-24T00:01:02Z","message":{{"role":"user","content":"turn-46"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let idx2 = cache.get_or_sync(AgentKind::Claude, &file).unwrap();
+        assert_eq!(idx2.turns.len(), 47);
+        assert!(
+            idx2.delta_bytes_scanned < 500,
+            "expected O(delta) scan, got {} bytes",
+            idx2.delta_bytes_scanned
+        );
+
+        let all_resp = idx2.slice_page(
+            &file,
+            TranscriptQuery {
+                limit: 60,
+                before: None,
+                all: true,
+            },
+            None,
+            1000,
+        );
+        assert_eq!(all_resp.total_messages, 47);
+        assert_eq!(all_resp.messages.len(), 47);
+        assert!(!all_resp.has_more);
+        assert_eq!(all_resp.messages[0].text, "turn-0");
+        assert_eq!(all_resp.messages[46].text, "turn-46");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3058,6 +3058,9 @@ mod tests {
                 source: "transcript".into(),
                 updated_ms: 1000,
             }),
+            host_id: None,
+            host_display_name: None,
+            mux_kind: None,
         };
         let ev = NormalizedEvent {
             v: PROTO_VERSION,

@@ -33,7 +33,7 @@ serde = { version = "1", default-features = false, features = ["std", "derive"] 
 serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util", "process", "sync", "time", "macros", "signal"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "fs", "net", "io-util", "process", "sync", "time", "macros", "signal"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 log = { version = "0.4", default-features = false }
 

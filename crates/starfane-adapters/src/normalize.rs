@@ -5,7 +5,7 @@ use serde_json::Value;
 use starfane_proto::{
     id::{new_id, prefix},
     truncate_chars, AgentKind, Confidence, EmitRequest, EnvCtx, EventDetail, EventId, EventKind,
-    NormalizedEvent, PaneId, SessionId, PROTO_VERSION,
+    NormalizedEvent, SessionId, PROTO_VERSION,
 };
 
 const MAX_TOOL_SUMMARY_CHARS: usize = 200;
@@ -119,7 +119,7 @@ fn normalize_claude(
         confidence: Confidence::Exact,
         session_id: SessionId::new(session_id),
         subagent_id: opt_nonempty_str(payload, "agent_id"),
-        pane: env.tmux_pane.clone().map(PaneId::new),
+        pane: env.pane_id(),
         cwd: opt_nonempty_str(payload, "cwd"),
         model: opt_nonempty_str(payload, "model"),
         native_event: event_name.to_string(),
@@ -173,7 +173,7 @@ fn normalize_codex(
         confidence: Confidence::Exact,
         session_id: SessionId::new(session_id),
         subagent_id: opt_nonempty_str(payload, "agent_id"),
-        pane: env.tmux_pane.clone().map(PaneId::new),
+        pane: env.pane_id(),
         cwd: opt_nonempty_str(payload, "cwd"),
         model: opt_nonempty_str(payload, "model"),
         native_event: event_name.to_string(),
@@ -238,7 +238,7 @@ fn normalize_agy(
         confidence: Confidence::Exact,
         session_id: SessionId::new(conversation_id),
         subagent_id: None,
-        pane: env.tmux_pane.clone().map(PaneId::new),
+        pane: env.pane_id(),
         cwd: opt_nonempty_str(payload, "cwd"),
         model: opt_nonempty_str(payload, "modelName"),
         native_event: event_name.to_string(),

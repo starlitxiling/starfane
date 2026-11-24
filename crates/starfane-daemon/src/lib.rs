@@ -3,12 +3,15 @@
 //!
 //! Contracts: `docs/crate-contracts.md` §7.
 
+pub mod access;
 pub mod client;
 pub mod config;
 pub mod core;
 pub mod lark;
 pub mod mcp;
+pub mod nodes;
 pub mod notice;
+pub mod notify;
 pub mod store;
 pub mod uds;
 pub mod web;
