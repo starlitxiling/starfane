@@ -1,0 +1,20 @@
+[package]
+name = "baton"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "baton"
+path = "src/main.rs"
+
+[dependencies]
+baton-adapters.workspace = true
+baton-daemon.workspace = true
+baton-emit.workspace = true
+baton-proto.workspace = true
+clap.workspace = true
+log.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

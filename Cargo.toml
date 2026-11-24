@@ -8,6 +8,8 @@ members = [
     "crates/baton-evidence",
     "crates/baton-binding",
     "crates/baton-daemon",
+    "bin/baton",
+    "tools/fake-agent",
 ]
 
 [workspace.package]
