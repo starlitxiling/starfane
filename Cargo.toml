@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/baton-proto",
     "crates/baton-emit",
+    "crates/baton-adapters",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ license = "MIT"
 # Internal workspace crates
 baton-proto = { path = "crates/baton-proto" }
 baton-emit = { path = "crates/baton-emit" }
+baton-adapters = { path = "crates/baton-adapters" }
 
 # Minimal external dependencies (default-features = false everywhere)
 serde = { version = "1", default-features = false, features = ["std", "derive"] }

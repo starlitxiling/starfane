@@ -1,0 +1,21 @@
+{
+  "conversationId": "99999999-8888-4777-8666-555555555555",
+  "workspacePaths": [
+    "/Users/demo/work/baton"
+  ],
+  "transcriptPath": "/Users/demo/.gemini/antigravity-cli/brain/99999999-8888-4777-8666-555555555555/.system_generated/logs/transcript.jsonl",
+  "artifactDirectoryPath": "/Users/demo/.gemini/antigravity-cli/brain/99999999-8888-4777-8666-555555555555",
+  "modelName": "gemini-4-neon-high",
+  "lastUserInput": "baton: implement feature pipeline",
+  "cwd": "/Users/demo/work/baton",
+  "hookEventName": "PostToolUse",
+  "stepIdx": 4,
+  "toolCall": {
+    "id": "toolu_agy_01",
+    "name": "run_command",
+    "args": {
+      "CommandLine": "cargo test --workspace"
+    }
+  },
+  "error": ""
+}

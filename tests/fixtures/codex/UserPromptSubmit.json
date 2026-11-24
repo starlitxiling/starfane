@@ -1,0 +1,10 @@
+{
+  "session_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+  "transcript_path": "/Users/demo/.codex/sessions/2026/11/20/rollout-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl",
+  "cwd": "/Users/demo/work/baton",
+  "model": "gpt-6.2-sol",
+  "permission_mode": "default",
+  "turn_id": "turn-01",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "baton: implement evidence verifier"
+}
