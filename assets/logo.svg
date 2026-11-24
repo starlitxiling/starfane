@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="squircleBg" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2B2926"/>
+      <stop offset="55%" stop-color="#1E1D1B"/>
+      <stop offset="100%" stop-color="#131210"/>
+    </linearGradient>
+    <linearGradient id="shaftGrad" x1="0" y1="-40" x2="0" y2="14" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#ECE9E0"/>
+    </linearGradient>
+    <linearGradient id="gripGrad" x1="0" y1="10" x2="0" y2="40" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#E07A5F"/>
+      <stop offset="100%" stop-color="#B95436"/>
+    </linearGradient>
+    <radialGradient id="tipGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(86 34) scale(26)">
+      <stop offset="0%" stop-color="#FAF9F6" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#FAF9F6" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Rounded Squircle Base -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#squircleBg)"/>
+  <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="27.25" stroke="#FAF9F6" stroke-opacity="0.13" stroke-width="1.5"/>
+
+  <!-- Subtle Glow Behind Baton Tip -->
+  <circle cx="86" cy="34" r="26" fill="url(#tipGlow)"/>
+
+  <!-- Conducting Beat Arc & Agent Triad (Claude / Codex / AGY) -->
+  <path d="M 28 73 C 29 48, 43 32, 68 27" stroke="#FAF9F6" stroke-opacity="0.18" stroke-width="2.2" stroke-linecap="round"/>
+  <circle cx="30" cy="60" r="6" fill="#E07A5F"/>
+  <circle cx="42" cy="40" r="6" fill="#3DB479"/>
+  <circle cx="62" cy="29" r="6" fill="#5E83F2"/>
+
+  <!-- Subtle Tempo Echo Bars in Lower Right -->
+  <path d="M 78 96 L 98 96" stroke="#FAF9F6" stroke-opacity="0.22" stroke-width="4" stroke-linecap="round"/>
+  <path d="M 85 84 L 98 84" stroke="#FAF9F6" stroke-opacity="0.14" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Conductor's Baton -->
+  <g transform="translate(66 64) rotate(36)">
+    <rect x="-5" y="-40" width="10" height="54" rx="5" fill="url(#shaftGrad)"/>
+    <rect x="-7" y="12" width="14" height="27" rx="7" fill="url(#gripGrad)"/>
+    <rect x="-6" y="10" width="12" height="4" rx="2" fill="#E6BE68"/>
+  </g>
+</svg>
