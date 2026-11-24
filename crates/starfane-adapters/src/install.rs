@@ -87,6 +87,8 @@ pub fn hook_config_path(agent: AgentKind, home: &Path, scope: &Scope) -> PathBuf
         (AgentKind::Codex, Scope::Project(root)) => root.join(".codex").join("hooks.json"),
         (AgentKind::Agy, Scope::User) => home.join(".gemini").join("config").join("hooks.json"),
         (AgentKind::Agy, Scope::Project(root)) => root.join(".agents").join("hooks.json"),
+        (AgentKind::Shell, Scope::User) => home.join(".starfane").join("shell-hooks.json"),
+        (AgentKind::Shell, Scope::Project(root)) => root.join(".starfane").join("shell-hooks.json"),
     }
 }
 
@@ -96,6 +98,11 @@ pub fn install_plan(
     home: &Path,
     opts: &InstallOptions,
 ) -> Result<InstallPlan, AdapterError> {
+    if agent.is_shell() {
+        return Err(AdapterError::InvalidInput(
+            "shell panes do not support hooks or MCP registration".into(),
+        ));
+    }
     let path = hook_config_path(agent, home, &opts.scope);
     let (before, mut root) = read_json_object(&path)?;
 
@@ -121,6 +128,11 @@ pub fn install_plan(
         }
         AgentKind::Agy => {
             upsert_agy_hooks(&mut root, &opts.starfane_bin, opts.agy_permission_heuristic);
+        }
+        AgentKind::Shell => {
+            return Err(AdapterError::InvalidInput(
+                "shell panes do not support hooks or MCP registration".into(),
+            ));
         }
     }
 
@@ -171,6 +183,11 @@ pub fn uninstall_plan(
     scope: &Scope,
     starfane_bin: &Path,
 ) -> Result<InstallPlan, AdapterError> {
+    if agent.is_shell() {
+        return Err(AdapterError::InvalidInput(
+            "shell panes do not support hooks or MCP registration".into(),
+        ));
+    }
     let path = hook_config_path(agent, home, scope);
     let (before, mut root) = read_json_object(&path)?;
 
@@ -181,7 +198,7 @@ pub fn uninstall_plan(
             AgentKind::Claude | AgentKind::Codex => {
                 remove_grouped_hooks(&mut root, &marker_prefix);
             }
-            AgentKind::Agy => {
+            AgentKind::Agy | AgentKind::Shell => {
                 root.remove(AGY_HOOK_GROUP_KEY);
             }
         }
@@ -516,6 +533,7 @@ fn mcp_add_command(agent: AgentKind, scope: &Scope, starfane_bin: &Path) -> Vec<
             "--agent".into(),
             "agy".into(),
         ],
+        AgentKind::Shell => Vec::new(),
     }
 }
 
@@ -547,5 +565,6 @@ fn mcp_remove_command(agent: AgentKind, scope: &Scope) -> Vec<String> {
             "remove".into(),
             "starfane".into(),
         ],
+        AgentKind::Shell => Vec::new(),
     }
 }

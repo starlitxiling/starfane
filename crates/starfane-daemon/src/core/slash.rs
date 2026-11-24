@@ -183,6 +183,7 @@ pub fn native_commands(agent: AgentKind) -> Vec<SlashCommand> {
             native(agent, "/mcp", "", "查看 MCP 工具连接状态", false),
             native(agent, "/help", "", "查看 Codex CLI 帮助", false),
         ],
+        AgentKind::Shell => Vec::new(),
     }
 }
 

@@ -120,6 +120,7 @@ pub(crate) fn cached_transcript_telemetry(
             (m, e)
         }
         AgentKind::Claude => (extract_claude_latest_model(&tail), None),
+        AgentKind::Shell => (None, None),
     };
     cache.insert(
         path.to_path_buf(),
@@ -329,6 +330,7 @@ pub(crate) fn infer_session_effort(
             .map(str::to_ascii_lowercase)
             .or_else(|| home.and_then(read_codex_default_effort)),
         AgentKind::Claude => home.and_then(|h| read_claude_default_effort(h, model)),
+        AgentKind::Shell => None,
     }
 }
 // Removed leftover tail lines after cached_transcript_metrics refactor.
@@ -600,6 +602,7 @@ pub(crate) fn infer_context_window(
                 None
             }
         }
+        AgentKind::Shell => None,
     }
 }
 
@@ -1217,6 +1220,7 @@ pub(crate) fn extract_session_id_from_transcript_path(
             }
             None
         }
+        AgentKind::Shell => None,
     }
 }
 
@@ -1245,6 +1249,7 @@ pub(crate) fn extract_transcript_metrics(
         AgentKind::Claude => extract_claude_metrics(text, now_ms),
         AgentKind::Codex => extract_codex_metrics(text, now_ms),
         AgentKind::Agy => extract_agy_metrics(text, now_ms),
+        AgentKind::Shell => None,
     }
 }
 

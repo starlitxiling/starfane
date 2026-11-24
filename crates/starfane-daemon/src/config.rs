@@ -170,6 +170,13 @@ pub struct TmuxConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct DiscoveryConfig {
+    /// Also surface non-agent tmux panes (plain shells, training scripts) as `AgentKind::Shell`.
+    pub include_shell_panes: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StarfaneConfig {
     pub web: WebConfig,
     pub notify: NotifyConfig,
@@ -177,6 +184,7 @@ pub struct StarfaneConfig {
     pub feishu: FeishuConfig,
     pub paths: PathsConfig,
     pub tmux: TmuxConfig,
+    pub discovery: DiscoveryConfig,
 }
 
 impl StarfaneConfig {
@@ -210,6 +218,7 @@ impl StarfaneConfig {
             starfane_proto::AgentKind::Claude => &self.paths.claude,
             starfane_proto::AgentKind::Codex => &self.paths.codex,
             starfane_proto::AgentKind::Agy => &self.paths.agy,
+            starfane_proto::AgentKind::Shell => return "sh".to_string(),
         };
         non_empty(configured).unwrap_or_else(|| agent.as_str().to_string())
     }

@@ -19,6 +19,13 @@ const MIN_CAPTURE_LINES: usize = 1;
 /// Hard cap on lines requested via `tmux capture-pane`.
 pub const MAX_CAPTURE_LINES: usize = 2000;
 
+/// Options controlling live tmux pane discovery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoverOptions {
+    /// Also include non-agent panes (plain shells, training processes, monitors) as `AgentKind::Shell`.
+    pub include_shell_panes: bool,
+}
+
 /// Metadata for an active coding-agent pane discovered in tmux.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscoveredPane {
@@ -83,8 +90,12 @@ impl Tmux {
         Ok(self.discover_agent_panes_from(&panes))
     }
 
-    /// Discover running `claude`, `codex`, and `agy` panes from an already-fetched pane list.
-    pub fn discover_agent_panes_from(&self, panes: &[PaneInfo]) -> Vec<DiscoveredPane> {
+    /// Discover running panes from an already-fetched pane list under `opts`.
+    pub fn discover_panes_from(
+        &self,
+        panes: &[PaneInfo],
+        opts: DiscoverOptions,
+    ) -> Vec<DiscoveredPane> {
         if panes.is_empty() {
             return Vec::new();
         }
@@ -96,7 +107,12 @@ impl Tmux {
         .map(|o| if o.success { o.stdout } else { String::new() })
         .unwrap_or_default();
 
-        classify_panes(panes, &ps_out)
+        classify_panes_with(panes, &ps_out, opts)
+    }
+
+    /// Discover running `claude`, `codex`, and `agy` panes from an already-fetched pane list.
+    pub fn discover_agent_panes_from(&self, panes: &[PaneInfo]) -> Vec<DiscoveredPane> {
+        self.discover_panes_from(panes, DiscoverOptions::default())
     }
 
     /// Capture the last `lines` lines of `pane_id`, trimming trailing empty lines and capping at [`MAX_CAPTURE_BYTES`].
@@ -137,6 +153,15 @@ impl Tmux {
 
 /// Pure classifier combining `list-panes` rows with `ps -eo pid=,ppid=,args=` output.
 pub fn classify_panes(panes: &[PaneInfo], ps_output: &str) -> Vec<DiscoveredPane> {
+    classify_panes_with(panes, ps_output, DiscoverOptions::default())
+}
+
+/// Pure classifier combining `list-panes` rows with `ps -eo pid=,ppid=,args=` output under `opts`.
+pub fn classify_panes_with(
+    panes: &[PaneInfo],
+    ps_output: &str,
+    opts: DiscoverOptions,
+) -> Vec<DiscoveredPane> {
     let mut by_pid: HashMap<u32, String> = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
 
@@ -160,15 +185,16 @@ pub fn classify_panes(panes: &[PaneInfo], ps_output: &str) -> Vec<DiscoveredPane
 
     let mut out = Vec::new();
     for pane in panes {
+        let tmux_target = format!(
+            "{}:{}.{}",
+            pane.session_name, pane.window_index, pane.pane_index
+        );
         if let Some(det) = detect_pane_agent(pane, &by_pid, &children) {
             let git_root = find_git_root(Path::new(&pane.current_path));
             let subtree_pids = collect_subtree_pids(pane.pane_pid, &children, 4);
             out.push(DiscoveredPane {
                 pane_id: pane.pane_id.clone(),
-                tmux_target: format!(
-                    "{}:{}.{}",
-                    pane.session_name, pane.window_index, pane.pane_index
-                ),
+                tmux_target,
                 tmux_label: pane.tmux_label(),
                 agent: det.agent,
                 cwd: pane.current_path.clone(),
@@ -178,6 +204,27 @@ pub fn classify_panes(panes: &[PaneInfo], ps_output: &str) -> Vec<DiscoveredPane
                 agent_pid: det.pid,
                 subtree_pids,
                 codex_resume_id: det.codex_resume_id,
+                pane_in_mode: pane.in_mode,
+                pane_dead: pane.dead,
+                pane_current_command: pane.current_command.clone(),
+            });
+        } else if opts.include_shell_panes && !pane.dead {
+            let cmd = pane.current_command.trim();
+            let model = (!cmd.is_empty()).then(|| cmd.to_string());
+            let git_root = find_git_root(Path::new(&pane.current_path));
+            let subtree_pids = collect_subtree_pids(pane.pane_pid, &children, 4);
+            out.push(DiscoveredPane {
+                pane_id: pane.pane_id.clone(),
+                tmux_target,
+                tmux_label: pane.tmux_label(),
+                agent: AgentKind::Shell,
+                cwd: pane.current_path.clone(),
+                git_root,
+                model,
+                effort: None,
+                agent_pid: Some(pane.pane_pid),
+                subtree_pids,
+                codex_resume_id: None,
                 pane_in_mode: pane.in_mode,
                 pane_dead: pane.dead,
                 pane_current_command: pane.current_command.clone(),
@@ -441,7 +488,7 @@ fn extract_effort_flag(agent: AgentKind, args: &str) -> Option<String> {
                     }
                 }
             }
-            AgentKind::Agy => {}
+            AgentKind::Agy | AgentKind::Shell => {}
         }
         i += 1;
     }
@@ -555,6 +602,19 @@ mod tests {
         assert_eq!(found[2].tmux_target, "learning:6.0");
         assert_eq!(found[2].agent, AgentKind::Agy);
         assert_eq!(found[2].model.as_deref(), Some("gemini-4-neon-high"));
+
+        let with_shells = classify_panes_with(
+            &panes,
+            ps,
+            DiscoverOptions {
+                include_shell_panes: true,
+            },
+        );
+        assert_eq!(with_shells.len(), 4);
+        assert_eq!(with_shells[3].pane_id.as_str(), "%6");
+        assert_eq!(with_shells[3].tmux_target, "learning:0.0");
+        assert_eq!(with_shells[3].agent, AgentKind::Shell);
+        assert_eq!(with_shells[3].model.as_deref(), Some("zsh"));
     }
 
     #[test]

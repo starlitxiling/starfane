@@ -13,8 +13,9 @@ mod model;
 mod resolve;
 
 pub use discover::{
-    capture_pane_tail, classify_panes, discover_agent_panes, trim_and_cap_tail, DiscoveredPane,
-    PanePreview, MAX_CAPTURE_BYTES, MAX_CAPTURE_LINES,
+    capture_pane_tail, classify_panes, classify_panes_with, discover_agent_panes,
+    trim_and_cap_tail, DiscoverOptions, DiscoveredPane, PanePreview, MAX_CAPTURE_BYTES,
+    MAX_CAPTURE_LINES,
 };
 pub use error::TmuxError;
 pub use gate::{

@@ -209,7 +209,8 @@ impl StageBinding {
                 Some(_) => return Err(err("empty model")),
                 None => (head, None),
             };
-            binding.agent = Some(AgentKind::parse(agent).ok_or_else(|| err("unknown agent"))?);
+            binding.agent =
+                Some(AgentKind::parse_coding_agent(agent).ok_or_else(|| err("unknown agent"))?);
             binding.model = model;
             binding.effort = effort;
         }

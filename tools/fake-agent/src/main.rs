@@ -54,6 +54,7 @@ fn default_idle_prompt(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Claude | AgentKind::Agy => "> ",
         AgentKind::Codex => "› ",
+        AgentKind::Shell => "$ ",
     }
 }
 
@@ -183,6 +184,7 @@ fn render_payload(
                     obj.insert("lastUserInput".into(), Value::String(inp.to_string()));
                 }
             }
+            AgentKind::Shell => {}
         }
         obj.insert("cwd".into(), Value::String(cwd.to_string()));
 

@@ -23,17 +23,26 @@ pub fn normalize_hook(
         AgentKind::Claude => normalize_claude(event_name, payload, env, recv_ts_ms),
         AgentKind::Codex => normalize_codex(event_name, payload, env, recv_ts_ms),
         AgentKind::Agy => normalize_agy(event_name, payload, env, recv_ts_ms),
+        AgentKind::Shell => Err(AdapterError::InvalidInput(
+            "shell panes do not emit hook events".into(),
+        )),
     }
 }
 
 /// Convenience wrapper normalizing an [`EmitRequest`].
 pub fn normalize_request(req: &EmitRequest) -> Result<NormalizedEvent, AdapterError> {
+    let field = match req.agent {
+        AgentKind::Agy => "hookEventName",
+        AgentKind::Claude | AgentKind::Codex => "hook_event_name",
+        AgentKind::Shell => {
+            return Err(AdapterError::InvalidInput(
+                "shell panes do not emit hook events".into(),
+            ))
+        }
+    };
     let event_name = req.event_name().ok_or(AdapterError::MissingField {
         agent: req.agent,
-        field: match req.agent {
-            AgentKind::Agy => "hookEventName",
-            AgentKind::Claude | AgentKind::Codex => "hook_event_name",
-        },
+        field,
     })?;
     normalize_hook(
         req.agent,

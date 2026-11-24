@@ -634,9 +634,9 @@ return tr.messages[tr.messages.length - 1]?.role === 'user';
 }
 function loadSessionOutput(s, { silent = false, forcePreview = false } = {}) {
 if (!s) return;
-loadTranscript(s.session_id, { silent });
+if (s.agent !== 'shell') loadTranscript(s.session_id, { silent });
 if (!s.pane) return;
-if (silent && !forcePreview && UI.outputMode !== 'raw') {
+if (silent && !forcePreview && s.agent !== 'shell' && UI.outputMode !== 'raw') {
 const tr = S.transcripts.get(s.session_id);
 const tailOpen = UI.open.has(`tail:${s.session_id}`) || Boolean($('details.live-tail')?.open);
 if (!sessionNeedsLiveTail(s, tr) && !tailOpen) {
@@ -958,6 +958,7 @@ if (Array.isArray(data?.sessions)) { S.tmuxSessions = data.sessions; schedule();
 } catch (e) { console.warn('GET /api/tmux/sessions failed', e); }
 }
 async function loadSlashCommands(agent) {
+if (agent === 'shell') return;
 const ag = AGENTS.includes(agent) ? agent : 'claude';
 if (S.slashCmds.has(ag) || S.slashFetching.has(ag)) return;
 S.slashFetching.add(ag);
@@ -2020,11 +2021,11 @@ return r;
 ta.addEventListener('input', () => {
 if (comp.sid) UI.drafts.set(`ws:msg:${comp.sid}`, ta.value);
 autoGrow(ta);
-updateSlashFromInput(ta, comp.agent);
+if (comp.agent !== 'shell') updateSlashFromInput(ta, comp.agent);
 });
-ta.addEventListener('click', () => updateSlashFromInput(ta, comp.agent));
+ta.addEventListener('click', () => { if (comp.agent !== 'shell') updateSlashFromInput(ta, comp.agent); });
 ta.addEventListener('keyup', (e) => {
-if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateSlashFromInput(ta, comp.agent);
+if (comp.agent !== 'shell' && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateSlashFromInput(ta, comp.agent);
 });
 ta.addEventListener('paste', (e) => {
 const cd = e.clipboardData;
@@ -2189,7 +2190,8 @@ W.sideCount.textContent = String(shown.length);
 if (document.activeElement !== W.sideSearch && W.sideSearch.value !== draft('ws:filter')) W.sideSearch.value = draft('ws:filter');
 W.sideShowEnded.checked = UI.showEnded;
 W.sideToggleSlot.replaceChildren(allGroupNames.length > 1 ? btn(allCollapsed ? '全部展开' : '全部收起', { cls: 'ghost xs', onclick: toggleAllGroups }) : '');
-W.sideChips.replaceChildren(...['', ...AGENTS].map((a) => h('button', {
+const filterAgents = (roots.some((s) => s.agent === 'shell') || UI.agentFilter === 'shell') ? [...AGENTS, 'shell'] : AGENTS;
+W.sideChips.replaceChildren(...['', ...filterAgents].map((a) => h('button', {
 type: 'button', class: `chip${UI.agentFilter === a ? ' on' : ''}`,
 onclick: () => { UI.agentFilter = a; schedule(); },
 }, a || '全部')));
@@ -2236,7 +2238,12 @@ const meLabel = modelEffortLabel(s.model, s.effort);
 const titleTip = [dir, s.tmux_target, s.pane, meLabel].filter(Boolean).join(' · ');
 const parent = s.is_subagent && s.parent_session_id ? S.sessions.get(s.parent_session_id) : null;
 const displayTitle = s.is_subagent ? subagentDisplayName(s) : sessionLabel(s);
-const viewToggle = h('div', { class: 'view-seg', role: 'tablist', 'aria-label': '显示模式' },
+const isShell = s.agent === 'shell';
+const effectiveMode = isShell ? 'raw' : UI.outputMode;
+const viewToggle = isShell
+? h('div', { class: 'view-seg', role: 'tablist', 'aria-label': '显示模式' },
+h('button', { type: 'button', role: 'tab', class: 'on', onclick: () => { if (s.pane) loadPreview(s.pane, { lines: pvLinesOf(s.pane), silent: false }); } }, '终端'))
+: h('div', { class: 'view-seg', role: 'tablist', 'aria-label': '显示模式' },
 h('button', { type: 'button', role: 'tab', class: UI.outputMode === 'reading' ? 'on' : '', onclick: () => { UI.outputMode = 'reading'; rerender(); } }, '阅读'),
 h('button', { type: 'button', role: 'tab', class: UI.outputMode === 'raw' ? 'on' : '', onclick: () => { UI.outputMode = 'raw'; if (s.pane) loadPreview(s.pane, { lines: pvLinesOf(s.pane), silent: true }); rerender(); } }, '终端'));
 W.headEl.replaceChildren(
@@ -2257,16 +2264,16 @@ s.parent_session_id ? btn('← 返回主会话', { cls: 'ghost xs', onclick: () 
 } else {
 W.crumbEl.classList.add('ws-hidden');
 }
-if (!S.transcripts.has(s.session_id)) loadTranscript(s.session_id, { silent: false });
+if (!isShell && !S.transcripts.has(s.session_id)) loadTranscript(s.session_id, { silent: false });
 if (s.pane && !S.previews.has(`${s.pane}:${pvLinesOf(s.pane)}`)) loadPreview(s.pane, { lines: pvLinesOf(s.pane), silent: false });
-loadSlashCommands(s.agent);
+if (!isShell) loadSlashCommands(s.agent);
 const built = buildOutputBody(s);
-const sameView = W.vp.dataset.sid === s.session_id && W.vp.dataset.mode === UI.outputMode;
+const sameView = W.vp.dataset.sid === s.session_id && W.vp.dataset.mode === effectiveMode;
 if (!sameView) {
 W.vp.dataset.sid = s.session_id;
-W.vp.dataset.mode = UI.outputMode;
+W.vp.dataset.mode = effectiveMode;
 W.vp.dataset.sig = built.sig;
-W.vp.className = `term-viewport${UI.outputMode === 'raw' ? ' raw-mode' : ''}`;
+W.vp.className = `term-viewport${effectiveMode === 'raw' ? ' raw-mode' : ''}`;
 W.vp.replaceChildren(built.node);
 W.vp.scrollTop = W.vp.scrollHeight;
 syncScrollLatestBtn(W.vp);
@@ -2274,9 +2281,9 @@ syncScrollLatestBtn(W.vp);
 const prevHeight = W.vp.scrollHeight;
 const atBottom = prevHeight - W.vp.scrollTop - W.vp.clientHeight < 44;
 const prevTop = W.vp.scrollTop;
-const expanding = UI.loadingEarlierSid === s.session_id && UI.outputMode === 'reading';
+const expanding = UI.loadingEarlierSid === s.session_id && effectiveMode === 'reading';
 W.vp.dataset.sig = built.sig;
-W.vp.className = `term-viewport${UI.outputMode === 'raw' ? ' raw-mode' : ''}`;
+W.vp.className = `term-viewport${effectiveMode === 'raw' ? ' raw-mode' : ''}`;
 W.vp.replaceChildren(built.node);
 if (expanding) {
 UI.loadingEarlierSid = null;
@@ -2286,11 +2293,11 @@ W.vp.scrollTop = atBottom ? W.vp.scrollHeight : prevTop;
 }
 syncScrollLatestBtn(W.vp);
 }
-const prompts = collectUserPrompts(s);
-const railSig = `${s.session_id}|${UI.outputMode}|${UI.outlineCollapsed}|${prompts.map((p) => `${p.idx}:${p.text}`).join('|')}`;
-if (W.railSig !== railSig || (!UI.outlineCollapsed && prompts.length > 0 && UI.outputMode === 'reading' && !W.rail?.isConnected)) {
+const prompts = isShell ? [] : collectUserPrompts(s);
+const railSig = `${s.session_id}|${effectiveMode}|${UI.outlineCollapsed}|${prompts.map((p) => `${p.idx}:${p.text}`).join('|')}`;
+if (W.railSig !== railSig || (!UI.outlineCollapsed && prompts.length > 0 && effectiveMode === 'reading' && !W.rail?.isConnected)) {
 W.railSig = railSig;
-const showReopen = UI.outputMode === 'reading' && prompts.length > 0 && UI.outlineCollapsed;
+const showReopen = effectiveMode === 'reading' && prompts.length > 0 && UI.outlineCollapsed;
 W.reopenBtn.classList.toggle('ws-hidden', !showReopen);
 if (showReopen) {
 W.reopenBtn.dataset.cnt = String(prompts.length);
@@ -2309,12 +2316,14 @@ C.readonlyHint.classList.remove('ws-hidden');
 } else {
 C.readonlyHint.classList.add('ws-hidden');
 }
+const effCompMode = isShell ? 'direct' : UI.composerMode;
 for (const b of C.modeBtns) {
-b.classList.toggle('on', b.dataset.mode === UI.composerMode);
+b.classList.toggle('ws-hidden', isShell && b.dataset.mode !== 'direct');
+b.classList.toggle('on', b.dataset.mode === effCompMode);
 b.disabled = !!readOnlyMsg;
 }
-C.modeHint.textContent = readOnlyMsg || (UI.composerMode === 'direct' ? '输入 / 唤出命令 · Cmd+Enter 发送' : '可选模板 · 留空使用默认配置');
-if (UI.composerMode === 'direct' || readOnlyMsg) {
+C.modeHint.textContent = readOnlyMsg || (isShell ? '发送终端命令或输入 · Cmd+Enter 执行' : (effCompMode === 'direct' ? '输入 / 唤出命令 · Cmd+Enter 发送' : '可选模板 · 留空使用默认配置'));
+if (effCompMode === 'direct' || readOnlyMsg) {
 C.directRow.classList.remove('ws-hidden');
 C.pipeSlot.classList.add('ws-hidden');
 if (C.sid !== s.session_id) {
@@ -2328,8 +2337,9 @@ autoGrow(C.ta);
 closeSlashMenu();
 } else {
 C.agent = s.agent;
+if (isShell) closeSlashMenu();
 }
-const ph = readOnlyMsg || `发消息给 ${sessionLabel(s)}…（输入 / 唤出命令，Cmd+Enter 发送）`;
+const ph = readOnlyMsg || (isShell ? `输入终端命令发送到 ${sessionLabel(s)}…（Cmd+Enter 执行）` : `发消息给 ${sessionLabel(s)}…（输入 / 唤出命令，Cmd+Enter 发送）`);
 if (C.ta.placeholder !== ph) C.ta.placeholder = ph;
 const sending = UI.busy.has(`send:${s.session_id}`);
 C.ta.disabled = !!readOnlyMsg;
@@ -2397,8 +2407,9 @@ h('span', { class: 'trunc grow' }, subagentDisplayName(c)),
 h('span', { class: 'dim', style: 'font-size:11px' }, stateText(c.state)))) : null);
 return h('div', { class: 'stack-xs', style: 'gap:2px' }, card, subTree);
 }
-const AGENT_DISPLAY = { claude: 'Claude', codex: 'Codex', agy: 'AGY' };
+const AGENT_DISPLAY = { claude: 'Claude', codex: 'Codex', agy: 'AGY', shell: 'Shell' };
 function collectUserPrompts(s) {
+if (!s || s.agent === 'shell') return [];
 const tr = S.transcripts.get(s.session_id);
 let msgs = [];
 if (tr?.state === 'ok' && tr.source === 'transcript' && tr.messages.length > 0) {
@@ -2533,7 +2544,7 @@ onclick: () => loadEarlierTranscript(s.session_id, 500),
 }) : null));
 }
 function buildOutputBody(s) {
-const mode = UI.outputMode;
+const mode = s.agent === 'shell' ? 'raw' : UI.outputMode;
 const pane = s.pane;
 const curPvLines = pane ? pvLinesOf(pane) : PREVIEW_LINES;
 const pvKey = pane ? `${pane}:${curPvLines}` : null;

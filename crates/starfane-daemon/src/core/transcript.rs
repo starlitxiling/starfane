@@ -104,6 +104,9 @@ impl Core {
                 .get(sid)
                 .cloned()
                 .ok_or_else(|| ApiError::not_found(format!("session {sid}")))?;
+            if session.agent.is_shell() {
+                return Ok(TranscriptResponse::none(None));
+            }
             let cached = session
                 .transcript_path
                 .as_deref()
@@ -328,6 +331,7 @@ pub(crate) fn resolve_transcript_path_in(home: &Path, session: &SessionRecord) -
             }
             resolve_codex_transcript_by_id_in(home, sid)
         }
+        AgentKind::Shell => None,
     }
 }
 
@@ -462,6 +466,7 @@ fn parse_transcript_for_agent_counted(
         AgentKind::Claude => parse_claude_jsonl(text),
         AgentKind::Codex => parse_codex_jsonl(text),
         AgentKind::Agy => parse_agy_jsonl(text),
+        AgentKind::Shell => Vec::new(),
     };
     let total = msgs.len();
     if msgs.len() > limit {

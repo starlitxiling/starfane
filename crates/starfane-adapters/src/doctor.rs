@@ -212,6 +212,7 @@ fn check_agent_hooks(agent: AgentKind, env: &DoctorEnv, findings: &mut Vec<Docto
             })
             .unwrap_or(false),
         AgentKind::Agy => val.get("starfane").is_some(),
+        AgentKind::Shell => false,
     };
 
     if installed {

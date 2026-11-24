@@ -223,7 +223,12 @@ pub(crate) fn reconcile_discovered_panes(
                     rec.git_root = dp.git_root.clone();
                     rec_changed = true;
                 }
-                if dp.model.is_some() && rec.model.is_none() {
+                if rec.agent == AgentKind::Shell {
+                    if rec.model != dp.model {
+                        rec.model = dp.model.clone();
+                        rec_changed = true;
+                    }
+                } else if dp.model.is_some() && rec.model.is_none() {
                     rec.model = dp.model.clone();
                     rec_changed = true;
                 }
@@ -455,6 +460,9 @@ pub(crate) fn apply_legacy_tail_hash(
                         rec.state = SessionState::Idle;
                         rec.state_since_ms = now_ms;
                         rec.last_event_ms = now_ms;
+                        if rec.agent.is_shell() {
+                            return Some((rec.clone(), None));
+                        }
                         let ev = NormalizedEvent {
                             v: PROTO_VERSION,
                             id: EventId::new(id::new_id(id::prefix::EVENT)),
@@ -561,10 +569,16 @@ impl Core {
     /// Scan tmux for existing agent panes, sync into `State`, and run heuristic completion checks.
     pub async fn sync_discovered_panes(&self) {
         let core = self.clone();
+        let include_shell_panes = core.inner.cfg.discovery.include_shell_panes;
         let scan = tokio::task::spawn_blocking(move || {
             let panes = core.inner.tmux.list_panes()?;
             let live_ids: HashSet<PaneId> = panes.iter().map(|p| p.pane_id.clone()).collect();
-            let discovered = core.inner.tmux.discover_agent_panes_from(&panes);
+            let discovered = core.inner.tmux.discover_panes_from(
+                &panes,
+                starfane_tmux::DiscoverOptions {
+                    include_shell_panes,
+                },
+            );
             Ok::<_, starfane_tmux::TmuxError>((discovered, live_ids))
         })
         .await;
@@ -1127,7 +1141,7 @@ impl Core {
             let live_roots: Vec<RootMetricsInput> = st
                 .sessions
                 .values()
-                .filter(|s| !s.is_subagent && s.state != SessionState::Ended)
+                .filter(|s| !s.is_subagent && !s.agent.is_shell() && s.state != SessionState::Ended)
                 .map(|s| RootMetricsInput {
                     sid: s.session_id.clone(),
                     agent: s.agent,
@@ -1409,6 +1423,11 @@ impl Core {
         prompt: Option<String>,
         name: Option<String>,
     ) -> Result<serde_json::Value, ApiError> {
+        if agent.is_shell() {
+            return Err(ApiError::bad_request(
+                "cannot spawn plain shell via coding-agent launcher",
+            ));
+        }
         let home_env = std::env::var_os("HOME").map(PathBuf::from);
         let cwd = self.resolve_spawn_cwd_in(home_env.as_deref(), project_root.as_deref())?;
 
@@ -1651,6 +1670,7 @@ fn build_bare_interactive_cmd(
             }
             argv.extend(effective_extra);
         }
+        AgentKind::Shell => {}
     }
     argv
 }
@@ -2205,5 +2225,57 @@ mod tests {
             next_sequential_window_name(&existing, AgentKind::Codex),
             "codex-1"
         );
+    }
+
+    #[test]
+    fn shell_panes_track_current_command_and_never_emit_turn_complete() {
+        let mut st = State::default();
+        let pane = PaneId::new("%22");
+        let live: HashSet<PaneId> = [pane.clone()].into_iter().collect();
+
+        // Discover plain shell pane (spot:0.0 running zsh).
+        let d1 = reconcile_discovered_panes(
+            &mut st,
+            &[mk_dp("%22", "spot:0.0", AgentKind::Shell, Some("zsh"))],
+            &live,
+            1_000,
+        );
+        assert!(d1.changed);
+        let sid = legacy_session_id(&pane);
+        assert_eq!(st.sessions[&sid].agent, AgentKind::Shell);
+        assert_eq!(st.sessions[&sid].model.as_deref(), Some("zsh"));
+
+        // Command change in shell updates model live.
+        let d2 = reconcile_discovered_panes(
+            &mut st,
+            &[mk_dp("%22", "spot:0.0", AgentKind::Shell, Some("python3"))],
+            &live,
+            2_000,
+        );
+        assert!(d2.changed);
+        assert_eq!(st.sessions[&sid].model.as_deref(), Some("python3"));
+
+        // Tail activity updates Working/Idle state without synthesizing TurnComplete events.
+        assert!(apply_legacy_tail_hash(&mut st, &sid, &pane, "initial\n", 3_000).is_none());
+        let tr_work = apply_legacy_tail_hash(&mut st, &sid, &pane, "running step 1\n", 4_000);
+        assert!(tr_work.is_some());
+        assert_eq!(st.sessions[&sid].state, SessionState::Working);
+        assert!(apply_legacy_tail_hash(&mut st, &sid, &pane, "running step 1\n", 5_000).is_none());
+        assert!(apply_legacy_tail_hash(&mut st, &sid, &pane, "running step 1\n", 6_000).is_none());
+        let (rec_idle, ev_opt) =
+            apply_legacy_tail_hash(&mut st, &sid, &pane, "running step 1\n", 7_000).unwrap();
+        assert_eq!(rec_idle.state, SessionState::Idle);
+        assert!(ev_opt.is_none());
+
+        // Upgrading pane from Shell to Codex cleanly replaces model/agent on the same pane record.
+        let d3 = reconcile_discovered_panes(
+            &mut st,
+            &[mk_dp("%22", "spot:0.0", AgentKind::Codex, Some("gpt-5"))],
+            &live,
+            8_000,
+        );
+        assert!(d3.changed);
+        assert_eq!(st.sessions[&sid].agent, AgentKind::Codex);
+        assert_eq!(st.sessions[&sid].model.as_deref(), Some("gpt-5"));
     }
 }

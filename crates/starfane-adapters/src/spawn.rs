@@ -51,12 +51,16 @@ pub const fn default_bypass_permission_flag(agent: AgentKind) -> &'static str {
         AgentKind::Claude => "--dangerously-skip-permissions",
         AgentKind::Codex => "--dangerously-bypass-approvals-and-sandbox",
         AgentKind::Agy => "--dangerously-skip-permissions",
+        AgentKind::Shell => "",
     }
 }
 
 /// Ensure `extra` includes the agent's default full-permission flag unless the caller or
 /// `.starfane/team.toml` already specified an explicit permission/sandbox flag.
 pub fn ensure_bypass_permission_arg(agent: AgentKind, extra: &mut Vec<String>) {
+    if agent.is_shell() {
+        return;
+    }
     let has_explicit = extra.iter().any(|arg| {
         let a = arg.trim();
         match agent {
@@ -82,6 +86,7 @@ pub fn ensure_bypass_permission_arg(agent: AgentKind, extra: &mut Vec<String>) {
                     || a.starts_with("--mode=")
                     || a == "--sandbox"
             }
+            AgentKind::Shell => true,
         }
     });
     if !has_explicit {
@@ -97,6 +102,11 @@ pub fn ensure_bypass_permission_arg(agent: AgentKind, extra: &mut Vec<String>) {
 ///
 /// Strictly interactive (never `-p` / `exec`).
 pub fn build_l4_spawn_cmd(req: &SpawnRequest) -> Result<Vec<String>, AdapterError> {
+    if req.agent.is_shell() {
+        return Err(AdapterError::InvalidInput(
+            "cannot spawn plain shell via coding-agent launcher".into(),
+        ));
+    }
     let prompt = req.prompt.trim();
     if prompt.is_empty() {
         return Err(AdapterError::InvalidInput(
@@ -175,6 +185,11 @@ pub fn build_l4_spawn_cmd(req: &SpawnRequest) -> Result<Vec<String>, AdapterErro
             argv.extend(req.extra_args.iter().cloned());
             argv.push("-i".into());
             argv.push(prompt.to_string());
+        }
+        AgentKind::Shell => {
+            return Err(AdapterError::InvalidInput(
+                "cannot spawn plain shell via coding-agent launcher".into(),
+            ));
         }
     }
 

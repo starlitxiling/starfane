@@ -11,9 +11,11 @@ pub enum AgentKind {
     Claude,
     Codex,
     Agy,
+    Shell,
 }
 
 impl AgentKind {
+    /// Hook-capable coding agents (excludes plain discovered shell panes).
     pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Agy];
 
     pub fn as_str(self) -> &'static str {
@@ -21,17 +23,32 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Agy => "agy",
+            AgentKind::Shell => "shell",
         }
     }
 
-    /// Case-insensitive parse of `claude` / `codex` / `agy`.
+    pub fn is_shell(self) -> bool {
+        self == AgentKind::Shell
+    }
+
+    pub fn is_coding_agent(self) -> bool {
+        !self.is_shell()
+    }
+
+    /// Case-insensitive parse of `claude` / `codex` / `agy` / `shell`.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Some(AgentKind::Claude),
             "codex" => Some(AgentKind::Codex),
             "agy" => Some(AgentKind::Agy),
+            "shell" => Some(AgentKind::Shell),
             _ => None,
         }
+    }
+
+    /// Case-insensitive parse accepting only hook-capable coding agents (`claude` / `codex` / `agy`).
+    pub fn parse_coding_agent(s: &str) -> Option<Self> {
+        Self::parse(s).filter(|a| a.is_coding_agent())
     }
 }
 
@@ -153,11 +170,21 @@ mod tests {
     #[test]
     fn agent_parse_and_serde() {
         assert_eq!(AgentKind::parse("CLAUDE"), Some(AgentKind::Claude));
+        assert_eq!(AgentKind::parse("SHELL"), Some(AgentKind::Shell));
+        assert_eq!(AgentKind::parse_coding_agent("shell"), None);
+        assert!(AgentKind::Shell.is_shell());
+        assert!(!AgentKind::Claude.is_shell());
+        assert_eq!(AgentKind::ALL.len(), 3);
         assert_eq!(AgentKind::parse("gpt"), None);
         assert_eq!(serde_json::to_string(&AgentKind::Agy).unwrap(), "\"agy\"");
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Shell).unwrap(),
+            "\"shell\""
+        );
         assert_eq!("codex".parse::<AgentKind>().unwrap(), AgentKind::Codex);
         for a in AgentKind::ALL {
             assert_eq!(AgentKind::parse(a.as_str()), Some(a));
+            assert_eq!(AgentKind::parse_coding_agent(a.as_str()), Some(a));
         }
     }
 

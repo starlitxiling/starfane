@@ -33,7 +33,7 @@ static SPOOL_SEQ: AtomicU64 = AtomicU64::new(0);
 pub fn hook_reply(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Agy => "{}\n",
-        AgentKind::Claude | AgentKind::Codex => "",
+        AgentKind::Claude | AgentKind::Codex | AgentKind::Shell => "",
     }
 }
 

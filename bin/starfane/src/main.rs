@@ -24,11 +24,11 @@ fn emit_main(args: &[String]) -> i32 {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--agent" => agent = it.next().and_then(|v| AgentKind::parse(v)),
+            "--agent" => agent = it.next().and_then(|v| AgentKind::parse_coding_agent(v)),
             "--event" => event = it.next().cloned(),
             other => {
                 if let Some(v) = other.strip_prefix("--agent=") {
-                    agent = AgentKind::parse(v);
+                    agent = AgentKind::parse_coding_agent(v);
                 } else if let Some(v) = other.strip_prefix("--event=") {
                     event = Some(v.to_string());
                 }

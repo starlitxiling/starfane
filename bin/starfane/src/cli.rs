@@ -254,7 +254,7 @@ pub fn run() -> i32 {
         Cmd::Uninstall(a) => install(&ctx, a, true),
         Cmd::Ls { all, project } => ls(&ctx, all, project),
         Cmd::Mcp { agent } => {
-            let agent = match AgentKind::parse(&agent) {
+            let agent = match AgentKind::parse_coding_agent(&agent) {
                 Some(a) => a,
                 None => return usage(&format!("unknown agent {agent}")),
             };
@@ -500,7 +500,9 @@ fn install(ctx: &Ctx, a: InstallArgs, uninstall: bool) -> R<()> {
     } else {
         a.agents
             .iter()
-            .map(|s| AgentKind::parse(s).ok_or_else(|| err(format!("unknown agent {s}"))))
+            .map(|s| {
+                AgentKind::parse_coding_agent(s).ok_or_else(|| err(format!("unknown agent {s}")))
+            })
             .collect::<R<_>>()?
     };
     let scope = match a.scope.as_str() {
@@ -1026,9 +1028,10 @@ fn review(ctx: &Ctx, cmd: ReviewCmd) -> R<()> {
         }
         ReviewCmd::Precision { agent } => {
             let agent = match agent {
-                Some(a) => {
-                    Some(AgentKind::parse(&a).ok_or_else(|| err(format!("unknown agent {a}")))?)
-                }
+                Some(a) => Some(
+                    AgentKind::parse_coding_agent(&a)
+                        .ok_or_else(|| err(format!("unknown agent {a}")))?,
+                ),
                 None => None,
             };
             c.call(DaemonCommand::GetPrecision { agent, model: None })?
