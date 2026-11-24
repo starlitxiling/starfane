@@ -81,6 +81,34 @@ enum Cmd {
         #[arg(long)]
         no_open: bool,
     },
+    /// Backup and restore tmux sessions, windows, split layouts, and agent sessions.
+    Tmux {
+        #[command(subcommand)]
+        cmd: TmuxCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TmuxCmd {
+    /// Capture a tmux layout snapshot (uses live daemon state if running, else inspects tmux directly).
+    Backup {
+        /// Write a snapshot even when layout/sessions match the latest saved snapshot.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Restore tmux sessions from the latest (or specified) snapshot without touching existing sessions.
+    Restore {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Recreate sessions/windows/panes without re-launching `claude` / `codex` resume commands.
+        #[arg(long)]
+        no_agents: bool,
+        /// Show what would be restored without creating any tmux sessions.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List saved tmux layout snapshots.
+    Backups,
 }
 
 #[derive(Debug, Args)]
@@ -265,6 +293,7 @@ pub fn run() -> i32 {
         Cmd::Debug(a) => debug(&ctx, a),
         Cmd::Review { cmd } => review(&ctx, cmd),
         Cmd::Web { print_url, no_open } => web(&ctx, print_url, no_open),
+        Cmd::Tmux { cmd } => tmux_cmd(&ctx, cmd),
     };
     match result {
         Ok(()) => 0,
@@ -429,21 +458,49 @@ fn doctor(ctx: &Ctx) -> R<()> {
         fix_hint: (!reachable).then(|| "starfane daemon --detach".to_string()),
     });
     match load_config() {
-        Ok(c) => findings.push(starfane_adapters::DoctorFinding {
-            id: "config".into(),
-            agent: None,
-            level: starfane_adapters::Level::Ok,
-            message: format!(
-                "config {} (web {}:{}, easytier {}, tailscale {}, feishu {})",
-                paths::config_path().display(),
-                c.web.bind,
-                c.web.port,
-                if c.web.allow_easytier { "on" } else { "off" },
-                if c.web.allow_tailscale { "on" } else { "off" },
-                if c.feishu.enabled { "on" } else { "off" }
-            ),
-            fix_hint: None,
-        }),
+        Ok(c) => {
+            findings.push(starfane_adapters::DoctorFinding {
+                id: "config".into(),
+                agent: None,
+                level: starfane_adapters::Level::Ok,
+                message: format!(
+                    "config {} (web {}:{}, easytier {}, tailscale {}, feishu {}, shell_panes {})",
+                    paths::config_path().display(),
+                    c.web.bind,
+                    c.web.port,
+                    if c.web.allow_easytier { "on" } else { "off" },
+                    if c.web.allow_tailscale { "on" } else { "off" },
+                    if c.feishu.enabled { "on" } else { "off" },
+                    if c.discovery.include_shell_panes {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                ),
+                fix_hint: None,
+            });
+            let backups =
+                starfane_tmux::list_snapshots(&paths::tmux_backups_dir()).unwrap_or_default();
+            findings.push(starfane_adapters::DoctorFinding {
+                id: "tmux.backup".into(),
+                agent: None,
+                level: starfane_adapters::Level::Ok,
+                message: format!(
+                    "tmux.backup {} (interval {}s, auto_restore {}, snapshots {})",
+                    if c.tmux.backup.enabled { "on" } else { "off" },
+                    c.tmux.backup.interval_secs,
+                    if c.tmux.backup.auto_restore_on_start {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    backups.len()
+                ),
+                fix_hint: (!c.tmux.backup.enabled).then(|| {
+                    "enable `[tmux.backup] enabled = true` in config.toml if desired".into()
+                }),
+            });
+        }
         Err(e) => findings.push(starfane_adapters::DoctorFinding {
             id: "config".into(),
             agent: None,
@@ -1144,4 +1201,238 @@ fn web(ctx: &Ctx, print_url: bool, no_open: bool) -> R<()> {
             .map_err(|e| err(format!("open browser: {e}")))?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// tmux backup / restore (daemon-preferred, offline-capable)
+// ---------------------------------------------------------------------------
+
+fn offline_tmux(cfg: &StarfaneConfig) -> starfane_tmux::Tmux {
+    starfane_tmux::Tmux::new(PathBuf::from(cfg.tmux_bin()), cfg.tmux_socket())
+}
+
+fn tmux_cmd(ctx: &Ctx, cmd: TmuxCmd) -> R<()> {
+    match cmd {
+        TmuxCmd::Backup { force } => {
+            if let Ok(mut c) = DaemonClient::connect(&ctx.socket, false) {
+                let v = c.call(DaemonCommand::TmuxBackup { force })?;
+                if ctx.json {
+                    print_json(&v);
+                } else {
+                    let out: starfane_tmux::BackupSaveOutcome = serde_json::from_value(v)
+                        .map_err(|e| err(format!("parse backup response: {e}")))?;
+                    print_backup_outcome(&out);
+                }
+                return Ok(());
+            }
+            let cfg = load_config()?;
+            let tmux = offline_tmux(&cfg);
+            let windows = tmux.list_windows().map_err(|e| err(e.to_string()))?;
+            let panes = tmux.list_panes().map_err(|e| err(e.to_string()))?;
+            let clients = tmux.list_clients().map_err(|e| err(e.to_string()))?;
+            let discovered = tmux.discover_panes_from(
+                &panes,
+                starfane_tmux::DiscoverOptions {
+                    include_shell_panes: false,
+                },
+            );
+            let mut hints = std::collections::HashMap::new();
+            for dp in discovered {
+                if !dp.pane_dead && !dp.agent.is_shell() {
+                    hints.insert(
+                        dp.pane_id,
+                        starfane_tmux::PaneAgentHint {
+                            agent: dp.agent,
+                            resume_id: dp.codex_resume_id,
+                            model: dp.model,
+                        },
+                    );
+                }
+            }
+            let snap = starfane_tmux::build_snapshot(
+                &windows,
+                &panes,
+                &clients,
+                &hints,
+                &cfg.tmux.backup.exclude_sessions,
+                now_ms_cli(),
+            );
+            let dir = paths::tmux_backups_dir();
+            let out = starfane_tmux::save_snapshot_to_dir(
+                &dir,
+                &snap,
+                cfg.tmux.backup.max_snapshots,
+                force,
+            )
+            .map_err(|e| err(format!("save snapshot: {e}")))?;
+            if ctx.json {
+                print_json(&serde_json::to_value(&out).unwrap_or_default());
+            } else {
+                print_backup_outcome(&out);
+            }
+            Ok(())
+        }
+        TmuxCmd::Restore {
+            file,
+            no_agents,
+            dry_run,
+        } => {
+            let restore_agents_override = no_agents.then_some(false);
+            if !no_agents && !dry_run {
+                if let Ok(mut c) = DaemonClient::connect(&ctx.socket, false) {
+                    let v = c.call(DaemonCommand::TmuxRestore {
+                        file: file.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                        restore_agents: restore_agents_override,
+                        dry_run,
+                    })?;
+                    if ctx.json {
+                        print_json(&v);
+                    } else {
+                        let rep: starfane_tmux::RestoreReport = serde_json::from_value(v)
+                            .map_err(|e| err(format!("parse restore response: {e}")))?;
+                        print_restore_report(&rep);
+                    }
+                    return Ok(());
+                }
+            }
+            let cfg = load_config()?;
+            let dir = paths::tmux_backups_dir();
+            let (snap_path, snap) = match file {
+                Some(p) => {
+                    let resolved = if p.is_absolute() || p.components().count() > 1 {
+                        p
+                    } else {
+                        dir.join(p)
+                    };
+                    let s = starfane_tmux::load_snapshot_file(&resolved)
+                        .map_err(|e| err(format!("load {}: {e}", resolved.display())))?;
+                    (resolved, s)
+                }
+                None => starfane_tmux::load_latest_snapshot(&dir)
+                    .map_err(|e| err(format!("load latest snapshot: {e}")))?
+                    .ok_or_else(|| {
+                        err(format!(
+                            "no tmux backup snapshot found under {}",
+                            dir.display()
+                        ))
+                    })?,
+            };
+            let tmux = offline_tmux(&cfg);
+            let opts = starfane_tmux::RestoreOptions {
+                restore_agents: restore_agents_override.unwrap_or(cfg.tmux.backup.restore_agents),
+                restore_bypass_permissions: cfg.tmux.backup.restore_bypass_permissions,
+                dry_run,
+                claude_bin: cfg.agent_bin(AgentKind::Claude),
+                codex_bin: cfg.agent_bin(AgentKind::Codex),
+            };
+            let mut rep = tmux
+                .restore_snapshot(&snap, &opts)
+                .map_err(|e| err(format!("restore tmux: {e}")))?;
+            rep.snapshot_path = Some(snap_path);
+            if ctx.json {
+                print_json(&serde_json::to_value(&rep).unwrap_or_default());
+            } else {
+                print_restore_report(&rep);
+            }
+            Ok(())
+        }
+        TmuxCmd::Backups => {
+            let dir = paths::tmux_backups_dir();
+            let list = starfane_tmux::list_snapshots(&dir)
+                .map_err(|e| err(format!("list snapshots: {e}")))?;
+            if ctx.json {
+                print_json(&serde_json::to_value(&list).unwrap_or_default());
+                return Ok(());
+            }
+            if list.is_empty() {
+                println!("no tmux snapshots under {}", dir.display());
+                return Ok(());
+            }
+            println!(
+                "{:<28} {:<15} {:<8} {:<8} {:<6} RESUMABLE",
+                "FILE", "CREATED_MS", "SESS", "WIN", "PANE"
+            );
+            for item in list {
+                println!(
+                    "{:<28} {:<15} {:<8} {:<8} {:<6} {}",
+                    item.file_name,
+                    item.created_ms,
+                    item.session_count,
+                    item.window_count,
+                    item.pane_count,
+                    item.resumable_agent_count
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn now_ms_cli() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn print_backup_outcome(out: &starfane_tmux::BackupSaveOutcome) {
+    if out.saved {
+        println!(
+            "saved snapshot {} (sessions={}, windows={}, panes={}, resumable_agents={})",
+            out.path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| out.latest_path.display().to_string()),
+            out.session_count,
+            out.window_count,
+            out.pane_count,
+            out.resumable_agent_count
+        );
+    } else {
+        println!(
+            "skipped snapshot ({}): sessions={}, windows={}, panes={}, resumable_agents={}",
+            out.skipped_reason.as_deref().unwrap_or("skipped"),
+            out.session_count,
+            out.window_count,
+            out.pane_count,
+            out.resumable_agent_count
+        );
+    }
+}
+
+fn print_restore_report(rep: &starfane_tmux::RestoreReport) {
+    println!(
+        "{}restore from {}:",
+        if rep.dry_run { "[dry-run] " } else { "" },
+        rep.snapshot_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "latest.json".into())
+    );
+    println!(
+        "  restored_sessions: {}",
+        if rep.restored_sessions.is_empty() {
+            "-".into()
+        } else {
+            rep.restored_sessions.join(", ")
+        }
+    );
+    if !rep.skipped_sessions.is_empty() {
+        println!("  skipped_sessions:  {}", rep.skipped_sessions.join(", "));
+    }
+    println!(
+        "  windows={}, panes={}, resumed_agents={}",
+        rep.restored_windows,
+        rep.restored_panes,
+        rep.resumed_agents.len()
+    );
+    for a in &rep.resumed_agents {
+        println!(
+            "    - {}:{} ({}) -> {}",
+            a.session_name, a.window_name, a.agent, a.command
+        );
+    }
+    for w in &rep.warnings {
+        println!("  ⚠ {w}");
+    }
 }

@@ -5,6 +5,7 @@
 //! [`resolve_pane`], [`validate_pointer_text`]) is separated from process I/O so it can be
 //! matrix-tested without a tmux server.
 
+mod backup;
 mod discover;
 mod error;
 mod exec;
@@ -12,6 +13,12 @@ mod gate;
 mod model;
 mod resolve;
 
+pub use backup::{
+    build_resume_command, build_snapshot, list_snapshots, load_latest_snapshot, load_snapshot_file,
+    save_snapshot_to_dir, shell_single_quote, validate_resume_id, BackupSaveOutcome, PaneAgentHint,
+    RestoreOptions, RestoreReport, ResumedAgentInfo, SavedPane, SavedSession, SavedWindow,
+    SnapshotSummary, TmuxBackupSnapshot, BACKUP_VERSION,
+};
 pub use discover::{
     capture_pane_tail, classify_panes, classify_panes_with, discover_agent_panes,
     trim_and_cap_tail, DiscoverOptions, DiscoveredPane, PanePreview, MAX_CAPTURE_BYTES,
@@ -23,8 +30,8 @@ pub use gate::{
     validate_interactive_text, validate_pointer_text, GateConfig,
 };
 pub use model::{
-    parse_client_line, parse_clients, parse_pane_line, parse_panes, ClientInfo, PaneInfo,
-    PaneStatus, FIELD_SEP,
+    parse_client_line, parse_clients, parse_pane_line, parse_panes, parse_window_line,
+    parse_windows, ClientInfo, PaneInfo, PaneStatus, WindowInfo, FIELD_SEP,
 };
 pub use resolve::{pid_ancestors, resolve_pane, PaneHint};
 
@@ -179,6 +186,15 @@ impl Tmux {
                 .filter(|l| !l.is_empty())
                 .map(str::to_string)
                 .collect()),
+            Err(e) if e.is_no_server() => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// All windows on the server with layout strings. A missing tmux server yields an empty list.
+    pub fn list_windows(&self) -> Result<Vec<WindowInfo>, TmuxError> {
+        match self.run(&["list-windows", "-a", "-F", model::WINDOW_FORMAT], None) {
+            Ok(out) => parse_windows(&out),
             Err(e) if e.is_no_server() => Ok(Vec::new()),
             Err(e) => Err(e),
         }

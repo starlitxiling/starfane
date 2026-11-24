@@ -14,6 +14,10 @@ pub(crate) const CLIENT_FORMAT: &str =
     "#{client_tty}\x1f#{client_session}\x1f#{client_activity}\x1f#{client_flags}";
 const CLIENT_FIELDS: usize = 4;
 
+pub(crate) const WINDOW_FORMAT: &str =
+    "#{session_name}\x1f#{window_index}\x1f#{window_name}\x1f#{window_layout}\x1f#{window_active}";
+const WINDOW_FIELDS: usize = 5;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PaneInfo {
     pub pane_id: PaneId,
@@ -55,6 +59,15 @@ pub struct ClientInfo {
     /// `client_activity`: Unix seconds of the client's last keyboard/mouse activity.
     pub activity_s: u64,
     pub flags: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WindowInfo {
+    pub session_name: String,
+    pub window_index: u32,
+    pub window_name: String,
+    pub window_layout: String,
+    pub window_active: bool,
 }
 
 /// Status written to pane user options by `Tmux::set_status`.
@@ -148,6 +161,31 @@ pub fn parse_clients(out: &str) -> Result<Vec<ClientInfo>, TmuxError> {
         .collect()
 }
 
+/// Parse a single `list-windows -a -F WINDOW_FORMAT` line.
+pub fn parse_window_line(line: &str) -> Result<WindowInfo, TmuxError> {
+    let f: Vec<&str> = line.split(FIELD_SEP).collect();
+    if f.len() != WINDOW_FIELDS {
+        return Err(TmuxError::Parse(format!(
+            "expected {WINDOW_FIELDS} fields, got {} in line {line:?}",
+            f.len()
+        )));
+    }
+    Ok(WindowInfo {
+        session_name: f[0].to_string(),
+        window_index: parse_num(f[1], "window_index", line)?,
+        window_name: f[2].to_string(),
+        window_layout: f[3].to_string(),
+        window_active: parse_flag(f[4], "window_active", line)?,
+    })
+}
+
+pub fn parse_windows(out: &str) -> Result<Vec<WindowInfo>, TmuxError> {
+    out.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(parse_window_line)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +194,20 @@ mod tests {
     fn pane_format_field_count_matches() {
         assert_eq!(PANE_FORMAT.split(FIELD_SEP).count(), PANE_FIELDS);
         assert_eq!(CLIENT_FORMAT.split(FIELD_SEP).count(), CLIENT_FIELDS);
+        assert_eq!(WINDOW_FORMAT.split(FIELD_SEP).count(), WINDOW_FIELDS);
+    }
+
+    #[test]
+    fn parses_window_line() {
+        let line = format!(
+            "learning{0}2{0}openkernel{0}bb62,212x54,0,0[212x27,0,0,1,212x26,0,28,2]{0}1",
+            FIELD_SEP
+        );
+        let w = parse_window_line(&line).unwrap();
+        assert_eq!(w.session_name, "learning");
+        assert_eq!(w.window_index, 2);
+        assert_eq!(w.window_name, "openkernel");
+        assert!(w.window_active);
+        assert!(w.window_layout.contains('['));
     }
 }

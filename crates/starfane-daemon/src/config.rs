@@ -161,11 +161,59 @@ pub struct PathsConfig {
     pub tmux: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TmuxBackupConfig {
+    /// Enable periodic tmux layout & agent-resume snapshots (`false` by default).
+    pub enabled: bool,
+    /// Snapshot check interval in seconds (default `300`, minimum `10` when enabled).
+    pub interval_secs: u64,
+    /// Rolling number of historical `snapshot-*.json` files retained (default `20`).
+    pub max_snapshots: usize,
+    /// Automatically restore `latest.json` at daemon startup when no tmux sessions exist.
+    pub auto_restore_on_start: bool,
+    /// Resume saved `claude` (`--resume`) and `codex` (`resume`) sessions after recreating panes.
+    pub restore_agents: bool,
+    /// Append bypass-permission flags when resuming `claude` / `codex` agents (`false` by default).
+    pub restore_bypass_permissions: bool,
+    /// Session names excluded from snapshots.
+    pub exclude_sessions: Vec<String>,
+}
+
+impl Default for TmuxBackupConfig {
+    fn default() -> Self {
+        TmuxBackupConfig {
+            enabled: false,
+            interval_secs: 300,
+            max_snapshots: 20,
+            auto_restore_on_start: false,
+            restore_agents: true,
+            restore_bypass_permissions: false,
+            exclude_sessions: Vec::new(),
+        }
+    }
+}
+
+impl TmuxBackupConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled {
+            if self.interval_secs < 10 {
+                return Err("tmux.backup.interval_secs must be >= 10 when enabled".into());
+            }
+            if self.max_snapshots < 1 {
+                return Err("tmux.backup.max_snapshots must be >= 1 when enabled".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TmuxConfig {
     /// `tmux -L <name>`; empty = default server.
     pub socket_name: String,
+    pub backup: TmuxBackupConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -195,6 +243,10 @@ impl StarfaneConfig {
                 let cfg: StarfaneConfig =
                     toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
                 cfg.web
+                    .validate()
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                cfg.tmux
+                    .backup
                     .validate()
                     .map_err(|e| format!("{}: {e}", path.display()))?;
                 Ok(cfg)
@@ -487,5 +539,36 @@ claude_args = ["--dangerously-skip-permissions"]
         assert_eq!(parse_duration_secs("2h"), Some(7200));
         assert_eq!(parse_duration_secs("15"), Some(15));
         assert_eq!(parse_duration_secs("x"), None);
+    }
+
+    #[test]
+    fn discovery_and_tmux_backup_config_validation() {
+        let def = StarfaneConfig::default();
+        assert!(!def.discovery.include_shell_panes);
+        assert!(!def.tmux.backup.enabled);
+        assert_eq!(def.tmux.backup.interval_secs, 300);
+        assert_eq!(def.tmux.backup.max_snapshots, 20);
+        assert!(!def.tmux.backup.auto_restore_on_start);
+        assert!(def.tmux.backup.restore_agents);
+        assert!(!def.tmux.backup.restore_bypass_permissions);
+
+        let dir = std::env::temp_dir().join("starfane-cfg-bk-test.toml");
+        std::fs::write(&dir, "[tmux.backup]\nenabled = true\ninterval_secs = 5\n").unwrap();
+        let err = StarfaneConfig::load(&dir).unwrap_err();
+        assert!(err.contains("interval_secs"), "{err}");
+
+        std::fs::write(
+            &dir,
+            "[discovery]\ninclude_shell_panes = true\n[tmux.backup]\nenabled = true\ninterval_secs = 60\nmax_snapshots = 10\nauto_restore_on_start = true\nexclude_sessions = [\"tmp\"]\n",
+        )
+        .unwrap();
+        let ok = StarfaneConfig::load(&dir).unwrap();
+        let _ = std::fs::remove_file(&dir);
+        assert!(ok.discovery.include_shell_panes);
+        assert!(ok.tmux.backup.enabled);
+        assert_eq!(ok.tmux.backup.interval_secs, 60);
+        assert_eq!(ok.tmux.backup.max_snapshots, 10);
+        assert!(ok.tmux.backup.auto_restore_on_start);
+        assert_eq!(ok.tmux.backup.exclude_sessions, vec!["tmp".to_string()]);
     }
 }

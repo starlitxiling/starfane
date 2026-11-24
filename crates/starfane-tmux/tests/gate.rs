@@ -12,7 +12,10 @@ use starfane_tmux::{
     Tmux, TmuxError, FIELD_SEP,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+static TEST_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const NOW: u64 = 1_000_000;
 
@@ -731,7 +734,8 @@ fn parse_clients_ok_and_bad() {
 // ---------------------------------------------------------------- no tmux server / binary
 
 fn unique_socket(tag: &str) -> String {
-    format!("starfane-test-{tag}-{}", std::process::id())
+    let seq = TEST_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("starfane-test-{tag}-{}-{seq}", std::process::id())
 }
 
 #[test]
@@ -809,11 +813,14 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Option<Sandbox> {
-        let tmux = Tmux::new(PathBuf::from("tmux"), Some(unique_socket("gate")));
+        let seq = TEST_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let socket = format!("starfane-test-gate-{}-{seq}", std::process::id());
+        let tmux = Tmux::new(PathBuf::from("tmux"), Some(socket));
         if !tmux.available() {
             return None;
         }
-        let dir = std::env::temp_dir().join(format!("starfane-tmux-gate-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("starfane-tmux-gate-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create sandbox dir");
         let dir = dir.canonicalize().expect("canonicalize sandbox dir");
         Some(Sandbox { tmux, dir })
@@ -1132,4 +1139,155 @@ fn sandbox_spawn_list_inject_status() {
         socket.list_panes().unwrap().is_empty(),
         "server must be gone after drop"
     );
+}
+
+#[test]
+#[ignore = "needs tmux; run with `cargo test -p starfane-tmux -- --ignored`"]
+fn sandbox_backup_and_restore_layout_idempotently() {
+    use starfane_tmux::{
+        build_snapshot, load_latest_snapshot, save_snapshot_to_dir, PaneAgentHint, RestoreOptions,
+    };
+    use std::collections::HashMap;
+
+    let Some(sb) = Sandbox::new() else {
+        panic!("tmux is required for this ignored test");
+    };
+    let dir_a = sb.dir.join("proj-a");
+    let dir_b = sb.dir.join("proj-b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+
+    // Session 1 (`work`): window 0 (`main`) with 2 split panes + window 1 (`agent`).
+    let p_w0 = sb
+        .tmux
+        .spawn_window(&SpawnWindow {
+            target_session: Some("work".into()),
+            create_session: true,
+            window_name: "main".into(),
+            cwd: dir_a.clone(),
+            env: vec![],
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        })
+        .unwrap();
+    let split_out = std::process::Command::new(&sb.tmux.bin)
+        .args([
+            "-L",
+            sb.tmux.socket_name.as_deref().unwrap(),
+            "split-window",
+            "-h",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            p_w0.as_str(),
+            "-c",
+            &dir_b.to_string_lossy(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ])
+        .output()
+        .unwrap();
+    assert!(split_out.status.success(), "{split_out:?}");
+
+    let p_w1 = sb
+        .tmux
+        .spawn_window(&SpawnWindow {
+            target_session: Some("work".into()),
+            create_session: false,
+            window_name: "agent".into(),
+            cwd: dir_b.clone(),
+            env: vec![],
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        })
+        .unwrap();
+
+    // Session 2 (`spot`): single window (`zsh`).
+    let _p_spot = sb
+        .tmux
+        .spawn_window(&SpawnWindow {
+            target_session: Some("spot".into()),
+            create_session: true,
+            window_name: "zsh".into(),
+            cwd: sb.dir.clone(),
+            env: vec![],
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        })
+        .unwrap();
+
+    let windows = sb.tmux.list_windows().unwrap();
+    let panes = sb.tmux.list_panes().unwrap();
+    assert_eq!(windows.len(), 3);
+    assert_eq!(panes.len(), 4);
+
+    let mut hints = HashMap::new();
+    hints.insert(
+        p_w1,
+        PaneAgentHint {
+            agent: AgentKind::Codex,
+            resume_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            model: Some("gpt-5".into()),
+        },
+    );
+    let snap = build_snapshot(&windows, &panes, &[], &hints, &[], 123_456);
+    let backup_dir = sb.dir.join("tmux-backups");
+    let save_out = save_snapshot_to_dir(&backup_dir, &snap, 5, false).unwrap();
+    assert!(save_out.saved);
+
+    // Simulate reboot: kill the entire sandbox tmux server.
+    sb.tmux.kill_server().unwrap();
+    assert!(sb.tmux.list_sessions().unwrap().is_empty());
+
+    let (_, loaded) = load_latest_snapshot(&backup_dir).unwrap().unwrap();
+    let opts_dry = RestoreOptions {
+        restore_agents: true,
+        restore_bypass_permissions: false,
+        dry_run: true,
+        claude_bin: "claude".into(),
+        codex_bin: "echo codex-dry".into(),
+    };
+    let dry_rep = sb.tmux.restore_snapshot(&loaded, &opts_dry).unwrap();
+    assert!(dry_rep.dry_run);
+    assert_eq!(dry_rep.restored_sessions, vec!["spot", "work"]);
+    assert_eq!(dry_rep.restored_windows, 3);
+    assert_eq!(dry_rep.restored_panes, 4);
+    assert_eq!(dry_rep.resumed_agents.len(), 1);
+    assert!(
+        sb.tmux.list_sessions().unwrap().is_empty(),
+        "dry_run must not start tmux server"
+    );
+
+    // Real restore (without running external codex CLI in sandbox: disable agent resume on first assert,
+    // or use a harmless no-op command — wait: test `echo` via `codex_bin = "/bin/echo"`).
+    let opts_real = RestoreOptions {
+        restore_agents: true,
+        restore_bypass_permissions: false,
+        dry_run: false,
+        claude_bin: "/bin/echo".into(),
+        codex_bin: "/bin/echo".into(),
+    };
+    let rep = sb.tmux.restore_snapshot(&loaded, &opts_real).unwrap();
+    assert!(!rep.dry_run);
+    assert_eq!(rep.restored_sessions, vec!["spot", "work"]);
+    assert!(rep.skipped_sessions.is_empty());
+    assert_eq!(rep.restored_windows, 3);
+    assert_eq!(rep.restored_panes, 4);
+    assert_eq!(rep.resumed_agents.len(), 1);
+    assert!(rep.warnings.is_empty(), "warnings: {:?}", rep.warnings);
+
+    let restored_sessions = sb.tmux.list_sessions().unwrap();
+    assert_eq!(restored_sessions, vec!["spot", "work"]);
+    let restored_windows = sb.tmux.list_windows().unwrap();
+    let restored_panes = sb.tmux.list_panes().unwrap();
+    assert_eq!(restored_windows.len(), 3);
+    assert_eq!(restored_panes.len(), 4);
+
+    // Idempotent second restore skips both existing sessions without duplicating anything.
+    let rep2 = sb.tmux.restore_snapshot(&loaded, &opts_real).unwrap();
+    assert!(rep2.restored_sessions.is_empty());
+    assert_eq!(rep2.skipped_sessions, vec!["spot", "work"]);
+    assert_eq!(rep2.restored_windows, 0);
+    assert_eq!(rep2.restored_panes, 0);
 }

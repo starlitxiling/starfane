@@ -178,6 +178,22 @@ pub enum DaemonCommand {
     },
     /// -> `{"message_id": String}`
     FeishuTest { text: String },
+    /// -> `BackupSaveOutcome`
+    TmuxBackup {
+        #[serde(default)]
+        force: bool,
+    },
+    /// -> `RestoreReport`
+    TmuxRestore {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_agents: Option<bool>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// -> `Vec<SnapshotSummary>`
+    ListTmuxBackups,
     /// -> `{}`
     Shutdown,
 }
@@ -212,6 +228,9 @@ impl DaemonCommand {
             DaemonCommand::GetPrecision { .. } => "get_precision",
             DaemonCommand::Dispatch { .. } => "dispatch",
             DaemonCommand::FeishuTest { .. } => "feishu_test",
+            DaemonCommand::TmuxBackup { .. } => "tmux_backup",
+            DaemonCommand::TmuxRestore { .. } => "tmux_restore",
+            DaemonCommand::ListTmuxBackups => "list_tmux_backups",
             DaemonCommand::Shutdown => "shutdown",
         }
     }

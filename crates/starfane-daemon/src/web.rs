@@ -66,6 +66,9 @@ pub fn router(core: Core) -> Router {
         .route("/api/events", get(events))
         .route("/api/sessions", get(sessions))
         .route("/api/tmux/sessions", get(tmux_sessions))
+        .route("/api/tmux/backup", post(tmux_backup))
+        .route("/api/tmux/restore", post(tmux_restore))
+        .route("/api/tmux/backups", get(tmux_backups))
         .route("/api/sessions/spawn", post(spawn_session))
         .route("/api/sessions/{id}/focus", post(focus))
         .route("/api/sessions/{id}/ack", post(ack_session))
@@ -572,6 +575,52 @@ async fn tmux_sessions(State(core): State<Core>) -> Response {
         .list_tmux_sessions()
         .await
         .map(|sessions| serde_json::json!({ "sessions": sessions }));
+    respond(r)
+}
+
+#[derive(Deserialize, Default)]
+struct TmuxBackupBody {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn tmux_backup(State(core): State<Core>, body: Bytes) -> Response {
+    let r = async {
+        let b: TmuxBackupBody = parse_body(&body)?;
+        core.backup_tmux(b.force)
+            .await
+            .and_then(|o| serde_json::to_value(o).map_err(|e| ApiError::internal(e.to_string())))
+    };
+    respond(r.await)
+}
+
+#[derive(Deserialize, Default)]
+struct TmuxRestoreBody {
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    restore_agents: Option<bool>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn tmux_restore(State(core): State<Core>, body: Bytes) -> Response {
+    let r = async {
+        let b: TmuxRestoreBody = parse_body(&body)?;
+        core.restore_tmux(b.file, b.restore_agents, b.dry_run)
+            .await
+            .and_then(|rep| {
+                serde_json::to_value(rep).map_err(|e| ApiError::internal(e.to_string()))
+            })
+    };
+    respond(r.await)
+}
+
+async fn tmux_backups(State(core): State<Core>) -> Response {
+    let r = core.list_tmux_backups().await.and_then(|backups| {
+        serde_json::to_value(serde_json::json!({ "backups": backups }))
+            .map_err(|e| ApiError::internal(e.to_string()))
+    });
     respond(r)
 }
 

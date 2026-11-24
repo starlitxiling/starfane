@@ -97,6 +97,7 @@ fn is_idempotent_read(cmd: &DaemonCommand) -> bool {
             | DaemonCommand::GetReview { .. }
             | DaemonCommand::ListReviews { .. }
             | DaemonCommand::GetPrecision { .. }
+            | DaemonCommand::ListTmuxBackups
     )
 }
 

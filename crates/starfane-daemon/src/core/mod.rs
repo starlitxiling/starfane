@@ -1,5 +1,6 @@
 //! `Core`: shared daemon state + command dispatch (contracts §7).
 
+mod backup;
 mod delivery;
 pub(crate) mod discover;
 mod engine;
@@ -829,6 +830,16 @@ impl Core {
                 .await
                 .and_then(to_json),
             C::FeishuTest { text } => self.feishu_test(&text).await,
+            C::TmuxBackup { force } => self.backup_tmux(force).await.and_then(to_json),
+            C::TmuxRestore {
+                file,
+                restore_agents,
+                dry_run,
+            } => self
+                .restore_tmux(file, restore_agents, dry_run)
+                .await
+                .and_then(to_json),
+            C::ListTmuxBackups => self.list_tmux_backups().await.and_then(to_json),
             C::Shutdown => {
                 self.request_shutdown();
                 Ok(serde_json::json!({}))
@@ -985,6 +996,10 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         core.config().web.port
     );
 
+    // Startup auto-restore MUST run before initial scan or periodic backup so an empty tmux
+    // server after reboot never overwrites `latest.json`.
+    core.maybe_auto_restore_on_start().await;
+
     // Immediate initial scan so already-running tmux panes are visible on the first request.
     core.sync_discovered_panes().await;
 
@@ -998,6 +1013,29 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         });
     }
     tokio::spawn(crate::lark::run(core.clone()));
+    if core.config().tmux.backup.enabled {
+        let c = core.clone();
+        let secs = core.config().tmux.backup.interval_secs.max(10);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(secs));
+            loop {
+                tick.tick().await;
+                match c.backup_tmux(false).await {
+                    Ok(out) if out.saved => {
+                        log::info!(
+                            "tmux backup saved: sessions={} windows={} panes={} resumable={}",
+                            out.session_count,
+                            out.window_count,
+                            out.pane_count,
+                            out.resumable_agent_count
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("tmux backup failed: {}", e.message),
+                }
+            }
+        });
+    }
     {
         let c = core.clone();
         tokio::spawn(async move {
@@ -1046,6 +1084,11 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
     }
     core.mark_dirty();
     core.flush_snapshot();
+    if core.config().tmux.backup.enabled {
+        if let Err(e) = core.backup_tmux(false).await {
+            log::warn!("shutdown tmux backup failed: {}", e.message);
+        }
+    }
     for p in [&cfg.socket, &pid_path] {
         if let Err(e) = std::fs::remove_file(p) {
             log::warn!("cleanup {}: {e}", p.display());

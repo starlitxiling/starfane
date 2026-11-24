@@ -84,6 +84,10 @@ pub fn snapshot_path() -> PathBuf {
 pub fn backups_dir() -> PathBuf {
     state_dir().join("backups")
 }
+/// `<state>/tmux-backups/` — periodic tmux session/layout backups.
+pub fn tmux_backups_dir() -> PathBuf {
+    state_dir().join("tmux-backups")
+}
 /// `<state>/bind/` — pending L4 spawn bind tokens.
 pub fn bind_dir() -> PathBuf {
     state_dir().join("bind")

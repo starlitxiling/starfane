@@ -14,6 +14,7 @@ starfane-adapters.workspace = true
 starfane-daemon.workspace = true
 starfane-emit.workspace = true
 starfane-proto.workspace = true
+starfane-tmux.workspace = true
 clap.workspace = true
 log.workspace = true
 serde_json.workspace = true
