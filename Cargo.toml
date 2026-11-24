@@ -5,6 +5,7 @@ members = [
     "crates/baton-emit",
     "crates/baton-adapters",
     "crates/baton-tmux",
+    "crates/baton-evidence",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ baton-proto = { path = "crates/baton-proto" }
 baton-emit = { path = "crates/baton-emit" }
 baton-adapters = { path = "crates/baton-adapters" }
 baton-tmux = { path = "crates/baton-tmux" }
+baton-evidence = { path = "crates/baton-evidence" }
 
 # Minimal external dependencies (default-features = false everywhere)
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
