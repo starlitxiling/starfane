@@ -954,4 +954,73 @@ claude_args = ["--dangerously-skip-permissions"]
         assert!(ok.tmux.backup.auto_restore_on_start);
         assert_eq!(ok.tmux.backup.exclude_sessions, vec!["tmp".to_string()]);
     }
+
+    #[test]
+    fn readme_toml_config_examples_parse_and_validate() {
+        fn extract_first_toml_block(md: &str) -> String {
+            let start = md.find("```toml\n").expect("```toml fence in README") + "```toml\n".len();
+            let rest = &md[start..];
+            let end = rest.find("```").expect("closing fence in README");
+            rest[..end].to_string()
+        }
+
+        fn uncomment_examples(block: &str) -> String {
+            block
+                .lines()
+                .map(|line| {
+                    if let Some(rest) = line.strip_prefix("# ") {
+                        let t = rest.trim_start();
+                        if t.starts_with('[')
+                            || t.split_once('=').is_some_and(|(k, _)| {
+                                let k = k.trim();
+                                !k.is_empty()
+                                    && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                            })
+                        {
+                            return rest;
+                        }
+                    }
+                    line
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        for (name, md) in [
+            ("README.md", include_str!("../../../README.md")),
+            ("README.zh-CN.md", include_str!("../../../README.zh-CN.md")),
+        ] {
+            let active = extract_first_toml_block(md);
+            let cfg_active: StarfaneConfig =
+                toml::from_str(&active).unwrap_or_else(|e| panic!("{name} active TOML: {e}"));
+            cfg_active
+                .validate()
+                .unwrap_or_else(|e| panic!("{name} active validate: {e}"));
+            assert!(cfg_active.zellij.enabled, "{name} zellij default enabled");
+            assert!(
+                cfg_active.notifiers.is_empty(),
+                "{name} fresh config has zero active notifiers"
+            );
+
+            let full = uncomment_examples(&active);
+            let cfg_full: StarfaneConfig =
+                toml::from_str(&full).unwrap_or_else(|e| panic!("{name} full TOML: {e}\n{full}"));
+            cfg_full
+                .validate()
+                .unwrap_or_else(|e| panic!("{name} full validate: {e}"));
+            assert_eq!(cfg_full.web.scoped_tokens.len(), 1, "{name} scoped_tokens");
+            assert!(cfg_full.web.scoped_tokens[0].read_only);
+            assert_eq!(cfg_full.notifiers.len(), 2, "{name} notifiers");
+            assert_eq!(cfg_full.notify_routes.len(), 1, "{name} notify_routes");
+            assert_eq!(cfg_full.nodes.len(), 2, "{name} nodes");
+            assert_eq!(cfg_full.nodes[0].kind, NodeKindConfig::Ssh);
+            assert_eq!(cfg_full.nodes[1].kind, NodeKindConfig::Peer);
+            assert_eq!(cfg_full.nodes[1].endpoints.len(), 2);
+        }
+
+        // Verify documented `.starfane/team.toml` `[notify]` example parses cleanly.
+        let team = TeamConfig::parse("[notify]\nnotifiers = [\"feishu-work\"]\n").unwrap();
+        assert_eq!(team.notify_routes.len(), 1);
+        assert_eq!(team.notify_routes[0].notifiers, vec!["feishu-work"]);
+    }
 }

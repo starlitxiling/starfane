@@ -551,3 +551,195 @@ async fn live_peer_dispatch_preserves_delivery_report_delivered_and_blocked() {
     mock_peer.await.unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn peer_session_count_excludes_subagents_and_ended_and_preserves_404_semantics() {
+    let root = mk_dir("peer-404");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+
+    // Serve 3 requests:
+    // 1. GET /api/state -> 1 live root + 1 subagent + 1 ended root (live root count MUST be 1, not 3)
+    // 2. GET /api/sessions/gone-s/transcript -> 404 NotFound
+    // 3. GET /api/panes/%2599/preview -> 404 NotFound
+    let mock_peer = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            let (status, body) = if first_line.starts_with("GET /api/state ") {
+                (
+                    "200 OK",
+                    json!({
+                        "ok": true,
+                        "data": {
+                            "sessions": [
+                                { "session_id": "gone-s", "agent": "claude", "pane": "%99", "state": "idle" },
+                                { "session_id": "gone-s/sub1", "agent": "claude", "parent_session_id": "gone-s", "is_subagent": true, "state": "working" },
+                                { "session_id": "old-ended", "agent": "codex", "state": "ended" }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    "404 Not Found",
+                    json!({
+                        "ok": false,
+                        "error": { "code": "not_found", "message": "not found on peer" }
+                    })
+                    .to_string(),
+                )
+            };
+            let http = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(http.as_bytes()).await.unwrap();
+        }
+    });
+
+    let mut hub_cfg = StarfaneConfig {
+        nodes: vec![NodeConfig {
+            id: "peer404".into(),
+            kind: NodeKindConfig::Peer,
+            enabled: true,
+            endpoints: vec![format!("http://{peer_addr}")],
+            ..NodeConfig::default()
+        }],
+        ..StarfaneConfig::default()
+    };
+    hub_cfg.paths.tmux = "/usr/bin/false".into();
+    hub_cfg.zellij.enabled = false;
+    let hub = Core::new(&DaemonConfig {
+        state_dir: root.join("state"),
+        socket: root.join("state/starfaned.sock"),
+        config: hub_cfg,
+        web_dir: None,
+        foreground: true,
+    })
+    .unwrap();
+
+    let mut sse_rx = hub.subscribe();
+    hub.sync_remote_nodes().await;
+    let mut sse_host_count = None;
+    while let Ok(ev) = sse_rx.try_recv() {
+        if let starfane_proto::DaemonEvent::Host { host, .. } = ev {
+            if host.id.as_str() == "peer404" {
+                sse_host_count = Some(host.session_count);
+            }
+        }
+    }
+    assert_eq!(
+        sse_host_count,
+        Some(1),
+        "Peer sync Host event must exclude subagents and Ended sessions"
+    );
+
+    // Peer 404 on transcript must map to NotFound -> clean TranscriptResponse::none (not 500)!
+    let tr = hub
+        .session_transcript(
+            &starfane_proto::SessionId::new("peer404:gone-s"),
+            TranscriptQuery::tail(20),
+        )
+        .await
+        .expect("Peer 404 transcript must degrade to source=none instead of 500");
+    assert_eq!(tr.source, "none");
+    assert!(tr.messages.is_empty());
+
+    // Peer 404 on pane preview must preserve ErrorCode::NotFound (not ErrorCode::Internal)!
+    let pv_err = hub
+        .capture_pane(
+            &starfane_proto::PaneId::new("peer404:%99"),
+            starfane_tmux::CaptureRequest::tail(20),
+        )
+        .await
+        .expect_err("Peer 404 preview should return Err");
+    assert_eq!(pv_err.code, starfane_proto::ErrorCode::NotFound);
+
+    mock_peer.await.unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn test_notifier_routes_pluggable_feishu_default_when_legacy_feishu_disabled() {
+    use starfane_daemon::config::{NotifierConfig, NotifierKind};
+    let root = mk_dir("notifier-test");
+
+    // Loopback webhook receiver representing a pluggable notifier registered with id "feishu-default".
+    let hook_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook_addr = hook_listener.local_addr().unwrap();
+    let hook_srv = tokio::spawn(async move {
+        let (mut sock, _) = hook_listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await;
+        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"sent\":true}";
+        sock.write_all(resp.as_bytes()).await.unwrap();
+    });
+
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+
+    let mut cfg = StarfaneConfig {
+        web: WebConfig {
+            bind: "127.0.0.1".into(),
+            port: api_addr.port(),
+            auth_enabled: false,
+            ..WebConfig::default()
+        },
+        notifiers: vec![NotifierConfig {
+            id: "feishu-default".into(),
+            kind: NotifierKind::Webhook,
+            enabled: true,
+            url: format!("http://{hook_addr}/hook"),
+            ..NotifierConfig::default()
+        }],
+        ..StarfaneConfig::default()
+    };
+    cfg.feishu.enabled = false;
+    cfg.paths.tmux = "/usr/bin/false".into();
+    cfg.zellij.enabled = false;
+
+    let core = Core::new(&DaemonConfig {
+        state_dir: root.join("state"),
+        socket: root.join("state/starfaned.sock"),
+        config: cfg,
+        web_dir: None,
+        foreground: true,
+    })
+    .unwrap();
+    let app = starfane_daemon::web::router(core);
+    let srv = tokio::spawn(async move {
+        let _ = axum::serve(
+            api_listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
+    });
+
+    let payload = r#"{"text":"ping"}"#;
+    let (st, _, body) = raw_http(
+        api_addr,
+        &format!(
+            "POST /api/notifiers/feishu-default/test HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            api_addr.port(),
+            api_addr.port(),
+            payload.len(),
+            payload
+        ),
+    )
+    .await;
+    assert_eq!(
+        st, 200,
+        "pluggable feishu-default must not 503 when legacy [feishu] is disabled: {body}"
+    );
+    assert!(body.contains(r#"\"sent\":true"#) || body.contains("sent"));
+
+    hook_srv.await.unwrap();
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}

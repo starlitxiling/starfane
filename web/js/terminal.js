@@ -6,7 +6,23 @@ import { APP, S, UI } from './store.js';
 
 let cachedNerdSupport = null;
 let userFontProbed = false;
+let userFontLoaded = false;
 let fontsReadyBound = false;
+
+function formatFontFamilyToken(raw) {
+  const clean = String(raw || '').trim();
+  if (!clean) return '';
+  return clean.includes(',') || clean.startsWith('"') || clean.startsWith("'") ? clean : `"${clean}"`;
+}
+
+function syncTermMonoCss() {
+  const parts = [];
+  const configured = formatFontFamilyToken(S.terminalFont);
+  if (configured) parts.push(configured);
+  if (userFontLoaded) parts.push('"StarfaneUserTermFont"');
+  parts.push('var(--term-mono-base)');
+  document.documentElement.style.setProperty('--term-mono', parts.join(', '));
+}
 
 function bindFontsReadyReprobe() {
   if (fontsReadyBound || typeof document === 'undefined' || !document.fonts) return;
@@ -42,8 +58,7 @@ export function applyTerminalFontConfig(fontFamily, hasUserFont = false) {
   const clean = String(fontFamily || '').trim();
   if (clean && S.terminalFont !== clean) {
     S.terminalFont = clean;
-    const quoted = clean.includes(',') || clean.startsWith('"') || clean.startsWith("'") ? clean : `"${clean}"`;
-    document.documentElement.style.setProperty('--term-mono', `${quoted}, var(--term-mono-base)`);
+    syncTermMonoCss();
     cachedNerdSupport = null;
   }
   if (hasUserFont && !userFontProbed && typeof FontFace !== 'undefined') {
@@ -52,10 +67,8 @@ export function applyTerminalFontConfig(fontFamily, hasUserFont = false) {
     face.load()
       .then((loaded) => {
         document.fonts.add(loaded);
-        const cur = S.terminalFont
-          ? `${S.terminalFont.includes(',') || S.terminalFont.startsWith('"') ? S.terminalFont : `"${S.terminalFont}"`}, `
-          : '';
-        document.documentElement.style.setProperty('--term-mono', `${cur}"StarfaneUserTermFont", var(--term-mono-base)`);
+        userFontLoaded = true;
+        syncTermMonoCss();
         cachedNerdSupport = null;
         APP.schedule();
       })

@@ -386,9 +386,26 @@ fn daemon(_ctx: &Ctx, a: DaemonArgs) -> R<()> {
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(log)
-            .stderr(log2)
-            .spawn()
-            .map_err(|e| err(format!("spawn daemon: {e}")))?;
+            .stderr(log2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            extern "C" {
+                fn setsid() -> std::ffi::c_int;
+            }
+            // Start a fresh POSIX session detached from the caller's controlling TTY so closing
+            // the launching shell never sends SIGHUP to `starfaned` or its child processes (e.g. `lark-cli`).
+            // SAFETY: `setsid()` is async-signal-safe per POSIX.1-2008.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        cmd.spawn().map_err(|e| err(format!("spawn daemon: {e}")))?;
         return Ok(());
     }
     crate::logger::init();

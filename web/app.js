@@ -141,11 +141,18 @@ function openSession(id) {
 }
 
 function route() {
-  let [v, a] = (location.hash.replace(/^#\/?/, '') || 'workspace').split('/');
+  const raw = location.hash.replace(/^#\/?/, '') || 'workspace';
+  const slash = raw.indexOf('/');
+  let v = slash === -1 ? raw : raw.slice(0, slash);
+  const a = slash === -1 ? '' : raw.slice(slash + 1);
   if (v === 'sessions') v = 'workspace';
   if (v === 'debug') { v = 'pipelines'; UI.pipeFilter = 'debug'; }
   UI.view = VIEWS.includes(v) ? v : 'workspace';
-  UI.arg = a ? decodeURIComponent(a) : null;
+  if (a) {
+    try { UI.arg = decodeURIComponent(a); } catch { UI.arg = a; }
+  } else {
+    UI.arg = null;
+  }
   if (UI.view === 'workspace' && UI.arg && S.sessions.has(UI.arg)) UI.selSession = UI.arg;
   if (UI.view === 'reviews') {
     if (S.reviewsState === 'idle' || S.reviewsState === 'err') loadReviews();

@@ -1322,17 +1322,16 @@ async fn list_notifiers(State(core): State<Core>) -> Response {
 async fn test_notifier(State(core): State<Core>, Path(id): Path<String>, body: Bytes) -> Response {
     let r = async {
         let b: TextBody = parse_body(&body)?;
+        if let Some(notifier) = core.notify_router().get(&id) {
+            let res = notifier.send_test(&b.text).await?;
+            return Ok(serde_json::json!({ "id": id, "result": res }));
+        }
         if id == crate::notify::DEFAULT_FEISHU_NOTIFIER_ID {
             return core
                 .handle(DaemonCommand::FeishuTest { text: b.text })
                 .await;
         }
-        let notifier = core
-            .notify_router()
-            .get(&id)
-            .ok_or_else(|| ApiError::not_found(format!("unknown notifier {id}")))?;
-        let res = notifier.send_test(&b.text).await?;
-        Ok(serde_json::json!({ "id": id, "result": res }))
+        Err(ApiError::not_found(format!("unknown notifier {id}")))
     };
     respond(r.await)
 }

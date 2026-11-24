@@ -468,7 +468,10 @@ impl NodeProvider for SshMuxNodeProvider {
             let now = id::now_ms();
             let sessions =
                 parse_ssh_compound_output(&host_id, &display, &out.stdout, include_shell, now)?;
-            let count = sessions.len();
+            let count = sessions
+                .iter()
+                .filter(|s| !s.is_subagent && s.state != SessionState::Ended)
+                .count();
             Ok(NodeSnapshot {
                 host: HostRecord {
                     id: host_id,
@@ -685,17 +688,21 @@ impl PeerDaemonNodeProvider {
     }
 
     /// Execute an HTTP request across multi-candidate outbound endpoints with sticky failover.
+    /// Transport errors and 5xx responses fail over to the next candidate; authoritative 4xx
+    /// application responses (400/404/409/422) from a live peer are returned immediately.
     async fn request_json(
         &self,
         method: &str,
         path_and_query: &str,
         body: Option<&serde_json::Value>,
-    ) -> Result<(String, serde_json::Value), String> {
+    ) -> Result<(String, serde_json::Value), PeerHttpError> {
         let candidates = self.ordered_candidates();
         if candidates.is_empty() {
-            return Err("no peer endpoints configured".into());
+            return Err(PeerHttpError::Transport(
+                "no peer endpoints configured".into(),
+            ));
         }
-        let mut last_err = String::new();
+        let mut last_err = PeerHttpError::Transport("no peer endpoints tried".into());
         for (idx, base) in candidates {
             let url = format!("{base}{path_and_query}");
             match http_request_json(method, &url, self.token.as_deref(), body).await {
@@ -706,8 +713,17 @@ impl PeerDaemonNodeProvider {
                         .unwrap_or_else(|p| p.into_inner()) = idx;
                     return Ok((base, val));
                 }
+                Err(PeerHttpError::Http { status, body })
+                    if matches!(status, 400 | 404 | 409 | 422) =>
+                {
+                    *self
+                        .active_endpoint_idx
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = idx;
+                    return Err(PeerHttpError::Http { status, body });
+                }
                 Err(e) => {
-                    last_err = format!("{base}: {e}");
+                    last_err = e.with_prefix(&base);
                 }
             }
         }
@@ -732,7 +748,10 @@ impl NodeProvider for PeerDaemonNodeProvider {
     fn sync<'a>(&'a self, display_name: &'a str) -> BoxFuture<'a, Result<NodeSnapshot, String>> {
         let display = display_name.to_string();
         Box::pin(async move {
-            let (active_ep, env) = self.request_json("GET", "/api/state", None).await?;
+            let (active_ep, env) = self
+                .request_json("GET", "/api/state", None)
+                .await
+                .map_err(|e| e.to_string())?;
             let data = env.get("data").unwrap_or(&env);
             let raw_sessions = data
                 .get("sessions")
@@ -757,7 +776,10 @@ impl NodeProvider for PeerDaemonNodeProvider {
                 qualified.push(s);
             }
             let now = id::now_ms();
-            let count = qualified.len();
+            let count = qualified
+                .iter()
+                .filter(|s| !s.is_subagent && s.state != SessionState::Ended)
+                .count();
             Ok(NodeSnapshot {
                 host: HostRecord {
                     id: self.host_id.clone(),
@@ -793,7 +815,7 @@ impl NodeProvider for PeerDaemonNodeProvider {
             let (_, env) = self
                 .request_json("GET", &path, None)
                 .await
-                .map_err(|e| ApiError::internal(format!("peer preview failed: {e}")))?;
+                .map_err(|e| e.into_api_error("peer preview failed"))?;
             let data = env.get("data").cloned().unwrap_or(env);
             let mut preview: PanePreview = serde_json::from_value(data)
                 .map_err(|e| ApiError::internal(format!("decode peer preview: {e}")))?;
@@ -820,7 +842,7 @@ impl NodeProvider for PeerDaemonNodeProvider {
             let (_, env) = self
                 .request_json("GET", &path, None)
                 .await
-                .map_err(|e| ApiError::internal(format!("peer transcript failed: {e}")))?;
+                .map_err(|e| e.into_api_error("peer transcript failed"))?;
             let data = env.get("data").cloned().unwrap_or(env);
             serde_json::from_value(data)
                 .map_err(|e| ApiError::internal(format!("decode peer transcript: {e}")))
@@ -855,7 +877,7 @@ impl NodeProvider for PeerDaemonNodeProvider {
             let (_, env) = self
                 .request_json("POST", "/api/dispatch", Some(&body))
                 .await
-                .map_err(|e| ApiError::internal(format!("peer dispatch failed: {e}")))?;
+                .map_err(|e| e.into_api_error("peer dispatch failed"))?;
             let data = env.get("data").cloned().unwrap_or(env);
             let mut report: DeliveryReport = serde_json::from_value(data)
                 .map_err(|e| ApiError::internal(format!("decode peer dispatch report: {e}")))?;
@@ -878,7 +900,7 @@ impl NodeProvider for PeerDaemonNodeProvider {
             let (_, env) = self
                 .request_json("POST", &path, Some(&serde_json::json!({})))
                 .await
-                .map_err(|e| ApiError::internal(format!("peer focus failed: {e}")))?;
+                .map_err(|e| e.into_api_error("peer focus failed"))?;
             Ok(env.get("data").cloned().unwrap_or(env))
         })
     }
@@ -888,23 +910,75 @@ impl NodeProvider for PeerDaemonNodeProvider {
 // Minimal Zero-Dependency Async HTTP/1.1 Client (http:// via Tokio TcpStream; https:// via curl)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+enum PeerHttpError {
+    Transport(String),
+    Http { status: u16, body: String },
+}
+
+impl PeerHttpError {
+    fn with_prefix(self, base: &str) -> Self {
+        match self {
+            PeerHttpError::Transport(m) => PeerHttpError::Transport(format!("{base}: {m}")),
+            PeerHttpError::Http { status, body } => PeerHttpError::Http {
+                status,
+                body: format!("{base}: {body}"),
+            },
+        }
+    }
+
+    fn into_api_error(self, ctx: &str) -> ApiError {
+        use starfane_proto::ErrorCode;
+        match self {
+            PeerHttpError::Transport(m) => {
+                ApiError::new(ErrorCode::Unavailable, format!("{ctx}: {m}"))
+            }
+            PeerHttpError::Http { status, body } => {
+                let msg = format!("{ctx}: HTTP {status}: {body}");
+                let code = match status {
+                    400 => ErrorCode::BadRequest,
+                    404 => ErrorCode::NotFound,
+                    409 => ErrorCode::Conflict,
+                    422 => ErrorCode::GateRejected,
+                    503 => ErrorCode::Unavailable,
+                    _ => ErrorCode::Internal,
+                };
+                ApiError::new(code, msg)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PeerHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PeerHttpError::Transport(m) => f.write_str(m),
+            PeerHttpError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
+        }
+    }
+}
+
 async fn http_request_json(
     method: &str,
     url: &str,
     token: Option<&str>,
     body: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, PeerHttpError> {
     if let Some(rest) = url.strip_prefix("http://") {
         tokio::time::timeout(
             PEER_HTTP_TIMEOUT,
             http1_plain_json(method, rest, token, body),
         )
         .await
-        .map_err(|_| format!("timeout after {}s", PEER_HTTP_TIMEOUT.as_secs()))?
+        .map_err(|_| {
+            PeerHttpError::Transport(format!("timeout after {}s", PEER_HTTP_TIMEOUT.as_secs()))
+        })?
     } else if url.starts_with("https://") {
         curl_http_json(method, url, token, body).await
     } else {
-        Err(format!("unsupported peer endpoint scheme: {url}"))
+        Err(PeerHttpError::Transport(format!(
+            "unsupported peer endpoint scheme: {url}"
+        )))
     }
 }
 
@@ -913,7 +987,7 @@ async fn http1_plain_json(
     without_scheme: &str,
     token: Option<&str>,
     body: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, PeerHttpError> {
     let (host_port, path) = match without_scheme.find('/') {
         Some(idx) => (&without_scheme[..idx], &without_scheme[idx..]),
         None => (without_scheme, "/"),
@@ -932,10 +1006,11 @@ async fn http1_plain_json(
 
     let mut stream = TcpStream::connect(&connect_addr)
         .await
-        .map_err(|e| format!("connect {connect_addr}: {e}"))?;
+        .map_err(|e| PeerHttpError::Transport(format!("connect {connect_addr}: {e}")))?;
 
     let body_bytes = match body {
-        Some(v) => serde_json::to_vec(v).map_err(|e| format!("encode body: {e}"))?,
+        Some(v) => serde_json::to_vec(v)
+            .map_err(|e| PeerHttpError::Transport(format!("encode body: {e}")))?,
         None => Vec::new(),
     };
 
@@ -944,7 +1019,9 @@ async fn http1_plain_json(
     );
     if let Some(tok) = token {
         if tok.contains(['\r', '\n']) {
-            return Err("invalid newline in bearer token".into());
+            return Err(PeerHttpError::Transport(
+                "invalid newline in bearer token".into(),
+            ));
         }
         req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
     }
@@ -960,25 +1037,25 @@ async fn http1_plain_json(
     stream
         .write_all(&wire)
         .await
-        .map_err(|e| format!("write request: {e}"))?;
+        .map_err(|e| PeerHttpError::Transport(format!("write request: {e}")))?;
 
     let mut raw = Vec::new();
     stream
         .take(MAX_PEER_RESPONSE_BYTES + 1)
         .read_to_end(&mut raw)
         .await
-        .map_err(|e| format!("read response: {e}"))?;
+        .map_err(|e| PeerHttpError::Transport(format!("read response: {e}")))?;
     if (raw.len() as u64) > MAX_PEER_RESPONSE_BYTES {
-        return Err(format!(
+        return Err(PeerHttpError::Transport(format!(
             "peer response exceeded {} MiB limit",
             MAX_PEER_RESPONSE_BYTES / (1024 * 1024)
-        ));
+        )));
     }
 
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
+        .ok_or_else(|| PeerHttpError::Transport("malformed HTTP response".to_string()))?;
     let head = String::from_utf8_lossy(&raw[..split]);
     let status_code = head
         .lines()
@@ -992,17 +1069,18 @@ async fn http1_plain_json(
     });
     let body_slice = &raw[split + 4..];
     let decoded = if is_chunked {
-        decode_chunked(body_slice)?
+        decode_chunked(body_slice).map_err(PeerHttpError::Transport)?
     } else {
         body_slice.to_vec()
     };
     if !(200..300).contains(&status_code) {
-        return Err(format!(
-            "HTTP {status_code}: {}",
-            String::from_utf8_lossy(&decoded).trim()
-        ));
+        return Err(PeerHttpError::Http {
+            status: status_code,
+            body: String::from_utf8_lossy(&decoded).trim().to_string(),
+        });
     }
-    serde_json::from_slice(&decoded).map_err(|e| format!("parse JSON: {e}"))
+    serde_json::from_slice(&decoded)
+        .map_err(|e| PeerHttpError::Transport(format!("parse JSON: {e}")))
 }
 
 fn decode_chunked(mut src: &[u8]) -> Result<Vec<u8>, String> {
@@ -1047,12 +1125,16 @@ async fn curl_http_json(
     url: &str,
     token: Option<&str>,
     body: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, PeerHttpError> {
     if url.contains(['\r', '\n']) {
-        return Err("invalid newline in peer URL".into());
+        return Err(PeerHttpError::Transport(
+            "invalid newline in peer URL".into(),
+        ));
     }
     if token.is_some_and(|t| t.contains(['\r', '\n'])) {
-        return Err("invalid newline in peer token".into());
+        return Err(PeerHttpError::Transport(
+            "invalid newline in peer token".into(),
+        ));
     }
     let mut cfg_stdin = format!("url = \"{}\"\n", curl_escape_config_val(url));
     if let Some(tok) = token {
@@ -1062,7 +1144,8 @@ async fn curl_http_json(
         ));
     }
     if let Some(val) = body {
-        let body_str = serde_json::to_string(val).map_err(|e| format!("encode body: {e}"))?;
+        let body_str = serde_json::to_string(val)
+            .map_err(|e| PeerHttpError::Transport(format!("encode body: {e}")))?;
         if let Some(rest) = url.strip_prefix("https://") {
             let host_port = rest.split('/').next().unwrap_or("");
             if !host_port.is_empty() {
@@ -1081,11 +1164,12 @@ async fn curl_http_json(
     let mut cmd = tokio::process::Command::new("curl");
     cmd.args([
         "-sS",
-        "--fail-with-body",
         "--max-time",
         "6",
         "-X",
         method,
+        "-w",
+        "\n%{http_code}",
         "-K",
         "-",
     ]);
@@ -1094,21 +1178,31 @@ async fn curl_http_json(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("spawn curl: {e}"))?;
+        .map_err(|e| PeerHttpError::Transport(format!("spawn curl: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(cfg_stdin.as_bytes()).await;
     }
     let out = child
         .wait_with_output()
         .await
-        .map_err(|e| format!("wait curl: {e}"))?;
+        .map_err(|e| PeerHttpError::Transport(format!("wait curl: {e}")))?;
     if !out.status.success() {
-        return Err(format!(
+        return Err(PeerHttpError::Transport(format!(
             "curl failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        )));
     }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("parse curl JSON: {e}"))
+    let full = String::from_utf8_lossy(&out.stdout);
+    let (body_part, code_part) = full.rsplit_once('\n').unwrap_or(("", full.as_ref()));
+    let status = code_part.trim().parse::<u16>().unwrap_or(0);
+    if !(200..300).contains(&status) {
+        return Err(PeerHttpError::Http {
+            status,
+            body: body_part.trim().to_string(),
+        });
+    }
+    serde_json::from_str(body_part)
+        .map_err(|e| PeerHttpError::Transport(format!("parse curl JSON: {e}")))
 }
 
 fn sanitize_sock_name(id: &str) -> String {

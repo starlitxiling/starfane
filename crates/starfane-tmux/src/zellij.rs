@@ -326,6 +326,7 @@ impl TerminalMux for ZellijMux {
             "paste".to_string(),
             "-p".to_string(),
             format!("terminal_{numeric}"),
+            "--".to_string(),
             text.to_string(),
         ];
         self.run_session_action(sess, &args)?;
@@ -339,6 +340,7 @@ impl TerminalMux for ZellijMux {
             "paste".to_string(),
             "-p".to_string(),
             format!("terminal_{numeric}"),
+            "--".to_string(),
             text.to_string(),
         ];
         self.run_session_action(sess, &args)?;
@@ -844,6 +846,76 @@ mod tests {
     }
 
     #[test]
+    fn paste_passes_double_dash_separator_for_leading_dash_text() {
+        use crate::exec::ExecOutput;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct CaptureExec {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl ExecTransport for CaptureExec {
+            fn run(
+                &self,
+                _bin: &Path,
+                args: &[String],
+                _stdin: Option<&[u8]>,
+            ) -> Result<ExecOutput, TmuxError> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                Ok(ExecOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    success: true,
+                    code: Some(0),
+                })
+            }
+            fn run_shell(&self, _script: &str) -> Result<ExecOutput, TmuxError> {
+                unreachable!()
+            }
+            fn is_local(&self) -> bool {
+                true
+            }
+        }
+
+        let exec = Arc::new(CaptureExec::default());
+        let zj = ZellijMux::with_transport(PathBuf::from("zellij"), exec.clone());
+        let pane = PaneId::new("zj:work/7");
+        zj.paste_interactive_text(&pane, "--help -la").unwrap();
+        zj.paste_pointer_text(&pane, "- [ ] check", &GateConfig::default())
+            .unwrap();
+
+        let calls = exec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            vec![
+                "-s",
+                "work",
+                "action",
+                "paste",
+                "-p",
+                "terminal_7",
+                "--",
+                "--help -la"
+            ]
+        );
+        assert_eq!(
+            calls[1],
+            vec![
+                "-s",
+                "work",
+                "action",
+                "paste",
+                "-p",
+                "terminal_7",
+                "--",
+                "- [ ] check"
+            ]
+        );
+    }
+
+    #[test]
     #[ignore = "needs zellij >= 0.44; run with `cargo test -p starfane-tmux -- --include-ignored`"]
     fn sandbox_zellij_list_spawn_paste_dump_and_focus() {
         let zj = ZellijMux::new(PathBuf::from("zellij"));
@@ -879,6 +951,10 @@ mod tests {
         zj.paste_interactive_text(&spawned, "ZJ_PASTE_MARKER")
             .expect("paste_interactive_text");
         zj.submit_enter(&spawned).expect("submit_enter");
+        // Leading-dash text must be passed after `--` so Zellij's clap parser does not reject it as a flag.
+        zj.paste_interactive_text(&spawned, "--zj-dash-flag -la")
+            .expect("paste_interactive_text with leading dash");
+        zj.submit_enter(&spawned).expect("submit_enter after dash");
         thread::sleep(Duration::from_millis(250));
 
         let cap = zj
@@ -892,6 +968,11 @@ mod tests {
         assert!(
             cap.text.contains("ZJ_PASTE_MARKER"),
             "missing pasted text in dump: {:?}",
+            cap.text
+        );
+        assert!(
+            cap.text.contains("--zj-dash-flag -la"),
+            "missing leading-dash pasted text in dump: {:?}",
             cap.text
         );
 
