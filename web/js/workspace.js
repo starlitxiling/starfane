@@ -52,9 +52,12 @@ import {
 } from './api.js';
 import {
   applySlashItem,
+  attachFoldedPaste,
   autoGrow,
   closeSlashMenu,
+  quoteReplyToComposer,
   renderAttachBar,
+  saveComposerSelection,
   syncSlashActive,
   updateSlashFromInput,
   uploadImageFiles,
@@ -74,7 +77,6 @@ import {
   hostOf,
   modelEffortLabel,
   muxKindOf,
-  nextAttachId,
   paneDisplayId,
   pickDefaultSession,
   pvKeyOf,
@@ -356,7 +358,24 @@ function renderMessageCard(s, msg, idx, userIdx = null) {
   const tools = Array.isArray(msg.tools) ? msg.tools.filter(Boolean) : [];
   const tKey = `tools:${s.session_id}:${idx}:${msg.ts_ms || 0}`;
   const agentName = AGENT_DISPLAY[s.agent] || s.agent || 'Agent';
-  return h('article', {
+  const canQuote = !isUser && Boolean(msg.text && msg.text.trim()) && !s.is_subagent && s.state !== 'ended';
+  let cardEl;
+  const quoteBtn = canQuote ? h('button', {
+    type: 'button',
+    class: 'msg-quote-btn',
+    title: '引用选中的片段或整条回复到输入框（继续在其下方提问）',
+    onmousedown: (e) => e.preventDefault(),
+    onclick: () => {
+      const sel = window.getSelection?.();
+      let rawSel = '';
+      if (sel && !sel.isCollapsed && sel.rangeCount > 0 && cardEl) {
+        const rng = sel.getRangeAt(0);
+        if (cardEl.contains(rng.commonAncestorContainer)) rawSel = sel.toString().trim();
+      }
+      quoteReplyToComposer(s.session_id, rawSel || msg.text);
+    },
+  }, '引用') : null;
+  cardEl = h('article', {
     class: `msg-card ${isUser ? 'user' : 'assistant'}`,
     id: isUser && userIdx != null ? `turn-u-${userIdx}` : null,
   },
@@ -367,11 +386,12 @@ function renderMessageCard(s, msg, idx, userIdx = null) {
         h('i', { class: `dot agent-dot-${s.agent || 'x'}` }),
         span(`tag a-${s.agent || 'x'}`, agentName),
         modelEffortLabel(s.model, s.effort) ? span('mono muted', modelEffortLabel(s.model, s.effort)) : null),
-    h('span', { class: 'row' }, msg.ts_ms ? span('tabular dim', clock(msg.ts_ms)) : null)),
+    h('span', { class: 'row' }, quoteBtn, msg.ts_ms ? span('tabular dim', clock(msg.ts_ms)) : null)),
   msg.text ? renderMarkdown(msg.text) : (tools.length ? h('div', { class: 'muted', style: 'font-size:13px' }, '正在调用工具…') : null),
   tools.length ? h('details', { class: 'msg-tools', 'data-k': tKey, open: UI.open.has(tKey) },
     h('summary', null, `调用了 ${tools.length} 个工具`),
     h('div', { class: 'msg-tool-list' }, tools.map((t) => span('tag mono', t)))) : null);
+  return cardEl;
 }
 
 function renderTimelineCards(s, list) {
@@ -706,8 +726,8 @@ export function createWorkspaceShell() {
       const payload = { target: { type: 'session', id: sid }, text, interactive: true };
       if (atts.length) {
         payload.attachments = atts.map((a) => (a.kind === 'image'
-          ? { kind: 'image', title: a.title, path: a.path }
-          : { kind: 'text', title: a.title, content: a.content }));
+          ? { kind: 'image', title: a.title, path: a.path, ...(a.token ? { token: a.token } : {}) }
+          : { kind: 'text', title: a.title, content: a.content, ...(a.token ? { token: a.token } : {}) }));
       }
       const r = await api('POST', '/api/dispatch', payload);
       UI.drafts.delete(dk);
@@ -716,6 +736,7 @@ export function createWorkspaceShell() {
         ta.value = '';
         ta.style.height = 'auto';
         autoGrow(ta);
+        comp.lastSel = { sid, start: 0, end: 0 };
         renderAttachBar(sid);
       }
       if (s.pane) {
@@ -727,15 +748,24 @@ export function createWorkspaceShell() {
   };
   ta.addEventListener('input', () => {
     if (comp.sid) UI.drafts.set(`ws:msg:${comp.sid}`, ta.value);
+    saveComposerSelection(ta);
     autoGrow(ta);
     if (comp.agent !== 'shell') updateSlashFromInput(ta, comp.agent);
   });
-  ta.addEventListener('click', () => { if (comp.agent !== 'shell') updateSlashFromInput(ta, comp.agent); });
+  ta.addEventListener('click', () => {
+    saveComposerSelection(ta);
+    if (comp.agent !== 'shell') updateSlashFromInput(ta, comp.agent);
+  });
   ta.addEventListener('keyup', (e) => {
+    saveComposerSelection(ta);
     if (comp.agent !== 'shell' && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) updateSlashFromInput(ta, comp.agent);
   });
+  ta.addEventListener('mouseup', () => saveComposerSelection(ta));
+  ta.addEventListener('select', () => saveComposerSelection(ta));
+  ta.addEventListener('blur', () => saveComposerSelection(ta));
   ta.addEventListener('paste', (e) => {
     const cd = e.clipboardData;
+    const range = [ta.selectionStart ?? ta.value.length, ta.selectionEnd ?? ta.value.length];
     if (cd) {
       const imgFiles = [];
       for (const it of [...(cd.items || [])]) {
@@ -749,7 +779,7 @@ export function createWorkspaceShell() {
       }
       if (imgFiles.length) {
         e.preventDefault();
-        uploadImageFiles(comp.sid, imgFiles);
+        uploadImageFiles(comp.sid, imgFiles, { range, focus: true });
         return;
       }
     }
@@ -760,12 +790,8 @@ export function createWorkspaceShell() {
       e.preventDefault();
       const sid = comp.sid;
       if (!sid) return;
-      const list = UI.attachments.get(sid) || [];
-      const bytes = new TextEncoder().encode(txt).length;
-      list.push({ id: nextAttachId(), kind: 'text', title: `粘贴片段 #${list.length + 1}`, content: txt, lines, bytes });
-      UI.attachments.set(sid, list);
-      renderAttachBar(sid);
-      toast(`已折叠为粘贴附件（${lines} 行 · ${fmtBytes(bytes)}），可继续补充说明`, 'ok');
+      const item = attachFoldedPaste(sid, txt, { range, focus: true });
+      if (item) toast(`已折叠为 ${item.token}（${item.lines} 行 · ${fmtBytes(item.bytes)}），发送时将按原位置展开`, 'ok');
     }
   });
   ta.addEventListener('keydown', (e) => {
@@ -831,7 +857,7 @@ export function createWorkspaceShell() {
     }
   });
   const dock = h('div', { class: 'composer-dock' }, card);
-  const comp = { dock, card, slashEl, readonlyHint, modeBtns, modeHint, attachBar, directRow, ta, imgBtn, sendBtn, pipeSlot, sid: null, agent: null };
+  const comp = { dock, card, slashEl, readonlyHint, modeBtns, modeHint, attachBar, directRow, ta, imgBtn, sendBtn, pipeSlot, sid: null, agent: null, lastSel: null };
   const convCol = h('div', { class: 'ws-conv-col' }, reopenBtn, chatStage, dock);
   const bodySplit = h('div', { class: 'ws-body-split' }, convCol);
   const emptyMain = emptyState('选择一个会话开始对话', '从左侧点击任意正在运行的 tmux / Zellij 会话，即可查看实时终端并直接发送指令。',
@@ -1147,6 +1173,7 @@ export function patchWorkspace(W) {
       C.agent = s.agent;
       C.ta.dataset.draft = `ws:msg:${s.session_id}`;
       C.ta.value = draft(`ws:msg:${s.session_id}`);
+      C.lastSel = { sid: s.session_id, start: C.ta.value.length, end: C.ta.value.length };
       C.ta.style.height = 'auto';
       autoGrow(C.ta);
       closeSlashMenu();

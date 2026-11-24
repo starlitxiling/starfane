@@ -9,27 +9,53 @@ use std::process::Command;
 use std::time::Duration;
 
 /// Long text thresholds above which `Dispatch` persists content to `<state_dir>/inputs/paste-<id>.md`
-/// and injects a clean single-line file pointer instead of overflowing the terminal paste buffer.
-const LONG_TEXT_CHAR_THRESHOLD: usize = 1000;
-const LONG_TEXT_LINE_THRESHOLD: usize = 12;
+/// and injects a clean single-line file pointer instead of overflowing the terminal paste buffer
+/// (safely inside `validate_interactive_text`'s 4000-char bracketed-paste limit).
+const LONG_TEXT_CHAR_THRESHOLD: usize = 2400;
+const LONG_TEXT_LINE_THRESHOLD: usize = 40;
+
+fn has_disallowed_control(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+}
+
+enum ResolvedAttachment<'a> {
+    Image {
+        path: PathBuf,
+        token: Option<&'a str>,
+    },
+    Text {
+        att: &'a PasteAttachment,
+        token: Option<&'a str>,
+    },
+}
+
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
 
 /// Prepare dispatch text & optional paste / image attachments.
 ///
 /// - Image attachments (`kind == "image"`, or `path` present with empty `content`) are strictly
-///   validated to reside under `<state_dir>/inputs/` and formatted as clean single-line image path
-///   references readable by Claude / Codex / AGY.
-/// - Text attachments or long text (>1000 chars or >12 lines) are persisted to
-///   `<state_dir>/inputs/paste-<id>.md` (0600) and referenced via a clean single-line pointer.
+///   validated to reside under `<state_dir>/inputs/`.
+/// - When attachments carry inline `token`s matching placeholders inside `raw_text` (e.g.
+///   `"[粘贴 #1]"`, `"[图片 #1]"`), placeholders are expanded in a single forward pass in-place
+///   so interleaved quotes, screenshots, and follow-up questions keep their exact original order.
+/// - Within `LONG_TEXT_*` bounds, assembled multi-line content is returned directly for verbatim
+///   bracketed paste; when longer (or containing unsafe control characters), the ordered assembled
+///   content is written to `<state_dir>/inputs/paste-<id>.md` (0600) with a concise pointer.
 pub(crate) fn prepare_dispatch_payload(
     state_dir: &Path,
     raw_text: &str,
     attachments: &[PasteAttachment],
 ) -> Result<(String, Option<PathBuf>), ApiError> {
-    let trimmed = raw_text.trim();
-    let mut image_paths: Vec<PathBuf> = Vec::new();
-    let mut text_attachments: Vec<&PasteAttachment> = Vec::new();
-
+    let mut resolved: Vec<ResolvedAttachment<'_>> = Vec::with_capacity(attachments.len());
     for att in attachments {
+        let token = att
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let is_image = att
             .kind
             .as_deref()
@@ -41,18 +67,209 @@ pub(crate) fn prepare_dispatch_payload(
                 .as_deref()
                 .ok_or_else(|| ApiError::bad_request("image attachment missing path"))?;
             let valid = super::uploads::validate_uploaded_image_path(state_dir, raw_path)?;
-            image_paths.push(valid);
+            resolved.push(ResolvedAttachment::Image { path: valid, token });
         } else if !att.content.trim().is_empty() {
-            text_attachments.push(att);
+            resolved.push(ResolvedAttachment::Text { att, token });
         }
     }
 
-    if trimmed.is_empty() && text_attachments.is_empty() && image_paths.is_empty() {
+    if raw_text.trim().is_empty() && resolved.is_empty() {
         return Err(ApiError::bad_request("text is empty"));
     }
 
+    let norm_raw = normalize_newlines(raw_text);
+    let mut token_entries: Vec<(&str, usize)> = Vec::new();
+    for (idx, item) in resolved.iter().enumerate() {
+        let tok_opt = match item {
+            ResolvedAttachment::Image { token, .. } | ResolvedAttachment::Text { token, .. } => {
+                *token
+            }
+        };
+        if let Some(tok) = tok_opt {
+            if norm_raw.contains(tok) && !token_entries.iter().any(|(existing, _)| *existing == tok)
+            {
+                token_entries.push((tok, idx));
+            }
+        }
+    }
+
+    if !token_entries.is_empty() {
+        let mut anchored = vec![false; resolved.len()];
+        let mut expanded = String::with_capacity(norm_raw.len());
+        let mut non_token_text = String::with_capacity(norm_raw.len());
+        let mut cursor = 0usize;
+
+        while cursor < norm_raw.len() {
+            let slice = &norm_raw[cursor..];
+            let mut best: Option<(usize, usize, usize)> = None;
+            for &(tok, idx) in &token_entries {
+                if let Some(pos) = slice.find(tok) {
+                    let is_better = match best {
+                        None => true,
+                        Some((best_pos, best_len, _)) => {
+                            pos < best_pos || (pos == best_pos && tok.len() > best_len)
+                        }
+                    };
+                    if is_better {
+                        best = Some((pos, tok.len(), idx));
+                    }
+                }
+            }
+
+            let Some((pos, tok_len, idx)) = best else {
+                expanded.push_str(slice);
+                non_token_text.push_str(slice);
+                break;
+            };
+
+            let prefix = &slice[..pos];
+            expanded.push_str(prefix);
+            non_token_text.push_str(prefix);
+            anchored[idx] = true;
+            let mut next_cursor = cursor + pos + tok_len;
+
+            match &resolved[idx] {
+                ResolvedAttachment::Image { path, .. } => {
+                    expanded.push_str(&format!("[图片: {}]", path.display()));
+                }
+                ResolvedAttachment::Text { att, .. } => {
+                    let body = normalize_newlines(&att.content);
+                    if body.contains('\n') {
+                        if !expanded.is_empty() && !expanded.ends_with('\n') {
+                            while expanded.ends_with(' ') {
+                                expanded.pop();
+                            }
+                            if !expanded.is_empty() && !expanded.ends_with('\n') {
+                                expanded.push('\n');
+                            }
+                        }
+                        expanded.push_str(&body);
+                        let rest = &norm_raw[next_cursor..];
+                        if !body.ends_with('\n') && !rest.is_empty() && !rest.starts_with('\n') {
+                            expanded.push('\n');
+                            if rest.starts_with(' ') {
+                                next_cursor += 1;
+                            }
+                        }
+                    } else {
+                        expanded.push_str(&body);
+                    }
+                }
+            }
+            cursor = next_cursor;
+        }
+
+        let all_images: Vec<PathBuf> = resolved
+            .iter()
+            .filter_map(|r| match r {
+                ResolvedAttachment::Image { path, .. } => Some(path.clone()),
+                ResolvedAttachment::Text { .. } => None,
+            })
+            .collect();
+        let has_any_text_att = resolved
+            .iter()
+            .any(|r| matches!(r, ResolvedAttachment::Text { .. }));
+
+        if non_token_text.trim().is_empty() && !has_any_text_att && !all_images.is_empty() {
+            let imgs_joined = all_images
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let pointer = if all_images.len() == 1 {
+                format!("请查看这张图片：{imgs_joined}")
+            } else {
+                format!("请查看以下图片：{imgs_joined}")
+            };
+            return Ok((pointer, Some(all_images[0].clone())));
+        }
+
+        let mut assembled = expanded.trim().to_string();
+        for (idx, item) in resolved.iter().enumerate() {
+            if anchored[idx] {
+                continue;
+            }
+            match item {
+                ResolvedAttachment::Image { path, .. } => {
+                    if !assembled.is_empty() {
+                        assembled.push('\n');
+                    }
+                    assembled.push_str(&format!("[图片: {}]", path.display()));
+                }
+                ResolvedAttachment::Text { att, .. } => {
+                    let body = normalize_newlines(&att.content);
+                    if !assembled.is_empty() {
+                        assembled.push_str("\n\n");
+                        if let Some(title) = att
+                            .title
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            assembled.push_str("## ");
+                            assembled.push_str(title);
+                            assembled.push('\n');
+                        }
+                    }
+                    assembled.push_str(body.trim_end_matches('\n'));
+                }
+            }
+        }
+
+        let assembled_is_long = assembled.chars().count() > LONG_TEXT_CHAR_THRESHOLD
+            || assembled.lines().count() > LONG_TEXT_LINE_THRESHOLD
+            || has_disallowed_control(&assembled);
+
+        if !assembled_is_long {
+            return Ok((assembled, all_images.first().cloned()));
+        }
+
+        let file_id = id::new_id("P");
+        let now_ms = id::now_ms();
+        let path = state_dir.join("inputs").join(format!("paste-{file_id}.md"));
+        let mut md = format!(
+            "<!-- starfane paste input | id: {file_id} | created_ms: {now_ms} -->\n\n{assembled}"
+        );
+        if !md.ends_with('\n') {
+            md.push('\n');
+        }
+        crate::store::write_private(&path, md.as_bytes())
+            .map_err(|e| ApiError::internal(format!("save paste input {}: {e}", path.display())))?;
+
+        let line_count = assembled.lines().count().max(1);
+        let pointer = if all_images.is_empty() {
+            format!(
+                "请按原文顺序阅读并处理以下输入：{}（共 {line_count} 行）",
+                path.display()
+            )
+        } else {
+            let imgs_joined = all_images
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "请按原文顺序阅读并处理以下输入：{}（共 {line_count} 行；文内含图片：{imgs_joined}，请一并读取查看）",
+                path.display()
+            )
+        };
+        return Ok((pointer, Some(path)));
+    }
+
+    // Legacy / unanchored path (attachments omitted tokens or callers without tokens).
+    let trimmed = norm_raw.trim();
+    let mut image_paths: Vec<PathBuf> = Vec::new();
+    let mut text_attachments: Vec<&PasteAttachment> = Vec::new();
+    for item in resolved {
+        match item {
+            ResolvedAttachment::Image { path, .. } => image_paths.push(path),
+            ResolvedAttachment::Text { att, .. } => text_attachments.push(att),
+        }
+    }
+
     let text_is_long = trimmed.chars().count() > LONG_TEXT_CHAR_THRESHOLD
-        || trimmed.lines().count() > LONG_TEXT_LINE_THRESHOLD;
+        || trimmed.lines().count() > LONG_TEXT_LINE_THRESHOLD
+        || has_disallowed_control(trimmed);
 
     if text_attachments.is_empty() && !text_is_long {
         if image_paths.is_empty() {
@@ -950,40 +1167,56 @@ mod tests {
                 title: Some("empty".into()),
                 content: "   ".into(),
                 path: None,
+                token: None,
             }],
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest);
 
-        // 3. Text > 1000 chars is saved to <state_dir>/inputs/paste-*.md.
-        let big = "a".repeat(1005);
+        // 3. Moderate text (15 lines / 1200 chars) passes inline verbatim without spawning paste-*.md.
+        let inline_quote = "a".repeat(1200);
+        let (out_mod, p_mod) = prepare_dispatch_payload(&dir, &inline_quote, &[]).unwrap();
+        assert_eq!(out_mod, inline_quote);
+        assert!(p_mod.is_none());
+
+        let moderate_lines = (1..=15)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (out_ml, p_ml) = prepare_dispatch_payload(&dir, &moderate_lines, &[]).unwrap();
+        assert_eq!(out_ml, moderate_lines);
+        assert!(p_ml.is_none());
+
+        // 4. Text > 2400 chars is saved to <state_dir>/inputs/paste-*.md.
+        let big = "a".repeat(2405);
         let (ptr_big, p_big) = prepare_dispatch_payload(&dir, &big, &[]).unwrap();
-        let p_big = p_big.expect("saved file for >1000 chars");
+        let p_big = p_big.expect("saved file for >2400 chars");
         assert!(p_big.starts_with(dir.join("inputs")));
         assert!(!ptr_big.contains('\n'));
         assert!(ptr_big.contains(&p_big.display().to_string()));
         let content_big = std::fs::read_to_string(&p_big).unwrap();
         assert!(content_big.contains(&big));
 
-        // 4. Text > 12 lines is saved to file.
-        let many_lines = (1..=15)
+        // 5. Text > 40 lines is saved to file.
+        let many_lines = (1..=45)
             .map(|i| format!("line-{i}"))
             .collect::<Vec<_>>()
             .join("\n");
         let (ptr_lines, p_lines) = prepare_dispatch_payload(&dir, &many_lines, &[]).unwrap();
-        let p_lines = p_lines.expect("saved file for >12 lines");
+        let p_lines = p_lines.expect("saved file for >40 lines");
         assert!(!ptr_lines.contains('\n'));
-        assert!(ptr_lines.contains("共 15 行"));
+        assert!(ptr_lines.contains("共 45 行"));
         assert!(std::fs::read_to_string(&p_lines)
             .unwrap()
-            .contains("line-15"));
+            .contains("line-45"));
 
-        // 5. Short instruction + attachment combines prefix + file path pointer.
+        // 6. Legacy short instruction + unanchored attachment combines prefix + file path pointer.
         let att = vec![PasteAttachment {
             kind: Some("text".into()),
             title: Some("stacktrace".into()),
             content: "err1\nerr2\nerr3".into(),
             path: None,
+            token: None,
         }];
         let (ptr_att, p_att) = prepare_dispatch_payload(&dir, "帮我定位这个报错", &att).unwrap();
         let p_att = p_att.expect("saved file for attachment");
@@ -994,13 +1227,13 @@ mod tests {
         assert!(md.contains("## stacktrace"));
         assert!(md.contains("err1\nerr2\nerr3"));
 
-        // 6. Attachment-only (empty text) succeeds cleanly.
+        // 7. Attachment-only (empty text) succeeds cleanly.
         let (ptr_only, p_only) = prepare_dispatch_payload(&dir, "", &att).unwrap();
         let p_only = p_only.expect("saved file for attachment-only");
         assert!(ptr_only.starts_with("请阅读并处理以下粘贴内容："));
         assert!(ptr_only.contains(&p_only.display().to_string()));
 
-        // 7. Image attachment inside inputs/ works both image-only and with instruction;
+        // 8. Image attachment inside inputs/ works both image-only and with instruction;
         //    outside paths are rejected.
         let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
         let up = super::super::uploads::save_uploaded_image(
@@ -1015,6 +1248,7 @@ mod tests {
             title: Some("shot.png".into()),
             content: String::new(),
             path: Some(up.path.clone()),
+            token: None,
         }];
         let (ptr_img_only, _) = prepare_dispatch_payload(&dir, "", &img_att).unwrap();
         assert!(
@@ -1035,8 +1269,185 @@ mod tests {
             title: None,
             content: String::new(),
             path: Some("/etc/passwd".into()),
+            token: None,
         }];
         assert!(prepare_dispatch_payload(&dir, "look", &bad_img).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_dispatch_payload_preserves_inline_anchor_order() {
+        let dir = std::env::temp_dir().join(format!("starfane-anchor-test-{}", id::new_id("T")));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let up = super::super::uploads::save_uploaded_image(
+            &dir,
+            Some("shot.png"),
+            Some("image/png"),
+            png_b64,
+        )
+        .unwrap();
+        let canon_img = std::fs::canonicalize(&up.path).unwrap();
+        let canon_img_str = canon_img.display().to_string();
+
+        // 1. Interleaved quote A + follow-up A + screenshot + quote B + follow-up B (short enough for inline).
+        let raw_inline = "先看第一段回复：[粘贴 #1]\n我对上面第一段的追问\n对照截图：[图片 #1]\n再看第二段：[粘贴 #2]\n针对第二段的修改要求";
+        let atts_inline = vec![
+            PasteAttachment {
+                kind: Some("text".into()),
+                title: Some("粘贴片段 #1".into()),
+                content: "Agent 回复第一段行1\nAgent 回复第一段行2".into(),
+                path: None,
+                token: Some("[粘贴 #1]".into()),
+            },
+            PasteAttachment {
+                kind: Some("image".into()),
+                title: Some("shot.png".into()),
+                content: String::new(),
+                path: Some(up.path.clone()),
+                token: Some("[图片 #1]".into()),
+            },
+            PasteAttachment {
+                kind: Some("text".into()),
+                title: Some("粘贴片段 #2".into()),
+                content: "Agent 回复第二段".into(),
+                path: None,
+                token: Some("[粘贴 #2]".into()),
+            },
+        ];
+        let (out_inline, path_inline) =
+            prepare_dispatch_payload(&dir, raw_inline, &atts_inline).unwrap();
+        assert_eq!(
+            path_inline.as_deref(),
+            Some(canon_img.as_path()),
+            "inline anchored payload within bounds should return image path without spilling paste-*.md: {path_inline:?}"
+        );
+        let has_md = std::fs::read_dir(dir.join("inputs"))
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"));
+        assert!(
+            !has_md,
+            "inline anchored payload should not create paste-*.md"
+        );
+        let p_q1 = out_inline.find("Agent 回复第一段行1").unwrap();
+        let p_f1 = out_inline.find("我对上面第一段的追问").unwrap();
+        let p_img = out_inline
+            .find(&format!("[图片: {canon_img_str}]"))
+            .unwrap();
+        let p_q2 = out_inline.find("Agent 回复第二段").unwrap();
+        let p_f2 = out_inline.find("针对第二段的修改要求").unwrap();
+        assert!(
+            p_q1 < p_f1 && p_f1 < p_img && p_img < p_q2 && p_q2 < p_f2,
+            "order destroyed in inline output:\n{out_inline}"
+        );
+
+        // 2. Same interleaved layout exceeding LONG_TEXT_LINE_THRESHOLD writes ONE ordered paste-*.md.
+        let long_q1 = (1..=42)
+            .map(|i| format!("long-quote-line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let atts_long = vec![
+            PasteAttachment {
+                kind: Some("text".into()),
+                title: Some("粘贴片段 #1".into()),
+                content: long_q1,
+                path: None,
+                token: Some("[粘贴 #1]".into()),
+            },
+            PasteAttachment {
+                kind: Some("image".into()),
+                title: Some("shot.png".into()),
+                content: String::new(),
+                path: Some(up.path.clone()),
+                token: Some("[图片 #1]".into()),
+            },
+            PasteAttachment {
+                kind: Some("text".into()),
+                title: Some("粘贴片段 #2".into()),
+                content: "第二段结论\n还有第二行".into(),
+                path: None,
+                token: Some("[粘贴 #2]".into()),
+            },
+        ];
+        let (ptr_long, p_long) = prepare_dispatch_payload(&dir, raw_inline, &atts_long).unwrap();
+        let p_long = p_long.expect("long anchored payload spills to ordered markdown");
+        assert!(!ptr_long.contains('\n'), "{ptr_long}");
+        assert!(
+            ptr_long.contains(&p_long.display().to_string()),
+            "{ptr_long}"
+        );
+        assert!(ptr_long.contains(&canon_img_str), "{ptr_long}");
+        let saved_md = std::fs::read_to_string(&p_long).unwrap();
+        assert!(!saved_md.contains("## 粘贴文本"));
+        assert!(!saved_md.contains("## 粘贴内容"));
+        let mp_q1 = saved_md.find("long-quote-line-1").unwrap();
+        let mp_f1 = saved_md.find("我对上面第一段的追问").unwrap();
+        let mp_img = saved_md.find(&format!("[图片: {canon_img_str}]")).unwrap();
+        let mp_q2 = saved_md.find("第二段结论").unwrap();
+        let mp_f2 = saved_md.find("针对第二段的修改要求").unwrap();
+        assert!(
+            mp_q1 < mp_f1 && mp_f1 < mp_img && mp_img < mp_q2 && mp_q2 < mp_f2,
+            "order destroyed in spilled markdown:\n{saved_md}"
+        );
+
+        // 3. Non-recursive expansion: literal `[图片 #1]` / `[粘贴 #2]` inside `[粘贴 #1]` is untouched.
+        let atts_nonrec = vec![
+            PasteAttachment {
+                kind: Some("text".into()),
+                title: Some("粘贴片段 #1".into()),
+                content: "原文内自带字面量 [图片 #1] 与 [粘贴 #2]".into(),
+                path: None,
+                token: Some("[粘贴 #1]".into()),
+            },
+            atts_inline[1].clone(),
+            atts_inline[2].clone(),
+        ];
+        let (out_nonrec, _) = prepare_dispatch_payload(
+            &dir,
+            "引用：[粘贴 #1]\n图：[图片 #1]\n二：[粘贴 #2]",
+            &atts_nonrec,
+        )
+        .unwrap();
+        assert!(
+            out_nonrec.contains("原文内自带字面量 [图片 #1] 与 [粘贴 #2]"),
+            "{out_nonrec}"
+        );
+
+        // 4. Image-only token produces clean Chinese image pointer.
+        let (ptr_tok_img, _) =
+            prepare_dispatch_payload(&dir, "[图片 #1]", &[atts_inline[1].clone()]).unwrap();
+        assert_eq!(ptr_tok_img, format!("请查看这张图片：{canon_img_str}"));
+
+        // 5. Manually deleted token on a remaining pill is appended instead of silently dropped.
+        let atts_mixed = vec![
+            atts_inline[1].clone(),
+            PasteAttachment {
+                kind: Some("text".into()),
+                title: Some("补充附件".into()),
+                content: "未被占位符引用的补充片段".into(),
+                path: None,
+                token: Some("[粘贴 #9]".into()),
+            },
+        ];
+        let (out_mixed, _) = prepare_dispatch_payload(&dir, "看图 [图片 #1]", &atts_mixed).unwrap();
+        assert!(out_mixed.contains(&format!("[图片: {canon_img_str}]")));
+        assert!(out_mixed.contains("未被占位符引用的补充片段"));
+
+        // 6. Disallowed control characters (ESC) spill safely to paste-*.md.
+        let atts_esc = vec![PasteAttachment {
+            kind: Some("text".into()),
+            title: None,
+            content: "contains\x1besc".into(),
+            path: None,
+            token: Some("[粘贴 #1]".into()),
+        }];
+        let (ptr_esc, p_esc) =
+            prepare_dispatch_payload(&dir, "check [粘贴 #1]", &atts_esc).unwrap();
+        assert!(p_esc.is_some());
+        assert!(!ptr_esc.chars().any(char::is_control));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

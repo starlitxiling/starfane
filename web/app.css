@@ -232,6 +232,8 @@
  100%{box-shadow:0 0 0 0 rgba(53,92,138,0)}
 }
  .msg-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px;font-size:12.5px;color:var(--muted);flex-wrap:wrap}
+ .msg-quote-btn{border:1px solid transparent;background:transparent;color:var(--muted);font:500 11.5px/1 var(--font);padding:3px 8px;border-radius:var(--r-pill);cursor:pointer;transition:background var(--ease),color var(--ease),border-color var(--ease)}
+ .msg-quote-btn:hover{background:var(--bg-subtle);border-color:var(--border-strong);color:var(--ink)}
  .msg-role{font-weight:650;color:var(--ink);font-size:13px}
  .msg-tools{margin-top:14px;padding-top:10px;border-top:1px solid var(--border-subtle)}
  .msg-tools >summary{font-size:12.5px;color:var(--muted);padding:2px 0}
@@ -295,6 +297,8 @@
  .attach-bar{display:flex;flex-wrap:wrap;gap:6px;padding-top:2px}
  .attach-pill{display:inline-flex;align-items:center;gap:8px;max-width:100%;padding:5px 8px 5px 10px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border-strong);font-size:12px;color:var(--ink);font-variant-numeric:tabular-nums}
  .attach-pill.img-pill{padding:4px 8px 4px 5px;gap:8px}
+ .attach-tok{border:1px solid var(--border-strong);background:var(--bg-recessed);color:var(--ink-2);font:600 11px/1.2 var(--mono);padding:2px 6px;border-radius:6px;cursor:pointer;white-space:nowrap;flex-shrink:0;transition:background var(--ease),color var(--ease),border-color var(--ease)}
+ .attach-tok:hover{background:var(--surface);color:var(--ink);border-color:rgba(24,24,27,0.28)}
  .attach-thumb-btn{border:0;padding:0;background:transparent;cursor:pointer;border-radius:7px;overflow:hidden;flex-shrink:0;display:flex}
  .attach-thumb{width:36px;height:36px;object-fit:cover;border-radius:7px;border:1px solid var(--border);display:block;background:var(--bg-recessed)}
  .attach-thumb-load{width:36px;height:36px;border-radius:7px;border:1px solid var(--border);background:var(--bg-recessed);display:flex;align-items:center;justify-content:center;flex-shrink:0}

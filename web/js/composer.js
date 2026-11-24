@@ -1,5 +1,11 @@
 // starfane web console — direct composer, paste/image attachments, slash menu, and pipeline composer
-import { IMG_MAX_BYTES, PARSE_DEBOUNCE_MS, PLAYBOOK_STAGES } from './constants.js';
+import {
+  IMG_MAX_BYTES,
+  PARSE_DEBOUNCE_MS,
+  PASTE_CHAR_LIMIT,
+  PASTE_LINE_LIMIT,
+  PLAYBOOK_STAGES,
+} from './constants.js';
 import {
   agentTag,
   btn,
@@ -43,10 +49,204 @@ export function autoGrow(ta) {
   if (prevTop > 0) ta.scrollTop = prevTop;
 }
 
-export function removeAttachment(sid, attId) {
-  const list = (UI.attachments.get(sid) || []).filter((x) => x.id !== attId);
+function makeAttachToken(kind, num) {
+  return kind === 'image' ? `[图片 #${num}]` : `[粘贴 #${num}]`;
+}
+
+function currentComposerText(sid) {
+  const ta = UI.wsShell?.comp?.sid === sid ? UI.wsShell.comp.ta : null;
+  return ta ? ta.value : draft(`ws:msg:${sid}`);
+}
+
+function nextAttachmentNum(list, kind, curText) {
+  let max = 0;
+  for (const item of list) {
+    if (item.kind === kind && Number.isFinite(item.num)) max = Math.max(max, item.num);
+  }
+  let n = max + 1;
+  while (curText.includes(makeAttachToken(kind, n))) n += 1;
+  return n;
+}
+
+function clampRange(range, len) {
+  const a = Math.max(0, Math.min(len, Number(range?.[0] ?? len)));
+  const b = Math.max(a, Math.min(len, Number(range?.[1] ?? a)));
+  return [a, b];
+}
+
+function resolveInsertRange(sid, cur, ta) {
+  const len = cur.length;
+  if (ta && document.activeElement === ta && ta.selectionStart != null) {
+    return clampRange([ta.selectionStart, ta.selectionEnd ?? ta.selectionStart], len);
+  }
+  const comp = UI.wsShell?.comp;
+  if (comp?.lastSel && comp.lastSel.sid === sid) {
+    return clampRange([comp.lastSel.start, comp.lastSel.end], len);
+  }
+  if (ta && ta.selectionStart != null) {
+    return clampRange([ta.selectionStart, ta.selectionEnd ?? ta.selectionStart], len);
+  }
+  return [len, len];
+}
+
+export function saveComposerSelection(ta) {
+  const comp = UI.wsShell?.comp;
+  if (!comp || comp.ta !== ta || !comp.sid) return;
+  const len = ta.value.length;
+  comp.lastSel = {
+    sid: comp.sid,
+    start: ta.selectionStart ?? len,
+    end: ta.selectionEnd ?? len,
+  };
+}
+
+function insertTextAtCursor(sid, snippet, opts = {}) {
+  if (!sid) return null;
+  const dk = `ws:msg:${sid}`;
+  const comp = UI.wsShell?.comp;
+  const ta = comp?.sid === sid ? comp.ta : null;
+  const cur = ta ? ta.value : draft(dk);
+  const [start, end] = opts.range ? clampRange(opts.range, cur.length) : resolveInsertRange(sid, cur, ta);
+  const before = cur.slice(0, start);
+  const after = cur.slice(end);
+  const lead = opts.inlineToken && before.length > 0 && !/\s$/.test(before) ? ' ' : '';
+  const extraAfter = opts.trailingNewline && !after.startsWith('\n') ? '\n' : '';
+  const trail = !extraAfter && opts.inlineToken && after.length > 0 && !/^\s/.test(after) ? ' ' : '';
+  const next = before + lead + snippet + extraAfter + trail + after;
+  const caret = before.length + lead.length + snippet.length + extraAfter.length;
+  UI.drafts.set(dk, next);
+  if (comp?.sid === sid) comp.lastSel = { sid, start: caret, end: caret };
+  if (ta) {
+    ta.value = next;
+    ta.style.height = 'auto';
+    autoGrow(ta);
+    if (opts.focus) ta.focus({ preventScroll: true });
+    ta.setSelectionRange(caret, caret);
+  }
+  return { next, caret };
+}
+
+function removeTokenFromDraft(sid, token) {
+  if (!sid || !token) return;
+  const dk = `ws:msg:${sid}`;
+  const comp = UI.wsShell?.comp;
+  const ta = comp?.sid === sid ? comp.ta : null;
+  const cur = ta ? ta.value : draft(dk);
+  const idx = cur.indexOf(token);
+  if (idx < 0) return;
+  let before = cur.slice(0, idx);
+  let after = cur.slice(idx + token.length);
+  if (before.endsWith(' ') && after.startsWith(' ')) {
+    after = after.slice(1);
+  } else if ((before === '' || before.endsWith('\n')) && after.startsWith('\n')) {
+    after = after.slice(1);
+  } else if (before.endsWith('\n') && after === '') {
+    before = before.slice(0, -1);
+  } else if (before.endsWith(' ') && (after === '' || after.startsWith('\n'))) {
+    before = before.slice(0, -1);
+  } else if (before === '' && after.startsWith(' ')) {
+    after = after.slice(1);
+  }
+  const next = before + after;
+  UI.drafts.set(dk, next);
+  if (comp?.sid === sid) {
+    const caret = Math.min(before.length, next.length);
+    comp.lastSel = { sid, start: caret, end: caret };
+  }
+  if (ta) {
+    ta.value = next;
+    ta.style.height = 'auto';
+    autoGrow(ta);
+  }
+}
+
+function locateOrReinsertToken(sid, att) {
+  if (!sid || !att?.token) return;
+  const comp = UI.wsShell?.comp;
+  const ta = comp?.sid === sid ? comp.ta : null;
+  const cur = ta ? ta.value : draft(`ws:msg:${sid}`);
+  const idx = cur.indexOf(att.token);
+  if (idx >= 0) {
+    if (ta) {
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(idx, idx + att.token.length);
+      saveComposerSelection(ta);
+    }
+    return;
+  }
+  insertTextAtCursor(sid, att.token, { inlineToken: true, focus: true });
+  toast(`已重新插入 ${att.token}`, 'ok');
+}
+
+export function attachFoldedPaste(sid, rawText, opts = {}) {
+  if (!sid) return null;
+  const normalized = String(rawText || '').replace(/\r\n?/g, '\n');
+  if (!normalized) return null;
+  const list = UI.attachments.get(sid) || [];
+  const num = nextAttachmentNum(list, 'text', currentComposerText(sid));
+  const token = makeAttachToken('text', num);
+  const lines = normalized.split('\n').length;
+  const bytes = new TextEncoder().encode(normalized).length;
+  const item = {
+    id: nextAttachId(),
+    num,
+    token,
+    kind: 'text',
+    title: `粘贴片段 #${num}`,
+    content: normalized,
+    lines,
+    bytes,
+  };
+  list.push(item);
+  UI.attachments.set(sid, list);
+  insertTextAtCursor(sid, token, {
+    inlineToken: true,
+    range: opts.range,
+    trailingNewline: opts.trailingNewline,
+    focus: opts.focus,
+  });
+  renderAttachBar(sid);
+  return item;
+}
+
+export function quoteReplyToComposer(sid, rawText) {
+  if (!sid) return;
+  const text = String(rawText || '').replace(/\r\n?/g, '\n').trim();
+  if (!text) return;
+  const comp = UI.wsShell?.comp;
+  if (UI.composerMode !== 'direct') {
+    UI.composerMode = 'direct';
+    if (comp) {
+      comp.directRow?.classList.remove('ws-hidden');
+      comp.pipeSlot?.classList.add('ws-hidden');
+    }
+    APP.rerender();
+  }
+  const lines = text.split('\n');
+  if (text.length < PASTE_CHAR_LIMIT && lines.length < PASTE_LINE_LIMIT) {
+    const cur = currentComposerText(sid);
+    const ta = comp?.sid === sid ? comp.ta : null;
+    const [start, end] = resolveInsertRange(sid, cur, ta);
+    const before = cur.slice(0, start);
+    const after = cur.slice(end);
+    const lead = before.length === 0 || before.endsWith('\n') ? '' : '\n';
+    const quoted = lines.map((l) => (l.length ? `> ${l}` : '>')).join('\n');
+    const trail = after.length === 0 ? '\n\n' : (after.startsWith('\n\n') ? '' : (after.startsWith('\n') ? '\n' : '\n\n'));
+    insertTextAtCursor(sid, `${lead}${quoted}${trail}`, { range: [start, end], focus: true });
+    toast('已引用到输入框，可继续在其下方提问', 'ok');
+    return;
+  }
+  const item = attachFoldedPaste(sid, text, { trailingNewline: true, focus: true });
+  if (item) toast(`长回复已折叠为 ${item.token}，可直接在其下方继续提问`, 'ok');
+}
+
+export function removeAttachment(sid, attId, opts = {}) {
+  const prev = UI.attachments.get(sid) || [];
+  const removed = prev.find((x) => x.id === attId);
+  const list = prev.filter((x) => x.id !== attId);
   if (list.length) UI.attachments.set(sid, list);
   else UI.attachments.delete(sid);
+  if (!opts.keepToken && removed?.token) removeTokenFromDraft(sid, removed.token);
   renderAttachBar(sid);
 }
 
@@ -55,18 +255,29 @@ export function expandAttachmentToInput(sid, attId) {
   const item = list.find((x) => x.id === attId);
   if (!item) return;
   const dk = `ws:msg:${sid}`;
-  const ta = UI.wsShell?.comp?.sid === sid ? UI.wsShell.comp.ta : null;
+  const comp = UI.wsShell?.comp;
+  const ta = comp?.sid === sid ? comp.ta : null;
   const cur = ta ? ta.value : draft(dk);
-  const next = cur ? `${cur}\n${item.content}` : item.content;
+  const idx = item.token ? cur.indexOf(item.token) : -1;
+  let next;
+  let caret;
+  if (idx >= 0) {
+    next = cur.slice(0, idx) + item.content + cur.slice(idx + item.token.length);
+    caret = idx + item.content.length;
+  } else {
+    next = cur ? `${cur}\n${item.content}` : item.content;
+    caret = next.length;
+  }
   UI.drafts.set(dk, next);
+  if (comp?.sid === sid) comp.lastSel = { sid, start: caret, end: caret };
   if (ta) {
     ta.value = next;
     ta.style.height = 'auto';
     autoGrow(ta);
-    ta.focus();
-    ta.selectionStart = ta.selectionEnd = next.length;
+    ta.focus({ preventScroll: true });
+    ta.setSelectionRange(caret, caret);
   }
-  removeAttachment(sid, attId);
+  removeAttachment(sid, attId, { keepToken: true });
 }
 
 function readFileAsBase64(file) {
@@ -82,10 +293,11 @@ function readFileAsBase64(file) {
   });
 }
 
-export async function uploadImageFiles(sid, files) {
+export async function uploadImageFiles(sid, files, opts = {}) {
   if (!sid) return;
   const imgs = [...(files || [])].filter((f) => f && String(f.type || '').startsWith('image/'));
   if (!imgs.length) return;
+  const queued = [];
   for (const file of imgs) {
     if (file.size > IMG_MAX_BYTES) {
       toast(`图片 ${file.name || ''} 超过 10 MB 限制`, 'warn');
@@ -96,8 +308,12 @@ export async function uploadImageFiles(sid, files) {
       ? file.name
       : `screenshot-${new Date().toTimeString().slice(0, 8).replace(/:/g, '')}.${ext}`;
     const list = UI.attachments.get(sid) || [];
+    const num = nextAttachmentNum(list, 'image', currentComposerText(sid));
+    const token = makeAttachToken('image', num);
     const item = {
       id: nextAttachId(),
+      num,
+      token,
       kind: 'image',
       title: name,
       filename: name,
@@ -109,7 +325,13 @@ export async function uploadImageFiles(sid, files) {
     };
     list.push(item);
     UI.attachments.set(sid, list);
-    renderAttachBar(sid);
+    const range = queued.length === 0 ? opts.range : undefined;
+    insertTextAtCursor(sid, token, { inlineToken: true, range, focus: opts.focus });
+    queued.push({ file, item, name });
+  }
+  if (!queued.length) return;
+  renderAttachBar(sid);
+  for (const { file, item, name } of queued) {
     try {
       const data_base64 = await readFileAsBase64(file);
       const r = await api('POST', '/api/uploads/image', { filename: name, mime: item.mime, data_base64 });
@@ -120,7 +342,7 @@ export async function uploadImageFiles(sid, files) {
       item.filename = r.filename || item.filename;
       item.title = item.filename;
       renderAttachBar(sid);
-      toast(`图片已添加（${fmtBytes(item.bytes)}）`, 'ok');
+      toast(`图片已添加为 ${item.token}（${fmtBytes(item.bytes)}）`, 'ok');
     } catch (e) {
       removeAttachment(sid, item.id);
       toast(`图片上传失败：${errText(e)}`, 'err');
@@ -132,7 +354,7 @@ export function renderAttachBar(sid) {
   if (!UI.wsShell?.comp) return;
   const bar = UI.wsShell.comp.attachBar;
   const list = sid ? (UI.attachments.get(sid) || []) : [];
-  const sig = list.map((x) => `${x.id}:${x.status || 'ok'}:${x.previewUrl || ''}`).join(',');
+  const sig = list.map((x) => `${x.id}:${x.token || ''}:${x.status || 'ok'}:${x.previewUrl || ''}`).join(',');
   if (bar.dataset.sid === (sid || '') && bar.dataset.sig === sig && bar.classList.contains('ws-hidden') === (list.length === 0)) return;
   bar.dataset.sid = sid || '';
   bar.dataset.sig = sig;
@@ -143,6 +365,12 @@ export function renderAttachBar(sid) {
   }
   bar.classList.remove('ws-hidden');
   bar.replaceChildren(...list.map((att) => {
+    const tokBtn = att.token ? h('button', {
+      type: 'button',
+      class: 'attach-tok',
+      title: '点击在输入框定位该占位符，若已删掉则重新插入',
+      onclick: () => locateOrReinsertToken(sid, att),
+    }, att.token) : null;
     if (att.kind === 'image') {
       const uploading = att.status === 'uploading';
       const thumb = uploading
@@ -155,6 +383,7 @@ export function renderAttachBar(sid) {
         }, h('img', { class: 'attach-thumb', src: att.previewUrl, alt: att.title }));
       return h('div', { class: 'attach-pill img-pill' },
         thumb,
+        tokBtn,
         h('span', { class: 'attach-info' },
           span('attach-meta', att.title),
           span('attach-sub', uploading ? '上传中…' : fmtBytes(att.bytes))),
@@ -163,7 +392,8 @@ export function renderAttachBar(sid) {
           h('button', { type: 'button', class: 'attach-act del', title: '移除图片', 'aria-label': '移除图片', onclick: () => removeAttachment(sid, att.id) }, '×')));
     }
     return h('div', { class: 'attach-pill' },
-      span('attach-meta', `📋 ${att.title} · ${att.lines} 行 · ${fmtBytes(att.bytes)}`),
+      tokBtn,
+      span('attach-meta', `${att.lines} 行 · ${fmtBytes(att.bytes)}`),
       h('span', { class: 'attach-acts' },
         h('button', { type: 'button', class: 'attach-act', onclick: () => APP.openDrawer('paste', { sessionId: sid, attachmentId: att.id }) }, '预览'),
         h('button', { type: 'button', class: 'attach-act', onclick: () => expandAttachmentToInput(sid, att.id) }, '转入输入框'),

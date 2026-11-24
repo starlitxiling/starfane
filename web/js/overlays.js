@@ -175,7 +175,8 @@ export function renderDrawer() {
     const list = UI.attachments.get(d.sessionId) || [];
     const att = list.find((x) => x.id === d.attachmentId);
     title = att ? att.title : '附件预览';
-    sub = att ? (att.kind === 'image' ? `${att.mime || 'image'} · ${fmtBytes(att.bytes)}` : `${att.lines} 行 · ${fmtBytes(att.bytes)}`) : '';
+    const tokPre = att?.token ? `${att.token} · ` : '';
+    sub = att ? (att.kind === 'image' ? `${tokPre}${att.mime || 'image'} · ${fmtBytes(att.bytes)}` : `${tokPre}${att.lines} 行 · ${fmtBytes(att.bytes)}`) : '';
     body = att ? drawerPaste(d.sessionId, att) : emptyState('附件已移除', '该附件已被发送或删除。');
   }
   root.replaceChildren(
@@ -389,7 +390,11 @@ function drawerPaste(sid, att) {
         att.path ? btn('复制图片路径', { cls: 'sm', onclick: (e) => copyText(att.path, e.currentTarget) }) : null,
         btn('移除图片', { cls: 'ghost sm danger', onclick: () => { removeAttachment(sid, att.id); closeDrawer(); } })),
       att.previewUrl ? h('div', { class: 'drawer-img-wrap' }, h('img', { class: 'drawer-img', src: att.previewUrl, alt: att.title })) : skeleton(4),
-      att.path ? kvGrid([['服务端路径', h('code', null, att.path)], ['大小', fmtBytes(att.bytes)]]) : null);
+      att.path ? kvGrid([
+        att.token ? ['内联占位符', h('code', null, att.token)] : null,
+        ['服务端路径', h('code', null, att.path)],
+        ['大小', fmtBytes(att.bytes)],
+      ].filter(Boolean)) : null);
   }
   return h('div', { class: 'stack-sm' },
     h('div', { class: 'drawer-controls' },

@@ -1052,8 +1052,8 @@ exit 0
         "direct L2 interactive dispatch must not leave unread inbox items: {inbox:?}"
     );
 
-    // 4. POST /api/dispatch with >1000 chars long text (no attachments) also writes to inputs/.
-    let long_text = "x".repeat(1200);
+    // 4. POST /api/dispatch with >2400 chars long text (no attachments) also writes to inputs/.
+    let long_text = "x".repeat(2500);
     let b_long = json!({
         "target": {"type": "pane", "id": "%12"},
         "text": long_text,
@@ -1247,6 +1247,36 @@ exit 0
         "{injected}"
     );
     assert!(injected.contains(&img_id), "{injected}");
+
+    // 4b. Inline anchored image token preserves cursor order (`先看：[图片 #1] 这里错了`).
+    let disp_anchored = json!({
+        "target": {"type": "pane", "id": "%16"},
+        "text": "先看：[图片 #1] 这里错了",
+        "attachments": [
+            {"kind": "image", "title": "screenshot.png", "path": img_path, "token": "[图片 #1]"}
+        ],
+        "interactive": true
+    })
+    .to_string();
+    let (st_da, body_da) = http_req(
+        &addr,
+        "POST",
+        "/api/dispatch",
+        Some(&tok),
+        Some(&disp_anchored),
+    )
+    .await;
+    assert_eq!(st_da, 200, "{body_da}");
+    let injected_after = std::fs::read_to_string(&injected_log).unwrap();
+    let second_chunk = injected_after.split("\n---END---\n").nth(1).unwrap_or("");
+    let canon_img_path = std::fs::canonicalize(&img_path)
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(
+        second_chunk.contains(&format!("先看：[图片: {canon_img_path}] 这里错了")),
+        "{second_chunk}"
+    );
 
     // Dispatching an outside path like `/etc/hosts` MUST be rejected (400).
     let disp_bad = json!({

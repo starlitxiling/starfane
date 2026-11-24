@@ -392,6 +392,11 @@ pub struct PasteAttachment {
     /// Server-side path under `<state_dir>/inputs/` for `"image"` attachments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Optional inline anchor token inside `Dispatch.text` (e.g. `"[粘贴 #1]"` or `"[图片 #1]"`).
+    /// When present and found in `text`, the attachment is expanded in-place to preserve
+    /// the user's exact interleaving order of quotes, images, and follow-up questions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

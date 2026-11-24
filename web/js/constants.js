@@ -80,8 +80,8 @@ export const OUTLINE_COLLAPSED_KEY = 'starfane_outline_collapsed';
 export const GLYPH_MODE_KEY = 'starfane_term_glyph_mode';
 export const NON_TMUX_GROUP = '非 tmux / 后台';
 export const NON_TMUX_OPEN_KEY = 'starfane_nontmux_open';
-export const PASTE_CHAR_LIMIT = 400;
-export const PASTE_LINE_LIMIT = 6;
+export const PASTE_CHAR_LIMIT = 1500;
+export const PASTE_LINE_LIMIT = 24;
 export const IMG_MAX_BYTES = 10 * 1024 * 1024;
 export const EFFORT_LABEL = {
   low: 'low · 低',
