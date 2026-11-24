@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>baton · 控制面</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect x='6' y='6' width='116' height='116' rx='28' fill='%231E1D1B'/%3E%3Cpath d='M28 73C29 48 43 32 68 27' stroke='%23FAF9F6' stroke-opacity='0.22' stroke-width='3' stroke-linecap='round' fill='none'/%3E%3Ccircle cx='30' cy='60' r='7' fill='%23E07A5F'/%3E%3Ccircle cx='42' cy='40' r='7' fill='%233DB479'/%3E%3Ccircle cx='62' cy='29' r='7' fill='%235E83F2'/%3E%3Cg transform='translate(66 64) rotate(36)'%3E%3Crect x='-5.5' y='-40' width='11' height='54' rx='5.5' fill='%23FAF9F6'/%3E%3Crect x='-7.5' y='12' width='15' height='27' rx='7.5' fill='%23D97757'/%3E%3Crect x='-6.5' y='10' width='13' height='4.5' rx='2.25' fill='%23E6BE68'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div id="app" class="app-shell">
+  <header id="topbar" class="topbar"></header>
+  <main id="view" class="view" aria-live="polite"></main>
+</div>
+<div id="drawer-root" class="drawer-root" aria-hidden="true"></div>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+<dialog id="modal" class="modal"></dialog>
+<noscript><p style="padding:24px;font-family:sans-serif;color:#1E1D1B;background:#FAF9F6">baton 控制台需要启用 JavaScript。</p></noscript>
+<script type="module" src="/assets/app.js"></script>
+</body>
+</html>
