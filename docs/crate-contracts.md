@@ -1,7 +1,7 @@
-# baton Crate 接口契约（M0 冻结版）
+# starfane Crate 接口契约（M0 冻结版 · 更名同步）
 
-> 状态：**v0.1 FROZEN**。本文是 Wave 2 并行编码的唯一接口来源。改动 `baton-proto` 或任何跨 crate 签名，必须先在 board 上 @architect 提出变更，**不得各自修改**。
-> 上游设计：[architecture.md](./architecture.md) v2.1。凡出现 `relay`，一律改名为 `baton`。
+> 状态：**v0.1 FROZEN**。本文是 Wave 2 并行编码的唯一接口来源。改动 `starfane-proto` 或任何跨 crate 签名，必须先在 board 上 @architect 提出变更，**不得各自修改**。
+> 上游设计：[architecture.md](./architecture.md) v2.1。原项目名 `baton`，现已更名为 `starfane`（守护进程 `starfaned`）。
 
 ---
 
@@ -9,38 +9,38 @@
 
 | 项 | 约定 |
 |---|---|
-| 命名 | 二进制 `baton`；守护进程 = `baton daemon`（文中称 batond）；crate 名 `baton-*`，Rust 中写作 `baton_*` |
-| 状态目录 | `$BATON_STATE_DIR`，默认 `~/.local/state/baton/` |
-| Socket | `$BATON_SOCKET`，默认 `<state>/batond.sock` |
-| 用户配置 | `$BATON_CONFIG`，默认 `~/.config/baton/config.toml` |
-| 项目目录 | `<git_root>/.baton/`（`team.toml`、`pipelines/`、`artifacts/`、`handoffs/`、`reviews/`、`feedback.jsonl`） |
-| 环境变量 | `BATON_STATE_DIR`、`BATON_SOCKET`、`BATON_CONFIG`、`BATON_BIND`（L4 spawn 的一次性绑定 token）、`BATON_LOG`（`error`/`warn`/`info`/`debug`）、`BATON_DISABLE=1`（emit 直接 no-op） |
+| 命名 | 二进制 `starfane`；守护进程 = `starfane daemon`（文中称 starfaned）；crate 名 `starfane-*`，Rust 中写作 `starfane_*` |
+| 状态目录 | `$STARFANE_STATE_DIR`，默认 `~/.local/state/starfane/` |
+| Socket | `$STARFANE_SOCKET`，默认 `<state>/starfaned.sock` |
+| 用户配置 | `$STARFANE_CONFIG`，默认 `~/.config/starfane/config.toml` |
+| 项目目录 | `<git_root>/.starfane/`（`team.toml`、`pipelines/`、`artifacts/`、`handoffs/`、`reviews/`、`feedback.jsonl`） |
+| 环境变量 | `STARFANE_STATE_DIR`、`STARFANE_SOCKET`、`STARFANE_CONFIG`、`STARFANE_BIND`（L4 spawn 的一次性绑定 token）、`STARFANE_LOG`（`error`/`warn`/`info`/`debug`）、`STARFANE_DISABLE=1`（emit 直接 no-op） |
 | 时间 | `ts_ms: u64`，表示 Unix 毫秒（UTC）；不引入 chrono |
-| ID | `baton_proto::id::new_id(prefix)`，生成 `<prefix>-<26 位 Crockford base32>`：48 位毫秒时间 + 80 位随机（随机数来自 `/dev/urandom`）。前缀：`E` 事件、`P` pipeline、`H` handoff、`A` artifact、`R` review、`F` finding、`B` bind token |
+| ID | `starfane_proto::id::new_id(prefix)`，生成 `<prefix>-<26 位 Crockford base32>`：48 位毫秒时间 + 80 位随机（随机数来自 `/dev/urandom`）。前缀：`E` 事件、`P` pipeline、`H` handoff、`A` artifact、`R` review、`F` finding、`B` bind token |
 | serde | 枚举统一 `#[serde(rename_all = "snake_case")]`（`ReviewDepth` 除外，见 §1.6）；`Option` 字段加 `#[serde(default, skip_serializing_if = "Option::is_none")]`；`Vec` 字段加 `#[serde(default)]`；**不使用 `deny_unknown_fields`**，向前兼容，必填检查交给 G1 |
-| 版本 | 每个顶层线缆 / 工件结构都带 `v: u32`，当前全部为 `1`（`baton_proto::PROTO_VERSION`） |
+| 版本 | 每个顶层线缆 / 工件结构都带 `v: u32`，当前全部为 `1`（`starfane_proto::PROTO_VERSION`） |
 | 错误 | 库 crate 各自定义 `pub enum Error`，手写 `Display` 和 `std::error::Error`；**不用 anyhow / thiserror** |
-| 依赖分层 | 见 §0.1；`baton-emit` **禁止**依赖 tokio、axum 和 `baton-daemon` |
+| 依赖分层 | 见 §0.1；`starfane-emit` **禁止**依赖 tokio、axum 和 `starfane-daemon` |
 
 ### 0.1 依赖图（只允许箭头方向）
 
 ```
-baton-proto  ← serde, serde_json
+starfane-proto  ← serde, serde_json
    ↑
-   ├── baton-emit       （proto, serde_json）                 std-only 热路径
-   ├── baton-adapters   （proto, serde_json, toml）
-   ├── baton-tmux       （proto）                               std::process 同步实现
-   ├── baton-evidence   （proto）                               调用 git 子进程
-   ├── baton-binding    （proto）                               纯函数
-   └── baton-daemon     （上述全部 + tokio + axum + toml + log）
+   ├── starfane-emit       （proto, serde_json）                 std-only 热路径
+   ├── starfane-adapters   （proto, serde_json, toml）
+   ├── starfane-tmux       （proto）                               std::process 同步实现
+   ├── starfane-evidence   （proto）                               调用 git 子进程
+   ├── starfane-binding    （proto）                               纯函数
+   └── starfane-daemon     （上述全部 + tokio + axum + toml + log）
           ↑
-       bin/baton        （全部 + clap）
+       bin/starfane        （全部 + clap）
 tools/fake-agent        （proto, serde_json）
 ```
 
 ---
 
-## 1. `baton-proto`
+## 1. `starfane-proto`
 
 模块划分：`id`、`paths`、`agent`、`event`、`session`、`pipeline`、`artifact`（含 `handoff`、`plan`、`review`、`triage`、`rca`、`report`）、`wire`、`api`、`sse`。
 
@@ -59,7 +59,7 @@ pub mod id { pub fn new_id(prefix: &str) -> String; }
 pub mod paths {
   pub fn state_dir() -> PathBuf;  pub fn socket_path() -> PathBuf;  pub fn spool_dir() -> PathBuf;
   pub fn events_dir() -> PathBuf; pub fn snapshot_path() -> PathBuf; pub fn backups_dir() -> PathBuf;
-  pub fn config_path() -> PathBuf; pub fn project_dir(git_root: &Path) -> PathBuf; // <root>/.baton
+  pub fn config_path() -> PathBuf; pub fn project_dir(git_root: &Path) -> PathBuf; // <root>/.starfane
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -107,7 +107,7 @@ pub struct EnvCtx {
   pub pid: u32,                    // emit 进程自身的 pid
   pub ppid: u32,                   // 父进程（hook shell）
   pub cwd: String,                 // emit 进程的 cwd（agy 下是 hooks.json 所在目录，不可信）
-  pub bind_token: Option<BindToken>, // $BATON_BIND
+  pub bind_token: Option<BindToken>, // $STARFANE_BIND
 }
 impl EnvCtx { pub fn capture() -> Self; }
 
@@ -309,7 +309,7 @@ pub struct PipelineSpec {
 
 ### 1.5 工件公共部分
 
-工件的**规范存储格式为 JSON**：`<root>/.baton/artifacts/<P-id>/<A-id>.json`。另由 daemon 渲染出 `<A-id>.md` 供人阅读。这是对 architecture §4 「TOML 前置元数据」的简化：MCP 提交本来就是 JSON，统一用 JSON 可以省掉嵌套 TOML 的复杂度。
+工件的**规范存储格式为 JSON**：`<root>/.starfane/artifacts/<P-id>/<A-id>.json`。另由 daemon 渲染出 `<A-id>.md` 供人阅读。这是对 architecture §4 「TOML 前置元数据」的简化：MCP 提交本来就是 JSON，统一用 JSON 可以省掉嵌套 TOML 的复杂度。
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -488,7 +488,7 @@ pub struct AdjudicatedFinding {
   pub feedback: Option<FeedbackRecord>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReviewRecord {               // 存储在 <root>/.baton/reviews/<R-id>.json
+pub struct ReviewRecord {               // 存储在 <root>/.starfane/reviews/<R-id>.json
   pub v: u32, pub id: ReviewId, pub report: ReviewReport,
   pub report_g1: Vec<G1Issue>,
   pub findings: Vec<AdjudicatedFinding>,
@@ -736,7 +736,7 @@ SSE 帧格式：`id: <seq>\nevent: <type>\ndata: <json>\n\n`。客户端通过 `
 
 ---
 
-## 2. `baton-emit`
+## 2. `starfane-emit`
 
 ```rust
 /// hook 热路径。不构造 tokio，不访问网络，不 panic（用 catch_unwind 包住）。
@@ -751,7 +751,7 @@ pub fn hook_reply(agent: AgentKind) -> &'static str;   // Agy => "{}\n"，其余
 ```
 
 行为规范：
-1. 若 `BATON_DISABLE=1`：写入 `hook_reply` 后返回 0。
+1. 若 `STARFANE_DISABLE=1`：写入 `hook_reply` 后返回 0。
 2. 读取 stdin，上限 1 MiB；能解析成 JSON 就保留，否则写入 `{"_raw": ...}`。
 3. 用 `UnixStream::connect` 连接 socket，并设置 50ms 的 write timeout，写入一行 `ClientFrame::Emit`。
 4. 第 3 步失败时：追加写入 spool；然后 `Command::new(current_exe).args(["daemon","--detach"])` 拉起 daemon，stdin/stdout/stderr 全部指向 null 且不等待子进程。拉起频率由 `<state>/spawn.lock` 的 mtime 控制，2 秒内只拉起一次。
@@ -759,7 +759,7 @@ pub fn hook_reply(agent: AgentKind) -> &'static str;   // Agy => "{}\n"，其余
 
 ---
 
-## 3. `baton-adapters`
+## 3. `starfane-adapters`
 
 ```rust
 pub fn normalize_hook(agent: AgentKind, event_name: &str, payload: &serde_json::Value,
@@ -770,7 +770,7 @@ pub fn normalize_request(req: &EmitRequest) -> Result<NormalizedEvent, AdapterEr
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
   pub scope: Scope, pub dry_run: bool,
-  pub baton_bin: PathBuf,                // 写入 hook 命令中的绝对路径
+  pub starfane_bin: PathBuf,                // 写入 hook 命令中的绝对路径
   pub agy_permission_heuristic: bool,    // 默认 false
   pub register_mcp: bool,                // 默认 true
 }
@@ -784,7 +784,7 @@ pub struct InstallPlan {
   pub notes: Vec<String>,                // 例如 codex trust 指引
 }
 pub fn install_plan(agent: AgentKind, home: &Path, opts: &InstallOptions) -> Result<InstallPlan, AdapterError>;
-pub fn uninstall_plan(agent: AgentKind, home: &Path, scope: &Scope, baton_bin: &Path) -> Result<InstallPlan, AdapterError>;
+pub fn uninstall_plan(agent: AgentKind, home: &Path, scope: &Scope, starfane_bin: &Path) -> Result<InstallPlan, AdapterError>;
 /// 先把每个将被改动的文件原样复制到 <state>/backups/<ts_ms>/<相对 home 的路径>，再执行原子写入；
 /// 写完回读并重新解析，失败就回滚。commands 按顺序执行，任一失败即中止并报告。
 pub fn apply_plan(plan: &InstallPlan, backups_root: &Path) -> Result<PathBuf /*本次备份目录*/, AdapterError>;
@@ -794,7 +794,7 @@ pub enum Level { Ok, Warn, Error }
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorFinding { pub id: String, pub agent: Option<AgentKind>, pub level: Level, pub message: String, pub fix_hint: Option<String> }
 #[derive(Debug, Clone)]
-pub struct DoctorEnv { pub home: PathBuf, pub path_var: String, pub baton_bin: PathBuf }
+pub struct DoctorEnv { pub home: PathBuf, pub path_var: String, pub starfane_bin: PathBuf }
 pub fn doctor_checks(env: &DoctorEnv) -> Vec<DoctorFinding>;
 pub fn resolve_agent_bin(agent: AgentKind, env: &DoctorEnv) -> Option<PathBuf>;   // 结果缓存到 config 的 [paths]
 
@@ -820,13 +820,13 @@ pub fn build_l4_spawn_cmd(req: &SpawnRequest) -> Result<Vec<String>, AdapterErro
 |---|---|---|---|
 | claude | `~/.claude/settings.json`（项目级：`.claude/settings.local.json`） | SessionStart、UserPromptSubmit、PermissionRequest、Notification、Stop、StopFailure、SubagentStart、SubagentStop、SessionEnd | `hooks.<E>[] += {"hooks":[{"type":"command","command":"<bin> emit --agent claude --event <E>","async":true,"timeout":5}]}` |
 | codex | `~/.codex/hooks.json`（**绝不碰 `config.toml` 的 `notify`**） | SessionStart、UserPromptSubmit、PermissionRequest、Stop、Interrupt、SubagentStart、SubagentStop、SessionEnd | 与 claude 同构；条目带 `"async":true,"timeout":5`；notes 中提示用户在 codex 内信任新的 hook 条目 |
-| agy | `~/.gemini/config/hooks.json`（项目级：`.agents/hooks.json`） | SessionStart、PreInvocation、Stop；可选 PreToolUse / PostToolUse（matcher `run_command\|write_file\|edit_file`） | 顶层命名组 `"baton": {"SessionStart":[{"type":"command","command":"<bin> emit --agent agy --event SessionStart","timeout":5}], …}` |
+| agy | `~/.gemini/config/hooks.json`（项目级：`.agents/hooks.json`） | SessionStart、PreInvocation、Stop；可选 PreToolUse / PostToolUse（matcher `run_command\|write_file\|edit_file`） | 顶层命名组 `"starfane": {"SessionStart":[{"type":"command","command":"<bin> emit --agent agy --event SessionStart","timeout":5}], …}` |
 
-- **标记规则**：claude 和 codex 中，`command` 以 `<baton_bin> emit --agent ` 开头的条目视为 baton 所有；agy 中，顶层 key `"baton"` 视为 baton 所有。卸载时只删除这些条目；删除后若数组为空就删掉该事件的 key，若对象为空就删掉对象。其余内容逐字节保留，JSON 用 2 空格缩进重排。
+- **标记规则**：claude 和 codex 中，`command` 以 `<starfane_bin> emit --agent ` 开头的条目视为 starfane 所有；agy 中，顶层 key `"starfane"` 视为 starfane 所有。卸载时只删除这些条目；删除后若数组为空就删掉该事件的 key，若对象为空就删掉对象。其余内容逐字节保留，JSON 用 2 空格缩进重排。
 - **MCP 注册**（走官方 CLI，不直接改文件）：
-  - claude：`claude mcp add -s user baton -- <bin> mcp --agent claude`，注销用 `claude mcp remove -s user baton`；
-  - codex：`codex mcp add baton -- <bin> mcp --agent codex`，注销用 `codex mcp remove baton`；
-  - agy：`agy mcp add baton <bin> mcp --agent agy`，注销用 `agy mcp remove baton`。
+  - claude：`claude mcp add -s user starfane -- <bin> mcp --agent claude`，注销用 `claude mcp remove -s user starfane`；
+  - codex：`codex mcp add starfane -- <bin> mcp --agent codex`，注销用 `codex mcp remove starfane`；
+  - agy：`agy mcp add starfane <bin> mcp --agent agy`，注销用 `agy mcp remove starfane`。
 
 ### 3.2 归一化映射（规范性要求，契约测试必须全部覆盖）
 
@@ -855,11 +855,11 @@ pub fn build_l4_spawn_cmd(req: &SpawnRequest) -> Result<Vec<String>, AdapterErro
 
 ---
 
-## 4. `baton-tmux`
+## 4. `starfane-tmux`
 
 ```rust
 #[derive(Debug, Clone)]
-pub struct Tmux { pub bin: PathBuf, pub socket_name: Option<String> }   // socket_name 对应 tmux -L（测试用 "baton-test"）
+pub struct Tmux { pub bin: PathBuf, pub socket_name: Option<String> }   // socket_name 对应 tmux -L（测试用 "starfane-test"）
 impl Tmux {
   pub fn new(bin: PathBuf, socket_name: Option<String>) -> Self;
   pub fn available(&self) -> bool;
@@ -910,22 +910,22 @@ pub fn check_injection_gate(pane: &PaneInfo, clients: &[ClientInfo], state: Sess
 
 #[derive(Debug, Clone)]
 pub struct SpawnWindow {
-  pub target_session: Option<String>,    // None 时使用（或新建）detached session "baton"
+  pub target_session: Option<String>,    // None 时使用（或新建）detached session "starfane"
   pub window_name: String, pub cwd: PathBuf,
-  pub env: Vec<(String, String)>,        // 例如 ("BATON_BIND", "B-…")
+  pub env: Vec<(String, String)>,        // 例如 ("STARFANE_BIND", "B-…")
   pub argv: Vec<String>,                 // 来自 adapters::build_l4_spawn_cmd
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct PaneStatus { pub state: SessionState, pub role: Option<StageKind>, pub pipeline: Option<PipelineId> }
 ```
 
-- `inject_pointer` 的执行顺序：校验 text 为单行且不超过 `max_pointer_len`，否则返回 `TmuxError::InvalidText` → `load-buffer -b baton_<rand> -`（text 从 stdin 传入）→ `paste-buffer -d -p -b baton_<rand> -t <pane>` → `sleep(paste_settle_ms)` → `send-keys -t <pane> C-m`。**本函数不做门禁检查，调用方必须先调用 `check_injection_gate`。**
-- `spawn_window` 的执行顺序：`new-window -d -P -F "#{pane_id}" -n <name> -c <cwd> [-e K=V]... -t <session>: -- <argv...>` → `set-option -p -t <pane> remain-on-exit failed` → 返回 pane。如果目标 session 不存在，先执行 `new-session -d -s baton -c <cwd>`。
-- `set_status` 写入的 pane 选项：`@baton_state`、`@baton_role`、`@baton_pipeline`。
+- `inject_pointer` 的执行顺序：校验 text 为单行且不超过 `max_pointer_len`，否则返回 `TmuxError::InvalidText` → `load-buffer -b starfane_<rand> -`（text 从 stdin 传入）→ `paste-buffer -d -p -b starfane_<rand> -t <pane>` → `sleep(paste_settle_ms)` → `send-keys -t <pane> C-m`。**本函数不做门禁检查，调用方必须先调用 `check_injection_gate`。**
+- `spawn_window` 的执行顺序：`new-window -d -P -F "#{pane_id}" -n <name> -c <cwd> [-e K=V]... -t <session>: -- <argv...>` → `set-option -p -t <pane> remain-on-exit failed` → 返回 pane。如果目标 session 不存在，先执行 `new-session -d -s agent-session -c <cwd>`。
+- `set_status` 写入的 pane 选项：`@starfane_state`、`@starfane_role`、`@starfane_pipeline`。
 
 ---
 
-## 5. `baton-evidence`
+## 5. `starfane-evidence`
 
 ```rust
 pub trait SourceProvider {
@@ -983,7 +983,7 @@ pub fn normalize_ws(s: &str) -> String;   // 每行 trim，行内连续空白折
 
 ---
 
-## 6. `baton-binding`
+## 6. `starfane-binding`
 
 ```rust
 #[derive(Debug, Clone, Default)]
@@ -1044,11 +1044,11 @@ pub fn validate(parsed: &ParsedBinding, ctx: &BindingContext) -> Vec<BindingWarn
 
 ---
 
-## 7. `baton-daemon`
+## 7. `starfane-daemon`
 
 ```rust
 pub struct DaemonConfig {
-  pub state_dir: PathBuf, pub socket: PathBuf, pub config: BatonConfig,
+  pub state_dir: PathBuf, pub socket: PathBuf, pub config: StarfaneConfig,
   pub web_dir: Option<PathBuf>,          // 开发热重载；None 时使用嵌入资产
   pub foreground: bool,
 }
@@ -1068,7 +1068,7 @@ pub mod mcp { pub fn run_stdio(agent: AgentKind, socket: &Path) -> i32; }   // �
 
 内部模块（daemon 作者自行实现，跨模块不需要冻结）：`ingest`、`registry`、`router`、`pipeline`、`delivery`、`store`、`web`、`lark`、`config`。
 
-### 7.1 用户配置 `~/.config/baton/config.toml`
+### 7.1 用户配置 `~/.config/starfane/config.toml`
 
 ```toml
 [web]
@@ -1100,15 +1100,27 @@ codex = ""
 agy = ""
 tmux = ""
 
+[discovery]
+include_shell_panes = false
+
 [tmux]
-socket_name = ""   # 测试时设为 "baton-test"
+socket_name = ""   # 测试时设为 "starfane-test"
+
+[tmux.backup]
+enabled = false
+interval_secs = 300
+max_snapshots = 20
+auto_restore_on_start = false
+restore_agents = true
+restore_bypass_permissions = false
+exclude_sessions = []
 ```
 
-项目级 `.baton/team.toml` 沿用 architecture §3.4（`[playbooks.feature]`、`[playbooks.debug]`、`[models.aliases]`、`[spawn]`），其中的值都使用 `StageBinding` 简写语法。
+项目级 `.starfane/team.toml` 沿用 architecture §3.4（`[playbooks.feature]`、`[playbooks.debug]`、`[models.aliases]`、`[spawn]`），其中的值都使用 `StageBinding` 简写语法。
 
 ### 7.2 REST + SSE
 
-鉴权：`Cookie: baton_token=<t>` 或请求头 `X-Baton-Token: <t>`。token 每次 daemon 启动时随机生成，写入 `<state>/web.token`（权限 0600）。所有请求都要校验 `Host ∈ {127.0.0.1:<port>, localhost:<port>}`；POST 请求还要校验 `Origin` 与 Host 同源。响应体统一为 `DaemonResponse` 去掉 `id` 后的结构 `{ok, data, error}`；HTTP 状态码映射：BadRequest→400、NotFound→404、Conflict→409、GateRejected→422、Unavailable→503、Internal→500。
+鉴权：`Cookie: starfane_token=<t>` 或请求头 `X-Starfane-Token: <t>`。token 每次 daemon 启动时随机生成，写入 `<state>/web.token`（权限 0600）。所有请求都要校验 `Host ∈ {127.0.0.1:<port>, localhost:<port>}`；POST 请求还要校验 `Origin` 与 Host 同源。响应体统一为 `DaemonResponse` 去掉 `id` 后的结构 `{ok, data, error}`；HTTP 状态码映射：BadRequest→400、NotFound→404、Conflict→409、GateRejected→422、Unavailable→503、Internal→500。
 
 | 方法 | 路径 | DaemonCommand / 说明 |
 |---|---|---|
@@ -1137,9 +1149,9 @@ socket_name = ""   # 测试时设为 "baton-test"
 
 ### 7.3 MCP（stdio，手写实现）
 
-- 方法：`initialize`（如果客户端请求的 `protocolVersion` 在 `["2024-11-05","2025-03-26","2025-06-18"]` 中就原样回显，否则返回 `"2025-06-18"`；`capabilities: {tools: {}}`；`serverInfo: {name: "baton", version}`）、`notifications/initialized`、`ping`、`tools/list`、`tools/call`。
+- 方法：`initialize`（如果客户端请求的 `protocolVersion` 在 `["2024-11-05","2025-03-26","2025-06-18"]` 中就原样回显，否则返回 `"2025-06-18"`；`capabilities: {tools: {}}`；`serverInfo: {name: "starfane", version}`）、`notifications/initialized`、`ping`、`tools/list`、`tools/call`。
 - `tools/call` 的返回：`{content: [{type: "text", text: <data 的 JSON 字符串>}], structuredContent: <data>, isError: <!ok>}`。
-- 身份：启动时调用 `ResolveIdentity`（参数来自 `$BATON_BIND`、`$TMUX_PANE`、cwd 和 `--agent`）；结果为 Resolved 就缓存。每个工具都接受可选的 `from_session` 参数，它的优先级高于缓存；Ambiguous 或 Unknown 时，工具返回 `isError: true` 并附上候选列表，提示 agent 带上 `from_session` 重试。
+- 身份：启动时调用 `ResolveIdentity`（参数来自 `$STARFANE_BIND`、`$TMUX_PANE`、cwd 和 `--agent`）；结果为 Resolved 就缓存。每个工具都接受可选的 `from_session` 参数，它的优先级高于缓存；Ambiguous 或 Unknown 时，工具返回 `isError: true` 并附上候选列表，提示 agent 带上 `from_session` 重试。
 
 | # | 工具 | inputSchema（JSON Schema 摘要） | 返回 `data` |
 |---|---|---|---|
@@ -1153,7 +1165,7 @@ socket_name = ""   # 测试时设为 "baton-test"
 | 8 | `report_milestone` | `{kind: "plan"\|"rca"\|"final_report"\|"progress", plan?: PlanDoc, rca?: RcaReport, report?: FinalReport, text?: string, notify_human?: boolean, from_session?}`；kind 为 plan / rca / final_report 时，对应字段必填；kind 为 progress 时 `text` 必填 | plan / rca / final_report 返回 `SubmitOutcome`；progress 返回 `{}` |
 | 9 | `start_pipeline` | `{playbook?: "feature"\|"debug", goal: string, utterance?: string, bindings?: {[stage]: shorthand}, project_root?: string, from_session?}` | `{pipeline: PipelineSpec, parsed: ParsedBinding, needs_confirmation: true}` |
 
-> 说明：第 9 个工具 `start_pipeline` 是在 coordinator 给出的 8 个工具之外补充的。它支撑 architecture §3.4 中「在对话里下达，由 agent 自己解析话术」的入口。没有它，「在对话里说一句就启动流程」无法实现。所有 inputSchema 的完整 JSON 由 `baton-proto` 中的 `mcp_tool_schemas() -> serde_json::Value` 统一生成，并做快照测试。
+> 说明：第 9 个工具 `start_pipeline` 是在 coordinator 给出的 8 个工具之外补充的。它支撑 architecture §3.4 中「在对话里下达，由 agent 自己解析话术」的入口。没有它，「在对话里说一句就启动流程」无法实现。所有 inputSchema 的完整 JSON 由 `starfane-proto` 中的 `mcp_tool_schemas() -> serde_json::Value` 统一生成，并做快照测试。
 
 工具与 `DaemonCommand` 的映射：
 - 1 → ListSessions
@@ -1193,30 +1205,31 @@ socket_name = ""   # 测试时设为 "baton-test"
 | `停止 <P-id>` / `stop` | PipelineAction::Cancel |
 | `静音 <30m\|2h>` / `mute`；`取消静音` / `unmute` | 暂停飞书推送（Web 不受影响） |
 
-**卡片回调**的 `action_value` 统一为 `{"baton":1,"op":"<op>","pipeline_id":"P-…","review_id"?:"…","finding_id"?:"…","nonce":"<8 位>"}`。`op` 取值：`confirm_pipeline`、`cancel_pipeline`、`approve_plan`、`request_changes`、`continue_deep`、`stop_deep`、`adopt_mitigation`、`feedback_valid`、`feedback_fp`、`feedback_wontfix`。绑定确认卡的 `form_value` 以阶段名为键，值为简写语法（来自 `select_static`）。
+**卡片回调**的 `action_value` 统一为 `{"starfane":1,"op":"<op>","pipeline_id":"P-…","review_id"?:"…","finding_id"?:"…","nonce":"<8 位>"}`。`op` 取值：`confirm_pipeline`、`cancel_pipeline`、`approve_plan`、`request_changes`、`continue_deep`、`stop_deep`、`adopt_mitigation`、`feedback_valid`、`feedback_fp`、`feedback_wontfix`。绑定确认卡的 `form_value` 以阶段名为键，值为简写语法（来自 `select_static`）。
 
 **安全**：`operator_id` 必须在 `allow_open_ids` 中，`chat_id` 必须在 `allow_chat_ids` 中（私聊豁免 chat 检查），否则只记审计日志不执行；同一个 nonce 只处理一次；远程文本先清洗（去除控制字符、截断到 2KB、换行折叠为空格）再进入 Dispatch。
 
 ---
 
-## 8. `bin/baton` CLI
+## 8. `bin/starfane` CLI
 
 全局参数：`--json`（机器可读输出）、`--socket <path>`。退出码：0 成功；1 错误；2 用法错误；3 daemon 不可用；4 门禁拒绝。
 
 | 子命令 | 参数 | 实现 |
 |---|---|---|
-| `emit` | `--agent <claude\|codex\|agy> [--event <E>]` | `baton_emit::run_emit`（**在 main 中最先匹配**，此时尚未初始化 clap 以外的任何东西） |
-| `daemon` | `[--detach] [--foreground] [--web-dir <dir>] [--port <n>]` | `baton_daemon::run`；`--detach` 时 fork 到后台并重定向日志到 `<state>/batond.log` |
+| `emit` | `--agent <claude\|codex\|agy> [--event <E>]` | `starfane_emit::run_emit`（**在 main 中最先匹配**，此时尚未初始化 clap 以外的任何东西） |
+| `daemon` | `[--detach] [--foreground] [--web-dir <dir>] [--port <n>]` | `starfane_daemon::run`；`--detach` 时 fork 到后台并重定向日志到 `<state>/starfaned.log` |
 | `doctor` | `[--json]` | `adapters::doctor_checks` + tmux / Rust / 磁盘 / lark-cli 检查 |
 | `install` | `[--agent <a>]... \| --all  [--scope user\|project] [--dry-run] [--agy-permission-heuristic] [--no-mcp]` | install_plan → 打印 diff → `apply_plan`（`--dry-run` 时不执行） |
 | `uninstall` | `[--agent <a>]... \| --all  [--scope] [--dry-run]` | uninstall_plan → apply_plan |
 | `ls` | `[--all] [--project <dir>]` | ListSessions + ListPipelines，输出表格 |
-| `mcp` | `--agent <a>` | `baton_daemon::mcp::run_stdio` |
+| `mcp` | `--agent <a>` | `starfane_daemon::mcp::run_stdio` |
 | `handoff` | `--from <sel> --to <sel> [--intent review] [--mode read-only] [-m <summary>] [--body-file <f>]` | CreateHandoff（由 CLI 自动收集 git diff --stat 作为 body） |
 | `pipeline` | `new "<话术>" [--project <dir>] [--playbook feature\|debug] [--yes]` \| `list` \| `show <id>` \| `confirm <id>` \| `approve <id>` \| `reject <id> [-m]` \| `cancel <id>` | ParseUtterance → 展示绑定表 → 交互确认（或 `--yes`）→ Create + Confirm |
 | `debug` | `"<现象；绑定话术>" [--project] [--yes]` \| `continue <id>` \| `stop <id>` | 等价于 `pipeline new --playbook debug` |
 | `review` | `show <R-id>` \| `feedback <R-id> <F-id> valid\|false-positive\|wontfix [-m]` \| `verdict <R-id> <F-id> <verdict>` \| `precision` | 对应的 DaemonCommand |
 | `web` | `[--print-url] [--no-open]` | 读取 `web.token`，用 `open` 打开 `http://127.0.0.1:<port>/auth?token=…` |
+| `tmux` | `backup [--force]` \| `restore [--file <path>] [--no-agents] [--dry-run]` \| `backups` | 备份与恢复 tmux 会话/窗口/分屏布局及可选恢复 `claude --resume` / `codex resume`（daemon 在线或离线均可） |
 
 选择器 `<sel>`：`%12`（pane）、`s:<session_id>`、`P-…/<stage>`，或 agent 名（要求在当前项目内唯一）。
 
@@ -1230,7 +1243,7 @@ fake-agent --agent <claude|codex|agy> --script <file.toml> [--emit-bin <path>]
 
 行为：在当前 pane 中打印该 agent 的空闲提示符（取 `GateConfig.idle_prompts` 的默认值），从 stdin 按行读取输入，并按 script 依次通过 `<emit-bin> emit --agent X --event E` 投递 fixture payload（payload 中的 `session_id` / `conversationId` 等字段做模板替换）。也可以把 `run_emit_with` 作为库直接调用。
 
-脚本格式：`[[step]] on = "start" | "input" | "after_ms:<n>"`，`event = "Stop"`，`payload = "<fixtures 相对路径>"`，`set = { fullyIdle = true }`。用于 M1–M4 在沙箱 `tmux -L baton-test` 中做端到端测试。
+脚本格式：`[[step]] on = "start" | "input" | "after_ms:<n>"`，`event = "Stop"`，`payload = "<fixtures 相对路径>"`，`set = { fullyIdle = true }`。用于 M1–M4 在沙箱 `tmux -L starfane-test` 中做端到端测试。
 
 ---
 
@@ -1239,21 +1252,21 @@ fake-agent --agent <claude|codex|agy> --script <file.toml> [--emit-bin <path>]
 | 资产 | 位置 | 要求 |
 |---|---|---|
 | hook stdin 样本 | `tests/fixtures/<agent>/<Event>[__<variant>].json` | 每个 agent 覆盖 §3.2 中的每一行；内容来自真实 schema 的最小化样本 |
-| 归一化契约测试 | `baton-adapters/tests/normalize.rs` | 每个 fixture 都断言 EventKind、Confidence、subagent_id 和 model |
-| install 往返测试 | `baton-adapters/tests/roundtrip.rs` | 在 tempdir 中构造 HOME（预置用户已有的 PostToolUse、notify 等内容），install 再 uninstall 后与原文件逐字节一致 |
-| G2 金标测试 | `baton-evidence/tests/golden/` | 一个小型 git 仓库 fixture，包含 verified / relocated / ambiguous / fabricated / log 各类样例 |
-| 话术测试 | `baton-binding/tests/utterances.toml` | ≥ 30 条，格式为 `{text, expect: {stage: shorthand}, warnings: [...]}` |
-| 门禁测试 | `baton-tmux/tests/gate.rs` | 纯函数矩阵测试；外加在 `tmux -L baton-test` 中跑的集成测试（用 `#[ignore]` 标记，CI 显式开启） |
-| MCP schema 快照 | `baton-proto/tests/mcp_schemas.rs` | 对 `mcp_tool_schemas()` 做快照测试 |
+| 归一化契约测试 | `starfane-adapters/tests/normalize.rs` | 每个 fixture 都断言 EventKind、Confidence、subagent_id 和 model |
+| install 往返测试 | `starfane-adapters/tests/roundtrip.rs` | 在 tempdir 中构造 HOME（预置用户已有的 PostToolUse、notify 等内容），install 再 uninstall 后与原文件逐字节一致 |
+| G2 金标测试 | `starfane-evidence/tests/golden/` | 一个小型 git 仓库 fixture，包含 verified / relocated / ambiguous / fabricated / log 各类样例 |
+| 话术测试 | `starfane-binding/tests/utterances.toml` | ≥ 30 条，格式为 `{text, expect: {stage: shorthand}, warnings: [...]}` |
+| 门禁测试 | `starfane-tmux/tests/gate.rs` | 纯函数矩阵测试；外加在 `tmux -L starfane-test` 中跑的集成测试（用 `#[ignore]` 标记，CI 显式开启） |
+| MCP schema 快照 | `starfane-proto/tests/mcp_schemas.rs` | 对 `mcp_tool_schemas()` 做快照测试 |
 
 **Wave 2 并行切分**（单向依赖，接口以本文为准）：
-- **W2-0**：`baton-proto`（先行，约 1 小时，完成后冻结）；
+- **W2-0**：`starfane-proto`（先行，约 1 小时，完成后冻结）；
 - **W2-0 合入后并行**：
-  - W2-a：`baton-emit` + `baton-adapters` + fixtures；
-  - W2-b：`baton-tmux`；
-  - W2-c：`baton-evidence`；
-  - W2-d：`baton-binding`；
-  - W2-e：`baton-daemon`（core、store、web、lark、mcp）；
+  - W2-a：`starfane-emit` + `starfane-adapters` + fixtures；
+  - W2-b：`starfane-tmux`；
+  - W2-c：`starfane-evidence`；
+  - W2-d：`starfane-binding`；
+  - W2-e：`starfane-daemon`（core、store、web、lark、mcp）；
   - W2-f：`web/` 前端（只依赖 §7.2 REST 与 §1.9 SSE）；
   - W2-g：`tools/fake-agent`；
-- **最后**：`bin/baton` 负责把各 crate 串起来（由 W2-e 的作者负责）。
+- **最后**：`bin/starfane` 负责把各 crate 串起来（由 W2-e 的作者负责）。

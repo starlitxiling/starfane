@@ -1,6 +1,6 @@
 # M0 前置技术 Spike 实测报告
 
-> 测试日期：2026-11-20 · 隔离环境：`tmux -L baton-spike` 与独立临时 `CODEX_HOME`（未触碰用户任何真实 tmux 会话、未修改 `~/.claude` / `~/.codex` / `~/.gemini`）。
+> 测试日期：2026-11-20 · 隔离环境：`tmux -L starfane-spike` 与独立临时 `CODEX_HOME`（未触碰用户任何真实 tmux 会话、未修改 `~/.claude` / `~/.codex` / `~/.gemini`）。
 > 测试版本：`agy 1.5.13`、`codex-cli 0.167.2`、`tmux 3.7c`。
 
 ---
@@ -9,9 +9,9 @@
 
 ### 1.1 实测方法
 1. 只读分析 `agy 1.5.13` 二进制符号与 `--help` 文本。
-2. 在隔离 `tmux -L baton-spike` 中进行两组实验：
+2. 在隔离 `tmux -L starfane-spike` 中进行两组实验：
    - **实验 A（未信任目录）**：在新建临时目录执行 `agy -i "/help"`。
-   - **实验 B（已信任目录 `/Users/demo/work/baton`）**：先执行 `agy -i "/help"` 观察 5 秒，再在同一 pane 内执行 L2 注入序列：`printf '%s' '/help' | tmux load-buffer -b baton_spike -` → `tmux paste-buffer -d -p -b baton_spike -t <pane>` → 等待 `300ms` → `tmux send-keys -t <pane> C-m`。
+   - **实验 B（已信任目录 `/Users/demo/work/starfane`）**：先执行 `agy -i "/help"` 观察 5 秒，再在同一 pane 内执行 L2 注入序列：`printf '%s' '/help' | tmux load-buffer -b starfane_spike -` → `tmux paste-buffer -d -p -b starfane_spike -t <pane>` → 等待 `300ms` → `tmux send-keys -t <pane> C-m`。
 
 ### 1.2 实测结果
 1. **L4 新目录信任弹窗陷阱（实验 A）**：
@@ -24,7 +24,7 @@
    - 此外，`agy --help` 明确：`--print` 与 `--prompt-interactive` 互斥，且启动耗时约 3–5 秒才出现提示符 `>`。
 
 ### 1.3 工程落地结论（面向 M2/M3）
-- **常规任务（无斜杠命令）**：优先走 **L4**（`agy --model <m> --effort <e> -i "baton: ... 请调用 baton.read_inbox"`），避开向运行中 TUI 注入的任何风险。
+- **常规任务（无斜杠命令）**：优先走 **L4**（`agy --model <m> --effort <e> -i "starfane: ... 请调用 starfane.read_inbox"`），避开向运行中 TUI 注入的任何风险。
 - **需要触发 `agy` TUI 斜杠命令（`/swarm <args>`、`/boost <args>`、`/teamwork <args>`）**：
   - **推荐两步策略**：(1) 若复用已有空闲 `agy` pane，走 **L2 门禁注入**（`load-buffer -` → `paste-buffer -d -p` → 等待 `250–300ms` → `send-keys C-m`），且**始终带任务参数**（`/swarm <指针>`，绝不发裸 `/swarm`）；(2) 若通过 L4 新开窗格，先以不带斜杠的指针启动或空启动等待 `SessionStart`/提示符就绪后再走 L2 注入斜杠命令；(3) 3–5 秒内未收到 `PreInvocation` ACK 时，在 Web/飞书卡片附一键复制命令兜底。
 
@@ -35,7 +35,7 @@
 ### 2.1 实测方法
 1. 只读分析 `codex 0.167.2` 原生 ARM64 二进制中 `QueueCommand`、`thread/queue/add`、`queue_1.sqlite` 相关逻辑与 `codex app-server daemon --help`。
 2. 使用完全隔离的 `CODEX_HOME=$(mktemp -d)`（零接触用户真实 `~/.codex`）实测以下调用边界：
-   - `codex queue --thread <uuid> --message "baton: ping"`（不带 / 带 `--resume`）
+   - `codex queue --thread <uuid> --message "starfane: ping"`（不带 / 带 `--resume`）
    - `codex queue --thread test-id --message "--leading-dash"`
    - `codex queue -- --thread test-id --message "hi"`
 
@@ -47,15 +47,15 @@
 2. **CLI 参数解析硬陷阱（已实测复现）**：
    - `--message "--leading-dash"` 直接报错 **exit 2**（`error: unexpected argument '--leading-dash' found`）！
    - 传递 `--` 分隔符同样报错 **exit 2**（二进制中显式禁用 `--`）。
-   - **修复方案**：调用 `codex queue` 时，**必须**使用等号绑定形式 `--message=<TEXT>` **且**统一加安全前缀 `baton: `（绝不以 `-` 开头）。
+   - **修复方案**：调用 `codex queue` 时，**必须**使用等号绑定形式 `--message=<TEXT>` **且**统一加安全前缀 `starfane: `（绝不以 `-` 开头）。
 3. **对 Live TUI 的即时性与离线限制**：
-   - 当 Codex TUI 使用默认共享 daemon 模式（`daemon_auto_start = true`）运行时，`codex queue --thread <session_id> --message="baton: ..." --resume` 可通过 `app-server` 投递；
+   - 当 Codex TUI 使用默认共享 daemon 模式（`daemon_auto_start = true`）运行时，`codex queue --thread <session_id> --message="starfane: ..." --resume` 可通过 `app-server` 投递；
    - 但若用户以 **`--no-daemon`** 启动独立 TUI，或 TUI 未绑定同一 app-server 控制 socket，或 `--resume` 静默告警，消息只会滞留在 `queue_1.sqlite` 而不立即触发当前 TUI 回合。
 
 ### 2.3 工程落地结论（面向 M2 投递阶梯）
 - **L1（`codex queue`）调用规范**：
   ```bash
-  codex queue --thread "$SESSION_ID" --message="baton: 新任务 $TASK_ID，请调用 baton.read_inbox" --resume
+  codex queue --thread "$SESSION_ID" --message="starfane: 新任务 $TASK_ID，请调用 starfane.read_inbox" --resume
   ```
 - **强制超时回退状态机（绝不信任 exit 0 即已送达）**：
   1. 若 `codex queue` 返回非 0（如 `no rollout found` / daemon 未运行），立即降级到 **L2（门禁粘贴）**；
