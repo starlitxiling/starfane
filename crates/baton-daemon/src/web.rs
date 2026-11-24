@@ -557,8 +557,8 @@ async fn pane_preview(
     let lines = q
         .get("lines")
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(80)
-        .clamp(1, 500);
+        .unwrap_or(200)
+        .clamp(1, baton_tmux::MAX_CAPTURE_LINES);
     let r = core
         .preview_pane(&PaneId(pane_id), lines)
         .await

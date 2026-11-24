@@ -21,8 +21,11 @@ const TOKEN_KEY = 'baton_token';
 const REQUEST_TIMEOUT_MS = 15000;
 const HEALTH_POLL_MS = 8000;
 const PREVIEW_POLL_MS = 3000;
-const PREVIEW_LINES = 100;
-const TRANSCRIPT_LIMIT = 24;
+const PREVIEW_LINES = 400;
+const PREVIEW_STEPS = [400, 1000, 2000];
+const TRANSCRIPT_LIMIT = 60;
+const TRANSCRIPT_STEPS = [60, 150, 300, 500];
+const LIVE_TAIL_LINES = 30;
 const CODE_COLLAPSE_LINES = 24;
 const TICK_MS = 15000;
 const PARSE_DEBOUNCE_MS = 380;
@@ -158,6 +161,7 @@ view: 'workspace', arg: null, modal: null, drawer: null,
 selSession: null, composerMode: 'direct', outputMode: 'reading', autoRefreshPreview: true, autoConfirm: true,
 showEnded: false, agentFilter: '', pipeFilter: 'all', revTab: 'reports', precAgent: '',
 selStage: {}, parsePreviews: {}, drafts: new Map(), attachments: new Map(), busy: new Set(), open: new Set(),
+trLimit: new Map(), pvLines: new Map(), loadingEarlierSid: null, drawerPvLines: 1000,
 slash: { open: false, start: 0, end: 0, query: '', items: [], idx: 0 },
 collapsedGroups: loadCollapsedGroups(), groupsInited: !!localStorage.getItem(GROUPS_INIT_KEY),
 outlineCollapsed: localStorage.getItem(OUTLINE_COLLAPSED_KEY) === '1',
@@ -167,6 +171,8 @@ muteMenu: false, muteCustomVal: '45', muteCustomUnit: 'm', muteTimeVal: '',
 let attachSeq = 0;
 const trReqSeq = new Map();
 const pvReqSeq = new Map();
+const trLimitOf = (sid) => UI.trLimit.get(sid) || TRANSCRIPT_LIMIT;
+const pvLinesOf = (pane) => UI.pvLines.get(pane) || PREVIEW_LINES;
 function hashStr(str) {
 let h = 2166136261;
 const s = String(str || '');
@@ -637,7 +643,7 @@ if (!sessionNeedsLiveTail(s, tr) && !tailOpen) {
 return;
 }
 }
-loadPreview(s.pane, { lines: PREVIEW_LINES, silent });
+loadPreview(s.pane, { lines: pvLinesOf(s.pane), silent });
 }
 async function loadAll() {
 S.lastLoad = Date.now();
@@ -662,26 +668,29 @@ S.loadError = errText(e);
 }
 schedule();
 }
-async function loadTranscript(sessionId, { silent = false } = {}) {
+async function loadTranscript(sessionId, { silent = false, limit } = {}) {
 if (!sessionId) return;
 const prev = S.transcripts.get(sessionId);
 if (prev?.unsupported) return;
+const lim = limit || trLimitOf(sessionId);
 const seq = (trReqSeq.get(sessionId) || 0) + 1;
 trReqSeq.set(sessionId, seq);
 if (!prev) {
-S.transcripts.set(sessionId, { state: 'loading', source: 'none', messages: [], hash: '', updatedMs: 0 });
+S.transcripts.set(sessionId, { state: 'loading', source: 'none', messages: [], hasMore: false, totalMessages: 0, limit: lim, hash: '', updatedMs: 0 });
 if (!silent) schedule();
 }
 try {
-const data = await api('GET', `/api/sessions/${enc(sessionId)}/transcript${qs({ limit: TRANSCRIPT_LIMIT })}`);
+const data = await api('GET', `/api/sessions/${enc(sessionId)}/transcript${qs({ limit: lim })}`);
 if (trReqSeq.get(sessionId) !== seq) return;
 const msgs = Array.isArray(data?.messages) ? data.messages : [];
 const source = data?.source === 'transcript' && msgs.length > 0 ? 'transcript' : 'none';
-const nextHash = hashStr(`${source}|${JSON.stringify(msgs)}`);
+const hasMore = Boolean(data?.has_more);
+const totalMessages = Number.isFinite(data?.total_messages) ? data.total_messages : msgs.length;
+const nextHash = hashStr(`${source}|${lim}|${hasMore ? 1 : 0}|${JSON.stringify(msgs)}`);
 const changed = !prev || prev.state !== 'ok' || prev.hash !== nextHash;
 S.transcripts.set(sessionId, {
 state: 'ok', source, transcriptPath: data?.transcript_path || null,
-messages: msgs, hash: nextHash, updatedMs: Date.now(), err: null,
+messages: msgs, hasMore, totalMessages, limit: lim, hash: nextHash, updatedMs: Date.now(), err: null,
 });
 if (data?.metrics && S.sessions.has(sessionId)) {
 const cur = S.sessions.get(sessionId);
@@ -693,17 +702,22 @@ patchTelemetryStrip(sessionId);
 }
 }
 if (changed) notifyOutputUpdated(sessionId);
-else updateOutputClock(sessionId);
+else {
+if (UI.loadingEarlierSid === sessionId) UI.loadingEarlierSid = null;
+updateOutputClock(sessionId);
+if (!silent) schedule();
+}
 } catch (e) {
 if (trReqSeq.get(sessionId) !== seq) return;
+if (UI.loadingEarlierSid === sessionId) UI.loadingEarlierSid = null;
 if (e instanceof ApiError && e.status === 405) {
-S.transcripts.set(sessionId, { state: 'ok', source: 'none', messages: [], hash: 'none', updatedMs: Date.now(), unsupported: true });
+S.transcripts.set(sessionId, { state: 'ok', source: 'none', messages: [], hasMore: false, totalMessages: 0, limit: lim, hash: 'none', updatedMs: Date.now(), unsupported: true });
 if (!prev || prev.state === 'loading') notifyOutputUpdated(sessionId);
 return;
 }
 const errMsg = errText(e);
 const changed = !prev || prev.state !== 'err' || prev.err !== errMsg;
-S.transcripts.set(sessionId, { ...(prev || { source: 'none', messages: [], hash: '' }), state: 'err', err: errMsg, updatedMs: Date.now() });
+S.transcripts.set(sessionId, { ...(prev || { source: 'none', messages: [], hasMore: false, totalMessages: 0, limit: lim, hash: '' }), state: 'err', err: errMsg, updatedMs: Date.now() });
 if (changed) notifyOutputUpdated(sessionId);
 }
 }
@@ -724,7 +738,7 @@ const text = data?.text ?? '';
 const nextHash = hashStr(`${text}|${!!data?.in_mode}|${!!data?.dead}`);
 const changed = !prev || prev.state !== 'ok' || prev.hash !== nextHash;
 S.previews.set(key, { state: 'ok', updatedMs: Date.now(), data, text, hash: nextHash, err: null });
-if (lines === PREVIEW_LINES) {
+if (lines === pvLinesOf(paneId)) {
 const cur = currentSession();
 if (cur?.pane === paneId) {
 if (changed) notifyOutputUpdated(cur.session_id);
@@ -740,7 +754,7 @@ const changed = !prev || prev.state !== 'err' || prev.err !== errMsg;
 S.previews.set(key, { ...(prev || { text: '', hash: '' }), state: 'err', err: errMsg, status: e?.status || 0, updatedMs: Date.now() });
 if (changed) {
 const cur = currentSession();
-if (lines === PREVIEW_LINES && cur?.pane === paneId) notifyOutputUpdated(cur.session_id);
+if (lines === pvLinesOf(paneId) && cur?.pane === paneId) notifyOutputUpdated(cur.session_id);
 else schedule();
 }
 }
@@ -794,12 +808,19 @@ if (vp.dataset.sig === built.sig) {
 updateOutputClock(sessionId);
 return;
 }
-const atBottom = vp.scrollHeight - vp.scrollTop - vp.clientHeight < 44;
+const prevHeight = vp.scrollHeight;
+const atBottom = prevHeight - vp.scrollTop - vp.clientHeight < 44;
 const prevTop = vp.scrollTop;
+const expanding = UI.loadingEarlierSid === sessionId && UI.outputMode === 'reading';
 vp.dataset.sig = built.sig;
 vp.className = `term-viewport${UI.outputMode === 'raw' ? ' raw-mode' : ''}`;
 vp.replaceChildren(built.node);
+if (expanding) {
+UI.loadingEarlierSid = null;
+vp.scrollTop = Math.max(0, prevTop + (vp.scrollHeight - prevHeight));
+} else {
 vp.scrollTop = atBottom ? vp.scrollHeight : prevTop;
+}
 syncScrollLatestBtn(vp);
 updateOutputClock(sessionId);
 const pCnt = collectUserPrompts(s).length;
@@ -1076,7 +1097,7 @@ if (d.open) {
 UI.open.add(d.dataset.k);
 if (d.classList.contains('live-tail')) {
 const cur = currentSession();
-if (cur?.pane) loadPreview(cur.pane, { lines: PREVIEW_LINES, silent: true });
+if (cur?.pane) loadPreview(cur.pane, { lines: pvLinesOf(cur.pane), silent: true });
 }
 } else UI.open.delete(d.dataset.k);
 }
@@ -1105,7 +1126,7 @@ if (S.precisionState === 'idle') loadPrecision();
 const s = currentSession();
 if (UI.view === 'workspace' && s) {
 if (!S.transcripts.has(s.session_id)) loadTranscript(s.session_id, { silent: false });
-if (s.pane && !S.previews.has(`${s.pane}:${PREVIEW_LINES}`)) loadPreview(s.pane, { lines: PREVIEW_LINES, silent: false });
+if (s.pane && !S.previews.has(`${s.pane}:${pvLinesOf(s.pane)}`)) loadPreview(s.pane, { lines: pvLinesOf(s.pane), silent: false });
 }
 schedule();
 }
@@ -1862,7 +1883,7 @@ function runBatonSlashAction(action) {
 if (action === 'mode_feature') { UI.composerMode = 'feature'; rerender(); }
 else if (action === 'mode_debug') { UI.composerMode = 'debug'; rerender(); }
 else if (action === 'open_mute') { UI.muteMenu = true; rerender(); }
-else if (action === 'toggle_terminal') { UI.outputMode = UI.outputMode === 'raw' ? 'reading' : 'raw'; if (UI.outputMode === 'raw') { const cur = currentSession(); if (cur?.pane) loadPreview(cur.pane, { lines: PREVIEW_LINES, silent: true }); } rerender(); }
+else if (action === 'toggle_terminal') { UI.outputMode = UI.outputMode === 'raw' ? 'reading' : 'raw'; if (UI.outputMode === 'raw') { const cur = currentSession(); if (cur?.pane) loadPreview(cur.pane, { lines: pvLinesOf(cur.pane), silent: true }); } rerender(); }
 else if (action === 'open_drawer') { const cur = currentSession(); if (cur) openDrawer('session', { sessionId: cur.session_id }); }
 }
 function applySlashItem(item) {
@@ -2210,7 +2231,7 @@ const parent = s.is_subagent && s.parent_session_id ? S.sessions.get(s.parent_se
 const displayTitle = s.is_subagent ? subagentDisplayName(s) : sessionLabel(s);
 const viewToggle = h('div', { class: 'view-seg', role: 'tablist', 'aria-label': '显示模式' },
 h('button', { type: 'button', role: 'tab', class: UI.outputMode === 'reading' ? 'on' : '', onclick: () => { UI.outputMode = 'reading'; rerender(); } }, '阅读'),
-h('button', { type: 'button', role: 'tab', class: UI.outputMode === 'raw' ? 'on' : '', onclick: () => { UI.outputMode = 'raw'; if (s.pane) loadPreview(s.pane, { lines: PREVIEW_LINES, silent: true }); rerender(); } }, '终端'));
+h('button', { type: 'button', role: 'tab', class: UI.outputMode === 'raw' ? 'on' : '', onclick: () => { UI.outputMode = 'raw'; if (s.pane) loadPreview(s.pane, { lines: pvLinesOf(s.pane), silent: true }); rerender(); } }, '终端'));
 W.headEl.replaceChildren(
 h('div', { class: 'ws-head-left', title: titleTip },
 h('h2', { class: 'ws-head-title' }, displayTitle),
@@ -2230,7 +2251,7 @@ s.parent_session_id ? btn('← 返回主会话', { cls: 'ghost xs', onclick: () 
 W.crumbEl.classList.add('ws-hidden');
 }
 if (!S.transcripts.has(s.session_id)) loadTranscript(s.session_id, { silent: false });
-if (s.pane && !S.previews.has(`${s.pane}:${PREVIEW_LINES}`)) loadPreview(s.pane, { lines: PREVIEW_LINES, silent: false });
+if (s.pane && !S.previews.has(`${s.pane}:${pvLinesOf(s.pane)}`)) loadPreview(s.pane, { lines: pvLinesOf(s.pane), silent: false });
 loadSlashCommands(s.agent);
 const built = buildOutputBody(s);
 const sameView = W.vp.dataset.sid === s.session_id && W.vp.dataset.mode === UI.outputMode;
@@ -2243,12 +2264,19 @@ W.vp.replaceChildren(built.node);
 W.vp.scrollTop = W.vp.scrollHeight;
 syncScrollLatestBtn(W.vp);
 } else if (W.vp.dataset.sig !== built.sig) {
-const atBottom = W.vp.scrollHeight - W.vp.scrollTop - W.vp.clientHeight < 44;
+const prevHeight = W.vp.scrollHeight;
+const atBottom = prevHeight - W.vp.scrollTop - W.vp.clientHeight < 44;
 const prevTop = W.vp.scrollTop;
+const expanding = UI.loadingEarlierSid === s.session_id && UI.outputMode === 'reading';
 W.vp.dataset.sig = built.sig;
 W.vp.className = `term-viewport${UI.outputMode === 'raw' ? ' raw-mode' : ''}`;
 W.vp.replaceChildren(built.node);
+if (expanding) {
+UI.loadingEarlierSid = null;
+W.vp.scrollTop = Math.max(0, prevTop + (W.vp.scrollHeight - prevHeight));
+} else {
 W.vp.scrollTop = atBottom ? W.vp.scrollHeight : prevTop;
+}
 syncScrollLatestBtn(W.vp);
 }
 const prompts = collectUserPrompts(s);
@@ -2369,7 +2397,7 @@ let msgs = [];
 if (tr?.state === 'ok' && tr.source === 'transcript' && tr.messages.length > 0) {
 msgs = tr.messages;
 } else if (s.pane) {
-const pv = S.previews.get(`${s.pane}:${PREVIEW_LINES}`);
+const pv = S.previews.get(`${s.pane}:${pvLinesOf(s.pane)}`);
 if (pv?.text?.trim()) msgs = parseTerminalTurns(pv.text, s.agent);
 }
 const out = [];
@@ -2455,38 +2483,86 @@ h('strong', null, `会话${stateText(s.state)}`),
 h('span', null, detail)),
 btn('清除异常状态', { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => ackSessionError(s) }));
 }
+function buildRawToolbar(pane, curLines, actualLines) {
+const isLoading = S.previews.get(`${pane}:${curLines}`)?.state === 'loading';
+return h('div', { class: 'raw-toolbar' },
+span('muted tabular', `显示 ${actualLines} 行（抓屏上限 ${curLines} 行）`),
+h('div', { class: 'row-nowrap', style: 'gap:6px;flex-wrap:wrap' },
+h('div', { class: 'view-seg' }, PREVIEW_STEPS.map((n) => h('button', {
+type: 'button',
+class: curLines === n ? 'on' : '',
+disabled: isLoading && curLines !== n,
+onclick: () => {
+UI.pvLines.set(pane, n);
+loadPreview(pane, { lines: n, silent: false });
+schedule();
+},
+}, `${n} 行`))),
+btn('刷新', { cls: 'xs', onclick: () => loadPreview(pane, { lines: curLines, silent: false }) })));
+}
+function loadEarlierTranscript(sid, nextLim) {
+UI.trLimit.set(sid, nextLim);
+UI.loadingEarlierSid = sid;
+return act(`trmore:${sid}`, () => loadTranscript(sid, { silent: false, limit: nextLim }));
+}
+function buildHistoryBar(s, tr) {
+const curLim = tr?.limit || trLimitOf(s.session_id);
+const nextLim = TRANSCRIPT_STEPS.find((x) => x > curLim) || 500;
+const canLoadMore = Boolean(tr?.hasMore) || (tr?.messages?.length >= curLim && curLim < 500);
+if (!canLoadMore) return null;
+const totalNote = tr?.totalMessages > tr.messages.length ? ` / 已解析 ${tr.totalMessages} 条` : '';
+return h('div', { class: 'history-bar' },
+span('muted tabular', `已显示最近 ${tr.messages.length} 条${totalNote}`),
+h('div', { class: 'row-nowrap', style: 'gap:6px' },
+curLim < 500 ? btn(`加载更早对话（${nextLim} 条）`, {
+cls: 'xs',
+busyKey: `trmore:${s.session_id}`,
+onclick: () => loadEarlierTranscript(s.session_id, nextLim),
+}) : null,
+curLim < 500 && nextLim < 500 ? btn('最多 500 条', {
+cls: 'ghost xs',
+busyKey: `trmore:${s.session_id}`,
+onclick: () => loadEarlierTranscript(s.session_id, 500),
+}) : null));
+}
 function buildOutputBody(s) {
 const mode = UI.outputMode;
 const pane = s.pane;
-const pvKey = pane ? `${pane}:${PREVIEW_LINES}` : null;
+const curPvLines = pane ? pvLinesOf(pane) : PREVIEW_LINES;
+const pvKey = pane ? `${pane}:${curPvLines}` : null;
 const pv = pvKey ? S.previews.get(pvKey) : null;
 const tr = S.transcripts.get(s.session_id);
 const errSig = `${s.state}:${hashStr(s.last_error || '')}`;
 const alertBanner = sessionAlertBanner(s);
 if (mode === 'raw') {
 if (!pane) return { sig: `raw:nopane:${s.session_id}:${errSig}`, sourceLabel: '原始终端', node: h('div', { class: 'raw-shell stack-sm' }, alertBanner, emptyState('该会话未绑定 tmux pane', s.last_message || '无法抓屏预览原始终端。')) };
-if (!pv || (pv.state === 'loading' && !pv.text)) return { sig: `raw:loading:${pane}:${errSig}`, sourceLabel: '原始终端', node: h('div', { class: 'raw-shell stack-sm' }, alertBanner, skeleton(6)) };
+if (!pv || (pv.state === 'loading' && !pv.text)) return { sig: `raw:loading:${pane}:${curPvLines}:${errSig}`, sourceLabel: '原始终端', node: h('div', { class: 'raw-shell stack-sm' }, alertBanner, skeleton(6)) };
 if (pv.state === 'err' && !pv.text) {
 return {
-sig: `raw:err:${pane}:${pv.err}:${errSig}`, sourceLabel: '原始终端',
+sig: `raw:err:${pane}:${curPvLines}:${pv.err}:${errSig}`, sourceLabel: '原始终端',
 node: h('div', { class: 'raw-shell stack-sm' },
 alertBanner,
-errorBanner(`读取终端失败：${pv.err}`, '重试获取终端', () => loadPreview(pane, { lines: PREVIEW_LINES, silent: false })),
+buildRawToolbar(pane, curPvLines, 0),
+errorBanner(`读取终端失败：${pv.err}`, '重试获取终端', () => loadPreview(pane, { lines: curPvLines, silent: false })),
 s.last_message ? h('div', { class: 'callout' }, h('div', { class: 'sec-h' }, '最近事件摘要'), renderMarkdown(s.last_message)) : null),
 };
 }
-if (!pv.text.trim()) return { sig: `raw:empty:${pane}:${errSig}`, sourceLabel: '原始终端', node: h('div', { class: 'raw-shell stack-sm' }, alertBanner, emptyState('终端暂无可见输出', s.last_message || '向下方输入框发送一条消息试试。')) };
-return { sig: `raw:ok:${pane}:${pv.hash}:${errSig}`, sourceLabel: '原始终端', node: h('div', { class: 'raw-shell stack-sm' }, alertBanner, h('pre', { class: 'term-pre' }, stripAnsi(pv.text))) };
+if (!pv.text.trim()) return { sig: `raw:empty:${pane}:${curPvLines}:${errSig}`, sourceLabel: '原始终端', node: h('div', { class: 'raw-shell stack-sm' }, alertBanner, buildRawToolbar(pane, curPvLines, 0), emptyState('终端暂无可见输出', s.last_message || '向下方输入框发送一条消息试试。')) };
+const cleanRaw = stripAnsi(pv.text);
+const actualLines = cleanRaw ? cleanRaw.split('\n').length : 0;
+return { sig: `raw:ok:${pane}:${curPvLines}:${pv.hash}:${errSig}`, sourceLabel: '原始终端', node: h('div', { class: 'raw-shell stack-sm' }, alertBanner, buildRawToolbar(pane, curPvLines, actualLines), h('pre', { class: 'term-pre' }, cleanRaw)) };
 }
 if (tr?.state === 'ok' && tr.source === 'transcript' && tr.messages.length > 0) {
-const tailText = pv?.text ? stripAnsi(pv.text).trim().split('\n').slice(-10).join('\n') : '';
+const tailText = pv?.text ? stripAnsi(pv.text).trim().split('\n').slice(-LIVE_TAIL_LINES).join('\n') : '';
 const tailKey = `tail:${s.session_id}`;
 const autoOpenTail = sessionNeedsLiveTail(s, tr);
+const historyBar = buildHistoryBar(s, tr);
 const timeline = h('div', { class: 'timeline' },
 alertBanner,
+historyBar,
 renderTimelineCards(s, tr.messages),
 tailText ? h('details', { class: 'live-tail', 'data-k': tailKey, open: UI.open.has(tailKey) || autoOpenTail },
-h('summary', null, `当前终端实时行（${pane || 'pane'}）`),
+h('summary', null, `当前终端实时行（${pane || 'pane'} · 最近 ${LIVE_TAIL_LINES} 行）`),
 h('pre', { class: 'term-pre' }, tailText)) : null);
 return { sig: `read:tr:${s.session_id}:${tr.hash}:${hashStr(tailText)}:${errSig}:${autoOpenTail ? 1 : 0}`, sourceLabel: '对话记录', node: timeline };
 }
@@ -2495,20 +2571,21 @@ if (tr?.state === 'loading') return { sig: `read:trload:${s.session_id}:${errSig
 if (s.last_message) return { sig: `read:last:${s.session_id}:${hashStr(s.last_message)}:${errSig}`, sourceLabel: '最近摘要', node: h('div', { class: 'timeline' }, alertBanner, renderMessageCard(s, { role: 'assistant', text: s.last_message }, 0)) };
 return { sig: `read:empty:${s.session_id}:${errSig}`, sourceLabel: '阅读视图', node: h('div', { class: 'timeline' }, alertBanner, emptyState('暂无可阅读内容', '该会话尚未产生对话记录且未绑定 tmux pane。')) };
 }
-if ((!pv || (pv.state === 'loading' && !pv.text)) && (!tr || tr.state === 'loading')) return { sig: `read:loading:${s.session_id}:${errSig}`, sourceLabel: '阅读视图', node: h('div', { class: 'timeline' }, alertBanner, skeleton(6)) };
+if ((!pv || (pv.state === 'loading' && !pv.text)) && (!tr || tr.state === 'loading')) return { sig: `read:loading:${s.session_id}:${curPvLines}:${errSig}`, sourceLabel: '阅读视图', node: h('div', { class: 'timeline' }, alertBanner, skeleton(6)) };
 if (pv?.state === 'err' && !pv.text) {
 return {
-sig: `read:err:${pane}:${pv.err}:${errSig}`, sourceLabel: '终端 Markdown',
+sig: `read:err:${pane}:${curPvLines}:${pv.err}:${errSig}`, sourceLabel: '终端 Markdown',
 node: h('div', { class: 'timeline' },
 alertBanner,
-errorBanner(`读取终端失败：${pv.err}`, '重试获取终端', () => loadSessionOutput(s, { silent: false })),
+errorBanner(`读取终端失败：${pv.err}`, '重试获取终端', () => loadSessionOutput(s, { silent: false, forcePreview: true })),
 s.last_message ? renderMessageCard(s, { role: 'assistant', text: s.last_message }, 0) : null),
 };
 }
-if (!pv?.text?.trim()) return { sig: `read:empty:${pane}:${errSig}`, sourceLabel: '终端 Markdown', node: h('div', { class: 'timeline' }, alertBanner, emptyState('终端暂无可见输出', s.last_message || '向下方输入框发送一条消息试试。')) };
+if (!pv?.text?.trim()) return { sig: `read:empty:${pane}:${curPvLines}:${errSig}`, sourceLabel: '终端 Markdown', node: h('div', { class: 'timeline' }, alertBanner, emptyState('终端暂无可见输出', s.last_message || '向下方输入框发送一条消息试试。')) };
 const turns = parseTerminalTurns(pv.text, s.agent);
-if (!turns.length) return { sig: `read:rawfallback:${pane}:${pv.hash}:${errSig}`, sourceLabel: '终端 Markdown', node: h('div', { class: 'timeline' }, alertBanner, h('article', { class: 'msg-card assistant' }, h('pre', { class: 'term-pre' }, stripAnsi(pv.text)))) };
-return { sig: `read:pv:${pane}:${pv.hash}:${errSig}`, sourceLabel: '终端 Markdown', node: h('div', { class: 'timeline' }, alertBanner, renderTimelineCards(s, turns)) };
+const fallbackToolbar = buildRawToolbar(pane, curPvLines, pv.text.split('\n').length);
+if (!turns.length) return { sig: `read:rawfallback:${pane}:${curPvLines}:${pv.hash}:${errSig}`, sourceLabel: '终端 Markdown', node: h('div', { class: 'timeline' }, alertBanner, fallbackToolbar, h('article', { class: 'msg-card assistant' }, h('pre', { class: 'term-pre' }, stripAnsi(pv.text)))) };
+return { sig: `read:pv:${pane}:${curPvLines}:${pv.hash}:${errSig}`, sourceLabel: '终端 Markdown', node: h('div', { class: 'timeline' }, alertBanner, fallbackToolbar, renderTimelineCards(s, turns)) };
 }
 function renderTimelineCards(s, list) {
 let uIdx = 0;
@@ -3081,7 +3158,7 @@ h('td', { class: 'num' }, v + fp ? pct(v / (v + fp)) : '—'))))));
 function openDrawer(kind, params) {
 UI.drawer = { kind, ...params };
 if (kind === 'session' && params.sessionId) loadHandoffs(params.sessionId);
-if (kind === 'terminal' && params.pane) loadPreview(params.pane, { lines: 200, silent: false });
+if (kind === 'terminal' && params.pane) loadPreview(params.pane, { lines: UI.drawerPvLines, silent: false });
 schedule();
 }
 function closeDrawer() { UI.drawer = null; schedule(); }
@@ -3103,16 +3180,23 @@ title = s ? `会话详情 · ${sessionLabel(s)}` : '会话详情';
 sub = s ? s.session_id : '';
 body = s ? drawerSession(s) : emptyState('会话不存在', '该会话可能已被清理。');
 } else if (d.kind === 'terminal') {
+const dLines = UI.drawerPvLines;
 title = `完整终端输出 · ${d.title || d.pane}`;
-sub = `${d.pane}（最近 200 行）`;
-const pv = S.previews.get(`${d.pane}:200`);
+sub = `${d.pane}（最近 ${dLines} 行）`;
+const pv = S.previews.get(`${d.pane}:${dLines}`);
 body = !pv || pv.state === 'loading' ? skeleton(8)
-: pv.state === 'err' ? errorBanner(`读取终端失败：${pv.err}`, '重试', () => loadPreview(d.pane, { lines: 200 }))
+: pv.state === 'err' ? errorBanner(`读取终端失败：${pv.err}`, '重试', () => loadPreview(d.pane, { lines: dLines }))
 : h('div', { class: 'stack-sm' },
 h('div', { class: 'row', style: 'justify-content:space-between' },
-span('muted tabular', `共 ${pv.data?.lines || 200} 行 · 更新于 ${clock(pv.updatedMs)}`),
-btn('刷新 200 行', { cls: 'sm', onclick: () => loadPreview(d.pane, { lines: 200 }) })),
-h('pre', { class: 'code-block', style: 'max-height:none' }, pv.text || '（无输出）'));
+span('muted tabular', `共 ${stripAnsi(pv.text || '').split('\n').length} 行 · 上限 ${pv.data?.lines || dLines} · 更新于 ${clock(pv.updatedMs)}`),
+h('div', { class: 'row-nowrap', style: 'gap:6px' },
+h('div', { class: 'view-seg' }, [1000, 2000].map((n) => h('button', {
+type: 'button',
+class: dLines === n ? 'on' : '',
+onclick: () => { UI.drawerPvLines = n; loadPreview(d.pane, { lines: n }); schedule(); },
+}, `${n} 行`))),
+btn('刷新', { cls: 'sm', onclick: () => loadPreview(d.pane, { lines: dLines }) }))),
+h('pre', { class: 'code-block', style: 'max-height:none' }, stripAnsi(pv.text || '') || '（无输出）'));
 } else if (d.kind === 'artifact') {
 title = d.title || `工件 · ${d.artifactId}`;
 sub = d.artifactId;
@@ -3181,8 +3265,8 @@ h('div', { class: 'drawer-controls' },
 s.pane ? focusBtn(s.session_id, 'sm') : null,
 (s.state === 'error' || s.state === 'needs_permission' || s.state === 'needs_input' || s.last_error)
 ? btn('清除异常状态', { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => ackSessionError(s) }) : null,
-btn('手动刷新', { cls: 'sm', onclick: () => { loadSessionOutput(s, { silent: false }); toast('已刷新会话输出'); } }),
-s.pane ? btn('完整 200 行终端', { cls: 'ghost sm', onclick: () => openDrawer('terminal', { pane: s.pane, title: sessionLabel(s) }) }) : null,
+btn('手动刷新', { cls: 'sm', onclick: () => { loadSessionOutput(s, { silent: false, forcePreview: true }); toast('已刷新会话输出'); } }),
+s.pane ? btn('完整终端日志', { cls: 'ghost sm', onclick: () => openDrawer('terminal', { pane: s.pane, title: sessionLabel(s) }) }) : null,
 h('label', { class: 'row muted', style: 'cursor:pointer;font-size:12.5px;margin-left:auto' },
 h('input', { type: 'checkbox', checked: UI.autoRefreshPreview, onchange: (e) => { UI.autoRefreshPreview = e.target.checked; rerender(); } }), '3s 自动刷新')),
 drawerMetricsCard(s.metrics),

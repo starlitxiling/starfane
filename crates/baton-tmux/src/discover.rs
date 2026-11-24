@@ -13,10 +13,11 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
-/// Hard cap on captured preview text (64 KiB).
-pub const MAX_CAPTURE_BYTES: usize = 64 * 1024;
+/// Hard cap on captured preview text (256 KiB).
+pub const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MIN_CAPTURE_LINES: usize = 1;
-const MAX_CAPTURE_LINES: usize = 500;
+/// Hard cap on lines requested via `tmux capture-pane`.
+pub const MAX_CAPTURE_LINES: usize = 2000;
 
 /// Metadata for an active coding-agent pane discovered in tmux.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -65,7 +66,7 @@ pub fn discover_agent_panes(socket: Option<&str>) -> Result<Vec<DiscoveredPane>,
     tmux.discover_agent_panes()
 }
 
-/// Standalone helper: capture the last `lines` of `pane_id` (capped at 64 KiB, trailing blank lines stripped).
+/// Standalone helper: capture the last `lines` of `pane_id` (capped at [`MAX_CAPTURE_BYTES`], trailing blank lines stripped).
 pub fn capture_pane_tail(
     socket: Option<&str>,
     pane_id: &PaneId,
@@ -98,7 +99,7 @@ impl Tmux {
         classify_panes(panes, &ps_out)
     }
 
-    /// Capture the last `lines` lines of `pane_id`, trimming trailing empty lines and capping at 64 KiB.
+    /// Capture the last `lines` lines of `pane_id`, trimming trailing empty lines and capping at [`MAX_CAPTURE_BYTES`].
     pub fn capture_pane_tail(&self, pane_id: &PaneId, lines: usize) -> Result<String, TmuxError> {
         valid_pane(pane_id)?;
         let clamped = lines.clamp(MIN_CAPTURE_LINES, MAX_CAPTURE_LINES);
@@ -557,12 +558,13 @@ mod tests {
     }
 
     #[test]
-    fn trims_trailing_blank_lines_and_caps_64k() {
+    fn trims_trailing_blank_lines_and_caps_bytes() {
         assert_eq!(trim_and_cap_tail("a\nb\n\n  \n", 80, 100), "a\nb");
         assert_eq!(trim_and_cap_tail("1\n2\n3\n4\n5\n\n", 3, 100), "3\n4\n5");
-        let big = "中".repeat(30_000); // 90,000 bytes
+        let big = "中".repeat(100_000); // 300,000 bytes > 256 KiB
         let capped = trim_and_cap_tail(&big, 80, MAX_CAPTURE_BYTES);
         assert!(capped.len() <= MAX_CAPTURE_BYTES);
+        assert!(capped.len() > MAX_CAPTURE_BYTES - 16);
         assert!(capped.ends_with('中'));
     }
 }

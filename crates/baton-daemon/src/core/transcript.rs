@@ -1,6 +1,6 @@
 //! Structured transcript JSONL reader for Claude Code, Codex CLI, and Antigravity (AGY).
 //!
-//! Reads at most the trailing 2 MiB of a session's transcript JSONL file, extracts the
+//! Reads at most the trailing 8 MiB of a session's transcript JSONL file, extracts the
 //! last `limit` clean user/assistant messages (truncating each message at 64 KiB on a UTF-8
 //! character boundary), hydrates truncated AGY entries from sibling `transcript_full.jsonl`
 //! by `step_index`, and skips malformed lines without ever panicking.
@@ -17,18 +17,18 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// Hard cap on trailing bytes kept from any transcript file (2 MiB).
-pub const MAX_TRANSCRIPT_READ_BYTES: u64 = 2 * 1024 * 1024;
-/// Hard cap on backward scan distance when skipping giant non-message JSONL lines (16 MiB).
-const MAX_TRANSCRIPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+/// Hard cap on trailing bytes kept from any transcript file (8 MiB).
+pub const MAX_TRANSCRIPT_READ_BYTES: u64 = 8 * 1024 * 1024;
+/// Hard cap on backward scan distance when skipping giant non-message JSONL lines (32 MiB).
+const MAX_TRANSCRIPT_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 /// Backward read chunk size for `read_tail_utf8`.
 const TAIL_CHUNK_BYTES: usize = 512 * 1024;
 /// Hard cap on each individual message body (64 KiB).
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Default number of messages returned by `GET /api/sessions/{id}/transcript`.
-pub const DEFAULT_TRANSCRIPT_LIMIT: usize = 24;
+pub const DEFAULT_TRANSCRIPT_LIMIT: usize = 60;
 /// Maximum allowed `limit` query value.
-pub const MAX_TRANSCRIPT_LIMIT: usize = 50;
+pub const MAX_TRANSCRIPT_LIMIT: usize = 500;
 /// Maximum in-memory cached transcripts.
 const MAX_CACHED_TRANSCRIPTS: usize = 256;
 
@@ -66,6 +66,10 @@ pub struct TranscriptResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
     pub messages: Vec<TranscriptMessage>,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub total_messages: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<SessionMetrics>,
 }
@@ -76,6 +80,8 @@ impl TranscriptResponse {
             source: "none".to_string(),
             transcript_path: None,
             messages: Vec::new(),
+            has_more: false,
+            total_messages: 0,
             metrics,
         }
     }
@@ -122,9 +128,13 @@ impl Core {
                         && hit.session_metrics == session.metrics
                     {
                         let mut resp = hit.resp.clone();
+                        let had_more_beyond_cache = hit.resp.has_more;
                         if resp.messages.len() > clamped {
                             let drop_n = resp.messages.len() - clamped;
                             resp.messages.drain(0..drop_n);
+                            resp.has_more = true;
+                        } else {
+                            resp.has_more = had_more_beyond_cache;
                         }
                         Some(resp)
                     } else {
@@ -187,14 +197,16 @@ pub(crate) fn load_session_transcript(session: &SessionRecord, limit: usize) -> 
     let Some(path) = resolve_transcript_path(session) else {
         return TranscriptResponse::none(session.metrics.clone());
     };
+    let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let Ok(tail) = read_tail_utf8(&path, MAX_TRANSCRIPT_READ_BYTES) else {
         return TranscriptResponse::none(session.metrics.clone());
     };
-    let messages = if session.agent == AgentKind::Agy {
-        parse_agy_jsonl_with_hydration(&tail, Some(&path), limit)
+    let (messages, total_parsed) = if session.agent == AgentKind::Agy {
+        parse_agy_jsonl_with_hydration_counted(&tail, Some(&path), limit)
     } else {
-        parse_transcript_for_agent(session.agent, &tail, limit)
+        parse_transcript_for_agent_counted(session.agent, &tail, limit)
     };
+    let has_more = total_parsed > messages.len() || file_len > MAX_TRANSCRIPT_READ_BYTES;
     let now_ms = baton_proto::id::now_ms();
     let parsed_metrics = extract_transcript_metrics(session.agent, &tail, now_ms);
     let metrics = if session
@@ -210,6 +222,8 @@ pub(crate) fn load_session_transcript(session: &SessionRecord, limit: usize) -> 
         source: "transcript".to_string(),
         transcript_path: Some(path.to_string_lossy().into_owned()),
         messages,
+        has_more,
+        total_messages: total_parsed,
         metrics,
     }
 }
@@ -430,21 +444,31 @@ pub(crate) fn read_tail_utf8(path: &Path, max_bytes: u64) -> std::io::Result<Str
 }
 
 /// Dispatch JSONL parsing for the given agent, keeping only the last `limit` messages.
+#[cfg(test)]
 pub(crate) fn parse_transcript_for_agent(
     agent: AgentKind,
     text: &str,
     limit: usize,
 ) -> Vec<TranscriptMessage> {
+    parse_transcript_for_agent_counted(agent, text, limit).0
+}
+
+fn parse_transcript_for_agent_counted(
+    agent: AgentKind,
+    text: &str,
+    limit: usize,
+) -> (Vec<TranscriptMessage>, usize) {
     let mut msgs = match agent {
         AgentKind::Claude => parse_claude_jsonl(text),
         AgentKind::Codex => parse_codex_jsonl(text),
         AgentKind::Agy => parse_agy_jsonl(text),
     };
+    let total = msgs.len();
     if msgs.len() > limit {
         let drop_n = msgs.len() - limit;
         msgs.drain(0..drop_n);
     }
-    msgs
+    (msgs, total)
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,16 +1030,25 @@ fn push_agy_message(out: &mut Vec<AgyParsedMsg>, item: AgyParsedMsg) {
 }
 
 fn parse_agy_jsonl(text: &str) -> Vec<TranscriptMessage> {
-    parse_agy_jsonl_with_hydration(text, None, usize::MAX)
+    parse_agy_jsonl_with_hydration_counted(text, None, usize::MAX).0
 }
 
 /// Parse compact AGY `transcript.jsonl`, keep the trailing `limit` messages, and hydrate any
 /// truncated `content` or `tool_calls` fields from sibling `transcript_full.jsonl` by `step_index`.
+#[cfg(test)]
 pub(crate) fn parse_agy_jsonl_with_hydration(
     text: &str,
     transcript_path: Option<&Path>,
     limit: usize,
 ) -> Vec<TranscriptMessage> {
+    parse_agy_jsonl_with_hydration_counted(text, transcript_path, limit).0
+}
+
+fn parse_agy_jsonl_with_hydration_counted(
+    text: &str,
+    transcript_path: Option<&Path>,
+    limit: usize,
+) -> (Vec<TranscriptMessage>, usize) {
     let mut items: Vec<AgyParsedMsg> = Vec::new();
     let mut pending_tools: Vec<String> = Vec::new();
 
@@ -1188,6 +1221,7 @@ pub(crate) fn parse_agy_jsonl_with_hydration(
         });
     }
 
+    let total_parsed = items.len();
     if items.len() > limit {
         let drop_n = items.len() - limit;
         items.drain(0..drop_n);
@@ -1242,7 +1276,7 @@ pub(crate) fn parse_agy_jsonl_with_hydration(
         }
     }
 
-    items.into_iter().map(|it| it.msg).collect()
+    (items.into_iter().map(|it| it.msg).collect(), total_parsed)
 }
 
 fn clean_agy_user_text(raw: &str) -> Option<String> {
@@ -1585,9 +1619,9 @@ not valid json at all
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("big.jsonl");
         let mut content = String::new();
-        // Write > 2.2 MiB of old lines so tail slicing (2 MiB) drops early lines + partial line.
+        // Write > 8.5 MiB of old lines so tail slicing (8 MiB) drops early lines + partial line.
         let filler = "x".repeat(2000);
-        for i in 0..1200 {
+        for i in 0..4500 {
             content.push_str(&format!(
                 r#"{{"type":"user","timestamp":"2026-11-20T00:00:00Z","message":{{"role":"user","content":"old-{i} {filler}"}}}}"#
             ));
@@ -1867,6 +1901,65 @@ not valid json at all
         assert!(agy_msgs[0].text.contains("done verifying"));
         assert_eq!(agy_msgs[1].text, "# Full Hydrated Plan");
         assert!(agy_msgs[2].text.contains("HTTP 400 failed"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_transcript_reports_has_more_and_total_messages() {
+        let dir =
+            std::env::temp_dir().join(format!("baton-tr-more-{}", baton_proto::id::new_id("T")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("conv.jsonl");
+        let mut content = String::new();
+        for i in 1..=5 {
+            content.push_str(&format!(
+                r#"{{"type":"user","timestamp":"2026-11-24T00:00:0{i}Z","message":{{"role":"user","content":"q-{i}"}}}}"#
+            ));
+            content.push('\n');
+        }
+        std::fs::write(&file, &content).unwrap();
+
+        let rec = SessionRecord {
+            session_id: SessionId::new("tr-more-1"),
+            agent: AgentKind::Claude,
+            pane: None,
+            pane_resolution: baton_proto::PaneResolution::Unknown,
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            git_root: None,
+            model: None,
+            effort: None,
+            state: baton_proto::SessionState::Idle,
+            state_since_ms: 0,
+            last_event_id: None,
+            last_event_ms: 0,
+            last_message: None,
+            last_error: None,
+            parent_session_id: None,
+            is_subagent: false,
+            subagent_count: 0,
+            active_subagents: 0,
+            stage: None,
+            unread_inbox: 0,
+            confidence: baton_proto::Confidence::Exact,
+            tmux_target: None,
+            tmux_label: None,
+            discovered_only: false,
+            transcript_path: Some(file.to_string_lossy().into_owned()),
+            metrics: None,
+        };
+
+        let partial = load_session_transcript(&rec, 2);
+        assert_eq!(partial.messages.len(), 2);
+        assert_eq!(partial.total_messages, 5);
+        assert!(partial.has_more);
+        assert_eq!(partial.messages[0].text, "q-4");
+        assert_eq!(partial.messages[1].text, "q-5");
+
+        let full = load_session_transcript(&rec, 10);
+        assert_eq!(full.messages.len(), 5);
+        assert_eq!(full.total_messages, 5);
+        assert!(!full.has_more);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
