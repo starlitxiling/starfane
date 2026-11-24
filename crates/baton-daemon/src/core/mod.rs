@@ -168,11 +168,14 @@ impl Core {
                 let stale_orphan = startup_now.saturating_sub(s.last_event_ms) > 3_600_000;
                 if stolen_pane || stale_orphan {
                     s.state = SessionState::Ended;
-                    s.pane = None;
+                    state::clear_tmux_binding(s);
                     s.state_since_ms = startup_now;
                     purged_any = true;
                 }
             }
+        }
+        if state.sanitize_orphan_tmux_metadata() {
+            purged_any = true;
         }
         if state.dedup_split_sessions() {
             purged_any = true;

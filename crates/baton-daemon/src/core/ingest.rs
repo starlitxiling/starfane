@@ -563,7 +563,7 @@ fn apply_event(
                     .is_some_and(|sr| active_pipelines.contains(&sr.pipeline_id));
                 if !has_active_stage {
                     rival.state = SessionState::Ended;
-                    rival.pane = None;
+                    super::state::clear_tmux_binding(rival);
                     rival.state_since_ms = ev.ts_ms;
                     applied.updated.push(rival.clone());
                 }
@@ -644,6 +644,21 @@ fn apply_event(
         )
     });
     rec.discovered_only = false;
+    if rec.pane.is_none() && pane.is_none() {
+        super::state::clear_tmux_binding(rec);
+    } else if rec.pane.is_some()
+        && pane.is_some()
+        && rec.pane != pane
+        && is_exact_pane_resolution(resolution)
+    {
+        rec.pane = pane;
+        rec.pane_resolution = resolution;
+        rec.tmux_target = inherited_target.take();
+        rec.tmux_label = inherited_label.take();
+    } else if rec.pane.is_none() && pane.is_some() {
+        rec.pane = pane;
+        rec.pane_resolution = resolution;
+    }
     if rec.tmux_target.is_none() && inherited_target.is_some() {
         rec.tmux_target = inherited_target;
     }
@@ -661,10 +676,6 @@ fn apply_event(
     }
     if rec.metrics.is_none() && inherited_metrics.is_some() {
         rec.metrics = inherited_metrics;
-    }
-    if rec.pane.is_none() && pane.is_some() {
-        rec.pane = pane;
-        rec.pane_resolution = resolution;
     }
     if rec.git_root.is_none() {
         rec.git_root = git_root;
@@ -690,4 +701,94 @@ fn apply_event(
     applied.updated.push(snapshot.clone());
     applied.route = Some((snapshot, false));
     applied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_agy_idle_event(session_id: &str, ts_ms: u64) -> NormalizedEvent {
+        NormalizedEvent {
+            v: PROTO_VERSION,
+            id: EventId::new(format!("E-{ts_ms}")),
+            ts_ms,
+            agent: AgentKind::Agy,
+            kind: EventKind::TurnComplete,
+            confidence: Confidence::Exact,
+            session_id: SessionId::new(session_id),
+            subagent_id: None,
+            pane: None,
+            cwd: Some("/Users/demo".into()),
+            model: Some("gemini-4-hydrogen-high".into()),
+            native_event: "Stop".into(),
+            transcript_path: None,
+            bind_token: None,
+            detail: EventDetail::default(),
+        }
+    }
+
+    #[test]
+    fn reviving_detached_session_via_non_tmux_hook_clears_stale_tmux_metadata() {
+        let mut st = State::default();
+        let pane = PaneId::new("%42");
+
+        // Rival previously held CwdMatch on %42 and was evicted.
+        st.sessions.insert(
+            SessionId::new("767462d7-ghost"),
+            SessionRecord {
+                session_id: SessionId::new("767462d7-ghost"),
+                agent: AgentKind::Agy,
+                pane: Some(pane.clone()),
+                pane_resolution: PaneResolution::CwdMatch,
+                cwd: Some("/Users/demo".into()),
+                git_root: None,
+                model: Some("gemini-4-hydrogen-high".into()),
+                effort: Some("high".into()),
+                state: SessionState::Idle,
+                state_since_ms: 100,
+                last_event_id: None,
+                last_event_ms: 100,
+                last_message: None,
+                last_error: None,
+                parent_session_id: None,
+                is_subagent: false,
+                subagent_count: 0,
+                active_subagents: 0,
+                stage: None,
+                unread_inbox: 0,
+                confidence: Confidence::Exact,
+                tmux_target: Some("learning:7.0".into()),
+                tmux_label: Some("learning-cloud-server".into()),
+                discovered_only: false,
+                transcript_path: None,
+                metrics: None,
+            },
+        );
+
+        // Exact-pane owner emits a hook on %42 -> evicts rival completely (clears tmux metadata).
+        let owner_ev = mk_agy_idle_event("81166b09-owner", 200);
+        apply_event(
+            &mut st,
+            &owner_ev,
+            None,
+            Some(pane.clone()),
+            PaneResolution::Env,
+        );
+        let evicted = &st.sessions[&SessionId::new("767462d7-ghost")];
+        assert_eq!(evicted.state, SessionState::Ended);
+        assert!(evicted.pane.is_none());
+        assert_eq!(evicted.pane_resolution, PaneResolution::Unknown);
+        assert!(evicted.tmux_target.is_none());
+        assert!(evicted.tmux_label.is_none());
+
+        // Later, non-tmux ghost emits a new hook (`pane: None`) -> revived as non-tmux only.
+        let ghost_ev = mk_agy_idle_event("767462d7-ghost", 300);
+        apply_event(&mut st, &ghost_ev, None, None, PaneResolution::Unknown);
+        let revived = &st.sessions[&SessionId::new("767462d7-ghost")];
+        assert_eq!(revived.state, SessionState::Idle);
+        assert!(revived.pane.is_none());
+        assert_eq!(revived.pane_resolution, PaneResolution::Unknown);
+        assert!(revived.tmux_target.is_none());
+        assert!(revived.tmux_label.is_none());
+    }
 }

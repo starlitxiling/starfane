@@ -183,6 +183,14 @@ pub(crate) fn is_exact_pane_resolution(res: PaneResolution) -> bool {
     )
 }
 
+/// Detach any pane and stale tmux target/label metadata from `rec`.
+pub(crate) fn clear_tmux_binding(rec: &mut SessionRecord) {
+    rec.pane = None;
+    rec.pane_resolution = PaneResolution::Unknown;
+    rec.tmux_target = None;
+    rec.tmux_label = None;
+}
+
 impl State {
     /// Inbox key for a spawned session whose id is not known yet.
     pub fn bind_inbox_key(token: &BindToken) -> SessionId {
@@ -351,7 +359,7 @@ impl State {
                 && s.state != SessionState::Ended
             {
                 s.state = SessionState::Ended;
-                s.pane = None;
+                clear_tmux_binding(s);
             }
         }
         let old_parent = self.sessions.get_mut(root_id).and_then(|rec| {
@@ -419,6 +427,28 @@ impl State {
         let mut changed = false;
         for (leg_id, real_id) in pairs {
             if self.merge_legacy_into_real(&leg_id, &real_id) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Clear stale tmux metadata on non-tmux (`pane == None`) sessions that previously held a
+    /// `tmux_target`, `tmux_label`, or speculative `CwdMatch` binding before being detached.
+    pub fn sanitize_orphan_tmux_metadata(&mut self) -> bool {
+        let mut changed = false;
+        for s in self.sessions.values_mut() {
+            if s.is_subagent || s.discovered_only || s.pane.is_some() {
+                continue;
+            }
+            let has_tmux_meta = s.tmux_target.is_some() || s.tmux_label.is_some();
+            if s.state != SessionState::Ended {
+                if has_tmux_meta || s.pane_resolution != PaneResolution::Unknown {
+                    clear_tmux_binding(s);
+                    changed = true;
+                }
+            } else if s.pane_resolution == PaneResolution::CwdMatch && has_tmux_meta {
+                clear_tmux_binding(s);
                 changed = true;
             }
         }
@@ -591,6 +621,8 @@ mod tests {
 
         let mut rival = mk_rec("rival-cwd-hijack", AgentKind::Agy, Some("%17"), false);
         rival.pane_resolution = PaneResolution::CwdMatch;
+        rival.tmux_target = Some("prome:0.0".into());
+        rival.tmux_label = Some("prome-prometheus-ros".into());
         rival.last_event_ms = 9999;
         st.sessions.insert(rival.session_id.clone(), rival);
 
@@ -603,6 +635,9 @@ mod tests {
             .unwrap();
         assert_eq!(rival_after.state, SessionState::Ended);
         assert!(rival_after.pane.is_none());
+        assert_eq!(rival_after.pane_resolution, PaneResolution::Unknown);
+        assert!(rival_after.tmux_target.is_none());
+        assert!(rival_after.tmux_label.is_none());
 
         let root_after = st.sessions.get(&root_id).expect("promoted root");
         assert!(!root_after.is_subagent);
@@ -619,5 +654,60 @@ mod tests {
         let child_after = st.sessions.get(&child_id).expect("reparented child");
         assert!(child_after.is_subagent);
         assert_eq!(child_after.parent_session_id.as_ref(), Some(&root_id));
+    }
+
+    #[test]
+    fn sanitizes_orphan_tmux_metadata_without_touching_live_panes() {
+        let mut st = State::default();
+
+        let mut ghost_live = mk_rec("ghost-live", AgentKind::Agy, None, false);
+        ghost_live.pane_resolution = PaneResolution::CwdMatch;
+        ghost_live.tmux_target = Some("learning:7.0".into());
+        ghost_live.tmux_label = Some("learning-cloud-server".into());
+        st.sessions
+            .insert(ghost_live.session_id.clone(), ghost_live);
+
+        let mut ghost_ended = mk_rec("ghost-ended", AgentKind::Agy, None, false);
+        ghost_ended.state = SessionState::Ended;
+        ghost_ended.pane_resolution = PaneResolution::CwdMatch;
+        ghost_ended.tmux_target = Some("learning:7.0".into());
+        ghost_ended.tmux_label = Some("learning-cloud-server".into());
+        st.sessions
+            .insert(ghost_ended.session_id.clone(), ghost_ended);
+
+        let mut live_exact = mk_rec("live-exact", AgentKind::Agy, Some("%42"), false);
+        live_exact.tmux_target = Some("learning:7.0".into());
+        live_exact.tmux_label = Some("learning-cloud-server".into());
+        st.sessions
+            .insert(live_exact.session_id.clone(), live_exact);
+
+        let mut ended_exact = mk_rec("ended-exact", AgentKind::Claude, None, false);
+        ended_exact.state = SessionState::Ended;
+        ended_exact.pane_resolution = PaneResolution::Env;
+        ended_exact.tmux_target = Some("learning:2.1".into());
+        ended_exact.tmux_label = Some("learning-openkernel".into());
+        st.sessions
+            .insert(ended_exact.session_id.clone(), ended_exact);
+
+        assert!(st.sanitize_orphan_tmux_metadata());
+        assert!(!st.sanitize_orphan_tmux_metadata());
+
+        let gl = &st.sessions[&SessionId::new("ghost-live")];
+        assert!(gl.pane.is_none());
+        assert_eq!(gl.pane_resolution, PaneResolution::Unknown);
+        assert!(gl.tmux_target.is_none());
+        assert!(gl.tmux_label.is_none());
+
+        let ge = &st.sessions[&SessionId::new("ghost-ended")];
+        assert_eq!(ge.pane_resolution, PaneResolution::Unknown);
+        assert!(ge.tmux_target.is_none());
+        assert!(ge.tmux_label.is_none());
+
+        let le = &st.sessions[&SessionId::new("live-exact")];
+        assert_eq!(le.pane.as_ref().map(|p| p.as_str()), Some("%42"));
+        assert_eq!(le.tmux_target.as_deref(), Some("learning:7.0"));
+
+        let ee = &st.sessions[&SessionId::new("ended-exact")];
+        assert_eq!(ee.tmux_target.as_deref(), Some("learning:2.1"));
     }
 }

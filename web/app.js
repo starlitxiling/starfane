@@ -300,9 +300,12 @@ if (b.native) s += ` /${b.native}`;
 return s;
 }
 function isTmuxSession(s) {
-return Boolean((s?.tmux_target && String(s.tmux_target).trim()) || (s?.pane && String(s.pane).trim()));
+const hasPane = Boolean(s?.pane && String(s.pane).trim());
+if (s?.state !== 'ended') return hasPane;
+return hasPane || Boolean(s?.tmux_target && String(s.tmux_target).trim());
 }
 function tmuxGroupOf(s) {
+if (s?.state !== 'ended' && !(s?.pane && String(s.pane).trim())) return NON_TMUX_GROUP;
 if (s.tmux_target && String(s.tmux_target).includes(':')) return String(s.tmux_target).split(':')[0];
 if (s.tmux_target && String(s.tmux_target).trim()) return String(s.tmux_target).trim();
 if (s.pane && String(s.pane).trim()) {

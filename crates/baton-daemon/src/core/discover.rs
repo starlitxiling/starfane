@@ -378,10 +378,28 @@ pub(crate) fn reconcile_discovered_panes(
                 if let Some(p) = rec.pane.take() {
                     st.pane_watch.remove(&p);
                 }
+                if rec.pane_resolution == PaneResolution::CwdMatch {
+                    super::state::clear_tmux_binding(rec);
+                }
                 rec.state_since_ms = now_ms;
                 updated.push(rec.clone());
                 changed = true;
             }
+        }
+    }
+
+    for rec in st.sessions.values_mut() {
+        if !rec.discovered_only
+            && !rec.is_subagent
+            && rec.state != SessionState::Ended
+            && rec.pane.is_none()
+            && (rec.tmux_target.is_some()
+                || rec.tmux_label.is_some()
+                || rec.pane_resolution != PaneResolution::Unknown)
+        {
+            super::state::clear_tmux_binding(rec);
+            updated.push(rec.clone());
+            changed = true;
         }
     }
 
@@ -813,7 +831,7 @@ impl Core {
                         && s.state != SessionState::Ended
                     {
                         s.state = SessionState::Ended;
-                        s.pane = None;
+                        super::state::clear_tmux_binding(s);
                         s.state_since_ms = poll_now;
                         metrics_updated.push(s.clone());
                     }
