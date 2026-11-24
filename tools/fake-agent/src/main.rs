@@ -1,11 +1,11 @@
-//! Sandbox fake interactive agent for isolated `tmux -L baton-test` E2E tests (contracts §9).
+//! Sandbox fake interactive agent for isolated `tmux -L starfane-test` E2E tests (contracts §9).
 //!
 //! Usage:
 //!   `fake-agent --agent <claude|codex|agy> --script <file.toml> [--emit-bin <path>] [--session-id <id>]`
 
-use baton_proto::{id::new_id, AgentKind};
 use serde::Deserialize;
 use serde_json::Value;
+use starfane_proto::{id::new_id, AgentKind};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, Cursor, Write};
@@ -25,7 +25,7 @@ struct ScriptMeta {
 struct ScriptStep {
     /// Trigger: `"start"`, `"input"`, or `"after_ms:<n>"`.
     on: String,
-    /// Hook event name passed to `baton emit --event <event>`.
+    /// Hook event name passed to `starfane emit --event <event>`.
     event: String,
     /// Fixture path (relative to script dir, current dir, or absolute).
     payload: String,
@@ -215,7 +215,8 @@ fn dispatch_emit(
         let _ = child.wait();
     } else {
         let mut sink = io::sink();
-        let _ = baton_emit::run_emit(agent, Some(event), Cursor::new(body.as_bytes()), &mut sink);
+        let _ =
+            starfane_emit::run_emit(agent, Some(event), Cursor::new(body.as_bytes()), &mut sink);
     }
     Ok(())
 }
@@ -412,14 +413,14 @@ fullyIdle = true
             AgentKind::Agy,
             "sess-42",
             "/tmp/demo",
-            Some("hello baton"),
+            Some("hello starfane"),
             &script.step[1].set,
         )
         .unwrap();
 
         assert_eq!(rendered["conversationId"], "sess-42");
         assert_eq!(rendered["cwd"], "/tmp/demo");
-        assert_eq!(rendered["lastUserInput"], "hello baton");
+        assert_eq!(rendered["lastUserInput"], "hello starfane");
         assert_eq!(rendered["fullyIdle"], true);
     }
 

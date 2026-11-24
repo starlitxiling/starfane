@@ -65,90 +65,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "baton"
-version = "0.1.0"
-dependencies = [
- "baton-adapters",
- "baton-daemon",
- "baton-emit",
- "baton-proto",
- "clap",
- "log",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "baton-adapters"
-version = "0.1.0"
-dependencies = [
- "baton-proto",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "baton-binding"
-version = "0.1.0"
-dependencies = [
- "baton-proto",
- "serde",
- "toml",
-]
-
-[[package]]
-name = "baton-daemon"
-version = "0.1.0"
-dependencies = [
- "axum",
- "baton-adapters",
- "baton-binding",
- "baton-evidence",
- "baton-proto",
- "baton-tmux",
- "futures-core",
- "log",
- "serde",
- "serde_json",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "baton-emit"
-version = "0.1.0"
-dependencies = [
- "baton-proto",
- "serde_json",
-]
-
-[[package]]
-name = "baton-evidence"
-version = "0.1.0"
-dependencies = [
- "baton-proto",
- "serde_json",
-]
-
-[[package]]
-name = "baton-proto"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
-name = "baton-tmux"
-version = "0.1.0"
-dependencies = [
- "baton-proto",
- "serde",
-]
-
-[[package]]
 name = "bytes"
 version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,10 +128,10 @@ dependencies = [
 name = "fake-agent"
 version = "0.1.0"
 dependencies = [
- "baton-emit",
- "baton-proto",
  "serde",
  "serde_json",
+ "starfane-emit",
+ "starfane-proto",
  "toml",
 ]
 
@@ -541,6 +457,90 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "starfane"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "log",
+ "serde_json",
+ "starfane-adapters",
+ "starfane-daemon",
+ "starfane-emit",
+ "starfane-proto",
+ "tokio",
+]
+
+[[package]]
+name = "starfane-adapters"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "starfane-proto",
+ "toml",
+]
+
+[[package]]
+name = "starfane-binding"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "starfane-proto",
+ "toml",
+]
+
+[[package]]
+name = "starfane-daemon"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-core",
+ "log",
+ "serde",
+ "serde_json",
+ "starfane-adapters",
+ "starfane-binding",
+ "starfane-evidence",
+ "starfane-proto",
+ "starfane-tmux",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "starfane-emit"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "starfane-proto",
+]
+
+[[package]]
+name = "starfane-evidence"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "starfane-proto",
+]
+
+[[package]]
+name = "starfane-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "starfane-tmux"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "starfane-proto",
 ]
 
 [[package]]

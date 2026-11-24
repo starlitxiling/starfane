@@ -1,0 +1,1103 @@
+[
+  {
+    "description": "List agent sessions known to starfane (agent, pane, state, model, pipeline stage).",
+    "inputSchema": {
+      "properties": {
+        "include_subagents": {
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Git root path or project name filter.",
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "list_sessions"
+  },
+  {
+    "description": "Hand work or context to another agent session. The body is stored by starfane; the target only receives a one-line pointer. Builders finish the implement stage with intent=review and a self_test.",
+    "inputSchema": {
+      "properties": {
+        "body_md": {
+          "type": "string"
+        },
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "intent": {
+          "enum": [
+            "review",
+            "implement",
+            "continue",
+            "ask",
+            "fyi"
+          ],
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "read_only",
+            "write"
+          ],
+          "type": "string"
+        },
+        "refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "self_test": {
+          "properties": {
+            "cmd": {
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "pass",
+                "fail",
+                "not_run"
+              ],
+              "type": "string"
+            },
+            "output_tail": {
+              "description": "Last ≤2000 chars of output.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "cmd",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        "summary": {
+          "maxLength": 500,
+          "type": "string"
+        },
+        "to": {
+          "properties": {
+            "agent": {
+              "enum": [
+                "claude",
+                "codex",
+                "agy"
+              ],
+              "type": "string"
+            },
+            "pane": {
+              "description": "tmux pane id, e.g. %12",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "stage": {
+              "properties": {
+                "pipeline_id": {
+                  "type": "string"
+                },
+                "stage": {
+                  "enum": [
+                    "plan",
+                    "implement",
+                    "test_review",
+                    "report",
+                    "triage",
+                    "deep"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "pipeline_id",
+                "stage"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
+        "todo": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "to",
+        "intent",
+        "mode",
+        "summary",
+        "body_md"
+      ],
+      "type": "object"
+    },
+    "name": "create_handoff"
+  },
+  {
+    "description": "Fetch tasks, handoffs, messages and review requests addressed to this session.",
+    "inputSchema": {
+      "properties": {
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "mark_delivered": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "required": [],
+      "type": "object"
+    },
+    "name": "read_inbox"
+  },
+  {
+    "description": "Acknowledge a handoff (acked = started, done = finished).",
+    "inputSchema": {
+      "properties": {
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "handoff_id": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "acked",
+            "done"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "handoff_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "name": "ack_handoff"
+  },
+  {
+    "description": "Submit a review.v1 report. Every finding needs verbatim evidence; quotes are mechanically verified against the head commit and fabricated ones are rejected.",
+    "inputSchema": {
+      "properties": {
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "review": {
+          "description": "review.v1 (header may be omitted). Zero findings with checked_areas is a valid, encouraged result.",
+          "properties": {
+            "base": {
+              "description": "Base commit of the reviewed range.",
+              "type": "string"
+            },
+            "checked_areas": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "depth": {
+              "enum": [
+                "D0",
+                "D1",
+                "D2",
+                "D3"
+              ],
+              "type": "string"
+            },
+            "findings": {
+              "items": {
+                "properties": {
+                  "category": {
+                    "enum": [
+                      "correctness",
+                      "concurrency",
+                      "security",
+                      "perf",
+                      "api",
+                      "style"
+                    ],
+                    "type": "string"
+                  },
+                  "checked_guards": {
+                    "items": {
+                      "properties": {
+                        "file": {
+                          "type": "string"
+                        },
+                        "line": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "note": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "file",
+                        "line"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "claim": {
+                    "description": "One falsifiable sentence.",
+                    "type": "string"
+                  },
+                  "confidence": {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  "evidence": {
+                    "items": {
+                      "properties": {
+                        "file": {
+                          "type": "string"
+                        },
+                        "line_end": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "line_start": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "quote": {
+                          "description": "Verbatim lines copied from the file at the reviewed commit.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "file",
+                        "line_start",
+                        "line_end",
+                        "quote"
+                      ],
+                      "type": "object"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "id": {
+                    "description": "Leave empty; assigned by starfane.",
+                    "type": "string"
+                  },
+                  "location": {
+                    "properties": {
+                      "file": {
+                        "type": "string"
+                      },
+                      "line_end": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "line_start": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "symbol": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "file",
+                      "line_start",
+                      "line_end"
+                    ],
+                    "type": "object"
+                  },
+                  "observable_impact": {
+                    "type": "string"
+                  },
+                  "preconditions": {
+                    "type": "string"
+                  },
+                  "repro": {
+                    "properties": {
+                      "content": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "enum": [
+                          "test",
+                          "input",
+                          "none"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  "severity": {
+                    "enum": [
+                      "blocker",
+                      "major",
+                      "minor",
+                      "nit"
+                    ],
+                    "type": "string"
+                  },
+                  "suggested_fix": {
+                    "type": "string"
+                  },
+                  "trigger_path": {
+                    "items": {
+                      "properties": {
+                        "file": {
+                          "type": "string"
+                        },
+                        "line": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "note": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "file",
+                        "line"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "verification_method": {
+                    "enum": [
+                      "code_trace",
+                      "static_check",
+                      "repro_test"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "category",
+                  "severity",
+                  "confidence",
+                  "claim",
+                  "location",
+                  "evidence",
+                  "verification_method"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "head": {
+              "description": "Reviewed commit; evidence is verified against this tree.",
+              "type": "string"
+            },
+            "scope_files": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "depth",
+            "base",
+            "head"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "review"
+      ],
+      "type": "object"
+    },
+    "name": "submit_review"
+  },
+  {
+    "description": "As falsifier, record your attempt to disprove a finding. 'disproved' requires verbatim counter_evidence; without it the verdict becomes needs_human.",
+    "inputSchema": {
+      "properties": {
+        "counter_evidence": {
+          "items": {
+            "properties": {
+              "file": {
+                "type": "string"
+              },
+              "line_end": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "line_start": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "quote": {
+                "description": "Verbatim lines copied from the file at the reviewed commit.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "file",
+              "line_start",
+              "line_end",
+              "quote"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "finding_id": {
+          "type": "string"
+        },
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "review_id": {
+          "type": "string"
+        },
+        "to": {
+          "enum": [
+            "blocker",
+            "major",
+            "minor",
+            "nit"
+          ],
+          "type": "string"
+        },
+        "verdict": {
+          "enum": [
+            "confirmed",
+            "needs_human",
+            "downgraded",
+            "disproved"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "review_id",
+        "finding_id",
+        "verdict",
+        "rationale"
+      ],
+      "type": "object"
+    },
+    "name": "submit_falsifier_verdict"
+  },
+  {
+    "description": "Submit Phase A fast-triage results (triage.v1): at most 2 evidence-backed hypotheses plus mitigation.",
+    "inputSchema": {
+      "properties": {
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "triage": {
+          "description": "triage.v1 (header may be omitted). Every conclusion is a hypothesis, never a confirmed root cause.",
+          "properties": {
+            "elapsed_secs": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "hypotheses": {
+              "items": {
+                "properties": {
+                  "claim": {
+                    "type": "string"
+                  },
+                  "confidence": {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  "evidence_refs": {
+                    "items": {
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "file": {
+                              "type": "string"
+                            },
+                            "line_end": {
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "line_start": {
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "quote": {
+                              "type": "string"
+                            },
+                            "type": {
+                              "const": "code"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "file",
+                            "line_start",
+                            "line_end",
+                            "quote"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "properties": {
+                            "line": {
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "path": {
+                              "description": "Log file path, relative to repo root or absolute.",
+                              "type": "string"
+                            },
+                            "quote": {
+                              "description": "Verbatim log text.",
+                              "type": "string"
+                            },
+                            "type": {
+                              "const": "log"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "path",
+                            "quote"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "how_to_confirm": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "hypothesis"
+                  }
+                },
+                "required": [
+                  "claim",
+                  "confidence",
+                  "evidence_refs",
+                  "how_to_confirm"
+                ],
+                "type": "object"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array"
+            },
+            "mitigation": {
+              "type": "string"
+            },
+            "probes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "symptom": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "symptom",
+            "hypotheses"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "triage"
+      ],
+      "type": "object"
+    },
+    "name": "submit_triage"
+  },
+  {
+    "description": "Report a stage milestone: plan (plan.v1), rca (rca.v1), final_report (report.v1), or a progress note.",
+    "inputSchema": {
+      "properties": {
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "plan",
+            "rca",
+            "final_report",
+            "progress"
+          ],
+          "type": "string"
+        },
+        "notify_human": {
+          "type": "boolean"
+        },
+        "plan": {
+          "description": "plan.v1 (header may be omitted).",
+          "properties": {
+            "acceptance": {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "design_md": {
+              "type": "string"
+            },
+            "goal": {
+              "type": "string"
+            },
+            "native_strategy": {
+              "enum": [
+                "swarm",
+                "boost",
+                "teamwork",
+                "subagents"
+              ],
+              "type": "string"
+            },
+            "risks": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "tasks": {
+              "items": {
+                "properties": {
+                  "files": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "title"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "test_plan": {
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            }
+          },
+          "required": [
+            "goal",
+            "design_md",
+            "tasks",
+            "acceptance",
+            "test_plan"
+          ],
+          "type": "object"
+        },
+        "rca": {
+          "description": "rca.v1 (header may be omitted).",
+          "properties": {
+            "fix": {
+              "properties": {
+                "branch": {
+                  "type": "string"
+                },
+                "commit": {
+                  "type": "string"
+                },
+                "files": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "branch",
+                "files"
+              ],
+              "type": "object"
+            },
+            "regression": {
+              "items": {
+                "properties": {
+                  "cmd": {
+                    "type": "string"
+                  },
+                  "outcome": {
+                    "enum": [
+                      "pass",
+                      "fail",
+                      "not_run"
+                    ],
+                    "type": "string"
+                  },
+                  "output_tail": {
+                    "description": "Last ≤2000 chars of output.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "cmd",
+                  "outcome"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "repro_before": {
+              "properties": {
+                "cmd": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "enum": [
+                    "pass",
+                    "fail",
+                    "not_run"
+                  ],
+                  "type": "string"
+                },
+                "output_tail": {
+                  "description": "Last ≤2000 chars of output.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cmd",
+                "outcome"
+              ],
+              "type": "object"
+            },
+            "repro_note": {
+              "type": "string"
+            },
+            "root_cause": {
+              "properties": {
+                "claim": {
+                  "type": "string"
+                },
+                "evidence": {
+                  "items": {
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "file": {
+                            "type": "string"
+                          },
+                          "line_end": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "line_start": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "quote": {
+                            "type": "string"
+                          },
+                          "type": {
+                            "const": "code"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "file",
+                          "line_start",
+                          "line_end",
+                          "quote"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "properties": {
+                          "line": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "path": {
+                            "description": "Log file path, relative to repo root or absolute.",
+                            "type": "string"
+                          },
+                          "quote": {
+                            "description": "Verbatim log text.",
+                            "type": "string"
+                          },
+                          "type": {
+                            "const": "log"
+                          }
+                        },
+                        "required": [
+                          "type",
+                          "path",
+                          "quote"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "type": "array"
+                },
+                "trigger_path": {
+                  "items": {
+                    "properties": {
+                      "file": {
+                        "type": "string"
+                      },
+                      "line": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "note": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "file",
+                      "line"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "claim",
+                "trigger_path",
+                "evidence"
+              ],
+              "type": "object"
+            },
+            "ruled_out": {
+              "items": {
+                "properties": {
+                  "evidence": {
+                    "items": {
+                      "oneOf": [
+                        {
+                          "properties": {
+                            "file": {
+                              "type": "string"
+                            },
+                            "line_end": {
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "line_start": {
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "quote": {
+                              "type": "string"
+                            },
+                            "type": {
+                              "const": "code"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "file",
+                            "line_start",
+                            "line_end",
+                            "quote"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "properties": {
+                            "line": {
+                              "minimum": 1,
+                              "type": "integer"
+                            },
+                            "path": {
+                              "description": "Log file path, relative to repo root or absolute.",
+                              "type": "string"
+                            },
+                            "quote": {
+                              "description": "Verbatim log text.",
+                              "type": "string"
+                            },
+                            "type": {
+                              "const": "log"
+                            }
+                          },
+                          "required": [
+                            "type",
+                            "path",
+                            "quote"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "type": "array"
+                  },
+                  "hypothesis": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "hypothesis",
+                  "evidence"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "triage_id": {
+              "type": "string"
+            },
+            "verification_after": {
+              "properties": {
+                "cmd": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "enum": [
+                    "pass",
+                    "fail",
+                    "not_run"
+                  ],
+                  "type": "string"
+                },
+                "output_tail": {
+                  "description": "Last ≤2000 chars of output.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cmd",
+                "outcome"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "root_cause",
+            "repro_before"
+          ],
+          "type": "object"
+        },
+        "report": {
+          "description": "report.v1 (header may be omitted).",
+          "properties": {
+            "changes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "decisions": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "doc_path": {
+              "type": "string"
+            },
+            "follow_ups": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "summary_md": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "summary_md"
+          ],
+          "type": "object"
+        },
+        "text": {
+          "description": "Required for kind=progress.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "name": "report_milestone"
+  },
+  {
+    "description": "Start a Feature or Debug pipeline from the user's words. Pass the user's phrasing in utterance (e.g. 'plan with claude, implement with codex, review with agy /swarm'); bindings use shorthand '<agent>[:<model>][@<effort>][ /<native>]'. The human must confirm before anything runs.",
+    "inputSchema": {
+      "properties": {
+        "bindings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Stage name -> binding shorthand.",
+          "type": "object"
+        },
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "playbook": {
+          "enum": [
+            "feature",
+            "debug"
+          ],
+          "type": "string"
+        },
+        "project_root": {
+          "type": "string"
+        },
+        "utterance": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "goal"
+      ],
+      "type": "object"
+    },
+    "name": "start_pipeline"
+  }
+]

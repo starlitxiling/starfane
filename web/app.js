@@ -1,4 +1,4 @@
-// baton web console — offline ES module
+// starfane web console — offline ES module
 'use strict';
 const VIEWS = ['workspace', 'inbox', 'pipelines', 'reviews'];
 const VIEW_LABEL = { workspace: '会话对话', inbox: '待处理', pipelines: '流水线', reviews: '代码评审' };
@@ -17,7 +17,7 @@ blocked: '已阻塞', done: '已完成', cancelled: '已取消', failed: '已失
 };
 const STATE_PRIO = { needs_permission: 0, needs_input: 0, error: 1, working: 2, starting: 3, idle: 4, interrupted: 4, unknown: 5, ended: 6 };
 const LEVEL_LABEL = { l0_inbox: 'L0 收件箱', l1_codex_queue: 'L1 Codex 队列', l2_inject: 'L2 直接注入', l4_spawn: 'L4 新建窗口' };
-const TOKEN_KEY = 'baton_token';
+const TOKEN_KEY = 'starfane_token';
 const REQUEST_TIMEOUT_MS = 15000;
 const HEALTH_POLL_MS = 8000;
 const PREVIEW_POLL_MS = 3000;
@@ -32,19 +32,19 @@ const PARSE_DEBOUNCE_MS = 380;
 const MAX_ACTIVITY = 80;
 const MAX_BACKOFF_MS = 15000;
 const TOAST_MS = 4200;
-const COLLAPSED_KEY = 'baton_collapsed_groups';
-const GROUPS_INIT_KEY = 'baton_groups_init';
-const SPAWN_PREFS_KEY = 'baton_spawn_prefs';
-const OUTLINE_COLLAPSED_KEY = 'baton_outline_collapsed';
+const COLLAPSED_KEY = 'starfane_collapsed_groups';
+const GROUPS_INIT_KEY = 'starfane_groups_init';
+const SPAWN_PREFS_KEY = 'starfane_spawn_prefs';
+const OUTLINE_COLLAPSED_KEY = 'starfane_outline_collapsed';
 const PASTE_CHAR_LIMIT = 400;
 const PASTE_LINE_LIMIT = 6;
 const EFFORT_LABEL = { low: 'low · 低', medium: 'medium · 中', high: 'high · 高', xhigh: 'xhigh · 超高', max: 'max · 最大' };
-const BATON_SLASH = [
-{ cmd: '/feature', args_hint: '', desc: '切换为新功能协作模式', group: 'baton', action: 'mode_feature' },
-{ cmd: '/debug', args_hint: '', desc: '切换为两速查错模式', group: 'baton', action: 'mode_debug' },
-{ cmd: '/mute', args_hint: '', desc: '打开飞书通知静音设置', group: 'baton', action: 'open_mute' },
-{ cmd: '/terminal', args_hint: '', desc: '切换阅读视图 / 原始终端', group: 'baton', action: 'toggle_terminal' },
-{ cmd: '/drawer', args_hint: '', desc: '展开当前会话详情抽屉', group: 'baton', action: 'open_drawer' },
+const STARFANE_SLASH = [
+{ cmd: '/feature', args_hint: '', desc: '切换为新功能协作模式', group: 'starfane', action: 'mode_feature' },
+{ cmd: '/debug', args_hint: '', desc: '切换为两速查错模式', group: 'starfane', action: 'mode_debug' },
+{ cmd: '/mute', args_hint: '', desc: '打开飞书通知静音设置', group: 'starfane', action: 'open_mute' },
+{ cmd: '/terminal', args_hint: '', desc: '切换阅读视图 / 原始终端', group: 'starfane', action: 'toggle_terminal' },
+{ cmd: '/drawer', args_hint: '', desc: '展开当前会话详情抽屉', group: 'starfane', action: 'open_drawer' },
 ];
 const FALLBACK_SLASH = {
 agy: [
@@ -130,7 +130,7 @@ localStorage.setItem(SPAWN_PREFS_KEY, JSON.stringify(p));
 } catch { /* ignore */ }
 }
 const NON_TMUX_GROUP = '非 tmux / 后台';
-const NON_TMUX_OPEN_KEY = 'baton_nontmux_open';
+const NON_TMUX_OPEN_KEY = 'starfane_nontmux_open';
 const IMG_MAX_BYTES = 10 * 1024 * 1024;
 function loadCollapsedGroups() {
 try {
@@ -154,7 +154,7 @@ slashCmds: new Map(), slashFetching: new Set(),
 reviews: new Map(), reviewsState: 'idle', reviewsErr: null,
 precision: null, precisionState: 'idle', precisionErr: null,
 artifacts: new Map(), handoffs: new Map(), previews: new Map(), transcripts: new Map(),
-activity: [], muteUntil: Number(localStorage.getItem('baton_mute_until') || 0),
+activity: [], muteUntil: Number(localStorage.getItem('starfane_mute_until') || 0),
 };
 const UI = {
 view: 'workspace', arg: null, modal: null, drawer: null,
@@ -436,7 +436,7 @@ constructor(code, message, status) { super(message); this.code = code; this.stat
 }
 function authHeaders() {
 const t = localStorage.getItem(TOKEN_KEY);
-return t ? { 'X-Baton-Token': t } : {};
+return t ? { 'X-Starfane-Token': t } : {};
 }
 async function api(method, path, body) {
 const ctl = new AbortController();
@@ -965,8 +965,8 @@ try {
 const data = await api('GET', `/api/slash-commands${qs({ agent: ag })}`);
 const list = Array.isArray(data?.commands) ? data.commands : [];
 if (list.length) {
-const hasBaton = list.some((c) => c.group === 'baton');
-S.slashCmds.set(ag, hasBaton ? list : [...list, ...BATON_SLASH]);
+const hasStarfane = list.some((c) => c.group === 'starfane');
+S.slashCmds.set(ag, hasStarfane ? list : [...list, ...STARFANE_SLASH]);
 if (UI.slash.open && WS?.comp?.ta && WS.comp.agent === ag) updateSlashFromInput(WS.comp.ta, ag);
 }
 } catch { /* fallback to built-in slash list */ }
@@ -975,7 +975,7 @@ finally { S.slashFetching.delete(ag); }
 function slashCommandsFor(agent) {
 const ag = AGENTS.includes(agent) ? agent : 'claude';
 if (S.slashCmds.has(ag)) return S.slashCmds.get(ag);
-return [...(FALLBACK_SLASH[ag] || FALLBACK_SLASH.claude), ...BATON_SLASH];
+return [...(FALLBACK_SLASH[ag] || FALLBACK_SLASH.claude), ...STARFANE_SLASH];
 }
 function modelsForAgent(agent) {
 const fb = FALLBACK_MODELS[agent] || { default: '', default_effort: 'high', efforts: [], models: [] };
@@ -1082,7 +1082,7 @@ const nextDrawer = $('.drawer-body');
 if (nextDrawer && drawerTop) nextDrawer.scrollTop = drawerTop;
 if (modalEl?.open && modalTop) modalEl.scrollTop = modalTop;
 const alerts = alertCount();
-document.title = `${alerts ? `(${alerts}) ` : ''}baton · 控制面`;
+document.title = `${alerts ? `(${alerts}) ` : ''}starfane · 控制面`;
 const nextTerm = $('.term-viewport');
 if (nextTerm && nextTerm !== termBox) {
 const samePane = termScroll && termScroll.sid === nextTerm.dataset.sid && termScroll.mode === nextTerm.dataset.mode;
@@ -1210,7 +1210,7 @@ return [...set];
 };
 function setMute(until) {
 S.muteUntil = until || 0;
-localStorage.setItem('baton_mute_until', String(S.muteUntil));
+localStorage.setItem('starfane_mute_until', String(S.muteUntil));
 }
 const muted = () => S.muteUntil > Date.now();
 const statusInd = (state, text, soft = false) => span(`status-ind${soft ? ' pill-soft' : ''}`, h('i', { class: `dot dot-${state}` }), text || stateText(state));
@@ -1606,7 +1606,7 @@ h('div', { class: 'mute-row' }, timeInp, btn('静音至此', { cls: 'sm', busyKe
 h('div', { class: 'mute-sep' }),
 h('button', {
 type: 'button', class: 'mute-foot-btn',
-onclick: () => { UI.muteMenu = false; schedule(); act('feishu-test', () => api('POST', '/api/feishu/test', { text: 'baton Web 控制台测试通知' }), '测试卡片已发送'); },
+onclick: () => { UI.muteMenu = false; schedule(); act('feishu-test', () => api('POST', '/api/feishu/test', { text: 'starfane Web 控制台测试通知' }), '测试卡片已发送'); },
 }, '发送飞书测试卡片'));
 }
 function renderTop() {
@@ -1617,7 +1617,7 @@ const activePipes = allPipelines().filter((p) => !isFinished(p)).length;
 const pendingVerdicts = [...S.reviews.values()].reduce((n, r) => n + (r.findings || []).filter((f) => f.falsifier?.verdict === 'needs_human' && !f.feedback).length, 0);
 const counts = { workspace: liveSessions, inbox: alerts, pipelines: activePipes, reviews: pendingVerdicts };
 const connTxt = { live: '实时已连接', connecting: '重连中…', down: '连接已断开' }[cs];
-const connTip = `baton ${S.version || '?'} · SSE ${S.conn} · seq ${S.lastSeq}${S.uptimeMs != null ? ` · 运行 ${dur(S.uptimeMs)}` : ''}`;
+const connTip = `starfane ${S.version || '?'} · SSE ${S.conn} · seq ${S.lastSeq}${S.uptimeMs != null ? ` · 运行 ${dur(S.uptimeMs)}` : ''}`;
 const bar = $('#topbar');
 if (!TOP || TOP.bar !== bar) {
 const nav = h('nav', { class: 'nav-seg', role: 'tablist', 'aria-label': '主导航' });
@@ -1629,7 +1629,7 @@ onclick: () => { UI.muteMenu = !UI.muteMenu; rerender(); },
 const mutePopSlot = h('div');
 const muteWrap = h('div', { class: 'mute-wrap' }, muteBtn, mutePopSlot);
 bar.replaceChildren(
-h('a', { class: 'brand', href: '#/workspace' }, h('img', { class: 'logo', src: '/assets/logo.svg', alt: '', width: 26, height: 26 }), h('span', null, 'baton')),
+h('a', { class: 'brand', href: '#/workspace' }, h('img', { class: 'logo', src: '/assets/logo.svg', alt: '', width: 26, height: 26 }), h('span', null, 'starfane')),
 nav,
 h('div', { class: 'top-tools' }, connPill, muteWrap));
 TOP = { bar, nav, connPill, muteBtn, mutePopSlot, popKey: '' };
@@ -1664,10 +1664,10 @@ return;
 }
 let content;
 if (S.authNeeded && !S.loaded) {
-content = emptyState('需要认证 Token', '请在弹窗中输入本地 daemon 生成的 token，或通过 baton web 打开控制台。');
+content = emptyState('需要认证 Token', '请在弹窗中输入本地 daemon 生成的 token，或通过 starfane web 打开控制台。');
 } else if (!S.loaded) {
 content = S.loadError
-? errorBanner(`无法连接 baton daemon：${S.loadError}`, '重新连接', loadAll)
+? errorBanner(`无法连接 starfane daemon：${S.loadError}`, '重新连接', loadAll)
 : h('div', { class: 'card' }, skeleton(6));
 } else {
 const fn = { inbox: viewInbox, pipelines: viewPipelines, reviews: viewReviews }[UI.view] || viewInbox;
@@ -1822,9 +1822,9 @@ return;
 }
 const agLabel = AGENT_DISPLAY[agent] || agent || 'Agent';
 const nativeItems = [];
-const batonItems = [];
+const starfaneItems = [];
 items.forEach((it, flatIdx) => {
-if (it.group === 'baton') batonItems.push([it, flatIdx]);
+if (it.group === 'starfane') starfaneItems.push([it, flatIdx]);
 else nativeItems.push([it, flatIdx]);
 });
 const mkRow = ([it, flatIdx]) => h('button', {
@@ -1845,9 +1845,9 @@ if (nativeItems.length) {
 listNodes.push(h('div', { class: 'slash-group' }, 'Agent 原生命令', agentTag(agent)));
 listNodes.push(...nativeItems.map(mkRow));
 }
-if (batonItems.length) {
-listNodes.push(h('div', { class: 'slash-group' }, 'Baton 控制台快捷命令'));
-listNodes.push(...batonItems.map(mkRow));
+if (starfaneItems.length) {
+listNodes.push(h('div', { class: 'slash-group' }, 'Starfane 控制台快捷命令'));
+listNodes.push(...starfaneItems.map(mkRow));
 }
 box.classList.remove('ws-hidden');
 box.replaceChildren(
@@ -1886,7 +1886,7 @@ if (nextIdx < 0) nextIdx = 0;
 UI.slash = { open: true, start, end: pos, query: q, items: filtered, idx: nextIdx };
 renderSlashMenu(ag);
 }
-function runBatonSlashAction(action) {
+function runStarfaneSlashAction(action) {
 if (action === 'mode_feature') { UI.composerMode = 'feature'; rerender(); }
 else if (action === 'mode_debug') { UI.composerMode = 'debug'; rerender(); }
 else if (action === 'open_mute') { UI.muteMenu = true; rerender(); }
@@ -1901,13 +1901,13 @@ const { start, end } = UI.slash;
 const head = ta.value.slice(0, start);
 const tail = ta.value.slice(end);
 closeSlashMenu();
-if (item.group === 'baton' || item.action) {
+if (item.group === 'starfane' || item.action) {
 const cleaned = (head + tail.replace(/^\s/, '')).trimEnd();
 ta.value = cleaned;
 if (sid) UI.drafts.set(`ws:msg:${sid}`, cleaned);
 ta.style.height = 'auto';
 autoGrow(ta);
-runBatonSlashAction(item.action);
+runStarfaneSlashAction(item.action);
 return;
 }
 const ins = item.needs_args ? `${item.cmd} ` : item.cmd;
@@ -3603,16 +3603,16 @@ const save = () => {
 const t = draft('auth:token').trim();
 if (!t) { toast('请输入 token', 'warn'); return; }
 localStorage.setItem(TOKEN_KEY, t);
-document.cookie = `baton_token=${enc(t)}; path=/; SameSite=Strict`;
+document.cookie = `starfane_token=${enc(t)}; path=/; SameSite=Strict`;
 UI.drafts.delete('auth:token');
 S.authNeeded = false; S.healthFails = 0;
 connectSSE(); loadAll();
 };
-const inp = field('auth:token', { class: 'inp mono', type: 'password', placeholder: '粘贴 baton_token…', autocomplete: 'off' });
+const inp = field('auth:token', { class: 'inp mono', type: 'password', placeholder: '粘贴 starfane_token…', autocomplete: 'off' });
 inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
 return h('div', { class: 'stack' },
 h('div', { class: 'modal-head' }, h('h3', null, '输入访问 Token')),
-h('p', { class: 'muted' }, '请粘贴本地 daemon 生成的 token（位于 ', h('code', null, '<state>/web.token'), '），或直接运行 ', h('code', null, 'baton web'), ' 自动登录。'),
+h('p', { class: 'muted' }, '请粘贴本地 daemon 生成的 token（位于 ', h('code', null, '<state>/web.token'), '），或直接运行 ', h('code', null, 'starfane web'), ' 自动登录。'),
 inp,
 h('div', { class: 'row', style: 'justify-content:flex-end' }, btn('保存并连接', { cls: 'primary', onclick: save })));
 }

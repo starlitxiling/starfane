@@ -1,7 +1,7 @@
 {
   "session_id": "11111111-2222-4333-8444-555555555555",
-  "transcript_path": "/Users/demo/.claude/projects/-Users-demo-work-baton/11111111-2222-4333-8444-555555555555.jsonl",
-  "cwd": "/Users/demo/work/baton",
+  "transcript_path": "/Users/demo/.claude/projects/-Users-demo-work-starfane/11111111-2222-4333-8444-555555555555.jsonl",
+  "cwd": "/Users/demo/work/starfane",
   "permission_mode": "default",
   "hook_event_name": "SubagentStart",
   "agent_id": "sub-claude-01",

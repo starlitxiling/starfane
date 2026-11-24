@@ -1,13 +1,13 @@
 {
   "session_id": "11111111-2222-4333-8444-555555555555",
-  "transcript_path": "/Users/demo/.claude/projects/-Users-demo-work-baton/11111111-2222-4333-8444-555555555555.jsonl",
-  "cwd": "/Users/demo/work/baton",
+  "transcript_path": "/Users/demo/.claude/projects/-Users-demo-work-starfane/11111111-2222-4333-8444-555555555555.jsonl",
+  "cwd": "/Users/demo/work/starfane",
   "permission_mode": "default",
   "hook_event_name": "SubagentStop",
   "stop_hook_active": false,
   "agent_id": "sub-claude-01",
   "agent_type": "Explore",
-  "agent_transcript_path": "/Users/demo/.claude/projects/-Users-demo-work-baton/subagents/sub-claude-01.jsonl",
-  "last_assistant_message": "Located all 3 call sites in baton-binding.",
+  "agent_transcript_path": "/Users/demo/.claude/projects/-Users-demo-work-starfane/subagents/sub-claude-01.jsonl",
+  "last_assistant_message": "Located all 3 call sites in starfane-binding.",
   "background_tasks": []
 }

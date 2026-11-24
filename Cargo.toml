@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/baton-proto",
-    "crates/baton-emit",
-    "crates/baton-adapters",
-    "crates/baton-tmux",
-    "crates/baton-evidence",
-    "crates/baton-binding",
-    "crates/baton-daemon",
-    "bin/baton",
+    "crates/starfane-proto",
+    "crates/starfane-emit",
+    "crates/starfane-adapters",
+    "crates/starfane-tmux",
+    "crates/starfane-evidence",
+    "crates/starfane-binding",
+    "crates/starfane-daemon",
+    "bin/starfane",
     "tools/fake-agent",
 ]
 
@@ -20,13 +20,13 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal workspace crates
-baton-proto = { path = "crates/baton-proto" }
-baton-emit = { path = "crates/baton-emit" }
-baton-adapters = { path = "crates/baton-adapters" }
-baton-tmux = { path = "crates/baton-tmux" }
-baton-evidence = { path = "crates/baton-evidence" }
-baton-binding = { path = "crates/baton-binding" }
-baton-daemon = { path = "crates/baton-daemon" }
+starfane-proto = { path = "crates/starfane-proto" }
+starfane-emit = { path = "crates/starfane-emit" }
+starfane-adapters = { path = "crates/starfane-adapters" }
+starfane-tmux = { path = "crates/starfane-tmux" }
+starfane-evidence = { path = "crates/starfane-evidence" }
+starfane-binding = { path = "crates/starfane-binding" }
+starfane-daemon = { path = "crates/starfane-daemon" }
 
 # Minimal external dependencies (default-features = false everywhere)
 serde = { version = "1", default-features = false, features = ["std", "derive"] }

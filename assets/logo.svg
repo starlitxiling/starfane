@@ -1,45 +1,108 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <linearGradient id="squircleBg" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#2B2926"/>
-      <stop offset="55%" stop-color="#1E1D1B"/>
-      <stop offset="100%" stop-color="#131210"/>
+    <clipPath id="clipC">
+      <rect x="16" y="16" width="480" height="480" rx="116" />
+    </clipPath>
+    <linearGradient id="bgC" x1="88" y1="24" x2="432" y2="488" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2E1758" />
+      <stop offset="52%" stop-color="#160C32" />
+      <stop offset="100%" stop-color="#080513" />
     </linearGradient>
-    <linearGradient id="shaftGrad" x1="0" y1="-40" x2="0" y2="14" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#FFFFFF"/>
-      <stop offset="100%" stop-color="#ECE9E0"/>
-    </linearGradient>
-    <linearGradient id="gripGrad" x1="0" y1="10" x2="0" y2="40" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#E07A5F"/>
-      <stop offset="100%" stop-color="#B95436"/>
-    </linearGradient>
-    <radialGradient id="tipGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(86 34) scale(26)">
-      <stop offset="0%" stop-color="#FAF9F6" stop-opacity="0.28"/>
-      <stop offset="100%" stop-color="#FAF9F6" stop-opacity="0"/>
+    <radialGradient id="portalGlowC" cx="256" cy="256" r="196" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F6DC97" stop-opacity="0.28" />
+      <stop offset="46%" stop-color="#7C56D9" stop-opacity="0.24" />
+      <stop offset="100%" stop-color="#080513" stop-opacity="0" />
     </radialGradient>
+    <linearGradient id="portalFillC" x1="256" y1="138" x2="256" y2="382" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#35206A" stop-opacity="0.62" />
+      <stop offset="65%" stop-color="#211448" stop-opacity="0.45" />
+      <stop offset="100%" stop-color="#120B2B" stop-opacity="0.25" />
+    </linearGradient>
+    <linearGradient id="rimC" x1="17.5" y1="17.5" x2="494.5" y2="494.5" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#C69AFF" stop-opacity="0.38" />
+      <stop offset="50%" stop-color="#F3D896" stop-opacity="0.24" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.06" />
+    </linearGradient>
+    <linearGradient id="archGoldC" x1="136" y1="136" x2="376" y2="382" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFF6D8" />
+      <stop offset="48%" stop-color="#E7C77E" />
+      <stop offset="100%" stop-color="#AF833A" />
+    </linearGradient>
+    <linearGradient id="goldBarC" x1="108" y1="384" x2="404" y2="384" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#9F7836" stop-opacity="0.35" />
+      <stop offset="22%" stop-color="#EAC981" />
+      <stop offset="50%" stop-color="#FFF5D6" />
+      <stop offset="78%" stop-color="#EAC981" />
+      <stop offset="100%" stop-color="#9F7836" stop-opacity="0.35" />
+    </linearGradient>
+    <linearGradient id="moonGoldC" x1="220" y1="54" x2="292" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFF9E6" />
+      <stop offset="55%" stop-color="#F0D48D" />
+      <stop offset="100%" stop-color="#C79B4C" />
+    </linearGradient>
+    <linearGradient id="ringGoldC" x1="190" y1="188" x2="322" y2="320" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFF4D4" stop-opacity="0.92" />
+      <stop offset="50%" stop-color="#B9C6FF" stop-opacity="0.58" />
+      <stop offset="100%" stop-color="#E8C77C" stop-opacity="0.9" />
+    </linearGradient>
+    <radialGradient id="starFillC" cx="256" cy="254" r="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="45%" stop-color="#FFF6DA" />
+      <stop offset="100%" stop-color="#E8C67A" />
+    </radialGradient>
+    <filter id="glowC" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="8" result="b" />
+      <feMerge>
+        <feMergeNode in="b" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
   </defs>
 
-  <!-- Rounded Squircle Base -->
-  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#squircleBg)"/>
-  <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="27.25" stroke="#FAF9F6" stroke-opacity="0.13" stroke-width="1.5"/>
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#bgC)" />
+  <g clip-path="url(#clipC)">
+    <rect x="16" y="16" width="480" height="480" fill="url(#portalGlowC)" />
 
-  <!-- Subtle Glow Behind Baton Tip -->
-  <circle cx="86" cy="34" r="26" fill="url(#tipGlow)"/>
+    <!-- Subtle night sky stardust -->
+    <circle cx="94" cy="116" r="3" fill="#F0E6FF" opacity="0.58" />
+    <circle cx="418" cy="112" r="3" fill="#FFF3D2" opacity="0.65" />
+    <circle cx="80" cy="272" r="2.4" fill="#C9D0FF" opacity="0.45" />
+    <circle cx="432" cy="284" r="2.4" fill="#F6E3AF" opacity="0.5" />
 
-  <!-- Conducting Beat Arc & Agent Triad (Claude / Codex / AGY) -->
-  <path d="M 28 73 C 29 48, 43 32, 68 27" stroke="#FAF9F6" stroke-opacity="0.18" stroke-width="2.2" stroke-linecap="round"/>
-  <circle cx="30" cy="60" r="6" fill="#E07A5F"/>
-  <circle cx="42" cy="40" r="6" fill="#3DB479"/>
-  <circle cx="62" cy="29" r="6" fill="#5E83F2"/>
+    <!-- Crescent moon crown + zenith cradle star -->
+    <g filter="url(#glowC)">
+      <path d="M 220 78 A 39 39 0 0 0 292 78 A 60 60 0 0 1 220 78 Z" fill="url(#moonGoldC)" />
+    </g>
+    <path d="M 256 54 L 259.5 64.5 L 270 68 L 259.5 71.5 L 256 82 L 252.5 71.5 L 242 68 L 252.5 64.5 Z"
+          fill="#FFFDF5" />
 
-  <!-- Subtle Tempo Echo Bars in Lower Right -->
-  <path d="M 78 96 L 98 96" stroke="#FAF9F6" stroke-opacity="0.22" stroke-width="4" stroke-linecap="round"/>
-  <path d="M 85 84 L 98 84" stroke="#FAF9F6" stroke-opacity="0.14" stroke-width="4" stroke-linecap="round"/>
+    <!-- Romanesque sanctuary portal with luminous fill -->
+    <path d="M 136 382 L 136 260 A 120 120 0 0 1 376 260 L 376 382 Z"
+          fill="url(#portalFillC)" />
+    <path d="M 136 382 L 136 260 A 120 120 0 0 1 376 260 L 376 382"
+          fill="none" stroke="url(#archGoldC)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" />
 
-  <!-- Conductor's Baton -->
-  <g transform="translate(66 64) rotate(36)">
-    <rect x="-5" y="-40" width="10" height="54" rx="5" fill="url(#shaftGrad)"/>
-    <rect x="-7" y="12" width="14" height="27" rx="7" fill="url(#gripGrad)"/>
-    <rect x="-6" y="10" width="12" height="4" rx="2" fill="#E6BE68"/>
+    <!-- Two-tier threshold plinth -->
+    <rect x="108" y="376" width="296" height="16" rx="8" fill="url(#goldBarC)" />
+    <rect x="160" y="406" width="192" height="10" rx="5" fill="url(#goldBarC)" opacity="0.56" />
+
+    <!-- Astrolabe sanctuary rings -->
+    <circle cx="256" cy="254" r="82" fill="none" stroke="#DCE4FF" stroke-width="2" stroke-dasharray="6 10" opacity="0.44" />
+    <circle cx="256" cy="254" r="64" fill="none" stroke="url(#ringGoldC)" stroke-width="4.5" opacity="0.82" />
+
+    <!-- Scattered rising sanctuary stardust -->
+    <circle cx="190" cy="316" r="3" fill="#FFF3D2" opacity="0.72" />
+    <circle cx="320" cy="306" r="2.8" fill="#DCE4FF" opacity="0.68" />
+    <circle cx="212" cy="196" r="2.5" fill="#F8E7B9" opacity="0.72" />
+    <circle cx="302" cy="202" r="2.5" fill="#E3E9FF" opacity="0.64" />
+    <circle cx="256" cy="342" r="3.2" fill="#FFF6DC" opacity="0.75" />
+
+    <!-- Radiant center star -->
+    <g filter="url(#glowC)">
+      <path d="M 256 202 L 268 242 L 308 254 L 268 266 L 256 306 L 244 266 L 204 254 L 244 242 Z"
+            fill="url(#starFillC)" />
+    </g>
+    <circle cx="256" cy="254" r="9" fill="#FFFFFF" />
   </g>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="114.5" fill="none" stroke="url(#rimC)" stroke-width="2" />
 </svg>
