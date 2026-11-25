@@ -510,11 +510,12 @@ impl Core {
         agent: Option<AgentKind>,
     ) -> Result<slash::SlashCommandsResponse, ApiError> {
         let core = self.clone();
+        let is_en = self.inner.cfg.web.is_en();
         tokio::task::spawn_blocking(move || {
             let home = slash::user_home_dir();
             let mut cache = lock(&core.inner.slash_cache);
             let scanned = cache.get_or_refresh(home.as_deref());
-            slash::build_catalog(agent, scanned)
+            slash::build_catalog(agent, scanned, is_en)
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
@@ -937,6 +938,10 @@ impl Core {
             obj.insert(
                 "has_user_term_font".into(),
                 serde_json::Value::Bool(has_user_font),
+            );
+            obj.insert(
+                "lang".into(),
+                serde_json::Value::String(self.inner.cfg.web.effective_lang().to_string()),
             );
         }
         v

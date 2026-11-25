@@ -34,9 +34,9 @@
 
 - **零 Headless · BYO-`tmux` 与 `zellij`（0.44+）**：通过统一的 `TerminalMux` 抽象同时支持 `tmux` 与 `zellij >= 0.44`（检测到自动启用），保留你长期运行的交互式 `claude`、`codex` 与 `agy` 窗格；启用 `[discovery] include_shell_panes = true` 后可一并纳管普通终端/训练/监控窗格（`shell`）；新建交互会话默认工作目录 `~/.agent_session`（指定目录时尊重用户目录）。
 - **亚 10ms Hook 热路径**：`starfane emit` 仅依赖 Rust 标准库（无异步运行时冷启动开销），通过本地 UDS（`starfaned.sock`）上报事件，守护进程重启期间自动落盘 spool 补传。
-- **全量历史浏览与零乱码内嵌 Web 控制台**：前端拆分为零构建原生 ES Modules（`web/app.js` + `web/js/*.js`）并支持零拷贝 ETag `304` 缓存；支持游标分页全量对话记录（`加载全部` / 加载更早历史）与全量终端滚动历史（`tmux capture-pane -S -` / `zellij dump-screen --full`，按 200 行分块配合 `content-visibility: auto` 流畅渲染 50,000+ 行）；内置离屏 `<canvas>` Nerd Font 探测与 Powerline/P10k/Starship PUA 私有图标兼容映射（右上角支持 `图标: 兼容 / 原始` 切换，亦支持 `[web] terminal_font` 或 `~/.config/starfane/fonts/terminal.woff2` / `.ttf` 自定义字体），彻底消除终端字体方块乱码。
+- **全量历史浏览、双语部署与零乱码内嵌 Web 控制台**：前端拆分为零构建原生 ES Modules（`web/app.js` + `web/js/*.js`）并支持零拷贝 ETag `304` 缓存；支持部署期指定界面语言（`[web] lang = "zh" | "en"` 或 `starfane daemon --lang zh|en`，默认中文 `"zh"`，不在网页内混杂切换按钮）；支持游标分页全量对话记录（`加载全部` / 加载更早历史）与全量终端滚动历史（`tmux capture-pane -S -` / `zellij dump-screen --full`，按 200 行分块配合 `content-visibility: auto` 流畅渲染 50,000+ 行）；内置离屏 `<canvas>` Nerd Font 探测与 Powerline/P10k/Starship PUA 私有图标兼容映射（右上角支持 `图标: 兼容 / 原始` 切换，亦支持 `[web] terminal_font` 或 `~/.config/starfane/fonts/terminal.woff2` / `.ttf` 自定义字体），彻底消除终端字体方块乱码。
 - **多机联邦纳管（`[[nodes]]`）**：支持在同一台 Hub 上混搭 **SSH ControlMaster 免安装节点**（`kind = "ssh"`，适合云主机/GPU 容器）与 **对等 `starfaned` 联邦节点**（`kind = "peer"`，支持多候选出站 `endpoints` 自动故障切换与对话记录代理）；侧边栏按主机分组展示，并支持在页面中实时重命名主机展示名（`POST /api/hosts/{id}/rename` 持久化）。
-- **按需启用多渠道通知路由与 Split Ownership**：全新安装默认零通知通道且保持静默，100% 向后兼容原有 `[feishu]` 飞书双向卡片（自动映射为 `feishu-default`）；支持按需配置 `[[notifiers]]`（多套 `feishu` profile、`telegram`、`webhook`、`macos` 原生通知）与 `[[notify_routes]]` 差异化路由，仓库内 `.starfane/team.toml` `[notify]` 仅允许引用逻辑 ID（解析阶段拒绝任何密钥/URL）。基于 **Split Ownership（`node_local` / `hub`）**，Peer 节点默认本地自发通知、凭证完全隔离不重复推送，SSH 免安装节点默认由 Hub 代发。
+- **按需启用多渠道通知路由与 Split Ownership**：全新安装默认零通知通道且保持静默，100% 向后兼容原有 `[feishu]` 飞书双向卡片（自动映射为 `feishu-default`）；支持按需配置 `[[notifiers]]`（多套 `feishu` profile、`telegram` 含论坛话题 `thread_id`、`discord` 富文本 Embed、`slack` Incoming Webhook 与 Bot API Block Kit、`wecom` 企业微信群机器人、`qq` OneBot v11 / Webhook 网关、`webhook`、`macos` 原生通知）与 `[[notify_routes]]` 差异化路由，仓库内 `.starfane/team.toml` `[notify]` 仅允许引用逻辑 ID（解析阶段拒绝任何密钥/URL）。基于 **Split Ownership（`node_local` / `hub`）**，Peer 节点默认本地自发通知、凭证完全隔离不重复推送，SSH 免安装节点默认由 Hub 代发。
 - **原生 `tmux` 定期快照与重启自动恢复**：内置 `[tmux.backup]` 支持定期保存去重后的 `tmux` 会话、窗口与分屏布局，支持守护进程启动时在空 `tmux` 环境下自动重建现场（`auto_restore_on_start = true`）并按需恢复 `claude --resume` / `codex resume` 会话（`starfane tmux backup | restore | backups`）。
 - **Swarm 子会话可观测与防误报证据门禁**：自动折叠父子会话与 Swarm Worker，实时展示上下文占比与生成速度（`tok/s`）；内置 **新功能协作（Feature Pipeline）** 与 **两速查错（Two-Speed Debug）**，支持自然语言阶段模型绑定与确定性 G1/G2/G3 证据核验。
 - **组网无关通用访问门禁（`AccessGate`）**：启动期预编译 IPv4/IPv6 `allowed_cidrs`、精确与 `*.suffix` 通配 `allowed_hosts`（适配反向代理 80/443/自定义端口）、具名 `presets`（`easytier` / `tailscale`）以及 `[[web.scoped_tokens]]`（支持 `read_only` 只读观察令牌或联邦令牌），在网关层严格拦截未授权局域网与公网访问（`403`）。
@@ -82,7 +82,7 @@
 2. 如果缺少 Rust 工具链或 tmux / zellij，或者准备修改 Agent Hook / MCP 配置，请先列出将要执行的具体命令或配置预览，向我请求确认后再安装与写入。
 3. 将 https://github.com/starlitxiling/starfane.git 克隆到 ~/starfane（若已存在则拉取更新），执行 `cargo build --release --bin starfane`，并软链到 `~/.local/bin/starfane`（确认 `~/.local/bin` 已在 `PATH` 中）。
 4. 运行 `starfane doctor` 与 `starfane install --all --dry-run` 展示变更预览，经我确认后执行 `starfane install --all`。
-5. 保持本地回环默认安全配置（`127.0.0.1:27418` + Token 鉴权；若 27418 已被占用或我另有指定，再修改 `~/.config/starfane/config.toml` 的 `[web] port`），启动 `starfane daemon --detach`，确认 `http://127.0.0.1:<port>/api/health` 返回正常后，运行 `starfane web --print-url --no-open` 把可直接访问的本地网页地址输出给我。
+5. 保持本地回环默认安全配置（`127.0.0.1:27418` + Token 鉴权 + 默认中文界面 `lang = "zh"`；若 27418 已被占用或我另有指定，再修改 `~/.config/starfane/config.toml` 的 `[web] port` / `lang`），启动 `starfane daemon --detach`，确认 `http://127.0.0.1:<port>/api/health` 返回正常后，运行 `starfane web --print-url --no-open` 把可直接访问的本地网页地址输出给我。
 ```
 
 ### 方式二：手动安装
@@ -143,6 +143,7 @@ starfane web --print-url --no-open
 [web]
 bind = "127.0.0.1"              # 若通过私有组网或反向代理对外开放可设为 "0.0.0.0"
 port = 27418                    # 避开常见端口冲突，可按需改为任意自定义端口
+lang = "zh"                     # 部署期网页界面语言："zh"（默认中文）或 "en"（英文，网页内不提供切换）
 auth_enabled = true             # 默认开启 Token 鉴权（含 scoped_tokens）；仅在可信组网 CIDR 下可设为 false
 allowed_cidrs = []              # 组网无关 IPv4/IPv6 白名单，如 ["10.88.0.0/16", "fd00::/8"]
 allowed_hosts = []              # 精确或 *.suffix 域名白名单，如 ["console.example.com", "*.ts.net"]
@@ -179,7 +180,7 @@ chat_id = ""
 allow_open_ids = []
 allow_chat_ids = []
 
-# 按需启用的多渠道插件通知（feishu / telegram / webhook / macos）
+# 按需启用的多渠道插件通知（feishu / telegram / discord / slack / wecom / qq / webhook / macos）
 # [[notifiers]]
 # id = "feishu-work"
 # kind = "feishu"
@@ -192,12 +193,61 @@ allow_chat_ids = []
 # kind = "telegram"
 # bot_token_env = "STARFANE_TG_TOKEN"
 # chat_id = "-1001234567890"
+# thread_id = 42                # 可选群组话题 ID（message_thread_id）
+# api_base_url = "https://api.telegram.org" # 可选反代/自定义 API 地址
 # ownership = "hub"             # 允许在 Hub 侧为 SSH 免安装节点代发通知
+#
+# [[notifiers]]
+# id = "discord-ops"
+# kind = "discord"
+# webhook_url_env = "STARFANE_DISCORD_WEBHOOK"
+# username = "starfane"         # 可选 Webhook 展示名（默认 "starfane"）
+# thread_id = "1234567890123456789" # 可选论坛/子线程 ID（附加 ?thread_id=...）
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "slack-ops"
+# kind = "slack"
+# webhook_url_env = "STARFANE_SLACK_WEBHOOK" # Incoming Webhook 模式（Block Kit）
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "slack-bot"
+# kind = "slack"
+# bot_token_env = "STARFANE_SLACK_BOT_TOKEN" # 或 Bot Web API（chat.postMessage）模式
+# channel = "C01234567"
+# api_base_url = "https://slack.com/api"
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "wecom-ops"
+# kind = "wecom"
+# webhook_url_env = "STARFANE_WECOM_WEBHOOK" # 企业微信群机器人 Webhook（Markdown / 成员提醒）
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "qq-ops"
+# kind = "qq"
+# api_base_url = "http://127.0.0.1:3000"     # 自托管 OneBot v11 HTTP API（NapCat / Lagrange / LLOneBot）
+# group_id = "123456789"                     # 支持 `group_id` 和/或 `user_id`（亦支持 `webhook_url_env` 网关）
+# bot_token_env = "STARFANE_QQ_ONEBOT_TOKEN" # 可选 Bearer 访问令牌
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "hook-ops"
+# kind = "webhook"
+# url = "https://hooks.example.com/starfane"
+# secret_env = "STARFANE_WEBHOOK_SECRET"     # 可选 Authorization: Bearer 密钥环境变量
+#
+# [[notifiers]]
+# id = "macos-local"
+# kind = "macos"
+# sound = "Glass"               # 可选 macOS 通知提示音
 #
 # [[notify_routes]]
 # node = "tencent"
 # project = "workflow"          # 同时支持 `cwd`、`agent`、`event_kinds` 匹配
-# notifiers = ["tg-ops"]
+# notifiers = ["tg-ops", "discord-ops", "slack-ops", "wecom-ops", "qq-ops"]
 
 [paths]
 claude = "claude"
@@ -259,7 +309,7 @@ display_name = "Local"          # 运行期可通过 Web 弹窗或 POST /api/hos
 | `starfane doctor` | 只读检查 Agent CLI、Hook、MCP、Codex 信任哈希、`tmux`（含 `history-limit`）、`zellij`（`>= 0.44`）、守护进程与配置 |
 | `starfane install [--all \| --agent X]` | 安装带标记的 Hook 与 MCP（支持 `--dry-run`，自动备份原配置） |
 | `starfane uninstall [--all \| --agent X]` | 干净还原 starfane 写入的配置条目 |
-| `starfane daemon [--detach \| --foreground]` | 启动 `starfaned` 守护进程（支持 `--port`、`--web-dir` 前端热重载） |
+| `starfane daemon [--detach \| --foreground]` | 启动 `starfaned` 守护进程（支持 `--port`、`--lang zh\|en`、`--web-dir` 前端热重载） |
 | `starfane web [--print-url] [--no-open]` | 打开或打印当前 Web 控制台地址 |
 | `starfane ls [--all] [--project P]` | 列出活跃 tmux/zellij/远程会话、状态、模型、上下文占比、TPS 与流水线 |
 | `starfane tmux backup [--force]` | 手动备份一次 tmux 布局与 Agent 会话 ID（守护进程离线亦可用） |
@@ -291,7 +341,7 @@ web/                  # 零构建内嵌 Web 控制台（原生 HTML/CSS + ES Mod
   index.html
   app.css
   app.js              # ES 模块入口与路由调度
-  js/                 # 模块化源码：constants / store / dom / markdown / terminal / api / topbar / composer / workspace / views / overlays
+  js/                 # 模块化源码：i18n / constants / store / dom / markdown / terminal / api / topbar / composer / workspace / views / overlays
 tests/fixtures/       # 脱敏的真实 Hook 输入样例库（41 个用例）
 docs/                 # 架构文档、Crate 契约、环境与 Spike 调研笔记
 ```
@@ -301,7 +351,7 @@ docs/                 # 架构文档、Crate 契约、环境与 Spike 调研笔�
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-node --check web/app.js web/js/*.js
+for f in web/app.js web/js/*.js; do node --check "$f" || exit 1; done
 cargo test --workspace
 cargo test -p starfane-tmux -- --include-ignored
 ```
@@ -318,7 +368,7 @@ cargo test -p starfane-tmux -- --include-ignored
 ### v0.2 — 复用器抽象、多机联邦与安全隔离 *(已发布)*
 - [x] **Zellij（0.44+）原生适配** — 统一 `TerminalMux` 抽象与 `ZellijMux` 发现、全量抓屏、安全注入、焦点探测与创建窗格
 - [x] **多机联邦协同（`[[nodes]]`）** — 支持 SSH `ControlMaster` 免安装节点与多候选地址 Peer `starfaned` 联邦混搭及运行时主机重命名
-- [x] **按需多渠道通知路由与 Split Ownership** — 支持 `[[notifiers]]`（飞书多 Profile、Telegram、Webhook、macOS 原生）、`[[notify_routes]]` 与 `.starfane/team.toml` 无密钥路由
+- [x] **按需多渠道通知路由与 Split Ownership** — 支持 `[[notifiers]]`（飞书多 Profile、Telegram 话题、Discord 富文本 Embed、Slack Incoming Webhook & Bot API Block Kit、企业微信群机器人、QQ OneBot v11 / Webhook、Webhook、macOS 原生）、`[[notify_routes]]` 与 `.starfane/team.toml` 无密钥路由
 - [x] **通用访问门禁（`AccessGate`）与隐私承诺** — IPv4/IPv6 `allowed_cidrs`、通配 `allowed_hosts`、`scoped_tokens`、严格 CSP 与彻底零遥测
 
 ### v0.3 — 跨节点持久化与便捷接入 *(计划中)*

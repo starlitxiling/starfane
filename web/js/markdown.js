@@ -1,19 +1,23 @@
 // starfane web console — zero-dependency safe Markdown renderer
 import { CODE_COLLAPSE_LINES } from './constants.js';
 import { copyText, h, span } from './dom.js';
+import { L } from './i18n.js';
 
 export function isSafeUrl(url) {
   const u = String(url || '').trim();
   return /^(https?:\/\/|file:\/\/)/i.test(u);
 }
 
-const INLINE_RE = /`([^`\n]+)`|\[((?:[^\]\n`]|`[^`\n]+`)+)\]\(([^)\s]+)\)|\*\*((?:[^*\n`]|\*(?!\*)|`[^`\n]+`)+?)\*\*|__([^_\n`]+?)__|~~((?:[^~\n`]|~(?!~)|`[^`\n]+`)+?)~~|\*((?:[^*\n`]|`[^`\n]+`)+?)\*/g;
+const INLINE_RE_SRC = '`([^`\\n]+)`|\\[((?:[^\\]\\n`]|`[^`\\n]+`)+)\\]\\(([^)\\s]+)\\)|\\*\\*((?:[^*\\n`]|\\*(?!\\*)|`[^`\\n]+`)+?)\\*\\*|__([^_\\n`]+?)__|~~((?:[^~\\n`]|~(?!~)|`[^`\\n]+`)+?)~~|\\*((?:[^*\\n`]|`[^`\\n]+`)+?)\\*';
+const INLINE_RE_POOL = Array.from({ length: 5 }, () => new RegExp(INLINE_RE_SRC, 'g'));
+const INLINE_HINT_RE = /[`*_[~]/;
 
 export function renderInlineMd(text, depth = 0) {
   const out = [];
   const s = String(text || '');
-  if (!s || depth > 4) return s ? [s] : out;
-  const re = new RegExp(INLINE_RE.source, 'g');
+  if (!s || depth > 4 || !INLINE_HINT_RE.test(s)) return s ? [s] : out;
+  const re = INLINE_RE_POOL[depth];
+  re.lastIndex = 0;
   let last = 0;
   let m;
   while ((m = re.exec(s)) !== null) {
@@ -41,6 +45,13 @@ export function renderInlineMd(text, depth = 0) {
   return out;
 }
 
+function isClosingFence(line, fenceLen) {
+  const t = line.trim();
+  if (t.length < fenceLen) return false;
+  for (let i = 0; i < t.length; i++) if (t.charCodeAt(i) !== 96) return false;
+  return true;
+}
+
 function splitTableRow(line) {
   let s = line.trim();
   if (s.startsWith('|')) s = s.slice(1);
@@ -59,7 +70,7 @@ function tableAligns(line) {
 export function renderCodeBlock(lang, codeText) {
   const lineCount = codeText ? codeText.split('\n').length : 0;
   const collapsible = lineCount > CODE_COLLAPSE_LINES;
-  const copyBtn = h('button', { type: 'button', class: 'md-copy-btn', onclick: (e) => copyText(codeText, e.currentTarget) }, '复制代码');
+  const copyBtn = h('button', { type: 'button', class: 'md-copy-btn', onclick: (e) => copyText(codeText, e.currentTarget) }, L('复制代码', 'Copy'));
   const wrap = h('div', { class: `md-code-wrap${collapsible ? ' is-collapsed' : ''}` },
     h('div', { class: 'md-code-head' }, span('md-code-lang', lang || 'code'), copyBtn),
     h('div', { class: 'md-code-body' }, h('pre', { class: 'md-code-pre' }, codeText)));
@@ -69,9 +80,9 @@ export function renderCodeBlock(lang, codeText) {
       class: 'md-code-expand',
       onclick: () => {
         const collapsed = wrap.classList.toggle('is-collapsed');
-        toggleBtn.textContent = collapsed ? `展开全部代码（共 ${lineCount} 行）` : '收起代码';
+        toggleBtn.textContent = collapsed ? L(`展开全部代码（共 ${lineCount} 行）`, `Show all code (${lineCount} lines)`) : L('收起代码', 'Collapse code');
       },
-    }, `展开全部代码（共 ${lineCount} 行）`);
+    }, L(`展开全部代码（共 ${lineCount} 行）`, `Show all code (${lineCount} lines)`));
     wrap.appendChild(toggleBtn);
   }
   return wrap;
@@ -99,10 +110,9 @@ export function renderMarkdown(src) {
       flushPara();
       const fenceLen = fence[1].length;
       const lang = (fence[2] || '').trim();
-      const closeRe = new RegExp(`^\\s*\`{${fenceLen},}\\s*$`);
       const buf = [];
       i++;
-      while (i < lines.length && !closeRe.test(lines[i])) {
+      while (i < lines.length && !isClosingFence(lines[i], fenceLen)) {
         buf.push(lines[i]);
         i++;
       }

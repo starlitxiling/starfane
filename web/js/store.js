@@ -3,7 +3,6 @@ import {
   AGENTS,
   COLLAPSED_KEY,
   FALLBACK_MODELS,
-  FALLBACK_SLASH,
   GLYPH_MODE_KEY,
   GROUPS_INIT_KEY,
   NON_TMUX_GROUP,
@@ -11,12 +10,14 @@ import {
   OUTLINE_COLLAPSED_KEY,
   PREVIEW_LINES,
   SPAWN_PREFS_KEY,
-  STAGE_LABEL,
-  STARFANE_SLASH,
-  STATE_LABEL,
   STATE_PRIO,
   TRANSCRIPT_LIMIT,
+  fallbackSlash,
+  stageLabel,
+  starfaneSlash,
+  stateLabel,
 } from './constants.js';
+import { L } from './i18n.js';
 
 export function loadSpawnPrefs() {
   try {
@@ -147,6 +148,7 @@ export const UI = {
 // Cross-module callback registry wired at boot in web/app.js (prevents circular ES module imports).
 export const APP = {
   schedule: () => {},
+  schedulePassive: () => {},
   rerender: () => {},
   go: () => {},
   openSession: () => {},
@@ -158,6 +160,7 @@ export const APP = {
   notifyOutputUpdated: () => {},
   updateOutputClock: () => {},
   patchTelemetryStrip: () => {},
+  compactTranscript: () => {},
   loadAll: async () => {},
   syncStateSilent: async () => {},
   loadSessionOutput: () => {},
@@ -189,6 +192,11 @@ export const trLimitOf = (sid) => UI.trLimit.get(sid) || TRANSCRIPT_LIMIT;
 export const pvModeOf = (pane) => UI.pvLines.get(pane) || PREVIEW_LINES;
 export const pvKeyOf = (pane, mode = pvModeOf(pane)) => `${pane}:${mode}`;
 
+export const MAX_CACHED_TRANSCRIPTS = 12;
+export const MAX_CACHED_PREVIEWS = 12;
+export const COMPACT_TRANSCRIPT_THRESHOLD = 120;
+const HEAVY_PREVIEW_CHAR_LIMIT = 512 * 1024;
+
 export function hashStr(str) {
   let h = 2166136261;
   const s = String(str || '');
@@ -199,11 +207,164 @@ export function hashStr(str) {
   return (h >>> 0).toString(36);
 }
 
+/**
+ * Memoized per-message content hash stored as a non-enumerable `_h` property so repeated
+ * tail polls, "Load earlier" merges, and incremental DOM card reconciliation avoid re-hashing
+ * megabytes of unchanged messages.
+ */
+export function hashMessage(msg) {
+  if (!msg) return '0';
+  if (typeof msg._h === 'string' && msg._h) return msg._h;
+  const tools = Array.isArray(msg.tools) && msg.tools.length ? msg.tools.join(',') : '';
+  const txt = String(msg.text || '');
+  const h = hashStr(`${msg.role || ''}|${msg.kind || ''}|${msg.ts_ms || 0}|${tools}|${txt.length}|${txt}`);
+  try {
+    Object.defineProperty(msg, '_h', { value: h, configurable: true, enumerable: false });
+  } catch {
+    msg._h = h;
+  }
+  return h;
+}
+
+export function hashTranscriptPayload(source, startSeq, totalMessages, hasMore, msgs) {
+  let acc = 2166136261;
+  const feed = (s) => {
+    for (let i = 0; i < s.length; i++) {
+      acc ^= s.charCodeAt(i);
+      acc = Math.imul(acc, 16777619);
+    }
+  };
+  feed(`${source}|${startSeq}|${totalMessages}|${hasMore ? 1 : 0}|${msgs.length}`);
+  for (let i = 0; i < msgs.length; i++) {
+    feed('|');
+    feed(hashMessage(msgs[i]));
+  }
+  return (acc >>> 0).toString(36);
+}
+
+/**
+ * Compact a loaded transcript back to the default trailing `TRANSCRIPT_LIMIT` window
+ * so full-history views don't permanently retain thousands of messages in RAM.
+ */
+export function compactTranscriptEntry(sessionId) {
+  if (!sessionId) return false;
+  const tr = S.transcripts.get(sessionId);
+  UI.trLimit.delete(sessionId);
+  if (!tr || tr.state !== 'ok' || tr.source !== 'transcript') return false;
+  if (tr.messages.length <= TRANSCRIPT_LIMIT && !tr.explicitAll && !tr.autoPollPaused) return false;
+  const tail = tr.messages.length > TRANSCRIPT_LIMIT ? tr.messages.slice(-TRANSCRIPT_LIMIT) : tr.messages;
+  const dropped = tr.messages.length - tail.length;
+  const nextStartSeq = (Number.isFinite(tr.startSeq) ? tr.startSeq : 0) + dropped;
+  const nextHasMore = nextStartSeq > 0;
+  const totalMessages = Math.max(tr.totalMessages || 0, nextStartSeq + tail.length);
+  const nextHash = hashTranscriptPayload(tr.source, nextStartSeq, totalMessages, nextHasMore, tail);
+  S.transcripts.delete(sessionId);
+  S.transcripts.set(sessionId, {
+    ...tr,
+    messages: tail,
+    startSeq: nextStartSeq,
+    totalMessages,
+    hasMore: nextHasMore,
+    nextBefore: nextHasMore ? nextStartSeq : null,
+    explicitAll: false,
+    loadedAll: !nextHasMore,
+    autoPollPaused: false,
+    latestTotalMessages: null,
+    limit: TRANSCRIPT_LIMIT,
+    hash: nextHash,
+  });
+  return true;
+}
+
+/**
+ * Insert/update a transcript cache entry with MRU ordering, bounded LRU capacity,
+ * and automatic compaction of inactive oversized histories.
+ */
+export function setTranscriptEntry(sessionId, entry) {
+  if (!sessionId) return;
+  S.transcripts.delete(sessionId);
+  S.transcripts.set(sessionId, entry);
+  const activeSid = UI.selSession;
+  // Compact any inactive heavy entries first so RAM stays bounded even before eviction.
+  for (const [sid, tr] of S.transcripts.entries()) {
+    if (sid === sessionId || sid === activeSid) continue;
+    if (tr?.state === 'ok' && (tr.messages?.length > COMPACT_TRANSCRIPT_THRESHOLD || tr.explicitAll)) {
+      compactTranscriptEntry(sid);
+    }
+  }
+  while (S.transcripts.size > MAX_CACHED_TRANSCRIPTS) {
+    let victim = null;
+    for (const sid of S.transcripts.keys()) {
+      if (sid !== sessionId && sid !== activeSid) { victim = sid; break; }
+    }
+    if (!victim) break;
+    S.transcripts.delete(victim);
+    UI.trLimit.delete(victim);
+  }
+}
+
+/**
+ * Insert/update a terminal preview entry with MRU ordering, bounded LRU capacity,
+ * and immediate reclamation of inactive `all` / >512 KiB scrollback buffers.
+ */
+export function setPreviewEntry(key, entry) {
+  if (!key) return;
+  S.previews.delete(key);
+  S.previews.set(key, entry);
+  const cur = UI.selSession ? S.sessions.get(UI.selSession) : null;
+  const activeKey = cur?.pane ? pvKeyOf(cur.pane) : null;
+  const drawerKey = UI.drawer?.kind === 'terminal' && UI.drawer.pane
+    ? pvKeyOf(UI.drawer.pane, UI.drawerPvLines)
+    : null;
+  for (const [k, pv] of [...S.previews.entries()]) {
+    if (k === key || k === activeKey || k === drawerKey) continue;
+    if (k.endsWith(':all') || pv?.paginated || (pv?.text?.length || 0) > HEAVY_PREVIEW_CHAR_LIMIT) {
+      S.previews.delete(k);
+    }
+  }
+  while (S.previews.size > MAX_CACHED_PREVIEWS) {
+    let victim = null;
+    for (const k of S.previews.keys()) {
+      if (k !== key && k !== activeKey && k !== drawerKey) { victim = k; break; }
+    }
+    if (!victim) break;
+    S.previews.delete(victim);
+  }
+}
+
+/**
+ * Release heavy transcript (>120 messages or `all`) and heavy terminal preview (`all` / >512 KiB)
+ * buffers when the user switches away from a session so one full-history window never bloats RAM.
+ */
+export function onLeaveSession(prevSid, nextSid) {
+  if (!prevSid || prevSid === nextSid) return;
+  const prevTr = S.transcripts.get(prevSid);
+  if (prevTr && (prevTr.messages?.length > COMPACT_TRANSCRIPT_THRESHOLD || prevTr.explicitAll)) {
+    compactTranscriptEntry(prevSid);
+  }
+  const prevSess = S.sessions.get(prevSid);
+  const pane = prevSess?.pane;
+  if (!pane) return;
+  const drawerPane = UI.drawer?.kind === 'terminal' ? UI.drawer.pane : null;
+  if (drawerPane === pane) return;
+  const mode = UI.pvLines.get(pane);
+  if (mode === 'all') {
+    UI.pvLines.delete(pane);
+    S.previews.delete(pvKeyOf(pane, 'all'));
+  }
+  const curKey = pvKeyOf(pane, mode || PREVIEW_LINES);
+  const pv = S.previews.get(curKey);
+  if (pv && (pv.paginated || (pv.text?.length || 0) > HEAVY_PREVIEW_CHAR_LIMIT)) {
+    S.previews.delete(curKey);
+  }
+}
+
 export const enc = encodeURIComponent;
 export const draft = (key, def = '') => (UI.drafts.has(key) ? UI.drafts.get(key) : def);
 export const base = (p) => (p ? String(p).replace(/\/+$/, '').split('/').pop() || p : '—');
-export const stateText = (s) => STATE_LABEL[s] || String(s ?? '').replace(/_/g, ' ');
-export const stageName = (k) => STAGE_LABEL[k] || String(k ?? '').replace(/_/g, ' ');
+export const stateText = (s) => stateLabel(s);
+export const stageName = (k) => stageLabel(k);
+export const groupDisplayName = (g) => (g === NON_TMUX_GROUP ? L('非 tmux / 后台', 'Non-tmux / Background') : g);
 export const short = (s, n = 8) => (s ? String(s).slice(0, n) : '—');
 
 export function hostOf(s) {
@@ -334,14 +495,14 @@ export function inboxItems() {
     add(kind, { pid: a.pipeline_id, sid: a.session_id, rid: a.review_id, title: a.title, since: a.since_ms });
   }
   for (const p of S.pipelines.values()) {
-    if (p.status === 'awaiting_binding_confirm') add('binding_confirm', { pid: p.id, title: `确认绑定：${p.goal}`, since: p.updated_ms });
+    if (p.status === 'awaiting_binding_confirm') add('binding_confirm', { pid: p.id, title: L(`确认绑定：${p.goal}`, `Confirm bindings: ${p.goal}`), since: p.updated_ms });
     const ah = (p.stages || []).find((s) => s.status === 'awaiting_human');
     if (p.status === 'awaiting_human' && ah) {
-      if (ah.id === 'plan') add('plan_approval', { pid: p.id, title: `批准计划：${p.goal}`, since: p.updated_ms });
-      else if (ah.id === 'triage') add('triage_ready', { pid: p.id, title: `快筛结论待决：${p.goal}`, since: p.updated_ms });
-      else add('blocked', { pid: p.id, title: `${stageName(ah.id)} 需要人工处理：${p.goal}`, since: p.updated_ms });
+      if (ah.id === 'plan') add('plan_approval', { pid: p.id, title: L(`批准计划：${p.goal}`, `Approve plan: ${p.goal}`), since: p.updated_ms });
+      else if (ah.id === 'triage') add('triage_ready', { pid: p.id, title: L(`快筛结论待决：${p.goal}`, `Triage decision needed: ${p.goal}`), since: p.updated_ms });
+      else add('blocked', { pid: p.id, title: L(`${stageName(ah.id)} 需要人工处理：${p.goal}`, `${stageName(ah.id)} needs human action: ${p.goal}`), since: p.updated_ms });
     }
-    if (p.status === 'blocked') add('blocked', { pid: p.id, title: `流程阻塞：${p.goal}`, since: p.updated_ms });
+    if (p.status === 'blocked') add('blocked', { pid: p.id, title: L(`流程阻塞：${p.goal}`, `Pipeline blocked: ${p.goal}`), since: p.updated_ms });
   }
   for (const s of S.sessions.values()) {
     if (!s.is_subagent && ['needs_permission', 'needs_input', 'error'].includes(s.state)) {
@@ -442,10 +603,12 @@ export function upsertHosts(list) {
 }
 
 export function pickDefaultSession() {
+  const prevSid = UI.selSession;
   if (UI.view === 'workspace' && UI.arg && S.sessions.has(UI.arg)) {
     const target = S.sessions.get(UI.arg);
     if (target && (UI.showEnded || target.state !== 'ended')) {
       if (UI.selSession !== target.session_id) {
+        onLeaveSession(prevSid, target.session_id);
         UI.selSession = target.session_id;
         APP.loadSessionOutput(target, { silent: false });
       }
@@ -457,9 +620,11 @@ export function pickDefaultSession() {
   const live = rootSessions();
   const first = live.find(isTmuxSession) || live[0];
   if (first) {
+    onLeaveSession(prevSid, first.session_id);
     UI.selSession = first.session_id;
     APP.loadSessionOutput(first, { silent: false });
   } else {
+    onLeaveSession(prevSid, null);
     UI.selSession = null;
   }
 }
@@ -467,7 +632,7 @@ export function pickDefaultSession() {
 export function slashCommandsFor(agent) {
   const ag = AGENTS.includes(agent) ? agent : 'claude';
   if (S.slashCmds.has(ag)) return S.slashCmds.get(ag);
-  return [...(FALLBACK_SLASH[ag] || FALLBACK_SLASH.claude), ...STARFANE_SLASH];
+  return [...fallbackSlash(ag), ...starfaneSlash()];
 }
 
 export function modelsForAgent(agent) {
@@ -489,7 +654,7 @@ export function modelsForAgent(agent) {
     if (typeof item === 'string') push(item, item, agentEffs);
     else if (item?.id) push(item.id, item.label || item.id, item.efforts);
   }
-  if (def && !seen.has(def)) list.unshift({ id: def, label: `${def}（默认）`, efforts: agentEffs });
+  if (def && !seen.has(def)) list.unshift({ id: def, label: L(`${def}（默认）`, `${def} (default)`), efforts: agentEffs });
   return { default: def || list[0]?.id || '', default_effort: defEff, efforts: agentEffs, models: list };
 }
 

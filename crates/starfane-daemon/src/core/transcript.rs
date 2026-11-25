@@ -38,8 +38,12 @@ pub const MAX_TRANSCRIPT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Lines exceeding 1 MiB matching `GENERIC`/`compacted` (or >4 MiB any line) are skipped in O(1) RAM.
 const STREAM_SKIP_GIANT_THRESHOLD: usize = 1024 * 1024;
 const STREAM_HARD_LINE_LIMIT: usize = 4 * 1024 * 1024;
-/// Maximum in-memory indexed transcript files.
-const MAX_CACHED_TRANSCRIPTS: usize = 256;
+/// Maximum in-memory indexed transcript files (LRU-evicted).
+const MAX_CACHED_TRANSCRIPTS: usize = 64;
+/// Maximum cached paginated `TranscriptResponse` snapshots (LRU-evicted).
+const MAX_CACHED_PAGES: usize = 128;
+/// Soft memory ceiling across all cached response pages (32 MiB).
+const MAX_PAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Cursor pagination & full-load request parameters for `GET /api/sessions/{id}/transcript`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +171,11 @@ impl AgyFullIndex {
         let Some((dev, ino, mtime_ns, file_len)) = file_identity(full_path) else {
             return;
         };
-        if self.dev != dev || self.ino != ino || file_len < self.scanned_offset {
+        if self.dev != dev
+            || self.ino != ino
+            || file_len < self.scanned_offset
+            || (file_len == self.file_len && mtime_ns != self.mtime_ns)
+        {
             *self = Self::new(dev, ino);
         } else if self.file_len == file_len && self.mtime_ns == mtime_ns {
             return;
@@ -385,7 +393,11 @@ impl TranscriptIndex {
         let Some((dev, ino, mtime_ns, file_len)) = file_identity(path) else {
             return false;
         };
-        if self.dev != dev || self.ino != ino || file_len < self.scanned_offset {
+        if self.dev != dev
+            || self.ino != ino
+            || file_len < self.scanned_offset
+            || (file_len == self.file_len && mtime_ns != self.mtime_ns)
+        {
             *self = Self::new(self.agent, dev, ino);
         } else if self.file_len == file_len && self.mtime_ns == mtime_ns {
             #[cfg(test)]
@@ -948,13 +960,13 @@ impl TranscriptIndex {
         }
     }
 
-    pub(crate) fn slice_page(
+    fn slice_page_with_parsed_metrics(
         &mut self,
         path: &Path,
         query: TranscriptQuery,
         session_metrics: Option<SessionMetrics>,
         now_ms: u64,
-    ) -> TranscriptResponse {
+    ) -> (TranscriptResponse, Option<SessionMetrics>) {
         let has_trailing_tools = !self.pending_tools.is_empty();
         let total = self.turns.len() + usize::from(has_trailing_tools);
         let end_excl = query.before.map(|b| b.min(total)).unwrap_or(total);
@@ -1000,25 +1012,32 @@ impl TranscriptIndex {
         let has_more = start_seq > 0;
 
         let (parsed_metrics, _, _) = self.telemetry.snapshot(now_ms);
-        let metrics = if session_metrics
-            .as_ref()
-            .is_some_and(|m| m.source == "cc_switch")
-        {
-            super::metrics::merge_cc_switch_with_fallback(session_metrics, parsed_metrics, None)
-        } else {
-            merge_metrics(parsed_metrics, session_metrics)
-        };
+        let metrics = merge_transcript_metrics(session_metrics, parsed_metrics.clone());
 
-        TranscriptResponse {
-            source: "transcript".to_string(),
-            transcript_path: Some(path.to_string_lossy().into_owned()),
-            messages: kept_rev,
-            has_more,
-            total_messages: total,
-            start_seq,
-            next_before: has_more.then_some(start_seq),
-            metrics,
-        }
+        (
+            TranscriptResponse {
+                source: "transcript".to_string(),
+                transcript_path: Some(path.to_string_lossy().into_owned()),
+                messages: kept_rev,
+                has_more,
+                total_messages: total,
+                start_seq,
+                next_before: has_more.then_some(start_seq),
+                metrics,
+            },
+            parsed_metrics,
+        )
+    }
+
+    pub(crate) fn slice_page(
+        &mut self,
+        path: &Path,
+        query: TranscriptQuery,
+        session_metrics: Option<SessionMetrics>,
+        now_ms: u64,
+    ) -> TranscriptResponse {
+        self.slice_page_with_parsed_metrics(path, query, session_metrics, now_ms)
+            .0
     }
 
     pub(crate) fn telemetry_snapshot(
@@ -1029,32 +1048,318 @@ impl TranscriptIndex {
     }
 }
 
-/// Bounded in-memory cache of append-only `TranscriptIndex`es (lives outside `Mutex<State>`).
-#[derive(Debug, Default)]
+fn merge_transcript_metrics(
+    session_metrics: Option<SessionMetrics>,
+    parsed_metrics: Option<SessionMetrics>,
+) -> Option<SessionMetrics> {
+    if session_metrics
+        .as_ref()
+        .is_some_and(|m| m.source == "cc_switch")
+    {
+        super::metrics::merge_cc_switch_with_fallback(session_metrics, parsed_metrics, None)
+    } else {
+        merge_metrics(parsed_metrics, session_metrics)
+    }
+}
+
+fn canonicalize_cache_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn estimate_response_bytes(resp: &TranscriptResponse) -> usize {
+    let mut bytes = 128usize;
+    for m in &resp.messages {
+        bytes = bytes.saturating_add(m.text.len() + 64);
+        for t in &m.tools {
+            bytes = bytes.saturating_add(t.len() + 16);
+        }
+    }
+    bytes
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PageCacheKey {
+    path: PathBuf,
+    agent: AgentKind,
+    dev: u64,
+    ino: u64,
+    file_len: u64,
+    mtime_ns: u128,
+    full_file_len: u64,
+    full_mtime_ns: u128,
+    all: bool,
+    limit: usize,
+    before: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedIndex {
+    index: TranscriptIndex,
+    last_used: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPage {
+    response: TranscriptResponse,
+    parsed_metrics: Option<SessionMetrics>,
+    approx_bytes: usize,
+    last_used: u64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TranscriptCacheStats {
+    page_hits: usize,
+    page_misses: usize,
+    index_evictions: usize,
+    page_evictions: usize,
+}
+
+/// Bounded LRU in-memory cache of append-only `TranscriptIndex`es AND paginated
+/// `TranscriptResponse` snapshots (lives outside `Mutex<State>`).
+#[derive(Debug)]
 pub(crate) struct TranscriptIndexCache {
-    entries: HashMap<PathBuf, TranscriptIndex>,
+    entries: HashMap<PathBuf, CachedIndex>,
+    pages: HashMap<PageCacheKey, CachedPage>,
+    page_bytes: usize,
+    access_seq: u64,
+    max_indices: usize,
+    max_pages: usize,
+    max_page_bytes: usize,
+    #[cfg(test)]
+    stats: TranscriptCacheStats,
+}
+
+impl Default for TranscriptIndexCache {
+    fn default() -> Self {
+        Self::with_capacity(
+            MAX_CACHED_TRANSCRIPTS,
+            MAX_CACHED_PAGES,
+            MAX_PAGE_CACHE_BYTES,
+        )
+    }
 }
 
 impl TranscriptIndexCache {
+    pub(crate) fn with_capacity(
+        max_indices: usize,
+        max_pages: usize,
+        max_page_bytes: usize,
+    ) -> Self {
+        Self {
+            entries: HashMap::new(),
+            pages: HashMap::new(),
+            page_bytes: 0,
+            access_seq: 0,
+            max_indices: max_indices.max(1),
+            max_pages: max_pages.max(1),
+            max_page_bytes: max_page_bytes.max(1024),
+            #[cfg(test)]
+            stats: TranscriptCacheStats::default(),
+        }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.access_seq = self.access_seq.wrapping_add(1);
+        self.access_seq
+    }
+
+    fn evict_lru_index_if_full(&mut self, incoming: &Path) {
+        if self.entries.contains_key(incoming) || self.entries.len() < self.max_indices {
+            return;
+        }
+        if let Some(victim) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(k, _)| k.clone())
+        {
+            self.entries.remove(&victim);
+            self.purge_pages_for_path(&victim, None);
+            #[cfg(test)]
+            {
+                self.stats.index_evictions += 1;
+            }
+        }
+    }
+
+    fn purge_pages_for_path(&mut self, path: &Path, keep_version: Option<(u64, u128, u64, u128)>) {
+        let mut reclaimed = 0usize;
+        self.pages.retain(|k, v| {
+            let keep = k.path != path
+                || keep_version.is_some_and(|(fl, mt, ffl, fmt)| {
+                    k.file_len == fl
+                        && k.mtime_ns == mt
+                        && k.full_file_len == ffl
+                        && k.full_mtime_ns == fmt
+                });
+            if !keep {
+                reclaimed = reclaimed.saturating_add(v.approx_bytes);
+            }
+            keep
+        });
+        self.page_bytes = self.page_bytes.saturating_sub(reclaimed);
+    }
+
+    fn insert_page(
+        &mut self,
+        key: PageCacheKey,
+        mut response: TranscriptResponse,
+        parsed_metrics: Option<SessionMetrics>,
+    ) {
+        let approx_bytes = estimate_response_bytes(&response);
+        if approx_bytes > self.max_page_bytes {
+            return;
+        }
+        // Reclaim stale snapshots for the same file version before inserting.
+        self.purge_pages_for_path(
+            &key.path,
+            Some((
+                key.file_len,
+                key.mtime_ns,
+                key.full_file_len,
+                key.full_mtime_ns,
+            )),
+        );
+        if let Some(old) = self.pages.remove(&key) {
+            self.page_bytes = self.page_bytes.saturating_sub(old.approx_bytes);
+        }
+        while !self.pages.is_empty()
+            && (self.pages.len() >= self.max_pages
+                || self.page_bytes.saturating_add(approx_bytes) > self.max_page_bytes)
+        {
+            let Some(victim) = self
+                .pages
+                .iter()
+                .min_by_key(|(_, p)| p.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = self.pages.remove(&victim) {
+                self.page_bytes = self.page_bytes.saturating_sub(removed.approx_bytes);
+                #[cfg(test)]
+                {
+                    self.stats.page_evictions += 1;
+                }
+            }
+        }
+        response.metrics = None;
+        let seq = self.next_seq();
+        self.page_bytes = self.page_bytes.saturating_add(approx_bytes);
+        self.pages.insert(
+            key,
+            CachedPage {
+                response,
+                parsed_metrics,
+                approx_bytes,
+                last_used: seq,
+            },
+        );
+    }
+
+    fn get_or_sync_canonical(
+        &mut self,
+        agent: AgentKind,
+        key_path: &Path,
+    ) -> Option<&mut TranscriptIndex> {
+        self.evict_lru_index_if_full(key_path);
+        let seq = self.next_seq();
+        let entry = self
+            .entries
+            .entry(key_path.to_path_buf())
+            .or_insert_with(|| CachedIndex {
+                index: TranscriptIndex::new(agent, 0, 0),
+                last_used: seq,
+            });
+        entry.last_used = seq;
+        if entry.index.agent != agent {
+            entry.index = TranscriptIndex::new(agent, 0, 0);
+        }
+        if !entry.index.sync_file(key_path) {
+            return None;
+        }
+        Some(&mut entry.index)
+    }
+
     pub(crate) fn get_or_sync(
         &mut self,
         agent: AgentKind,
         path: &Path,
     ) -> Option<&mut TranscriptIndex> {
-        if !self.entries.contains_key(path) && self.entries.len() >= MAX_CACHED_TRANSCRIPTS {
-            self.entries.clear();
+        let key_path = canonicalize_cache_path(path);
+        self.get_or_sync_canonical(agent, &key_path)
+    }
+
+    /// Return a cached `TranscriptResponse` page in sub-millisecond time when
+    /// `(canonical_path, dev, ino, file_len, mtime_ns, full_identity, query)` is unchanged;
+    /// otherwise incrementally sync `TranscriptIndex` in O(delta), slice the page, and cache it.
+    pub(crate) fn get_page_or_sync(
+        &mut self,
+        agent: AgentKind,
+        path: &Path,
+        query: TranscriptQuery,
+        session_metrics: Option<SessionMetrics>,
+        now_ms: u64,
+    ) -> Option<TranscriptResponse> {
+        let key_path = canonicalize_cache_path(path);
+        let (dev, ino, mtime_ns, file_len) = file_identity(&key_path)?;
+        let (full_file_len, full_mtime_ns) = if agent == AgentKind::Agy {
+            sibling_transcript_full(Some(&key_path))
+                .and_then(|fp| file_identity(&fp))
+                .map(|(_, _, fmt, flen)| (flen, fmt))
+                .unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+        let norm_limit = if query.all {
+            MAX_TRANSCRIPT_LIMIT
+        } else {
+            query.limit.clamp(1, MAX_TRANSCRIPT_LIMIT)
+        };
+        let page_key = PageCacheKey {
+            path: key_path.clone(),
+            agent,
+            dev,
+            ino,
+            file_len,
+            mtime_ns,
+            full_file_len,
+            full_mtime_ns,
+            all: query.all,
+            limit: norm_limit,
+            before: query.before,
+        };
+
+        if self.pages.contains_key(&page_key) {
+            let seq = self.next_seq();
+            if let Some(idx_entry) = self.entries.get_mut(&key_path) {
+                idx_entry.last_used = seq;
+            }
+            if let Some(page) = self.pages.get_mut(&page_key) {
+                page.last_used = seq;
+                let mut resp = page.response.clone();
+                resp.transcript_path = Some(path.to_string_lossy().into_owned());
+                resp.metrics =
+                    merge_transcript_metrics(session_metrics, page.parsed_metrics.clone());
+                #[cfg(test)]
+                {
+                    self.stats.page_hits += 1;
+                }
+                return Some(resp);
+            }
         }
-        let idx = self
-            .entries
-            .entry(path.to_path_buf())
-            .or_insert_with(|| TranscriptIndex::new(agent, 0, 0));
-        if idx.agent != agent {
-            *idx = TranscriptIndex::new(agent, 0, 0);
+
+        #[cfg(test)]
+        {
+            self.stats.page_misses += 1;
         }
-        if !idx.sync_file(path) {
-            return None;
-        }
-        Some(idx)
+        let idx = self.get_or_sync_canonical(agent, &key_path)?;
+        let (mut resp, parsed_metrics) =
+            idx.slice_page_with_parsed_metrics(&key_path, query, session_metrics, now_ms);
+        resp.transcript_path = Some(path.to_string_lossy().into_owned());
+        self.insert_page(page_key, resp.clone(), parsed_metrics);
+        Some(resp)
     }
 
     pub(crate) fn sync_and_telemetry(
@@ -1072,7 +1377,7 @@ impl TranscriptIndexCache {
 
 impl Core {
     /// Read and paginate structured conversation messages for `sid` via the O(delta)
-    /// `TranscriptIndexCache` (never blocks `Mutex<State>` on disk IO).
+    /// `TranscriptIndexCache` + bounded LRU page cache (never blocks `Mutex<State>` on disk IO).
     pub async fn session_transcript(
         &self,
         sid: &SessionId,
@@ -1113,10 +1418,8 @@ impl Core {
             };
             let now_ms = starfane_proto::id::now_ms();
             let mut tc = lock(&core.inner.transcript_index);
-            match tc.get_or_sync(session.agent, &path) {
-                Some(idx) => idx.slice_page(&path, query, session.metrics.clone(), now_ms),
-                None => TranscriptResponse::none(session.metrics.clone()),
-            }
+            tc.get_page_or_sync(session.agent, &path, query, session.metrics.clone(), now_ms)
+                .unwrap_or_else(|| TranscriptResponse::none(session.metrics.clone()))
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))
@@ -2689,5 +2992,284 @@ not valid json at all
             Some(TranscriptMessageKind::Intermediate)
         );
         assert_eq!(claude_msgs[1].kind, Some(TranscriptMessageKind::Final));
+    }
+
+    #[test]
+    fn page_cache_hits_on_unchanged_file_and_invalidates_on_append_rewrite_and_truncate() {
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-tr-pagecache-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("session.jsonl");
+        let make_line = |i: usize, tag: &str| {
+            format!(
+                r#"{{"type":"user","timestamp":"2026-11-25T00:00:{:02}Z","message":{{"role":"user","content":"{tag}-{i:04}"}}}}"#,
+                i % 60
+            )
+        };
+        let mut content = String::new();
+        for i in 0..300 {
+            content.push_str(&make_line(i, "msg"));
+            content.push('\n');
+        }
+        std::fs::write(&file, &content).unwrap();
+
+        let mut cache = TranscriptIndexCache::default();
+        let q_tail = TranscriptQuery::tail(60);
+        let q_all = TranscriptQuery {
+            limit: 60,
+            before: None,
+            all: true,
+        };
+
+        // 1. Cold miss populates index + page cache.
+        let r1 = cache
+            .get_page_or_sync(AgentKind::Claude, &file, q_tail, None, 1000)
+            .unwrap();
+        assert_eq!(r1.total_messages, 300);
+        assert_eq!(r1.messages.len(), 60);
+        assert_eq!(cache.stats.page_misses, 1);
+        assert_eq!(cache.stats.page_hits, 0);
+
+        // 2. Repeated request with identical (path, len, mtime, query) hits page cache directly.
+        let r2 = cache
+            .get_page_or_sync(AgentKind::Claude, &file, q_tail, None, 1001)
+            .unwrap();
+        assert_eq!(r2.messages, r1.messages);
+        assert_eq!(cache.stats.page_hits, 1);
+        assert_eq!(cache.stats.page_misses, 1);
+
+        // 3. Different query (`all=1`) misses page cache, reuses indexed turns with 0 delta bytes.
+        let r_all_1 = cache
+            .get_page_or_sync(AgentKind::Claude, &file, q_all, None, 1002)
+            .unwrap();
+        assert_eq!(r_all_1.messages.len(), 300);
+        assert_eq!(cache.stats.page_misses, 2);
+        let key_path = canonicalize_cache_path(&file);
+        assert_eq!(
+            cache
+                .entries
+                .get(&key_path)
+                .unwrap()
+                .index
+                .delta_bytes_scanned,
+            0
+        );
+
+        // Second `all=1` hits page cache.
+        let r_all_2 = cache
+            .get_page_or_sync(AgentKind::Claude, &file, q_all, None, 1003)
+            .unwrap();
+        assert_eq!(r_all_2.messages.len(), 300);
+        assert_eq!(cache.stats.page_hits, 2);
+
+        // 4. Append new message -> invalidates page cache via file_len/mtime, scans only delta bytes!
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        writeln!(f, "{}", make_line(300, "msg")).unwrap();
+        drop(f);
+
+        let r3 = cache
+            .get_page_or_sync(AgentKind::Claude, &file, q_tail, None, 1004)
+            .unwrap();
+        assert_eq!(r3.total_messages, 301);
+        assert_eq!(r3.messages.last().unwrap().text, "msg-0300");
+        assert_eq!(cache.stats.page_misses, 3);
+        let delta = cache
+            .entries
+            .get(&key_path)
+            .unwrap()
+            .index
+            .delta_bytes_scanned;
+        assert!(
+            delta > 0 && delta < 300,
+            "expected O(delta) scan, got {delta}"
+        );
+
+        // 5. Same-length in-place rewrite with bumped mtime -> invalidates and re-parses new text!
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let mut rewritten = String::new();
+        for i in 0..301 {
+            rewritten.push_str(&make_line(i, "new"));
+            rewritten.push('\n');
+        }
+        assert_eq!(
+            rewritten.len(),
+            std::fs::metadata(&file).unwrap().len() as usize
+        );
+        std::fs::write(&file, &rewritten).unwrap();
+
+        let r4 = cache
+            .get_page_or_sync(AgentKind::Claude, &file, q_tail, None, 1005)
+            .unwrap();
+        assert_eq!(r4.total_messages, 301);
+        assert_eq!(r4.messages.last().unwrap().text, "new-0300");
+        assert_eq!(cache.stats.page_misses, 4);
+
+        // 6. Truncation to smaller file -> invalidates and rebuilds cleanly.
+        let truncated = format!("{}\n{}\n", make_line(0, "cut"), make_line(1, "cut"));
+        std::fs::write(&file, &truncated).unwrap();
+        let r5 = cache
+            .get_page_or_sync(AgentKind::Claude, &file, q_tail, None, 1006)
+            .unwrap();
+        assert_eq!(r5.total_messages, 2);
+        assert_eq!(r5.messages.len(), 2);
+        assert_eq!(r5.messages[1].text, "cut-0001");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_enforces_bounded_lru_capacity_for_indices_and_pages() {
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-tr-lru-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let make_file = |name: &str, body: &str| {
+            let p = dir.join(name);
+            let line = serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-11-25T00:00:01Z",
+                "message": {"role": "user", "content": body}
+            });
+            std::fs::write(&p, format!("{line}\n")).unwrap();
+            p
+        };
+
+        let f1 = make_file("a.jsonl", "alpha");
+        let f2 = make_file("b.jsonl", "beta");
+        let f3 = make_file("c.jsonl", "gamma");
+        let q = TranscriptQuery::tail(10);
+
+        // Bound to max 2 indices and max 2 pages.
+        let mut cache = TranscriptIndexCache::with_capacity(2, 2, 1024 * 1024);
+        assert!(cache
+            .get_page_or_sync(AgentKind::Claude, &f1, q, None, 1000)
+            .is_some());
+        assert!(cache
+            .get_page_or_sync(AgentKind::Claude, &f2, q, None, 1001)
+            .is_some());
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.pages.len(), 2);
+
+        // Touch f1 again so f2 becomes the LRU victim!
+        assert!(cache
+            .get_page_or_sync(AgentKind::Claude, &f1, q, None, 1002)
+            .is_some());
+        assert_eq!(cache.stats.page_hits, 1);
+
+        // Insert f3 -> evicts f2 (LRU), preserves f1 (MRU)!
+        assert!(cache
+            .get_page_or_sync(AgentKind::Claude, &f3, q, None, 1003)
+            .is_some());
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.pages.len(), 2);
+        assert_eq!(cache.stats.index_evictions, 1);
+
+        let k1 = canonicalize_cache_path(&f1);
+        let k2 = canonicalize_cache_path(&f2);
+        let k3 = canonicalize_cache_path(&f3);
+        assert!(
+            cache.entries.contains_key(&k1),
+            "MRU entry f1 must stay cached"
+        );
+        assert!(
+            !cache.entries.contains_key(&k2),
+            "LRU entry f2 must be evicted"
+        );
+        assert!(
+            cache.entries.contains_key(&k3),
+            "new entry f3 must be cached"
+        );
+
+        // Accessing f1 again is still a page cache hit!
+        let r1 = cache
+            .get_page_or_sync(AgentKind::Claude, &f1, q, None, 1004)
+            .unwrap();
+        assert_eq!(r1.messages[0].text, "alpha");
+        assert_eq!(cache.stats.page_hits, 2);
+
+        // Test page byte budget eviction with a tiny 2 KiB cap.
+        let big1 = make_file("big1.jsonl", &"A".repeat(1200));
+        let big2 = make_file("big2.jsonl", &"B".repeat(1200));
+        let mut byte_capped = TranscriptIndexCache::with_capacity(8, 8, 2048);
+        assert!(byte_capped
+            .get_page_or_sync(AgentKind::Claude, &big1, q, None, 1000)
+            .is_some());
+        assert_eq!(byte_capped.pages.len(), 1);
+        assert!(byte_capped
+            .get_page_or_sync(AgentKind::Claude, &big2, q, None, 1001)
+            .is_some());
+        assert_eq!(byte_capped.pages.len(), 1);
+        assert!(byte_capped.page_bytes <= 2048);
+        assert_eq!(byte_capped.stats.page_evictions, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agy_page_cache_invalidates_when_sibling_transcript_full_updates() {
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-tr-agy-full-cache-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compact = dir.join("transcript.jsonl");
+        let full = dir.join("transcript_full.jsonl");
+        let compact_line = serde_json::json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-25T03:00:00Z",
+            "content": "short...<truncated 100 bytes>",
+            "truncated_fields": ["content"]
+        });
+        std::fs::write(&compact, format!("{compact_line}\n")).unwrap();
+
+        let mut cache = TranscriptIndexCache::default();
+        let q = TranscriptQuery::tail(10);
+
+        // Before transcript_full.jsonl exists -> degraded truncated content cached.
+        let r1 = cache
+            .get_page_or_sync(AgentKind::Agy, &compact, q, None, 1000)
+            .unwrap();
+        assert!(r1.messages[0].text.contains("<truncated 100 bytes>"));
+
+        // Sibling transcript_full.jsonl appears -> page cache key changes and hydrates!
+        let full_line = serde_json::json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-25T03:00:00Z",
+            "content": "Full hydrated assistant response body."
+        });
+        std::fs::write(&full, format!("{full_line}\n")).unwrap();
+
+        let r2 = cache
+            .get_page_or_sync(AgentKind::Agy, &compact, q, None, 1001)
+            .unwrap();
+        assert_eq!(
+            r2.messages[0].text,
+            "Full hydrated assistant response body."
+        );
+        assert_eq!(cache.stats.page_misses, 2);
+
+        // Next call hits hydrated page cache.
+        let r3 = cache
+            .get_page_or_sync(AgentKind::Agy, &compact, q, None, 1002)
+            .unwrap();
+        assert_eq!(
+            r3.messages[0].text,
+            "Full hydrated assistant response body."
+        );
+        assert_eq!(cache.stats.page_hits, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

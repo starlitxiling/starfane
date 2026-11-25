@@ -2,6 +2,7 @@
 // chunked virtualized terminal rendering, and terminal-to-Markdown turn parsing.
 import { GLYPH_MODE_KEY, TERM_CHUNK_LINES } from './constants.js';
 import { h } from './dom.js';
+import { L } from './i18n.js';
 import { APP, S, UI } from './store.js';
 
 let cachedNerdSupport = null;
@@ -40,13 +41,19 @@ function bindFontsReadyReprobe() {
   }
 }
 
+const ANSI_OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const ANSI_CSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const ANSI_ESC_RE = /\x1b[@-Z\\-_]/g;
+
 export function stripAnsi(raw) {
-  return String(raw || '')
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
-    .replace(/\x1b[@-Z\\-_]/g, '')
-    .replace(/\r\n?/g, '\n')
-    .replace(/\u00a0/g, ' ');
+  let s = String(raw || '');
+  if (!s) return '';
+  if (s.includes('\x1b')) {
+    s = s.replace(ANSI_OSC_RE, '').replace(ANSI_CSI_RE, '').replace(ANSI_ESC_RE, '');
+  }
+  if (s.includes('\r')) s = s.replace(/\r\n?/g, '\n');
+  if (s.includes('\u00a0')) s = s.replace(/\u00a0/g, ' ');
+  return s;
 }
 
 /**
@@ -214,30 +221,44 @@ const PUA_GLYPH_MAP = new Map([
   [0xF0DA, '▸'], [0xF0D7, '▾'], [0xF111, '●'],
 ]);
 
+const PUA_TEST_RE = /[\uE000-\uF8FF]|[\u{F0000}-\u{FFFFD}]|[\u{100000}-\u{10FFFD}]/u;
+const PUA_EXEC_RE = /[\uE000-\uF8FF]|[\u{F0000}-\u{FFFFD}]|[\u{100000}-\u{10FFFD}]/gu;
+
 /**
  * Replace Nerd Font / Powerline Private Use Area code points with crisp universal Unicode
  * equivalents so prompts never render as ugly tofu boxes when Nerd Fonts are unavailable.
  */
 export function normalizeTerminalGlyphs(text) {
-  if (!text) return '';
-  let out = '';
-  for (const ch of String(text)) {
+  const s = String(text || '');
+  if (!s || !PUA_TEST_RE.test(s)) return s;
+  const parts = [];
+  let last = 0;
+  let lastChar = '';
+  PUA_EXEC_RE.lastIndex = 0;
+  let m;
+  while ((m = PUA_EXEC_RE.exec(s)) !== null) {
+    if (m.index > last) {
+      const seg = s.slice(last, m.index);
+      parts.push(seg);
+      lastChar = seg[seg.length - 1];
+    }
+    const ch = m[0];
     const cp = ch.codePointAt(0);
     const mapped = PUA_GLYPH_MAP.get(cp);
     if (mapped !== undefined) {
-      out += mapped;
-    } else if (
-      (cp >= 0xE000 && cp <= 0xF8FF)
-      || (cp >= 0xF0000 && cp <= 0xFFFFD)
-      || (cp >= 0x100000 && cp <= 0x10FFFD)
-    ) {
+      if (mapped) {
+        parts.push(mapped);
+        lastChar = mapped[mapped.length - 1];
+      }
+    } else if (lastChar && !/\s/.test(lastChar)) {
       // Unmapped Nerd Font PUA glyph -> drop cleanly rather than displaying a missing-glyph tofu box.
-      if (out.length && !/\s$/.test(out)) out += ' ';
-    } else {
-      out += ch;
+      parts.push(' ');
+      lastChar = ' ';
     }
+    last = PUA_EXEC_RE.lastIndex;
   }
-  return out;
+  if (last < s.length) parts.push(s.slice(last));
+  return parts.join('');
 }
 
 export function formatTerminalText(raw) {
@@ -310,7 +331,7 @@ export function cleanTerminalToMarkdown(raw, _agent) {
     if (hd) { out.push(hd[1]); continue; }
     const usr = l.match(/^\s*[❯›]\s+(.+)$/);
     if (usr && !/^Ask Codex to do anything$/i.test(usr[1].trim())) {
-      out.push('', `> **用户输入**：${usr[1].trim()}`, '');
+      out.push('', L(`> **用户输入**：${usr[1].trim()}`, `> **User input**: ${usr[1].trim()}`), '');
       continue;
     }
     out.push(l);

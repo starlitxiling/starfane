@@ -124,6 +124,9 @@ struct DaemonArgs {
     web_dir: Option<PathBuf>,
     #[arg(long)]
     port: Option<u16>,
+    /// Web console UI display language (`zh` or `en`).
+    #[arg(long)]
+    lang: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -384,6 +387,9 @@ fn daemon(_ctx: &Ctx, a: DaemonArgs) -> R<()> {
         if let Some(p) = a.port {
             cmd.arg("--port").arg(p.to_string());
         }
+        if let Some(l) = &a.lang {
+            cmd.arg("--lang").arg(l);
+        }
         cmd.stdin(std::process::Stdio::null())
             .stdout(log)
             .stderr(log2);
@@ -412,6 +418,10 @@ fn daemon(_ctx: &Ctx, a: DaemonArgs) -> R<()> {
     let mut config = load_config()?;
     if let Some(p) = a.port {
         config.web.port = p;
+    }
+    if let Some(l) = a.lang {
+        config.web.lang = l;
+        config.web.validate().map_err(err)?;
     }
     let cfg = DaemonConfig {
         state_dir: paths::state_dir(),

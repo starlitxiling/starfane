@@ -19,6 +19,7 @@ import {
   warnText,
 } from './dom.js';
 import { act, api, loadPreview, loadSlashCommands } from './api.js';
+import { L } from './i18n.js';
 import {
   APP,
   S,
@@ -50,7 +51,7 @@ export function autoGrow(ta) {
 }
 
 function makeAttachToken(kind, num) {
-  return kind === 'image' ? `[图片 #${num}]` : `[粘贴 #${num}]`;
+  return kind === 'image' ? L(`[图片 #${num}]`, `[Image #${num}]`) : L(`[粘贴 #${num}]`, `[Paste #${num}]`);
 }
 
 function currentComposerText(sid) {
@@ -175,7 +176,7 @@ function locateOrReinsertToken(sid, att) {
     return;
   }
   insertTextAtCursor(sid, att.token, { inlineToken: true, focus: true });
-  toast(`已重新插入 ${att.token}`, 'ok');
+  toast(L(`已重新插入 ${att.token}`, `Re-inserted ${att.token}`), 'ok');
 }
 
 export function attachFoldedPaste(sid, rawText, opts = {}) {
@@ -192,7 +193,7 @@ export function attachFoldedPaste(sid, rawText, opts = {}) {
     num,
     token,
     kind: 'text',
-    title: `粘贴片段 #${num}`,
+    title: L(`粘贴片段 #${num}`, `Paste snippet #${num}`),
     content: normalized,
     lines,
     bytes,
@@ -233,11 +234,11 @@ export function quoteReplyToComposer(sid, rawText) {
     const quoted = lines.map((l) => (l.length ? `> ${l}` : '>')).join('\n');
     const trail = after.length === 0 ? '\n\n' : (after.startsWith('\n\n') ? '' : (after.startsWith('\n') ? '\n' : '\n\n'));
     insertTextAtCursor(sid, `${lead}${quoted}${trail}`, { range: [start, end], focus: true });
-    toast('已引用到输入框，可继续在其下方提问', 'ok');
+    toast(L('已引用到输入框，可继续在其下方提问', 'Quoted into composer — type your follow-up below'), 'ok');
     return;
   }
   const item = attachFoldedPaste(sid, text, { trailingNewline: true, focus: true });
-  if (item) toast(`长回复已折叠为 ${item.token}，可直接在其下方继续提问`, 'ok');
+  if (item) toast(L(`长回复已折叠为 ${item.token}，可直接在其下方继续提问`, `Long reply folded into ${item.token} — type your follow-up below`), 'ok');
 }
 
 export function removeAttachment(sid, attId, opts = {}) {
@@ -288,7 +289,7 @@ function readFileAsBase64(file) {
       const idx = res.indexOf(',');
       resolve(idx >= 0 ? res.slice(idx + 1) : res);
     };
-    fr.onerror = () => reject(new Error('读取图片文件失败'));
+    fr.onerror = () => reject(new Error(L('读取图片文件失败', 'Failed to read image file')));
     fr.readAsDataURL(file);
   });
 }
@@ -300,7 +301,7 @@ export async function uploadImageFiles(sid, files, opts = {}) {
   const queued = [];
   for (const file of imgs) {
     if (file.size > IMG_MAX_BYTES) {
-      toast(`图片 ${file.name || ''} 超过 10 MB 限制`, 'warn');
+      toast(L(`图片 ${file.name || ''} 超过 10 MB 限制`, `Image ${file.name || ''} exceeds 10 MB limit`), 'warn');
       continue;
     }
     const ext = (file.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
@@ -342,10 +343,10 @@ export async function uploadImageFiles(sid, files, opts = {}) {
       item.filename = r.filename || item.filename;
       item.title = item.filename;
       renderAttachBar(sid);
-      toast(`图片已添加为 ${item.token}（${fmtBytes(item.bytes)}）`, 'ok');
+      toast(L(`图片已添加为 ${item.token}（${fmtBytes(item.bytes)}）`, `Image attached as ${item.token} (${fmtBytes(item.bytes)})`), 'ok');
     } catch (e) {
       removeAttachment(sid, item.id);
-      toast(`图片上传失败：${errText(e)}`, 'err');
+      toast(L(`图片上传失败：${errText(e)}`, `Image upload failed: ${errText(e)}`), 'err');
     }
   }
 }
@@ -368,17 +369,17 @@ export function renderAttachBar(sid) {
     const tokBtn = att.token ? h('button', {
       type: 'button',
       class: 'attach-tok',
-      title: '点击在输入框定位该占位符，若已删掉则重新插入',
+      title: L('点击在输入框定位该占位符，若已删掉则重新插入', 'Click to locate placeholder in composer (or re-insert if deleted)'),
       onclick: () => locateOrReinsertToken(sid, att),
     }, att.token) : null;
     if (att.kind === 'image') {
       const uploading = att.status === 'uploading';
       const thumb = uploading
-        ? h('span', { class: 'attach-thumb-load', title: '图片上传中…' })
+        ? h('span', { class: 'attach-thumb-load', title: L('图片上传中…', 'Uploading image…') })
         : h('button', {
           type: 'button',
           class: 'attach-thumb-btn',
-          title: '点击放大预览原图',
+          title: L('点击放大预览原图', 'Click to preview full image'),
           onclick: () => APP.openDrawer('paste', { sessionId: sid, attachmentId: att.id }),
         }, h('img', { class: 'attach-thumb', src: att.previewUrl, alt: att.title }));
       return h('div', { class: 'attach-pill img-pill' },
@@ -386,18 +387,18 @@ export function renderAttachBar(sid) {
         tokBtn,
         h('span', { class: 'attach-info' },
           span('attach-meta', att.title),
-          span('attach-sub', uploading ? '上传中…' : fmtBytes(att.bytes))),
+          span('attach-sub', uploading ? L('上传中…', 'Uploading…') : fmtBytes(att.bytes))),
         h('span', { class: 'attach-acts' },
-          !uploading ? h('button', { type: 'button', class: 'attach-act', onclick: () => APP.openDrawer('paste', { sessionId: sid, attachmentId: att.id }) }, '预览') : null,
-          h('button', { type: 'button', class: 'attach-act del', title: '移除图片', 'aria-label': '移除图片', onclick: () => removeAttachment(sid, att.id) }, '×')));
+          !uploading ? h('button', { type: 'button', class: 'attach-act', onclick: () => APP.openDrawer('paste', { sessionId: sid, attachmentId: att.id }) }, L('预览', 'Preview')) : null,
+          h('button', { type: 'button', class: 'attach-act del', title: L('移除图片', 'Remove image'), 'aria-label': L('移除图片', 'Remove image'), onclick: () => removeAttachment(sid, att.id) }, '×')));
     }
     return h('div', { class: 'attach-pill' },
       tokBtn,
-      span('attach-meta', `${att.lines} 行 · ${fmtBytes(att.bytes)}`),
+      span('attach-meta', L(`${att.lines} 行 · ${fmtBytes(att.bytes)}`, `${att.lines} lines · ${fmtBytes(att.bytes)}`)),
       h('span', { class: 'attach-acts' },
-        h('button', { type: 'button', class: 'attach-act', onclick: () => APP.openDrawer('paste', { sessionId: sid, attachmentId: att.id }) }, '预览'),
-        h('button', { type: 'button', class: 'attach-act', onclick: () => expandAttachmentToInput(sid, att.id) }, '转入输入框'),
-        h('button', { type: 'button', class: 'attach-act del', title: '移除粘贴片段', 'aria-label': '移除粘贴片段', onclick: () => removeAttachment(sid, att.id) }, '×')));
+        h('button', { type: 'button', class: 'attach-act', onclick: () => APP.openDrawer('paste', { sessionId: sid, attachmentId: att.id }) }, L('预览', 'Preview')),
+        h('button', { type: 'button', class: 'attach-act', onclick: () => expandAttachmentToInput(sid, att.id) }, L('转入输入框', 'Expand inline')),
+        h('button', { type: 'button', class: 'attach-act del', title: L('移除粘贴片段', 'Remove snippet'), 'aria-label': L('移除粘贴片段', 'Remove snippet'), onclick: () => removeAttachment(sid, att.id) }, '×')));
   }));
 }
 
@@ -451,19 +452,19 @@ export function renderSlashMenu(agent) {
   span('slash-desc', it.desc || ''));
   const listNodes = [];
   if (nativeItems.length) {
-    listNodes.push(h('div', { class: 'slash-group' }, 'Agent 原生命令', agentTag(agent)));
+    listNodes.push(h('div', { class: 'slash-group' }, L('Agent 原生命令', 'Agent Native Commands'), agentTag(agent)));
     listNodes.push(...nativeItems.map(mkRow));
   }
   if (starfaneItems.length) {
-    listNodes.push(h('div', { class: 'slash-group' }, 'Starfane 控制台快捷命令'));
+    listNodes.push(h('div', { class: 'slash-group' }, L('Starfane 控制台快捷命令', 'Starfane Console Shortcuts')));
     listNodes.push(...starfaneItems.map(mkRow));
   }
   box.classList.remove('ws-hidden');
   box.replaceChildren(
-    h('div', { class: 'slash-list', role: 'listbox', 'aria-label': '斜杠命令菜单' }, listNodes),
+    h('div', { class: 'slash-list', role: 'listbox', 'aria-label': L('斜杠命令菜单', 'Slash command menu') }, listNodes),
     h('div', { class: 'slash-foot' },
-      h('span', null, '↑↓ 选择 · Enter / Tab 确认 · Esc 关闭'),
-      span('tabular', `${items.length} 条命令`)),
+      h('span', null, L('↑↓ 选择 · Enter / Tab 确认 · Esc 关闭', '↑↓ select · Enter / Tab confirm · Esc close')),
+      span('tabular', L(`${items.length} 条命令`, `${items.length} commands`))),
   );
 }
 
@@ -564,26 +565,30 @@ export function workspacePipelineComposer(s, mode) {
   const bindInp = field(bindKey, {
     class: 'inp sm',
     autocomplete: 'off',
-    placeholder: isDebug ? '选填：如 快速排查用 agy，深挖根因用 codex' : '选填：如 计划用 claude，实现用 codex，Review 用 agy',
+    placeholder: isDebug
+      ? L('选填：如 快速排查用 agy，深挖根因用 codex', 'Optional: e.g. triage with agy, deep root-cause with codex')
+      : L('选填：如 计划用 claude，实现用 codex，Review 用 agy', 'Optional: e.g. plan with claude, implement with codex, review with agy'),
   });
   bindInp.addEventListener('input', () => queueParse(scope, mode, projKey, bindKey, defaultProj));
   const projInp = field(projKey, {
     class: 'inp sm mono',
     autocomplete: 'off',
-    placeholder: '选填项目目录（留空使用当前会话目录）',
+    placeholder: L('选填项目目录（留空使用当前会话目录）', 'Optional project directory (defaults to session cwd)'),
   }, defaultProj);
   const ta = field(goalKey, {
     tag: 'textarea',
     rows: 2,
     class: 'composer-ta',
-    placeholder: isDebug ? '描述故障现象或报错（Cmd+Enter 启动两速查错）…' : '描述需求目标（Cmd+Enter 启动新功能协作）…',
+    placeholder: isDebug
+      ? L('描述故障现象或报错（Cmd+Enter 启动两速查错）…', 'Describe symptom or error (Cmd+Enter to launch Two-Speed Debug)…')
+      : L('描述需求目标（Cmd+Enter 启动新功能协作）…', 'Describe feature goal (Cmd+Enter to launch Feature Pipeline)…'),
   });
   const launch = () => act(`launch:${scope}`, async () => {
     const goal = draft(goalKey).trim();
     const utt = draft(bindKey).trim();
     const proj = draft(projKey, defaultProj).trim();
-    const combined = [goal, utt].filter(Boolean).join('；');
-    if (!combined) throw new Error(isDebug ? '请填写故障现象或排查说明' : '请填写需求目标或协作说明');
+    const combined = [goal, utt].filter(Boolean).join(L('；', '; '));
+    if (!combined) throw new Error(isDebug ? L('请填写故障现象或排查说明', 'Please enter symptom or debug instructions') : L('请填写需求目标或协作说明', 'Please enter goal or pipeline instructions'));
     const parsed = pv?.data && pv.text === utt ? pv.data : null;
     let p;
     if (isDebug) {
@@ -614,27 +619,27 @@ export function workspacePipelineComposer(s, mode) {
     delete UI.parsePreviews[scope];
     APP.go('pipelines', p.id);
     return p;
-  }, (p) => `${p.id} 已启动`);
+  }, (p) => L(`${p.id} 已启动`, `${p.id} started`));
 
   ta.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.isComposing) { e.preventDefault(); launch(); }
   });
   const parsedStrip = pv?.data ? h('div', { class: 'stack-xs' },
     h('div', { class: 'row' },
-      span('muted', '解析预览：'),
+      span('muted', L('解析预览：', 'Parsed bindings: ')),
       ...PLAYBOOK_STAGES[mode].map((k) => span('tag', `${stageName(k)}: ${shorthand(pv.data.resolved?.[k])}`))),
     (pv.data.warnings || []).length ? h('div', { class: 'callout warn' }, pv.data.warnings.map((w) => h('div', null, warnText(w)))) : null) : null;
   return h('div', { class: 'stack-sm' },
     h('div', { class: 'opt-panel' },
       h('div', { class: 'opt-grid' },
-        h('div', null, h('label', { class: 'lbl' }, '模型绑定话术（选填）'), bindInp),
-        h('div', null, h('label', { class: 'lbl' }, '项目目录（选填）'), projInp)),
+        h('div', null, h('label', { class: 'lbl' }, L('模型绑定话术（选填）', 'Model routing instructions (optional)')), bindInp),
+        h('div', null, h('label', { class: 'lbl' }, L('项目目录（选填）', 'Project directory (optional)')), projInp)),
       parsedStrip,
       h('label', { class: 'row muted', style: 'font-size:12px;cursor:pointer' },
         h('input', { type: 'checkbox', checked: UI.autoConfirm, onchange: (e) => { UI.autoConfirm = e.target.checked; APP.schedule(); } }),
-        '跳过二次绑定确认，创建后直接启动首阶段')),
+        L('跳过二次绑定确认，创建后直接启动首阶段', 'Skip confirmation step and start first stage immediately'))),
     ta,
     h('div', { class: 'composer-foot' },
-      btn('切回直接发送', { cls: 'ghost sm', onclick: () => { UI.composerMode = 'direct'; APP.rerender(); } }),
-      btn(isDebug ? '启动两速查错' : '启动新功能协作', { cls: 'primary sm', busyKey: `launch:${scope}`, onclick: launch })));
+      btn(L('切回直接发送', 'Back to Direct'), { cls: 'ghost sm', onclick: () => { UI.composerMode = 'direct'; APP.rerender(); } }),
+      btn(isDebug ? L('启动两速查错', 'Launch Two-Speed Debug') : L('启动新功能协作', 'Launch Feature Pipeline'), { cls: 'primary sm', busyKey: `launch:${scope}`, onclick: launch })));
 }

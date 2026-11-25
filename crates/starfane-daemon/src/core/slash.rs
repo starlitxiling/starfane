@@ -73,6 +73,7 @@ pub fn user_home_dir() -> Option<PathBuf> {
 pub fn build_catalog(
     agent: Option<AgentKind>,
     skills_by_agent: &BTreeMap<AgentKind, Vec<SlashCommand>>,
+    is_en: bool,
 ) -> SlashCommandsResponse {
     let mut commands = Vec::new();
     let mut seen: HashSet<(Option<String>, String)> = HashSet::new();
@@ -84,7 +85,7 @@ pub fn build_catalog(
 
     for a in agents {
         let tag = a.as_str().to_string();
-        for cmd in native_commands(a) {
+        for cmd in native_commands_for_lang(a, is_en) {
             if seen.insert((Some(tag.clone()), cmd.cmd.clone())) {
                 commands.push(cmd);
             }
@@ -92,13 +93,24 @@ pub fn build_catalog(
         if let Some(skills) = skills_by_agent.get(&a) {
             for sk in skills {
                 if seen.insert((Some(tag.clone()), sk.cmd.clone())) {
-                    commands.push(sk.clone());
+                    let mut localized = sk.clone();
+                    if is_en {
+                        if localized.args_hint == "[参数]" {
+                            localized.args_hint = "[args]".to_string();
+                        }
+                        if localized.desc == "本地自定义命令" {
+                            localized.desc = "Local custom command".to_string();
+                        } else if localized.desc == "本地技能" {
+                            localized.desc = "Local skill".to_string();
+                        }
+                    }
+                    commands.push(localized);
                 }
             }
         }
     }
 
-    for b in starfane_commands() {
+    for b in starfane_commands_for_lang(is_en) {
         if seen.insert((None, b.cmd.clone())) {
             commands.push(b);
         }
@@ -140,7 +152,178 @@ fn starfane_cmd(cmd: &str, desc: &str, action: &str) -> SlashCommand {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn native_commands(agent: AgentKind) -> Vec<SlashCommand> {
+    native_commands_for_lang(agent, false)
+}
+
+pub fn native_commands_for_lang(agent: AgentKind, is_en: bool) -> Vec<SlashCommand> {
+    if is_en {
+        return match agent {
+            AgentKind::Agy => vec![
+                native(
+                    agent,
+                    "/swarm",
+                    "<task>",
+                    "Parallel multi-agent swarm collaboration",
+                    true,
+                ),
+                native(
+                    agent,
+                    "/boost",
+                    "[task]",
+                    "High-effort deep reasoning and verification",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/teamwork",
+                    "<task>",
+                    "Multi-role team collaboration workflow",
+                    true,
+                ),
+                native(
+                    agent,
+                    "/plan",
+                    "[goal]",
+                    "Enter step-by-step planning mode",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/compact",
+                    "[note]",
+                    "Compact context window to free tokens",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/model",
+                    "[model]",
+                    "Inspect or switch current model",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/effort",
+                    "[level]",
+                    "Adjust reasoning effort level",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/clear",
+                    "",
+                    "Clear current conversation context",
+                    false,
+                ),
+                native(agent, "/help", "", "Show AGY help and keybindings", false),
+            ],
+            AgentKind::Claude => vec![
+                native(
+                    agent,
+                    "/compact",
+                    "[note]",
+                    "Compact conversation history to free context",
+                    false,
+                ),
+                native(agent, "/clear", "", "Clear current session context", false),
+                native(agent, "/plan", "[goal]", "Switch to planning mode", false),
+                native(
+                    agent,
+                    "/review",
+                    "[goal]",
+                    "Review current code changes",
+                    false,
+                ),
+                native(agent, "/model", "[model]", "Switch Claude model", false),
+                native(
+                    agent,
+                    "/effort",
+                    "[level]",
+                    "Adjust reasoning effort level",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/context",
+                    "",
+                    "Inspect context window breakdown",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/cost",
+                    "",
+                    "Show session token and cost usage",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/agents",
+                    "",
+                    "Inspect or manage subagent definitions",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/mcp",
+                    "",
+                    "Check connected MCP server status",
+                    false,
+                ),
+                native(agent, "/help", "", "Show Claude Code help", false),
+            ],
+            AgentKind::Codex => vec![
+                native(
+                    agent,
+                    "/compact",
+                    "",
+                    "Compact context to free window space",
+                    false,
+                ),
+                native(agent, "/new", "", "Start a new conversation session", false),
+                native(
+                    agent,
+                    "/review",
+                    "[note]",
+                    "Review workspace code changes",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/diff",
+                    "",
+                    "Show current Git working tree diff",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/model",
+                    "[model]",
+                    "Switch Codex model and reasoning effort",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/status",
+                    "",
+                    "Inspect session and quota status",
+                    false,
+                ),
+                native(
+                    agent,
+                    "/permissions",
+                    "",
+                    "Inspect or adjust sandbox and approval policy",
+                    false,
+                ),
+                native(agent, "/mcp", "", "Check MCP tool connections", false),
+                native(agent, "/help", "", "Show Codex CLI help", false),
+            ],
+            AgentKind::Shell => Vec::new(),
+        };
+    }
     match agent {
         AgentKind::Agy => vec![
             native(agent, "/swarm", "<任务>", "群体多 Agent 并行协作", true),
@@ -187,13 +370,39 @@ pub fn native_commands(agent: AgentKind) -> Vec<SlashCommand> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn starfane_commands() -> Vec<SlashCommand> {
+    starfane_commands_for_lang(false)
+}
+
+pub fn starfane_commands_for_lang(is_en: bool) -> Vec<SlashCommand> {
+    if is_en {
+        return vec![
+            starfane_cmd(
+                "/feature",
+                "Switch to Feature Pipeline mode",
+                "mode_feature",
+            ),
+            starfane_cmd("/debug", "Switch to Two-Speed Debug mode", "mode_debug"),
+            starfane_cmd("/mute", "Open Feishu notification mute menu", "open_mute"),
+            starfane_cmd(
+                "/terminal",
+                "Toggle reading view / raw terminal",
+                "toggle_terminal",
+            ),
+            starfane_cmd(
+                "/drawer",
+                "Open current session detail drawer",
+                "open_drawer",
+            ),
+        ];
+    }
     vec![
         starfane_cmd("/feature", "切换为新功能协作模式", "mode_feature"),
         starfane_cmd("/debug", "切换为排查 Debug 协作模式", "mode_debug"),
         starfane_cmd("/mute", "打开飞书通知静音设置", "open_mute"),
-        starfane_cmd("/terminal", "切换右侧终端面板", "toggle_terminal"),
-        starfane_cmd("/drawer", "展开或收起右侧活动抽屉", "toggle_drawer"),
+        starfane_cmd("/terminal", "切换阅读视图 / 原始终端", "toggle_terminal"),
+        starfane_cmd("/drawer", "展开当前会话详情抽屉", "open_drawer"),
     ]
 }
 
@@ -529,7 +738,7 @@ mod tests {
 
         let mut cache = SlashCache::default();
         let scanned = cache.get_or_refresh(Some(&root));
-        let claude_res = build_catalog(Some(AgentKind::Claude), scanned);
+        let claude_res = build_catalog(Some(AgentKind::Claude), scanned, false);
         assert_eq!(claude_res.agent.as_deref(), Some("claude"));
         assert!(claude_res
             .commands
@@ -548,9 +757,9 @@ mod tests {
             && c.group == "starfane"
             && c.action.as_deref() == Some("mode_feature")));
 
-        let codex_res = build_catalog(Some(AgentKind::Codex), scanned);
+        let codex_res = build_catalog(Some(AgentKind::Codex), scanned, false);
         assert!(codex_res.commands.iter().any(|c| c.cmd == "/review-loop"));
-        let agy_res = build_catalog(Some(AgentKind::Agy), scanned);
+        let agy_res = build_catalog(Some(AgentKind::Agy), scanned, false);
         assert!(agy_res
             .commands
             .iter()
@@ -559,6 +768,22 @@ mod tests {
             .commands
             .iter()
             .any(|c| c.cmd == "/excalidraw-diagram"));
+
+        // English deployment catalog uses ASCII args hints and English descriptions.
+        let agy_en = build_catalog(Some(AgentKind::Agy), scanned, true);
+        assert!(agy_en
+            .commands
+            .iter()
+            .filter(|c| c.group != "skill")
+            .all(|c| c.desc.is_ascii() && c.args_hint.is_ascii()));
+        let drawer_en = agy_en
+            .commands
+            .iter()
+            .find(|c| c.cmd == "/drawer")
+            .expect("/drawer in catalog");
+        assert_eq!(drawer_en.action.as_deref(), Some("open_drawer"));
+        assert_eq!(native_commands(AgentKind::Agy).len(), 9);
+        assert_eq!(starfane_commands().len(), 5);
 
         // Add a new skill on disk and confirm 60s TTL cache serves the cached snapshot without re-scanning.
         fs::create_dir_all(root.join(".codex/skills/fresh-skill")).unwrap();

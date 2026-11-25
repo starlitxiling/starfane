@@ -43,6 +43,11 @@ const EMBEDDED_ASSETS: &[(&str, &[u8], &str)] = &[
         "text/javascript; charset=utf-8",
     ),
     (
+        "js/i18n.js",
+        include_bytes!("../../../web/js/i18n.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
         "js/store.js",
         include_bytes!("../../../web/js/store.js"),
         "text/javascript; charset=utf-8",
@@ -109,7 +114,8 @@ pub async fn serve(core: Core) -> Result<(), String> {
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
     log::info!(
-        "web console on http://{addr}/ (auth_enabled={}, allow_easytier={}, easytier_cidrs={:?}, allow_tailscale={})",
+        "web console on http://{addr}/ (lang={}, auth_enabled={}, allow_easytier={}, easytier_cidrs={:?}, allow_tailscale={})",
+        core.config().web.effective_lang(),
         core.config().web.auth_enabled,
         core.config().web.allow_easytier,
         core.config().web.easytier_cidrs,
@@ -507,12 +513,35 @@ async fn load_asset(core: &Core, name: &str) -> Option<(Bytes, &'static str)> {
         .map(|(_, data, mime)| (Bytes::from_static(data), *mime))
 }
 
+fn localize_index_html(raw: Bytes, is_en: bool) -> Bytes {
+    if !is_en {
+        return raw;
+    }
+    let html = String::from_utf8_lossy(&raw)
+        .replace(
+            "<html lang=\"zh-CN\" data-lang=\"zh\">",
+            "<html lang=\"en\" data-lang=\"en\">",
+        )
+        .replace(
+            "<title>starfane · 控制面</title>",
+            "<title>starfane · Control Plane</title>",
+        )
+        .replace(
+            "starfane 控制台需要启用 JavaScript。",
+            "JavaScript is required to run the starfane console.",
+        );
+    Bytes::from(html)
+}
+
 async fn index(State(core): State<Core>, headers: HeaderMap) -> Response {
     if !host_ok(&core, &headers) {
         return forbidden("host not allowed");
     }
     match load_asset(&core, "index.html").await {
-        Some((b, t)) => static_response(&headers, b, t),
+        Some((b, t)) => {
+            let localized = localize_index_html(b, core.config().web.is_en());
+            static_response(&headers, localized, t)
+        }
         None => respond(Err(ApiError::not_found("index.html"))),
     }
 }
@@ -569,6 +598,7 @@ async fn health(State(core): State<Core>, headers: HeaderMap) -> Response {
         "version": VERSION,
         "uptime_ms": id::now_ms().saturating_sub(core.started_ms()),
         "auth_enabled": core.config().web.auth_enabled,
+        "lang": core.config().web.effective_lang(),
     })))
 }
 
@@ -1316,7 +1346,11 @@ async fn rename_host(State(core): State<Core>, Path(id): Path<String>, body: Byt
 
 async fn list_notifiers(State(core): State<Core>) -> Response {
     let ids = core.notify_router().list_ids();
-    respond(Ok(serde_json::json!({ "notifiers": ids })))
+    let details = core.notify_router().list_summaries();
+    respond(Ok(serde_json::json!({
+        "notifiers": ids,
+        "details": details,
+    })))
 }
 
 async fn test_notifier(State(core): State<Core>, Path(id): Path<String>, body: Bytes) -> Response {
@@ -1324,7 +1358,11 @@ async fn test_notifier(State(core): State<Core>, Path(id): Path<String>, body: B
         let b: TextBody = parse_body(&body)?;
         if let Some(notifier) = core.notify_router().get(&id) {
             let res = notifier.send_test(&b.text).await?;
-            return Ok(serde_json::json!({ "id": id, "result": res }));
+            return Ok(serde_json::json!({
+                "id": id,
+                "kind": notifier.kind(),
+                "result": res,
+            }));
         }
         if id == crate::notify::DEFAULT_FEISHU_NOTIFIER_ID {
             return core
@@ -1512,6 +1550,15 @@ mod tests {
             "text/javascript; charset=utf-8",
         );
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+
+        let zh_html = localize_index_html(Bytes::from_static(INDEX_HTML), false);
+        assert!(std::str::from_utf8(&zh_html)
+            .unwrap()
+            .contains("<html lang=\"zh-CN\" data-lang=\"zh\">"));
+        let en_html = localize_index_html(Bytes::from_static(INDEX_HTML), true);
+        let en_str = std::str::from_utf8(&en_html).unwrap();
+        assert!(en_str.contains("<html lang=\"en\" data-lang=\"en\">"));
+        assert!(en_str.contains("<title>starfane · Control Plane</title>"));
     }
 
     #[test]

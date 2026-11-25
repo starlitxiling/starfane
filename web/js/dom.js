@@ -1,5 +1,6 @@
 // starfane web console — DOM builders, formatters, and shared UI primitives
-import { LEVEL_LABEL, TOAST_MS } from './constants.js';
+import { TOAST_MS, levelLabel } from './constants.js';
+import { L, localeTag } from './i18n.js';
 import { UI, stageName, stateText } from './store.js';
 
 export const $ = (s, r = document) => r.querySelector(s);
@@ -76,15 +77,15 @@ export function dur(ms) {
 export function ago(ms) {
   if (!ms) return '—';
   const d = Math.max(0, Date.now() - ms);
-  return d < 5000 ? '刚刚' : `${dur(d)}前`;
+  return d < 5000 ? L('刚刚', 'just now') : L(`${dur(d)}前`, `${dur(d)} ago`);
 }
 
 export function clock(ms) {
-  return ms ? new Date(ms).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+  return ms ? new Date(ms).toLocaleTimeString(localeTag(), { hour12: false }) : '';
 }
 
 export function clockHM(ms) {
-  return ms ? new Date(ms).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' }) : '';
+  return ms ? new Date(ms).toLocaleTimeString(localeTag(), { hour12: false, hour: '2-digit', minute: '2-digit' }) : '';
 }
 
 export function fmtBytes(n) {
@@ -114,8 +115,8 @@ export function muteUntilLabel(ms) {
   const tom = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
   const isTom = tom.getFullYear() === dt.getFullYear() && tom.getMonth() === dt.getMonth() && tom.getDate() === dt.getDate();
   const hm = clockHM(ms);
-  if (sameDay) return `今天 ${hm}`;
-  if (isTom) return `明天 ${hm}`;
+  if (sameDay) return L(`今天 ${hm}`, `Today ${hm}`);
+  if (isTom) return L(`明天 ${hm}`, `Tomorrow ${hm}`);
   return `${dt.getMonth() + 1}/${dt.getDate()} ${hm}`;
 }
 
@@ -146,8 +147,8 @@ export function defaultMuteTimeStr() {
 }
 
 export function shorthand(b) {
-  if (!b) return '默认';
-  if (b.same_as) return `同 ${stageName(b.same_as)}`;
+  if (!b) return L('默认', 'default');
+  if (b.same_as) return L(`同 ${stageName(b.same_as)}`, `same as ${stageName(b.same_as)}`);
   let s = b.agent || 'auto';
   if (b.model) s += `:${b.model}`;
   if (b.effort) s += `@${b.effort}`;
@@ -187,11 +188,11 @@ export function ctxTone(p) {
 
 export function metricsSrcLabel(src) {
   return {
-    cc_switch: 'cc-switch 代理日志',
-    transcript: '对话日志 (transcript)',
-    status_line: '终端状态栏 (status_line)',
-    none: '暂无数据源',
-  }[src] || src || '未知';
+    cc_switch: L('cc-switch 代理日志', 'cc-switch proxy log'),
+    transcript: L('对话日志 (transcript)', 'Transcript log'),
+    status_line: L('终端状态栏 (status_line)', 'Terminal status_line'),
+    none: L('暂无数据源', 'No telemetry source'),
+  }[src] || src || L('未知', 'Unknown');
 }
 
 export function fmtMs(ms) {
@@ -215,52 +216,52 @@ export function buildTelemetryStrip(s) {
   const hasCtx = pctVal != null || hasUsed;
   if (!hasCtx && tpsVal == null) {
     return h('div', { class: 'ws-telemetry', 'data-tel-sid': s?.session_id || '' },
-      span('ws-tel-empty', '遥测待采集'));
+      span('ws-tel-empty', L('遥测待采集', 'Telemetry pending')));
   }
   let ctxText = '';
-  if (hasUsed && hasWin && pctVal != null) ctxText = `上下文 ${fmtTokens(m.context_used_tokens)} / ${fmtTokens(m.context_window_tokens)} · ${Math.round(pctVal)}%`;
-  else if (pctVal != null) ctxText = `上下文 ${Math.round(pctVal)}%`;
-  else if (hasUsed) ctxText = `上下文 ${fmtTokens(m.context_used_tokens)}`;
+  if (hasUsed && hasWin && pctVal != null) ctxText = `${L('上下文', 'CTX')} ${fmtTokens(m.context_used_tokens)} / ${fmtTokens(m.context_window_tokens)} · ${Math.round(pctVal)}%`;
+  else if (pctVal != null) ctxText = `${L('上下文', 'CTX')} ${Math.round(pctVal)}%`;
+  else if (hasUsed) ctxText = `${L('上下文', 'CTX')} ${fmtTokens(m.context_used_tokens)}`;
   const ctxTipParts = [];
-  if (m?.source && m.source !== 'none') ctxTipParts.push(`来源：${metricsSrcLabel(m.source)}`);
+  if (m?.source && m.source !== 'none') ctxTipParts.push(`${L('来源：', 'Source: ')}${metricsSrcLabel(m.source)}`);
   if (isFin(m?.total_input_tokens) || isFin(m?.total_output_tokens)) {
-    ctxTipParts.push(`累计输入 ${fmtTokens(m?.total_input_tokens)} · 输出 ${fmtTokens(m?.total_output_tokens)}`);
+    ctxTipParts.push(L(`累计输入 ${fmtTokens(m?.total_input_tokens)} · 输出 ${fmtTokens(m?.total_output_tokens)}`, `Total in ${fmtTokens(m?.total_input_tokens)} · out ${fmtTokens(m?.total_output_tokens)}`));
   }
   const tpsTipParts = [];
-  if (isFin(m?.ttft_ms)) tpsTipParts.push(`首字延迟 TTFT：${fmtMs(m.ttft_ms)}`);
+  if (isFin(m?.ttft_ms)) tpsTipParts.push(L(`首字延迟 TTFT：${fmtMs(m.ttft_ms)}`, `TTFT: ${fmtMs(m.ttft_ms)}`));
   if (isFin(m?.last_output_tokens) && isFin(m?.last_duration_ms)) {
-    tpsTipParts.push(`最近回合：${fmtTokens(m.last_output_tokens)} tok / ${fmtMs(m.last_duration_ms)}`);
+    tpsTipParts.push(L(`最近回合：${fmtTokens(m.last_output_tokens)} tok / ${fmtMs(m.last_duration_ms)}`, `Last turn: ${fmtTokens(m.last_output_tokens)} tok / ${fmtMs(m.last_duration_ms)}`));
   }
-  if (m?.source && m.source !== 'none') tpsTipParts.push(`来源：${metricsSrcLabel(m.source)}`);
+  if (m?.source && m.source !== 'none') tpsTipParts.push(`${L('来源：', 'Source: ')}${metricsSrcLabel(m.source)}`);
   const ctxCls = tone === 'high' ? ' ws-tel-high' : tone === 'warn' ? ' ws-tel-warn' : '';
   return h('div', { class: 'ws-telemetry', 'data-tel-sid': s?.session_id || '' },
-    hasCtx ? h('span', { class: `ws-tel-pill${ctxCls}`, title: ctxTipParts.join(' ｜ ') || '上下文容量' },
+    hasCtx ? h('span', { class: `ws-tel-pill${ctxCls}`, title: ctxTipParts.join(' | ') || L('上下文容量', 'Context window') },
       ctxText, pctVal != null ? ctxBar(pctVal, false) : null) : null,
-    tpsVal != null ? h('span', { class: 'ws-tel-pill', title: tpsTipParts.join(' ｜ ') || '输出速度' },
+    tpsVal != null ? h('span', { class: 'ws-tel-pill', title: tpsTipParts.join(' | ') || L('输出速度', 'Output speed') },
       `${tpsVal.toFixed(1)} tok/s`) : null);
 }
 
 export function errText(e) {
   if (e && typeof e === 'object' && 'code' in e && e.code && e.code !== 'unavailable') {
-    return `${e.message}（${e.code}）`;
+    return L(`${e.message}（${e.code}）`, `${e.message} (${e.code})`);
   }
   return e?.message || String(e);
 }
 
 export function deliveryText(r) {
-  if (!r) return '已发送';
-  const lvl = LEVEL_LABEL[r.level] || r.level || '';
-  const ack = r.ack === 'unverified_legacy' ? ' · 存量会话已写入' : '';
+  if (!r) return L('已发送', 'Sent');
+  const lvl = levelLabel(r.level);
+  const ack = r.ack === 'unverified_legacy' ? L(' · 存量会话已写入', ' · written to legacy session') : '';
   return `${lvl} · ${stateText(r.status)}${r.pane ? ` · ${r.pane}` : ''}${ack}`;
 }
 
 export function warnText(w) {
   switch (w.warning) {
-    case 'same_model_reviewer': return `Reviewer 与实现者使用同一模型（${w.model}），存在自审偏差风险`;
-    case 'native_agent_mismatch': return `${stageName(w.stage)}：原生模式 ${w.native} 与 agent ${w.agent} 不匹配`;
-    case 'unknown_model': return `${stageName(w.stage)}：${w.agent} 未知模型 “${w.model}”`;
-    case 'stage_not_in_playbook': return `阶段 ${stageName(w.stage)} 不属于 ${w.playbook}，已忽略`;
-    case 'unrecognized': return `未识别片段：“${w.text}”`;
+    case 'same_model_reviewer': return L(`Reviewer 与实现者使用同一模型（${w.model}），存在自审偏差风险`, `Reviewer uses the same model (${w.model}) as implementer — self-review bias risk`);
+    case 'native_agent_mismatch': return L(`${stageName(w.stage)}：原生模式 ${w.native} 与 agent ${w.agent} 不匹配`, `${stageName(w.stage)}: native mode ${w.native} does not match agent ${w.agent}`);
+    case 'unknown_model': return L(`${stageName(w.stage)}：${w.agent} 未知模型 “${w.model}”`, `${stageName(w.stage)}: unknown model "${w.model}" for ${w.agent}`);
+    case 'stage_not_in_playbook': return L(`阶段 ${stageName(w.stage)} 不属于 ${w.playbook}，已忽略`, `Stage ${stageName(w.stage)} is not part of ${w.playbook}; ignored`);
+    case 'unrecognized': return L(`未识别片段：“${w.text}”`, `Unrecognized clause: "${w.text}"`);
     default: return JSON.stringify(w);
   }
 }
@@ -295,7 +296,7 @@ export function emptyState(title, desc, action) {
 }
 
 export function errorBanner(msg, retryLabel, onRetry) {
-  return h('div', { class: 'callout err' }, h('span', null, msg), onRetry ? btn(retryLabel || '重试', { cls: 'sm', onclick: onRetry }) : null);
+  return h('div', { class: 'callout err' }, h('span', null, msg), onRetry ? btn(retryLabel || L('重试', 'Retry'), { cls: 'sm', onclick: onRetry }) : null);
 }
 
 export const kvRow = (k, v) => (v == null || v === '' || (Array.isArray(v) && !v.length) ? null : [h('div', { class: 'kv-k' }, k), h('div', { class: 'kv-v' }, v)]);
@@ -324,9 +325,9 @@ function fallbackCopy(text, done) {
   try { ta.setSelectionRange(0, text.length); } catch { /* ignore */ }
   try {
     if (document.execCommand('copy')) done();
-    else toast('复制失败，请手动选择复制', 'warn');
+    else toast(L('复制失败，请手动选择复制', 'Copy failed — please copy manually'), 'warn');
   } catch {
-    toast('复制失败，请手动选择复制', 'warn');
+    toast(L('复制失败，请手动选择复制', 'Copy failed — please copy manually'), 'warn');
   }
   ta.remove();
 }
@@ -335,7 +336,7 @@ export function copyText(text, btnEl) {
   const done = () => {
     if (!btnEl) return;
     const orig = btnEl.textContent;
-    btnEl.textContent = '已复制 ✓';
+    btnEl.textContent = L('已复制 ✓', 'Copied ✓');
     setTimeout(() => { btnEl.textContent = orig; }, 1600);
   };
   if (window.isSecureContext && navigator.clipboard?.writeText) {

@@ -7,25 +7,31 @@ import {
   PREVIEW_PAGE_STEP,
   REQUEST_TIMEOUT_MS,
   SSE_TYPES,
-  STARFANE_SLASH,
+  starfaneSlash,
   TOKEN_KEY,
   TRANSCRIPT_LIMIT,
   TRANSCRIPT_PAGE_STEP,
 } from './constants.js';
 import { $, deliveryText, errText, toast } from './dom.js';
+import { L, setLang } from './i18n.js';
 import {
   APP,
+  COMPACT_TRANSCRIPT_THRESHOLD,
   S,
   UI,
   currentSession,
   enc,
+  hashMessage,
   hashStr,
+  hashTranscriptPayload,
   migrateSessionSelection,
   pickDefaultSession,
   pvKeyOf,
   pvModeOf,
   pvReqSeq,
   setMute,
+  setPreviewEntry,
+  setTranscriptEntry,
   stateText,
   trLimitOf,
   trReqSeq,
@@ -65,7 +71,7 @@ export async function api(method, path, body) {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
-    throw new ApiError('unavailable', e.name === 'AbortError' ? '请求超时' : `无法连接本地 daemon（${e.message}）`, 0);
+    throw new ApiError('unavailable', e.name === 'AbortError' ? L('请求超时', 'Request timed out') : L(`无法连接本地 daemon（${e.message}）`, `Cannot connect to local daemon (${e.message})`), 0);
   } finally {
     clearTimeout(timer);
   }
@@ -73,7 +79,7 @@ export async function api(method, path, body) {
   try { env = await res.json(); } catch { env = null; }
   if (res.status === 401 || (res.status === 403 && S.authEnabled && env?.error?.code === 'unauthorized')) {
     if (S.authEnabled) { S.authNeeded = true; APP.schedule(); }
-    throw new ApiError('unauthorized', env?.error?.message || '需要认证 token', res.status);
+    throw new ApiError('unauthorized', env?.error?.message || L('需要认证 token', 'Authentication token required'), res.status);
   }
   if (!res.ok || !env || env.ok === false) {
     throw new ApiError(env?.error?.code || 'internal', env?.error?.message || `HTTP ${res.status}`, res.status);
@@ -176,14 +182,14 @@ export async function syncStateSilent() {
       if (Array.isArray(st.hosts)) upsertHosts(st.hosts);
       if (nextMute !== prevMute) setMute(nextMute);
       pickDefaultSession();
-      APP.schedule();
+      APP.schedulePassive();
       const subQs = UI.showEnded ? { subagents: 1, ended: 1 } : { subagents: 1 };
       if (UI.showEnded || [...nextSessions.values()].some((s) => (s.subagent_count || 0) > 0)) {
         api('GET', `/api/sessions${qs(subQs)}`)
           .then((list) => {
             const before = sessionsDiffSig(S.sessions);
             (list || []).forEach(upsertSession);
-            if (sessionsDiffSig(S.sessions) !== before) APP.schedule();
+            if (sessionsDiffSig(S.sessions) !== before) APP.schedulePassive();
           })
           .catch(() => {});
       }
@@ -197,6 +203,7 @@ export async function loadAll() {
   S.lastLoad = Date.now();
   try {
     const st = await api('GET', '/api/state');
+    if (setLang(st.lang)) S.slashCmds.clear();
     S.version = st.version || S.version;
     S.lastSeq = st.event_seq || 0;
     S.sessions = new Map();
@@ -246,13 +253,24 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
   if (!sessionId) return;
   const prev = S.transcripts.get(sessionId);
   if (prev?.unsupported) return;
-  // During background silent refresh, if user already loaded expanded/full history, preserve it by fetching the full span.
-  const effectiveAll = all || (silent && prev?.loadedAll);
-  const lim = effectiveAll ? undefined : (limit || Math.max(trLimitOf(sessionId), prev?.messages?.length || 0, TRANSCRIPT_LIMIT));
+  // Never re-fetch `all=1` megabytes on background silent polling!
+  // When user already loaded expanded/full history, silent polls fetch only a lightweight tail
+  // (`limit=60`) and splice incremental updates onto the loaded prefix without rebuilding history.
+  const prevExpanded = prev?.state === 'ok'
+    && prev.source === 'transcript'
+    && (prev.explicitAll || (prev.messages?.length || 0) > TRANSCRIPT_LIMIT);
+  if (silent && !all && prevExpanded && prev.autoPollPaused) return;
+  const incrementalTail = !all && !limit && prevExpanded && !prev.autoPollPaused;
+  const effectiveAll = Boolean(all) || (!silent && !limit && prevExpanded && prev.autoPollPaused);
+  const lim = effectiveAll
+    ? undefined
+    : (incrementalTail
+      ? TRANSCRIPT_LIMIT
+      : (limit || Math.min(Math.max(trLimitOf(sessionId), TRANSCRIPT_LIMIT), COMPACT_TRANSCRIPT_THRESHOLD)));
   const seq = (trReqSeq.get(sessionId) || 0) + 1;
   trReqSeq.set(sessionId, seq);
   if (!prev) {
-    S.transcripts.set(sessionId, {
+    setTranscriptEntry(sessionId, {
       state: 'loading',
       source: 'none',
       messages: [],
@@ -260,7 +278,10 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
       totalMessages: 0,
       startSeq: 0,
       nextBefore: null,
+      explicitAll: effectiveAll,
       loadedAll: effectiveAll,
+      autoPollPaused: false,
+      latestTotalMessages: null,
       limit: lim || TRANSCRIPT_LIMIT,
       hash: '',
       updatedMs: 0,
@@ -277,9 +298,79 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
     const totalMessages = Number.isFinite(data?.total_messages) ? data.total_messages : msgs.length;
     const startSeq = Number.isFinite(data?.start_seq) ? data.start_seq : Math.max(0, totalMessages - msgs.length);
     const nextBefore = Number.isFinite(data?.next_before) ? data.next_before : (hasMore ? startSeq : null);
-    const nextHash = hashStr(`${source}|${startSeq}|${totalMessages}|${hasMore ? 1 : 0}|${JSON.stringify(msgs)}`);
-    const changed = !prev || prev.state !== 'ok' || prev.hash !== nextHash;
-    S.transcripts.set(sessionId, {
+
+    if (data?.metrics && S.sessions.has(sessionId)) {
+      const cur = S.sessions.get(sessionId);
+      if (JSON.stringify(cur.metrics || null) !== JSON.stringify(data.metrics)) {
+        S.sessions.set(sessionId, { ...cur, metrics: data.metrics });
+        APP.patchTelemetryStrip(sessionId);
+      }
+    }
+
+    if (incrementalTail && prev && source === 'transcript') {
+      const prevStart = Number.isFinite(prev.startSeq) ? prev.startSeq : 0;
+      const prevEnd = prevStart + prev.messages.length;
+      if (startSeq >= prevStart && startSeq <= prevEnd) {
+        const prefixLen = startSeq - prevStart;
+        let same = prev.totalMessages === totalMessages
+          && prev.messages.length === prefixLen + msgs.length;
+        if (same) {
+          for (let i = 0; i < msgs.length; i++) {
+            if (hashMessage(prev.messages[prefixLen + i]) !== hashMessage(msgs[i])) {
+              same = false;
+              break;
+            }
+          }
+        }
+        if (same) {
+          prev.updatedMs = Date.now();
+          APP.updateOutputClock(sessionId);
+          if (!silent) APP.schedule();
+          return;
+        }
+        const merged = [...prev.messages.slice(0, prefixLen), ...msgs];
+        const mergedHasMore = prevStart > 0;
+        const mergedTotal = Math.max(totalMessages, prevStart + merged.length);
+        const nextHash = hashTranscriptPayload(source, prevStart, mergedTotal, mergedHasMore, merged);
+        setTranscriptEntry(sessionId, {
+          ...prev,
+          state: 'ok',
+          source,
+          transcriptPath: data?.transcript_path || prev.transcriptPath || null,
+          messages: merged,
+          hasMore: mergedHasMore,
+          totalMessages: mergedTotal,
+          startSeq: prevStart,
+          nextBefore: mergedHasMore ? prevStart : null,
+          explicitAll: Boolean(prev.explicitAll),
+          loadedAll: !mergedHasMore,
+          autoPollPaused: false,
+          latestTotalMessages: null,
+          limit: merged.length,
+          hash: nextHash,
+          updatedMs: Date.now(),
+          err: null,
+        });
+        APP.notifyOutputUpdated(sessionId);
+        return;
+      }
+      if (silent) {
+        // Larger gap than one 60-message tail while reviewing expanded/full history:
+        // pause silent auto-refresh instead of silently downloading `all=1` or clobbering scrollback.
+        setTranscriptEntry(sessionId, {
+          ...prev,
+          autoPollPaused: true,
+          latestTotalMessages: totalMessages,
+          updatedMs: Date.now(),
+        });
+        APP.notifyOutputUpdated(sessionId);
+        return;
+      }
+    }
+
+    const nextHash = hashTranscriptPayload(source, startSeq, totalMessages, hasMore, msgs);
+    const changed = !prev || prev.state !== 'ok' || prev.hash !== nextHash || Boolean(prev.autoPollPaused);
+    setTranscriptEntry(sessionId, {
       state: 'ok',
       source,
       transcriptPath: data?.transcript_path || null,
@@ -288,19 +379,15 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
       totalMessages,
       startSeq,
       nextBefore,
-      loadedAll: effectiveAll || !hasMore,
+      explicitAll: effectiveAll,
+      loadedAll: !hasMore,
+      autoPollPaused: false,
+      latestTotalMessages: null,
       limit: lim || msgs.length,
       hash: nextHash,
       updatedMs: Date.now(),
       err: null,
     });
-    if (data?.metrics && S.sessions.has(sessionId)) {
-      const cur = S.sessions.get(sessionId);
-      if (JSON.stringify(cur.metrics || null) !== JSON.stringify(data.metrics)) {
-        S.sessions.set(sessionId, { ...cur, metrics: data.metrics });
-        APP.patchTelemetryStrip(sessionId);
-      }
-    }
     if (changed) APP.notifyOutputUpdated(sessionId);
     else {
       if (UI.loadingEarlierSid === sessionId) UI.loadingEarlierSid = null;
@@ -311,17 +398,18 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
     if (trReqSeq.get(sessionId) !== seq) return;
     if (UI.loadingEarlierSid === sessionId) UI.loadingEarlierSid = null;
     if (e instanceof ApiError && e.status === 405) {
-      S.transcripts.set(sessionId, {
+      setTranscriptEntry(sessionId, {
         state: 'ok', source: 'none', messages: [], hasMore: false, totalMessages: 0, startSeq: 0, nextBefore: null,
-        loadedAll: true, limit: TRANSCRIPT_LIMIT, hash: 'none', updatedMs: Date.now(), unsupported: true,
+        explicitAll: false, loadedAll: true, autoPollPaused: false, latestTotalMessages: null,
+        limit: TRANSCRIPT_LIMIT, hash: 'none', updatedMs: Date.now(), unsupported: true,
       });
       if (!prev || prev.state === 'loading') APP.notifyOutputUpdated(sessionId);
       return;
     }
     const errMsg = errText(e);
     const changed = !prev || prev.state !== 'err' || prev.err !== errMsg;
-    S.transcripts.set(sessionId, {
-      ...(prev || { source: 'none', messages: [], hasMore: false, totalMessages: 0, startSeq: 0, nextBefore: null, limit: TRANSCRIPT_LIMIT, hash: '' }),
+    setTranscriptEntry(sessionId, {
+      ...(prev || { source: 'none', messages: [], hasMore: false, totalMessages: 0, startSeq: 0, nextBefore: null, explicitAll: false, autoPollPaused: false, latestTotalMessages: null, limit: TRANSCRIPT_LIMIT, hash: '' }),
       state: 'err',
       err: errMsg,
       updatedMs: Date.now(),
@@ -348,16 +436,19 @@ export async function loadEarlierTranscript(sessionId, step = TRANSCRIPT_PAGE_ST
     const totalMessages = Number.isFinite(data?.total_messages) ? Math.max(prev.totalMessages, data.total_messages) : merged.length;
     const startSeq = Number.isFinite(data?.start_seq) ? data.start_seq : Math.max(0, cursor - older.length);
     const nextBefore = Number.isFinite(data?.next_before) ? data.next_before : (hasMore ? startSeq : null);
-    const nextHash = hashStr(`${prev.source}|${startSeq}|${totalMessages}|${hasMore ? 1 : 0}|${JSON.stringify(merged)}`);
+    const nextHash = hashTranscriptPayload(prev.source, startSeq, totalMessages, hasMore, merged);
     UI.trLimit.set(sessionId, merged.length);
-    S.transcripts.set(sessionId, {
+    setTranscriptEntry(sessionId, {
       ...prev,
       messages: merged,
       hasMore,
       totalMessages,
       startSeq,
       nextBefore,
+      explicitAll: prev.explicitAll || !hasMore,
       loadedAll: !hasMore,
+      autoPollPaused: false,
+      latestTotalMessages: null,
       limit: merged.length,
       hash: nextHash,
       updatedMs: Date.now(),
@@ -380,7 +471,7 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
   const seq = (pvReqSeq.get(key) || 0) + 1;
   pvReqSeq.set(key, seq);
   if (!prev) {
-    S.previews.set(key, {
+    setPreviewEntry(key, {
       state: 'loading',
       text: '',
       hash: '',
@@ -406,7 +497,7 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
     const truncated = Boolean(data?.truncated);
     const nextHash = hashStr(`${text}|${startLine}|${totalLines}|${hasMore ? 1 : 0}|${!!data?.in_mode}|${!!data?.dead}`);
     const changed = !prev || prev.state !== 'ok' || prev.hash !== nextHash;
-    S.previews.set(key, {
+    setPreviewEntry(key, {
       state: 'ok',
       updatedMs: Date.now(),
       data,
@@ -427,13 +518,13 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
         else APP.updateOutputClock(cur.session_id);
       }
     } else if (changed) {
-      APP.schedule();
+      APP.schedulePassive();
     }
   } catch (e) {
     if (pvReqSeq.get(key) !== seq) return;
     const errMsg = errText(e);
     const changed = !prev || prev.state !== 'err' || prev.err !== errMsg;
-    S.previews.set(key, {
+    setPreviewEntry(key, {
       ...(prev || { text: '', hash: '', totalLines: 0, startLine: 0, hasMore: false, nextBeforeLine: null }),
       state: 'err',
       err: errMsg,
@@ -443,7 +534,7 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
     if (changed) {
       const cur = currentSession();
       if (effMode === pvModeOf(paneId) && cur?.pane === paneId) APP.notifyOutputUpdated(cur.session_id);
-      else APP.schedule();
+      else APP.schedulePassive();
     }
   }
 }
@@ -469,7 +560,7 @@ export async function loadEarlierPreview(paneId, step = PREVIEW_PAGE_STEP) {
     const nextBeforeLine = Number.isFinite(data?.next_before_line) ? data.next_before_line : (hasMore ? startLine : null);
     const totalLines = Number.isFinite(data?.total_lines) ? Math.max(prev.totalLines, data.total_lines) : mergedText.split('\n').length;
     const nextHash = hashStr(`${mergedText}|${startLine}|${totalLines}|${hasMore ? 1 : 0}`);
-    S.previews.set(key, {
+    setPreviewEntry(key, {
       ...prev,
       text: mergedText,
       startLine,
@@ -499,7 +590,7 @@ export async function renameHostApi(hostId, displayName) {
     APP.closeModal();
     APP.schedule();
     return rec;
-  }, (r) => `主机名称已更新为「${r?.display_name || displayName}」`);
+  }, (r) => L(`主机名称已更新为「${r?.display_name || displayName}」`, `Host renamed to "${r?.display_name || displayName}"`));
 }
 
 export async function loadHandoffs(sessionId) {
@@ -598,17 +689,19 @@ function handleEvent(type, d) {
     case 'artifact': if (d.kind === 'review' && S.reviewsState === 'ok') loadReviews(); break;
     case 'delivery': {
       const r = d.report || {};
-      if (r.status === 'unconfirmed' || r.status === 'failed') toast(`投递${stateText(r.status)}：${deliveryText(r)}`, 'warn');
-      break;
+      if (r.status === 'unconfirmed' || r.status === 'failed') toast(L(`投递${stateText(r.status)}：${deliveryText(r)}`, `Delivery ${stateText(r.status)}: ${deliveryText(r)}`), 'warn');
+      return;
     }
     case 'event': {
       S.activity.unshift(d.event);
       if (S.activity.length > MAX_ACTIVITY) S.activity.length = MAX_ACTIVITY;
-      break;
+      // Activity feed is only rendered inside the session inspector drawer; skip rerenders otherwise.
+      if (UI.drawer?.kind === 'session') APP.schedulePassive();
+      return;
     }
     default: break;
   }
-  APP.schedule();
+  APP.schedulePassive();
 }
 
 export function connectSSE() {
@@ -664,7 +757,7 @@ export async function loadSlashCommands(agent) {
     const list = Array.isArray(data?.commands) ? data.commands : [];
     if (list.length) {
       const hasStarfane = list.some((c) => c.group === 'starfane');
-      S.slashCmds.set(ag, hasStarfane ? list : [...list, ...STARFANE_SLASH]);
+      S.slashCmds.set(ag, hasStarfane ? list : [...list, ...starfaneSlash()]);
       if (UI.slash.open && UI.wsShell?.comp?.ta && UI.wsShell.comp.agent === ag) {
         APP.updateSlashFromInput(UI.wsShell.comp.ta, ag);
       }
@@ -675,8 +768,17 @@ export async function loadSlashCommands(agent) {
 }
 
 export async function pollHealth() {
+  if (document.hidden && S.loaded) return;
+  const prevFails = S.healthFails;
+  const prevVer = S.version;
+  const prevAuth = S.authNeeded;
+  const prevUpMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
   try {
     const r = await api('GET', '/api/health');
+    if (setLang(r.lang)) {
+      S.slashCmds.clear();
+      APP.rerender();
+    }
     S.healthFails = 0;
     S.version = r.version || S.version;
     S.uptimeMs = r.uptime_ms ?? null;
@@ -687,15 +789,35 @@ export async function pollHealth() {
     if (S.conn === 'down') connectSSE();
     if (!S.loaded) loadAll();
   } catch { S.healthFails++; }
-  APP.schedule();
+  const nextUpMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
+  if (S.healthFails !== prevFails || S.version !== prevVer || S.authNeeded !== prevAuth || nextUpMin !== prevUpMin) {
+    APP.schedulePassive();
+  }
 }
+
+const IDLE_READING_POLL_MS = 15000;
 
 export function pollActivePreview() {
   if (document.hidden || !S.loaded || !UI.autoRefreshPreview || UI.view !== 'workspace') return;
   const s = currentSession();
   if (!s || s.state === 'ended') return;
   // Pause automatic preview polling while user is scrolled up reviewing history.
-  const vp = $('.term-viewport');
+  const vp = UI.wsShell?.vp || $('.term-viewport');
   if (vp && (vp.scrollHeight - vp.scrollTop - vp.clientHeight > 120)) return;
+  if (s.agent !== 'shell' && UI.outputMode === 'reading') {
+    const tr = S.transcripts.get(s.session_id);
+    const isBusy = ['working', 'starting', 'needs_permission', 'needs_input', 'error'].includes(s.state)
+      || Boolean(s.discovered_only)
+      || sessionNeedsLiveTail(s, tr);
+    if (!isBusy) {
+      const tailOpen = UI.open.has(`tail:${s.session_id}`) || Boolean($('details.live-tail')?.open);
+      const lastUpdated = tr?.updatedMs || 0;
+      if (!tailOpen && lastUpdated && (Date.now() - lastUpdated) < IDLE_READING_POLL_MS) return;
+      if (tailOpen && lastUpdated && (Date.now() - lastUpdated) < IDLE_READING_POLL_MS) {
+        // Still allow gentle 15s checks when idle with tail expanded, without 3s transcript spam.
+        return;
+      }
+    }
+  }
   loadSessionOutput(s, { silent: true });
 }

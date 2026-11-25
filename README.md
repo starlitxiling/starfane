@@ -36,9 +36,9 @@ Most coding-agent orchestrators wrap providers in one-shot headless `exec` / `-p
 
 - **Zero Headless, BYO-`tmux` & `zellij` (0.44+)**: Keep your real, long-lived interactive `claude`, `codex`, and `agy` panes running in `tmux` or `zellij >= 0.44` via a unified `TerminalMux` abstraction—plus opt-in plain `shell` panes (monitors, scripts, dev terminals) via `[discovery] include_shell_panes = true`. `starfane` attaches unobtrusively via official hooks and stdio MCP, and spawns new interactive panes cleanly inside `~/.agent_session` (or any path you specify).
 - **Sub-10ms Hook Hot Path**: `starfane emit` is pure `std` Rust with zero async runtime startup overhead, posting events over a local Unix socket (`starfaned.sock`) and falling back to an on-disk spool if the daemon is restarting.
-- **Full History & Glyph-Safe Embedded Web Console**: Zero-build native ES Modules (`web/app.js` + `web/js/*.js`) with ETag `304` static serving, cursor-paginated full conversation transcript (`加载全部` / load earlier pages), full terminal scrollback capture (`tmux capture-pane -S -` / `zellij dump-screen --full`) rendered in 200-line `content-visibility: auto` chunks, Prompt TOC, image paste dispatch, slash-command autocomplete, and automatic offscreen `<canvas>` Nerd Font probing + PUA compatibility glyph mapping (plus custom `[web] terminal_font` or `~/.config/starfane/fonts/terminal.woff2` / `.ttf` loading) to eliminate missing-glyph tofu boxes.
+- **Full History, Bilingual UI & Glyph-Safe Embedded Web Console**: Zero-build native ES Modules (`web/app.js` + `web/js/*.js`) with ETag `304` static serving, deployment-time UI language selection (`[web] lang = "zh" | "en"` or `starfane daemon --lang zh|en`, defaulting to `"zh"` with no in-UI switch clutter), cursor-paginated full conversation transcript (load earlier pages / load all), full terminal scrollback capture (`tmux capture-pane -S -` / `zellij dump-screen --full`) rendered in 200-line `content-visibility: auto` chunks, Prompt TOC, image paste dispatch, slash-command autocomplete, and automatic offscreen `<canvas>` Nerd Font probing + PUA compatibility glyph mapping (plus custom `[web] terminal_font` or `~/.config/starfane/fonts/terminal.woff2` / `.ttf` loading) to eliminate missing-glyph tofu boxes.
 - **Multi-Host Federation (`[[nodes]]`)**: Mix zero-install **SSH ControlMaster** hosts (`kind = "ssh"`) for remote servers/GPU containers with full **Peer `starfaned`** federation (`kind = "peer"`, multi-candidate outbound `endpoints` failover & transcript proxying) in one host-grouped sidebar with runtime host renaming (`POST /api/hosts/{id}/rename`).
-- **Opt-In Pluggable Notification Routing & Split Ownership**: Silent by default on fresh installs, 100% compatible with two-way `[feishu]` Card 2.0 via `lark-cli`, and extensible via `[[notifiers]]` (`feishu` multi-profile, `telegram`, `webhook`, `macos`) and `[[notify_routes]]` (plus secret-free project routing in `.starfane/team.toml`). **Split Ownership** (`node_local` vs `hub`) keeps work credentials isolated on local/peer hosts and prevents duplicate alerts.
+- **Opt-In Pluggable Notification Routing & Split Ownership**: Silent by default on fresh installs, 100% compatible with two-way `[feishu]` Card 2.0 via `lark-cli`, and extensible via `[[notifiers]]` (`feishu` multi-profile, `telegram` with forum topics, `discord` rich embeds, `slack` Incoming Webhook & Bot API Block Kit, `wecom` Group Robot, `qq` OneBot v11 / webhook gateway, `webhook`, `macos`) and `[[notify_routes]]` (plus secret-free project routing in `.starfane/team.toml`). **Split Ownership** (`node_local` vs `hub`) keeps work credentials isolated on local/peer hosts and prevents duplicate alerts.
 - **Native `tmux` Backup & Reboot Restore**: Built-in `[tmux.backup]` periodically saves deduplicated `tmux` session/window/split-layout snapshots, can auto-restore missing sessions on daemon start (`auto_restore_on_start = true`), and optionally re-launches `claude --resume` / `codex resume` sessions (`starfane tmux backup | restore | backups`).
 - **Swarm, Subagents & Evidence-Gated Playbooks**: Automatically folds native subagents and Swarm workers under parent sessions, surfaces live context-window utilization and generation throughput (`tok/s`), and provides **Feature Pipeline** (`Plan → Implement → Test & Review → Report`) and **Two-Speed Debug** (`Triage → Deep RCA`) with deterministic G1/G2/G3 verification.
 - **Network-Agnostic `AccessGate`**: Precompiled IPv4/IPv6 `allowed_cidrs`, exact & `*.suffix` wildcard `allowed_hosts` (reverse-proxy friendly), named `presets` (`easytier`, `tailscale`), and `[[web.scoped_tokens]]` (`read_only` viewer or peer federation tokens) while strictly rejecting untrusted LAN and public traffic with `403 Forbidden`.
@@ -84,7 +84,7 @@ Please set up and start starfane (https://github.com/starlitxiling/starfane) on 
 2. If Rust/Cargo or tmux/zellij is missing, or before modifying any agent hooks/MCP configs, show the exact commands or diff summary and ask for my explicit approval before installing or editing.
 3. Clone https://github.com/starlitxiling/starfane.git into ~/starfane (or pull if present), build `cargo build --release --bin starfane`, and symlink `~/.local/bin/starfane` (ensure `~/.local/bin` is on `PATH`).
 4. Run `starfane doctor` and `starfane install --all --dry-run`, show me the preview, then run `starfane install --all` once approved.
-5. Keep the default loopback config (`127.0.0.1:27418` with token auth enabled; only set `[web] port` in `~/.config/starfane/config.toml` if port 27418 is busy or I request another port), start `starfane daemon --detach`, verify `http://127.0.0.1:<port>/api/health` is healthy, and run `starfane web --print-url --no-open` to give me the ready-to-open local URL.
+5. Keep the default loopback config (`127.0.0.1:27418` with token auth enabled; only set `[web] port` in `~/.config/starfane/config.toml` if port 27418 is busy or I request another port, and set `[web] lang = "en"` or pass `--lang en` if I want the English Web UI instead of the default Chinese `"zh"`), start `starfane daemon --detach`, verify `http://127.0.0.1:<port>/api/health` is healthy, and run `starfane web --print-url --no-open` to give me the ready-to-open local URL.
 ```
 
 ### Option B: Manual Setup
@@ -147,6 +147,7 @@ Create `~/.config/starfane/config.toml` (missing files use safe `127.0.0.1` + to
 [web]
 bind = "127.0.0.1"              # Use "0.0.0.0" only when exposing to a private mesh / reverse proxy
 port = 27418                    # Override if needed; change to any custom port you prefer
+lang = "en"                     # Web console UI language at deployment: "zh" (default) or "en" (no in-UI switch)
 auth_enabled = true             # Require per-boot token (or scoped_tokens); false only behind trusted CIDRs
 allowed_cidrs = []              # Network-agnostic IPv4/IPv6 CIDRs (e.g. ["10.88.0.0/16", "fd00::/8"])
 allowed_hosts = []              # Exact or *.suffix Host/Origin allowlist (e.g. ["console.example.com", "*.ts.net"])
@@ -183,7 +184,7 @@ chat_id = ""
 allow_open_ids = []
 allow_chat_ids = []
 
-# Opt-in pluggable notifiers (`feishu`, `telegram`, `webhook`, `macos`)
+# Opt-in pluggable notifiers (`feishu`, `telegram`, `discord`, `slack`, `wecom`, `qq`, `webhook`, `macos`)
 # [[notifiers]]
 # id = "feishu-work"
 # kind = "feishu"
@@ -196,12 +197,61 @@ allow_chat_ids = []
 # kind = "telegram"
 # bot_token_env = "STARFANE_TG_TOKEN"
 # chat_id = "-1001234567890"
+# thread_id = 42                # Optional forum topic `message_thread_id`
+# api_base_url = "https://api.telegram.org" # Optional proxy/override
 # ownership = "hub"             # Can also notify for SSH zero-install hosts
+#
+# [[notifiers]]
+# id = "discord-ops"
+# kind = "discord"
+# webhook_url_env = "STARFANE_DISCORD_WEBHOOK"
+# username = "starfane"         # Optional webhook display name (default: "starfane")
+# thread_id = "1234567890123456789" # Optional forum/thread ID (?thread_id=...)
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "slack-ops"
+# kind = "slack"
+# webhook_url_env = "STARFANE_SLACK_WEBHOOK" # Incoming Webhook mode (Block Kit)
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "slack-bot"
+# kind = "slack"
+# bot_token_env = "STARFANE_SLACK_BOT_TOKEN" # Or Bot Web API `chat.postMessage` mode
+# channel = "C01234567"
+# api_base_url = "https://slack.com/api"
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "wecom-ops"
+# kind = "wecom"
+# webhook_url_env = "STARFANE_WECOM_WEBHOOK" # WeCom Group Robot webhook (markdown / mentioned_list)
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "qq-ops"
+# kind = "qq"
+# api_base_url = "http://127.0.0.1:3000"     # OneBot v11 HTTP API (NapCat / Lagrange / LLOneBot)
+# group_id = "123456789"                     # `group_id` and/or `user_id` (or use `webhook_url_env`)
+# bot_token_env = "STARFANE_QQ_ONEBOT_TOKEN" # Optional Bearer access token
+# ownership = "hub"
+#
+# [[notifiers]]
+# id = "hook-ops"
+# kind = "webhook"
+# url = "https://hooks.example.com/starfane"
+# secret_env = "STARFANE_WEBHOOK_SECRET"     # Optional Authorization: Bearer token
+#
+# [[notifiers]]
+# id = "macos-local"
+# kind = "macos"
+# sound = "Glass"               # Optional macOS Notification Center sound
 #
 # [[notify_routes]]
 # node = "tencent"
 # project = "workflow"          # Also supports `cwd`, `agent`, `event_kinds`
-# notifiers = ["tg-ops"]
+# notifiers = ["tg-ops", "discord-ops", "slack-ops", "wecom-ops", "qq-ops"]
 
 [paths]
 claude = "claude"
@@ -263,7 +313,7 @@ display_name = "Local"          # Mutable at runtime via POST /api/hosts/{id}/re
 | `starfane doctor` | Read-only check of CLIs, hooks, MCP, Codex trust hashes, `tmux` (`history-limit`), `zellij` (`>= 0.44`), daemon, and config |
 | `starfane install [--all \| --agent X]` | Install marked hooks & MCP registrations with automatic backups (`--dry-run` supported) |
 | `starfane uninstall [--all \| --agent X]` | Cleanly revert starfane-managed hook and MCP entries |
-| `starfane daemon [--detach \| --foreground]` | Run the `starfaned` control-plane daemon (`--port`, `--web-dir` for UI hot-reload) |
+| `starfane daemon [--detach \| --foreground]` | Run the `starfaned` control-plane daemon (`--port`, `--lang zh\|en`, `--web-dir` for UI hot-reload) |
 | `starfane web [--print-url] [--no-open]` | Open or print the Web console URL |
 | `starfane ls [--all] [--project P]` | List active tmux/zellij/remote sessions, models, context usage, throughput, and pipelines |
 | `starfane tmux backup [--force]` | Capture a tmux layout snapshot (`latest.json` + rolling archive, online or offline) |
@@ -297,7 +347,7 @@ web/                  # Zero-build embedded Web console (HTML/CSS + native ESM)
   index.html
   app.css
   app.js              # ES module entry point & router
-  js/                 # Modular frontend: constants, store, dom, markdown, terminal, api, topbar, composer, workspace, views, overlays
+  js/                 # Modular frontend: i18n, constants, store, dom, markdown, terminal, api, topbar, composer, workspace, views, overlays
 tests/fixtures/       # Anonymized real-world hook payload fixtures (41 cases)
 docs/                 # Architecture specs, crate contracts, research notes
 ```
@@ -307,7 +357,7 @@ docs/                 # Architecture specs, crate contracts, research notes
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-node --check web/app.js web/js/*.js
+for f in web/app.js web/js/*.js; do node --check "$f" || exit 1; done
 cargo test --workspace
 cargo test -p starfane-tmux -- --include-ignored
 ```
@@ -324,7 +374,7 @@ cargo test -p starfane-tmux -- --include-ignored
 ### v0.2 — Multiplexer Abstraction, Federation & Guardrails *(Shipped)*
 - [x] **Zellij (0.44+) Support** — Unified `TerminalMux` trait + `ZellijMux` session/pane discovery, capture, safe injection, focus, and spawning
 - [x] **Multi-Host Federation (`[[nodes]]`)** — Mixed zero-install SSH `ControlMaster` nodes and multi-endpoint Peer `starfaned` nodes with runtime host renaming
-- [x] **Pluggable Notification Routing & Split Ownership** — Opt-in `[[notifiers]]` (Feishu multi-profile, Telegram, Webhook, macOS), `[[notify_routes]]`, and secret-free `.starfane/team.toml` routing
+- [x] **Pluggable Notification Routing & Split Ownership** — Opt-in `[[notifiers]]` (Feishu multi-profile, Telegram with forum topics, Discord rich embeds, Slack Incoming Webhook & Bot API Block Kit, WeCom Group Robot, QQ OneBot v11 / webhook, Webhook, macOS), `[[notify_routes]]`, and secret-free `.starfane/team.toml` routing
 - [x] **Network-Agnostic `AccessGate` & Privacy Guarantee** — Precompiled IPv4/IPv6 `allowed_cidrs`, wildcard `allowed_hosts`, `read_only` / admin `scoped_tokens`, strict CSP, and zero telemetry
 
 ### v0.3 — Cross-Host Persistence & Mobile Onboarding *(Planned)*

@@ -1,5 +1,6 @@
 // starfane web console — Inbox, Pipelines, and Reviews views
 import { AGENTS, DEPTHS, EFFORTS, SEVERITIES } from './constants.js';
+import { L } from './i18n.js';
 import {
   agentTag,
   ago,
@@ -44,14 +45,14 @@ import {
   upsertPipeline,
 } from './store.js';
 
-export const focusBtn = (id, cls = 'ghost sm') => btn('切到终端', {
+export const focusBtn = (id, cls = 'ghost sm') => btn(L('切到终端', 'Focus pane'), {
   cls,
-  title: '切换终端焦点到该 pane',
+  title: L('切换终端焦点到该 pane', 'Switch terminal focus to this pane'),
   busyKey: `focus:${id}`,
   onclick: () => act(`focus:${id}`, () => api('POST', `/api/sessions/${enc(id)}/focus`, {}), (r) => {
-    if (r?.switched_client) return `已切到 ${r.tmux_target || ''}`.trim();
-    if (r?.attach_command) return `已选中 ${r.tmux_target || ''}（无已 attach 客户端，可运行 ${r.attach_command}）`;
-    return '已切换终端焦点';
+    if (r?.switched_client) return L(`已切到 ${r.tmux_target || ''}`, `Switched to ${r.tmux_target || ''}`).trim();
+    if (r?.attach_command) return L(`已选中 ${r.tmux_target || ''}（无已 attach 客户端，可运行 ${r.attach_command}）`, `Selected ${r.tmux_target || ''} (no attached client; run ${r.attach_command})`);
+    return L('已切换终端焦点', 'Terminal focus switched');
   }),
 });
 
@@ -63,28 +64,28 @@ export function debugAction(p, verb, okMsg) {
   return act(`pa:${p.id}:${verb}`, async () => upsertPipeline(await api('POST', `/api/debug/${enc(p.id)}/${verb}`, {})), okMsg);
 }
 
-const cancelPipeBtn = (p) => btn('取消流程', {
+const cancelPipeBtn = (p) => btn(L('取消流程', 'Cancel pipeline'), {
   cls: 'ghost sm danger',
   busyKey: `pa:${p.id}:cancel`,
-  onclick: () => { if (window.confirm(`确认取消流程 ${p.id}？`)) pipelineAction(p, { action: 'cancel' }, '流程已取消'); },
+  onclick: () => { if (window.confirm(L(`确认取消流程 ${p.id}？`, `Cancel pipeline ${p.id}?`))) pipelineAction(p, { action: 'cancel' }, L('流程已取消', 'Pipeline cancelled')); },
 });
 
 export function bindingEditor(p, scope = 'bind') {
   const rows = (p.stages || []).map((st) => {
     const b = st.binding || {};
     const k = `${scope}:${p.id}:${st.id}`;
-    const agentOpts = [...(b.agent ? [] : [['', b.same_as ? `同 ${stageName(b.same_as)}` : '默认']]), ...AGENTS.map((a) => [a, a])];
+    const agentOpts = [...(b.agent ? [] : [['', b.same_as ? L(`同 ${stageName(b.same_as)}`, `same as ${stageName(b.same_as)}`) : L('默认', 'default')]]), ...AGENTS.map((a) => [a, a])];
     return h('tr', null,
       h('td', { style: 'font-weight:600;white-space:nowrap' }, stageName(st.id)),
       h('td', null, selectField(`${k}:agent`, agentOpts, b.agent || '', { class: 'inp sm' })),
-      h('td', null, field(`${k}:model`, { class: 'inp sm mono', placeholder: '默认模型', autocomplete: 'off' }, b.model || '')),
+      h('td', null, field(`${k}:model`, { class: 'inp sm mono', placeholder: L('默认模型', 'Default model'), autocomplete: 'off' }, b.model || '')),
       h('td', null, selectField(`${k}:effort`, [['', '—'], ...EFFORTS.map((e) => [e, e])], b.effort || '', { class: 'inp sm' })),
       h('td', null, h('div', { class: 'row' },
         st.id === 'test_review' ? selectField(`${k}:depth`, [['', 'D1'], ...DEPTHS.map((d) => [d, d])], b.depth || '', { class: 'inp sm' }) : null,
         b.native ? span('tag soft-plum', `/${b.native}`) : null)));
   });
   return h('div', { class: 'table-wrap' }, h('table', { class: 'tbl' },
-    h('thead', null, h('tr', null, ['阶段', 'Agent', 'Model', 'Effort', 'Depth / 原生模式'].map((x) => h('th', null, x)))),
+    h('thead', null, h('tr', null, [L('阶段', 'Stage'), 'Agent', 'Model', 'Effort', L('Depth / 原生模式', 'Depth / Native mode')].map((x) => h('th', null, x)))),
     h('tbody', null, rows)));
 }
 
@@ -106,15 +107,15 @@ function collectOverrides(p, scope = 'bind') {
 
 export function confirmBindingBar(p, scope = 'bind') {
   return h('div', { class: 'row', style: 'justify-content:space-between;margin-top:12px' },
-    span('muted', '可直接微调各阶段绑定，未修改项保持默认'),
+    span('muted', L('可直接微调各阶段绑定，未修改项保持默认', 'Adjust stage bindings below; untouched stages stay default')),
     h('div', { class: 'row' },
       cancelPipeBtn(p),
-      btn('确认并启动流程', {
+      btn(L('确认并启动流程', 'Confirm & start'), {
         cls: 'primary sm',
         busyKey: `confirm:${p.id}`,
         onclick: () => {
           const overrides = collectOverrides(p, scope);
-          act(`confirm:${p.id}`, async () => upsertPipeline(await api('POST', `/api/pipelines/${enc(p.id)}/confirm`, Object.keys(overrides).length ? { overrides } : {})), '流程已启动');
+          act(`confirm:${p.id}`, async () => upsertPipeline(await api('POST', `/api/pipelines/${enc(p.id)}/confirm`, Object.keys(overrides).length ? { overrides } : {})), L('流程已启动', 'Pipeline started'));
         },
       })));
 }
@@ -122,30 +123,30 @@ export function confirmBindingBar(p, scope = 'bind') {
 export function planActionBar(p) {
   const nk = `chg:${p.id}`;
   return h('div', { class: 'stack-sm', style: 'margin-top:12px' },
-    field(nk, { class: 'inp sm', placeholder: '如需退回修改，请在此填写修改说明…' }),
+    field(nk, { class: 'inp sm', placeholder: L('如需退回修改，请在此填写修改说明…', 'Enter change request notes if rejecting…') }),
     h('div', { class: 'row', style: 'justify-content:flex-end' },
       cancelPipeBtn(p),
-      btn('退回并要求修改', {
+      btn(L('退回并要求修改', 'Request changes'), {
         cls: 'sm',
         busyKey: `pa:${p.id}:request_changes`,
         onclick: () => {
           const note = draft(nk).trim();
-          if (!note) { toast('请先填写修改说明', 'warn'); return; }
-          pipelineAction(p, { action: 'request_changes', note }, '已退回计划并附修改意见').then((r) => { if (r) UI.drafts.delete(nk); });
+          if (!note) { toast(L('请先填写修改说明', 'Please enter change notes first'), 'warn'); return; }
+          pipelineAction(p, { action: 'request_changes', note }, L('已退回计划并附修改意见', 'Plan returned with change notes')).then((r) => { if (r) UI.drafts.delete(nk); });
         },
       }),
-      btn('批准计划并开始实现', { cls: 'primary sm', busyKey: `pa:${p.id}:approve_plan`, onclick: () => pipelineAction(p, { action: 'approve_plan' }, '计划已批准，进入实现阶段') })));
+      btn(L('批准计划并开始实现', 'Approve plan & implement'), { cls: 'primary sm', busyKey: `pa:${p.id}:approve_plan`, onclick: () => pipelineAction(p, { action: 'approve_plan' }, L('计划已批准，进入实现阶段', 'Plan approved; moving to implementation')) })));
 }
 
 export function triageActionBar(p) {
   return h('div', { class: 'row', style: 'justify-content:flex-end;margin-top:12px' },
     cancelPipeBtn(p),
-    btn('停止深挖', { cls: 'ghost sm', busyKey: `pa:${p.id}:stop`, onclick: () => debugAction(p, 'stop', '已停止深挖') }),
-    btn('采用止血方案', { cls: 'sm', busyKey: `pa:${p.id}:mitigate`, onclick: () => debugAction(p, 'mitigate', '已采用止血建议') }),
-    btn('继续深挖根因', { cls: 'primary sm', busyKey: `pa:${p.id}:continue`, onclick: () => debugAction(p, 'continue', '已进入 Phase B 深挖') }));
+    btn(L('停止深挖', 'Stop debug'), { cls: 'ghost sm', busyKey: `pa:${p.id}:stop`, onclick: () => debugAction(p, 'stop', L('已停止深挖', 'Debug stopped')) }),
+    btn(L('采用止血方案', 'Apply mitigation'), { cls: 'sm', busyKey: `pa:${p.id}:mitigate`, onclick: () => debugAction(p, 'mitigate', L('已采用止血建议', 'Mitigation selected')) }),
+    btn(L('继续深挖根因', 'Continue Deep RCA'), { cls: 'primary sm', busyKey: `pa:${p.id}:continue`, onclick: () => debugAction(p, 'continue', L('已进入 Phase B 深挖', 'Moved to Phase B Deep RCA')) }));
 }
 
-export function quickDispatchRow(key, target, placeholder = '直接向该会话发送回复…', btnCls = 'primary sm') {
+export function quickDispatchRow(key, target, placeholder = L('直接向该会话发送回复…', 'Send a reply directly to this session…'), btnCls = 'primary sm') {
   const k = `qmsg:${key}`;
   const inp = field(k, { class: 'inp sm', placeholder, autocomplete: 'off' });
   const send = () => {
@@ -155,36 +156,40 @@ export function quickDispatchRow(key, target, placeholder = '直接向该会话�
       const r = await api('POST', '/api/dispatch', { target, text, interactive: true });
       UI.drafts.delete(k);
       return r;
-    }, (r) => ({ msg: `已发送：${deliveryText(r)}`, kind: r && (r.status === 'failed' || r.status === 'unconfirmed') ? 'warn' : 'ok' }));
+    }, (r) => ({ msg: L(`已发送：${deliveryText(r)}`, `Sent: ${deliveryText(r)}`), kind: r && (r.status === 'failed' || r.status === 'unconfirmed') ? 'warn' : 'ok' }));
   };
   inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); send(); } });
-  return h('div', { class: 'row-nowrap', style: 'margin-top:10px' }, inp, btn('发送到会话', { cls: btnCls, busyKey: k, onclick: send }));
+  return h('div', { class: 'row-nowrap', style: 'margin-top:10px' }, inp, btn(L('发送到会话', 'Send'), { cls: btnCls, busyKey: k, onclick: send }));
 }
 
-const KIND_INFO = {
-  session_alert: ['会话等待响应', 'needs_permission'],
-  binding_confirm: ['绑定待确认', 'awaiting_binding_confirm'],
-  plan_approval: ['计划待批准', 'awaiting_human'],
-  triage_ready: ['快筛结论待决', 'awaiting_human'],
-  blocked: ['流程阻塞', 'blocked'],
-  needs_human_finding: ['评审待裁决', 'needs_human'],
-  delivery_unconfirmed: ['投递未确认', 'needs_permission'],
-};
+function kindInfo(kind) {
+  return {
+    session_alert: [L('会话等待响应', 'Session Needs Input'), 'needs_permission'],
+    binding_confirm: [L('绑定待确认', 'Confirm Bindings'), 'awaiting_binding_confirm'],
+    plan_approval: [L('计划待批准', 'Plan Approval'), 'awaiting_human'],
+    triage_ready: [L('快筛结论待决', 'Triage Decision'), 'awaiting_human'],
+    blocked: [L('流程阻塞', 'Pipeline Blocked'), 'blocked'],
+    needs_human_finding: [L('评审待裁决', 'Finding Review'), 'needs_human'],
+    delivery_unconfirmed: [L('投递未确认', 'Delivery Unconfirmed'), 'needs_permission'],
+  }[kind] || [kind, 'awaiting_human'];
+}
 
 export function viewInbox() {
   const items = inboxItems();
   return h('div', { class: 'stack' },
     h('div', { class: 'page-head' },
-      h('div', null, h('h1', null, '待处理'), h('p', null, '需要人工确认或响应的事项 —— 权限审批、计划确认、快筛决策与评审裁决')),
-      span('status-ind pill-soft', h('i', { class: `dot ${items.length ? 'dot-needs_permission' : 'dot-done'}` }), `${items.length} 项待处理`)),
+      h('div', null, h('h1', null, L('待处理', 'Inbox')), h('p', null, L('需要人工确认或响应的事项 —— 权限审批、计划确认、快筛决策与评审裁决', 'Items awaiting human approval or input — permissions, plans, triage decisions, and findings'))),
+      span('status-ind pill-soft', h('i', { class: `dot ${items.length ? 'dot-needs_permission' : 'dot-done'}` }), L(`${items.length} 项待处理`, `${items.length} pending`))),
     items.length
       ? items.map(inboxCard)
-      : h('div', { class: 'card' }, emptyState('当前没有待处理事项', '当会话等待审批、计划待确认或排查得出初步假设时，会实时出现在这里。',
-        btn('返回会话对话', { cls: 'sm', onclick: () => APP.go('workspace') }))));
+      : h('div', { class: 'card' }, emptyState(
+        L('当前没有待处理事项', 'Nothing in Inbox'),
+        L('当会话等待审批、计划待确认或排查得出初步假设时，会实时出现在这里。', 'Sessions needing input, plans awaiting approval, or triage hypotheses will appear here in real time.'),
+        btn(L('返回会话对话', 'Back to Workspace'), { cls: 'sm', onclick: () => APP.go('workspace') }))));
 }
 
 function inboxCard(it) {
-  const [kLabel, dotKind] = KIND_INFO[it.kind] || [it.kind, 'awaiting_human'];
+  const [kLabel, dotKind] = kindInfo(it.kind);
   const p = it.pid ? S.pipelines.get(it.pid) : null;
   const s = it.sid ? S.sessions.get(it.sid) : null;
   let body = null;
@@ -196,9 +201,9 @@ function inboxCard(it) {
     body = [
       a?.state === 'ok' && a.data
         ? h('div', { class: 'stack-sm' },
-          kvGrid([['目标', a.data.goal], ['任务数', `${(a.data.tasks || []).length} 项`], ['验收标准', plainList(a.data.acceptance)]]),
-          h('div', { class: 'row' }, btn('在抽屉查看完整设计', { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: aid, title: `计划设计 · ${p.id}` }) })))
-        : (aid ? skeleton(3) : h('div', { class: 'muted' }, '计划工件尚未生成')),
+          kvGrid([[L('目标', 'Goal'), a.data.goal], [L('任务数', 'Tasks'), L(`${(a.data.tasks || []).length} 项`, `${(a.data.tasks || []).length}`)], [L('验收标准', 'Acceptance'), plainList(a.data.acceptance)]]),
+          h('div', { class: 'row' }, btn(L('在抽屉查看完整设计', 'Open full plan in drawer'), { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: aid, title: L(`计划设计 · ${p.id}`, `Plan · ${p.id}`) }) })))
+        : (aid ? skeleton(3) : h('div', { class: 'muted' }, L('计划工件尚未生成', 'Plan artifact not yet generated'))),
       planActionBar(p),
     ];
   } else if (it.kind === 'triage_ready' && p) {
@@ -208,9 +213,9 @@ function inboxCard(it) {
       a?.state === 'ok' && a.data
         ? h('div', { class: 'stack-sm' },
           ...(a.data.hypotheses || []).map(hypothesisCompact),
-          a.data.mitigation ? h('div', { class: 'mitig-box' }, h('strong', null, '止血建议：'), a.data.mitigation) : null,
-          h('div', { class: 'row' }, btn('查看完整快筛证据', { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: aid, title: `快筛报告 · ${p.id}` }) })))
-        : (aid ? skeleton(3) : h('div', { class: 'muted' }, '快筛工件加载中…')),
+          a.data.mitigation ? h('div', { class: 'mitig-box' }, h('strong', null, L('止血建议：', 'Mitigation: ')), a.data.mitigation) : null,
+          h('div', { class: 'row' }, btn(L('查看完整快筛证据', 'Open full triage report'), { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: aid, title: L(`快筛报告 · ${p.id}`, `Triage Report · ${p.id}`) }) })))
+        : (aid ? skeleton(3) : h('div', { class: 'muted' }, L('快筛工件加载中…', 'Loading triage artifact…'))),
       triageActionBar(p),
     ];
   } else if (it.kind === 'needs_human_finding') {
@@ -218,17 +223,17 @@ function inboxCard(it) {
     const pend = rev ? (rev.findings || []).filter((f) => f.falsifier?.verdict === 'needs_human' && !f.feedback) : [];
     body = rev
       ? h('div', { class: 'stack-sm' },
-        pend.length ? pend.map((af) => findingRow(rev, af)) : h('div', { class: 'muted' }, '该评审下待裁决条目已全部处理'),
-        h('div', { class: 'row' }, btn('打开代码评审页', { cls: 'sm', onclick: () => APP.go('reviews', it.rid) })))
+        pend.length ? pend.map((af) => findingRow(rev, af)) : h('div', { class: 'muted' }, L('该评审下待裁决条目已全部处理', 'All findings awaiting review have been resolved')),
+        h('div', { class: 'row' }, btn(L('打开代码评审页', 'Open Reviews'), { cls: 'sm', onclick: () => APP.go('reviews', it.rid) })))
       : skeleton(3);
   } else if (s) {
     body = [
       s.last_error ? h('div', { class: 'callout err' }, span(null, s.last_error)) : null,
       s.last_message ? h('div', { class: 'callout' }, renderMarkdown(s.last_message)) : null,
       h('div', { class: 'row' },
-        btn('在会话对话中打开', { cls: 'sm', onclick: () => APP.openSession(s.session_id) }),
+        btn(L('在会话对话中打开', 'Open in Workspace'), { cls: 'sm', onclick: () => APP.openSession(s.session_id) }),
         s.pane ? focusBtn(s.session_id) : null,
-        (s.state === 'error' || s.last_error) ? btn('清除异常状态', { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => APP.ackSessionError(s) }) : null),
+        (s.state === 'error' || s.last_error) ? btn(L('清除异常状态', 'Clear error state'), { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => APP.ackSessionError(s) }) : null),
       quickDispatchRow(`inb:${s.session_id}`, { type: 'session', id: s.session_id }),
     ];
   } else if (p) {
@@ -237,7 +242,7 @@ function inboxCard(it) {
       stageStepper(p, st?.id, null),
       h('div', { class: 'row', style: 'justify-content:flex-end' },
         cancelPipeBtn(p),
-        st ? btn(`重试 ${stageName(st.id)}`, { cls: 'primary sm', onclick: () => pipelineAction(p, { action: 'retry_stage', stage: st.id }, `已重试 ${stageName(st.id)}`) }) : null),
+        st ? btn(L(`重试 ${stageName(st.id)}`, `Retry ${stageName(st.id)}`), { cls: 'primary sm', onclick: () => pipelineAction(p, { action: 'retry_stage', stage: st.id }, L(`已重试 ${stageName(st.id)}`, `Retried ${stageName(st.id)}`)) }) : null),
     ];
   }
   return h('article', { class: 'card' },
@@ -249,7 +254,7 @@ function inboxCard(it) {
           p ? h('a', { class: 'mono', href: `#/pipelines/${enc(p.id)}` }, p.id) : null,
           p ? span('muted', base(p.project?.root)) : null,
           s ? [agentTag(s.agent), s.pane ? span('tag host-pfx', paneDisplayId(s)) : null] : null,
-          span('tabular', `已等待 ${dur(Date.now() - (it.since || Date.now()))}`)))),
+          span('tabular', L(`已等待 ${dur(Date.now() - (it.since || Date.now()))}`, `Waiting ${dur(Date.now() - (it.since || Date.now()))}`))))),
     body);
 }
 
@@ -272,17 +277,17 @@ export function viewPipelines() {
     }, 60);
   }
   const filters = [
-    ['all', `进行中（${activeCount}）`],
-    ['feature', '功能协作'],
-    ['debug', '两速查错'],
-    ['done', `已结束（${doneCount}）`],
+    ['all', L(`进行中（${activeCount}）`, `Active (${activeCount})`)],
+    ['feature', L('功能协作', 'Feature Pipeline')],
+    ['debug', L('两速查错', 'Two-Speed Debug')],
+    ['done', L(`已结束（${doneCount}）`, `Finished (${doneCount})`)],
   ];
   return h('div', { class: 'stack' },
     h('div', { class: 'page-head' },
-      h('div', null, h('h1', null, '流水线'), h('p', null, 'Feature Pipeline 与 Two-Speed Debug 的阶段进度与产物记录')),
+      h('div', null, h('h1', null, L('流水线', 'Pipelines')), h('p', null, L('Feature Pipeline 与 Two-Speed Debug 的阶段进度与产物记录', 'Stage progress and artifacts for Feature Pipelines and Two-Speed Debug'))),
       h('div', { class: 'row' },
-        btn('发起新功能协作', { cls: 'sm', onclick: () => { UI.modal = 'feature'; APP.schedule(); } }),
-        btn('发起两速查错', { cls: 'sm', onclick: () => { UI.modal = 'debug'; APP.schedule(); } }))),
+        btn(L('发起新功能协作', 'New Feature Pipeline'), { cls: 'sm', onclick: () => { UI.modal = 'feature'; APP.schedule(); } }),
+        btn(L('发起两速查错', 'New Two-Speed Debug'), { cls: 'sm', onclick: () => { UI.modal = 'debug'; APP.schedule(); } }))),
     h('div', { class: 'chips' }, filters.map(([k, l]) => h('button', {
       type: 'button',
       class: `chip${f === k ? ' on' : ''}`,
@@ -290,7 +295,9 @@ export function viewPipelines() {
     }, l))),
     list.length
       ? list.map((p) => (p.playbook === 'debug' ? debugPipelineCard(p) : featurePipelineCard(p)))
-      : h('div', { class: 'card' }, emptyState('当前筛选下没有流水线', '你可以在「会话对话」底部直接切换候选模式发起协作或查错，也可以点右上角按钮创建。')));
+      : h('div', { class: 'card' }, emptyState(
+        L('当前筛选下没有流水线', 'No pipelines match this filter'),
+        L('你可以在「会话对话」底部直接切换候选模式发起协作或查错，也可以点右上角按钮创建。', 'Start a Feature Pipeline or Two-Speed Debug from the composer in Workspace, or use the buttons above.'))));
 }
 
 export function stageStepper(p, selKind, onSelect) {
@@ -320,15 +327,15 @@ function featurePipelineCard(p) {
   return h('article', { class: `card${UI.arg === p.id ? ' focus-ring' : ''}`, id: `pl-${p.id}` },
     h('div', { class: 'card-head' },
       h('div', { class: 'grow' },
-        h('div', { class: 'card-title' }, p.goal || '未命名功能协作'),
+        h('div', { class: 'card-title' }, p.goal || L('未命名功能协作', 'Untitled Feature Pipeline')),
         h('div', { class: 'card-meta' },
           h('code', null, p.id),
           statusInd(p.status),
-          span('tag', '功能协作'),
+          span('tag', L('功能协作', 'Feature')),
           span('muted', base(p.project?.root)),
           p.options?.review_depth ? span('tag soft-plum mono', p.options.review_depth) : null,
-          span('tabular', `更新于 ${ago(p.updated_ms)}`))),
-      btn('流程元数据', { cls: 'ghost sm', onclick: () => APP.openDrawer('pipeline', { pipelineId: p.id }) })),
+          span('tabular', L(`更新于 ${ago(p.updated_ms)}`, `Updated ${ago(p.updated_ms)}`)))),
+      btn(L('流程元数据', 'Metadata'), { cls: 'ghost sm', onclick: () => APP.openDrawer('pipeline', { pipelineId: p.id }) })),
     stageStepper(p, sel, (k) => { UI.selStage[p.id] = k; APP.schedule(); }),
     st ? h('div', { class: 'stage-strip' },
       h('div', { class: 'row' },
@@ -339,20 +346,20 @@ function featurePipelineCard(p) {
         st.binding?.native ? span('tag soft-plum', `/${st.binding.native}`) : null,
         st.pane ? span('tag mono', st.pane) : null),
       h('div', { class: 'row' },
-        st.session_id ? btn('打开会话', { cls: 'ghost sm', onclick: () => APP.openSession(st.session_id) }) : null,
-        aid ? btn('查看阶段工件', { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: aid, title: `${stageName(st.id)} · ${p.id}` }) }) : span('muted', '暂无工件'))) : null,
+        st.session_id ? btn(L('打开会话', 'Open session'), { cls: 'ghost sm', onclick: () => APP.openSession(st.session_id) }) : null,
+        aid ? btn(L('查看阶段工件', 'View artifact'), { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: aid, title: `${stageName(st.id)} · ${p.id}` }) }) : span('muted', L('暂无工件', 'No artifact yet')))) : null,
     target && ['running', 'awaiting_human', 'blocked'].includes(st.status)
-      ? quickDispatchRow(`st:${p.id}:${st.id}`, target, `给 ${stageName(st.id)} 阶段会话发消息…`, p.status === 'awaiting_human' ? 'sm' : 'primary sm') : null,
+      ? quickDispatchRow(`st:${p.id}:${st.id}`, target, L(`给 ${stageName(st.id)} 阶段会话发消息…`, `Send a message to ${stageName(st.id)} session…`), p.status === 'awaiting_human' ? 'sm' : 'primary sm') : null,
     actionArea);
 }
 
 function hypothesisCompact(hy, i) {
   return h('div', { class: 'hyp-card' },
     h('div', { class: 'row', style: 'justify-content:space-between' },
-      span('tag soft-amber', `假设 #${i + 1} · 未证实`),
+      span('tag soft-amber', L(`假设 #${i + 1} · 未证实`, `Hypothesis #${i + 1} · Unconfirmed`)),
       span('muted tabular', bar(hy.confidence, hy.confidence >= 0.7 ? 'hi' : hy.confidence >= 0.4 ? 'mid' : 'low'), ` ${pct(hy.confidence)}`)),
     renderMarkdown(hy.claim),
-    hy.how_to_confirm ? h('div', { class: 'muted', style: 'font-size:12.5px' }, '验证思路：', renderInlineMd(hy.how_to_confirm)) : null);
+    hy.how_to_confirm ? h('div', { class: 'muted', style: 'font-size:12.5px' }, L('验证思路：', 'How to verify: '), renderInlineMd(hy.how_to_confirm)) : null);
 }
 
 function debugPipelineCard(p) {
@@ -365,38 +372,38 @@ function debugPipelineCard(p) {
   const canDecide = (p.status === 'awaiting_human' && tri?.status === 'awaiting_human') || (tri?.status === 'done' && deep?.status === 'pending' && p.status === 'awaiting_human');
   const phaseA = h('div', { class: 'phase' },
     h('div', { class: 'phase-head' },
-      h('div', { class: 'row' }, span('tag soft-amber', 'Phase A'), h('strong', null, '快筛 Fast Triage'), statusInd(tri?.status || 'pending')),
+      h('div', { class: 'row' }, span('tag soft-amber', 'Phase A'), h('strong', null, L('快筛 Fast Triage', 'Fast Triage')), statusInd(tri?.status || 'pending')),
       tri?.binding?.agent ? agentTag(tri.binding.agent) : null),
     triId
       ? (triArt?.state === 'ok' && triArt.data
         ? h('div', { class: 'stack-sm' },
           ...(triArt.data.hypotheses || []).map(hypothesisCompact),
-          triArt.data.mitigation ? h('div', { class: 'mitig-box' }, h('strong', null, '止血建议：'), triArt.data.mitigation) : null,
-          h('div', { class: 'row' }, btn('抽屉查看完整快筛', { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: triId, title: `快筛报告 · ${p.id}` }) })))
+          triArt.data.mitigation ? h('div', { class: 'mitig-box' }, h('strong', null, L('止血建议：', 'Mitigation: ')), triArt.data.mitigation) : null,
+          h('div', { class: 'row' }, btn(L('抽屉查看完整快筛', 'Open full triage'), { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: triId, title: L(`快筛报告 · ${p.id}`, `Triage Report · ${p.id}`) }) })))
         : skeleton(3))
-      : h('div', { class: 'muted' }, tri?.status === 'running' ? '正在快速收集线索与初步假设…' : '等待启动快筛'),
+      : h('div', { class: 'muted' }, tri?.status === 'running' ? L('正在快速收集线索与初步假设…', 'Gathering clues and initial hypotheses…') : L('等待启动快筛', 'Waiting to start triage')),
     canDecide ? triageActionBar(p) : null);
   const phaseB = h('div', { class: 'phase' },
     h('div', { class: 'phase-head' },
-      h('div', { class: 'row' }, span('tag soft-plum', 'Phase B'), h('strong', null, '深挖 Deep Root-Cause'), statusInd(deep?.status || 'pending')),
+      h('div', { class: 'row' }, span('tag soft-plum', 'Phase B'), h('strong', null, L('深挖 Deep Root-Cause', 'Deep Root-Cause')), statusInd(deep?.status || 'pending')),
       deep?.binding?.agent ? agentTag(deep.binding.agent) : null),
     deepId
       ? (deepArt?.state === 'ok' && deepArt.data
         ? h('div', { class: 'stack-sm' },
           h('div', { style: 'font-weight:600;color:var(--ink)' }, deepArt.data.root_cause?.claim || '—'),
           h('div', { class: 'row' },
-            deepArt.data.repro_before ? statusInd(deepArt.data.repro_before.outcome, `修复前复现：${deepArt.data.repro_before.outcome}`, true) : null,
-            deepArt.data.verification_after ? statusInd(deepArt.data.verification_after.outcome, `修复后验证：${deepArt.data.verification_after.outcome}`, true) : null),
-          deepArt.data.ruled_out?.length ? span('muted tabular', `已排除 ${deepArt.data.ruled_out.length} 条假设`) : null,
-          h('div', { class: 'row' }, btn('抽屉查看完整 RCA', { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: deepId, title: `根因分析 · ${p.id}` }) })))
+            deepArt.data.repro_before ? statusInd(deepArt.data.repro_before.outcome, L(`修复前复现：${deepArt.data.repro_before.outcome}`, `Repro before fix: ${deepArt.data.repro_before.outcome}`), true) : null,
+            deepArt.data.verification_after ? statusInd(deepArt.data.verification_after.outcome, L(`修复后验证：${deepArt.data.verification_after.outcome}`, `Verified after fix: ${deepArt.data.verification_after.outcome}`), true) : null),
+          deepArt.data.ruled_out?.length ? span('muted tabular', L(`已排除 ${deepArt.data.ruled_out.length} 条假设`, `${deepArt.data.ruled_out.length} ruled out`)) : null,
+          h('div', { class: 'row' }, btn(L('抽屉查看完整 RCA', 'Open full RCA'), { cls: 'sm', onclick: () => APP.openDrawer('artifact', { artifactId: deepId, title: L(`根因分析 · ${p.id}`, `Root Cause Analysis · ${p.id}`) }) })))
         : skeleton(3))
-      : h('div', { class: 'muted' }, deep?.status === 'running' ? '正在复现并验证根本原因…' : '等待 Phase A 决策后启动'));
+      : h('div', { class: 'muted' }, deep?.status === 'running' ? L('正在复现并验证根本原因…', 'Reproducing and verifying root cause…') : L('等待 Phase A 决策后启动', 'Waiting for Phase A decision')));
   return h('article', { class: `card${UI.arg === p.id ? ' focus-ring' : ''}`, id: `pl-${p.id}` },
     h('div', { class: 'card-head' },
       h('div', { class: 'grow' },
-        h('div', { class: 'card-title' }, p.goal || '未命名排查'),
-        h('div', { class: 'card-meta' }, h('code', null, p.id), statusInd(p.status), span('tag soft-amber', '两速查错'), span('muted', base(p.project?.root)), span('tabular', `更新于 ${ago(p.updated_ms)}`))),
-      btn('流程元数据', { cls: 'ghost sm', onclick: () => APP.openDrawer('pipeline', { pipelineId: p.id }) })),
+        h('div', { class: 'card-title' }, p.goal || L('未命名排查', 'Untitled Debug')),
+        h('div', { class: 'card-meta' }, h('code', null, p.id), statusInd(p.status), span('tag soft-amber', L('两速查错', 'Two-Speed Debug')), span('muted', base(p.project?.root)), span('tabular', L(`更新于 ${ago(p.updated_ms)}`, `Updated ${ago(p.updated_ms)}`)))),
+      btn(L('流程元数据', 'Metadata'), { cls: 'ghost sm', onclick: () => APP.openDrawer('pipeline', { pipelineId: p.id }) })),
     p.status === 'awaiting_binding_confirm' ? [bindingEditor(p), confirmBindingBar(p)] : null,
     h('div', { class: 'phases' }, phaseA, phaseB));
 }
@@ -410,25 +417,27 @@ export const sevTagCls = (s) => (s === 'blocker' ? 'soft-red' : s === 'major' ? 
 
 export function dropReasons(af) {
   const r = [];
-  if (g2Of(af) === 'fabricated' || af.disposition === 'fabricated') r.push('G2 证据不可验证或伪造');
-  if (g3Of(af) === 'disproved') r.push('G3 被 Falsifier 证伪');
-  if (af.disposition === 'returned_g1') r.push('G1 结构退回');
-  return r.length ? r.join('；') : '已过滤';
+  if (g2Of(af) === 'fabricated' || af.disposition === 'fabricated') r.push(L('G2 证据不可验证或伪造', 'G2 unverified / fabricated evidence'));
+  if (g3Of(af) === 'disproved') r.push(L('G3 被 Falsifier 证伪', 'G3 disproved by Falsifier'));
+  if (af.disposition === 'returned_g1') r.push(L('G1 结构退回', 'G1 returned for missing fields'));
+  return r.length ? r.join(L('；', '; ')) : L('已过滤', 'Filtered');
 }
 
 export function viewReviews() {
   const revs = [...S.reviews.values()].sort((a, b) => (b.report?.header?.created_ms || 0) - (a.report?.header?.created_ms || 0));
   const dropped = revs.flatMap((r) => (r.findings || []).filter(isDropped).map((af) => [r, af]));
   const tabs = [
-    ['reports', `评审报告（${revs.length}）`],
-    ['dropped', `Dropped Findings · 可审计（${dropped.length}）`],
-    ['precision', 'Precision 准确率遥测'],
+    ['reports', L(`评审报告（${revs.length}）`, `Reviews (${revs.length})`)],
+    ['dropped', L(`Dropped Findings · 可审计（${dropped.length}）`, `Dropped Findings (${dropped.length})`)],
+    ['precision', L('Precision 准确率遥测', 'Precision Telemetry')],
   ];
   let body;
   if (S.reviewsState === 'loading' && !revs.length) body = h('div', { class: 'card' }, skeleton(5));
-  else if (S.reviewsState === 'err' && !revs.length) body = errorBanner(`评审列表加载失败：${S.reviewsErr}`, '重试加载', loadReviews);
+  else if (S.reviewsState === 'err' && !revs.length) body = errorBanner(L(`评审列表加载失败：${S.reviewsErr}`, `Failed to load reviews: ${S.reviewsErr}`), L('重试加载', 'Retry'), loadReviews);
   else if (UI.revTab === 'reports') {
-    body = revs.length ? h('div', { class: 'stack' }, revs.map(reviewCard)) : h('div', { class: 'card' }, emptyState('暂无代码评审报告', '当 Reviewer 提交 review.v1 报告后，会经过 G1 / G2 / G3 门禁并显示在这里。'));
+    body = revs.length ? h('div', { class: 'stack' }, revs.map(reviewCard)) : h('div', { class: 'card' }, emptyState(
+      L('暂无代码评审报告', 'No Review Reports Yet'),
+      L('当 Reviewer 提交 review.v1 报告后，会经过 G1 / G2 / G3 门禁并显示在这里。', 'Submitted review.v1 reports pass through G1 / G2 / G3 gates and appear here.')));
   } else if (UI.revTab === 'dropped') {
     body = droppedList(dropped);
   } else {
@@ -436,8 +445,8 @@ export function viewReviews() {
   }
   return h('div', { class: 'stack' },
     h('div', { class: 'page-head' },
-      h('div', null, h('h1', null, '代码评审'), h('p', null, 'review.v1 反误报审计 —— G1 结构校验 · G2 证据核实 · G3 Falsifier 证伪，被过滤条目全量可审计')),
-      btn('刷新评审数据', { cls: 'sm', onclick: () => { loadReviews(); if (UI.revTab === 'precision') loadPrecision(); } })),
+      h('div', null, h('h1', null, L('代码评审', 'Reviews')), h('p', null, L('review.v1 反误报审计 —— G1 结构校验 · G2 证据核实 · G3 Falsifier 证伪，被过滤条目全量可审计', 'review.v1 anti-hallucination audit — G1 structure · G2 evidence verification · G3 Falsifier disproof, with full audit trail for dropped findings'))),
+      btn(L('刷新评审数据', 'Refresh Reviews'), { cls: 'sm', onclick: () => { loadReviews(); if (UI.revTab === 'precision') loadPrecision(); } })),
     h('div', { class: 'subtabs', role: 'tablist' }, tabs.map(([k, l]) => h('button', {
       type: 'button',
       role: 'tab',
@@ -467,17 +476,17 @@ function reviewCard(rev) {
           span('mono muted', `${short(rp.base, 7)} → ${short(rp.head, 7)}`)),
         rp.summary ? h('div', { style: 'margin-top:8px' }, renderMarkdown(rp.summary)) : null),
       h('div', { class: 'row' },
-        statusInd(rev.complete ? 'done' : 'pending_falsifier', rev.complete ? '已完成' : '等待 Falsifier', true),
-        span('tag tabular', `G2 验证 ${cnt((f) => g2Of(f) === 'verified')} / 伪造 ${cnt((f) => g2Of(f) === 'fabricated')}`))),
+        statusInd(rev.complete ? 'done' : 'pending_falsifier', rev.complete ? L('已完成', 'Complete') : L('等待 Falsifier', 'Awaiting Falsifier'), true),
+        span('tag tabular', L(`G2 验证 ${cnt((f) => g2Of(f) === 'verified')} / 伪造 ${cnt((f) => g2Of(f) === 'fabricated')}`, `G2 verified ${cnt((f) => g2Of(f) === 'verified')} / fabricated ${cnt((f) => g2Of(f) === 'fabricated')}`)))),
     h('div', { class: 'stack-sm' },
       major.length ? major.map((af) => findingRow(rev, af))
-        : (fs.length ? h('div', { class: 'muted' }, '无 blocker / major 级发现') : h('div', { class: 'callout ok' }, '未发现问题 —— Reviewer 已记录检查范围（checked_areas）。')),
+        : (fs.length ? h('div', { class: 'muted' }, L('无 blocker / major 级发现', 'No blocker or major findings')) : h('div', { class: 'callout ok' }, L('未发现问题 —— Reviewer 已记录检查范围（checked_areas）。', 'No issues found — Reviewer recorded checked_areas.'))),
       minor.length ? h('details', { 'data-k': `rv:min:${rev.id}`, open: UI.open.has(`rv:min:${rev.id}`) },
-        h('summary', null, `折叠显示 ${minor.length} 条 minor / nit（不推送飞书）`),
+        h('summary', null, L(`折叠显示 ${minor.length} 条 minor / nit（不推送飞书）`, `Show ${minor.length} minor / nit findings (not pushed to Feishu)`)),
         h('div', { class: 'stack-sm', style: 'margin-top:8px' }, minor.map((af) => findingRow(rev, af)))) : null,
       droppedCnt ? h('div', { class: 'row muted', style: 'font-size:12.5px;margin-top:4px' },
-        `另有 ${droppedCnt} 条被门禁过滤的发现`,
-        btn('在 Dropped Findings 中审计 →', { cls: 'ghost xs', onclick: () => { UI.revTab = 'dropped'; APP.schedule(); } })) : null));
+        L(`另有 ${droppedCnt} 条被门禁过滤的发现`, `${droppedCnt} findings filtered by gates`),
+        btn(L('在 Dropped Findings 中审计 →', 'Audit in Dropped Findings →'), { cls: 'ghost xs', onclick: () => { UI.revTab = 'dropped'; APP.schedule(); } })) : null));
 }
 
 export function findingRow(rev, af, { dropped = false } = {}) {
@@ -489,30 +498,30 @@ export function findingRow(rev, af, { dropped = false } = {}) {
   const postFb = (lbl, labelVal) => act(`fb:${rev.id}:${f.id}`, async () => {
     await api('POST', `/api/reviews/${enc(rev.id)}/findings/${enc(f.id)}/feedback`, { label: labelVal });
     await refreshReview(rev.id);
-  }, `已标记为 ${lbl}`);
+  }, L(`已标记为 ${lbl}`, `Marked as ${lbl}`));
   return h('div', { class: `finding-row${dropped ? ' dropped' : ''}` },
     span(`tag ${sevTagCls(sev)}`, sev),
     span('tag', f.category),
     g2 ? statusInd(g2, `G2 ${g2}`) : null,
-    g3 ? statusInd(g3, `G3 ${g3 === 'pending_falsifier' ? '待证伪' : g3}`) : null,
-    h('div', { class: 'finding-claim' }, f.claim, dropped ? h('div', { class: 'muted', style: 'font-size:12px;margin-top:2px' }, `过滤原因：${dropReasons(af)}`) : null),
+    g3 ? statusInd(g3, `G3 ${g3 === 'pending_falsifier' ? L('待证伪', 'pending falsifier') : g3}`) : null,
+    h('div', { class: 'finding-claim' }, f.claim, dropped ? h('div', { class: 'muted', style: 'font-size:12px;margin-top:2px' }, L(`过滤原因：${dropReasons(af)}`, `Drop reason: ${dropReasons(af)}`)) : null),
     h('code', null, `${f.location?.file}:${f.location?.line_start}`),
     span('muted tabular', pct(f.confidence)),
     h('div', { class: 'row' },
-      btn('有效', { cls: `xs${fb === 'valid' ? ' on' : ''}`, onclick: () => postFb('有效', 'valid') }),
-      btn('误报', { cls: `xs${fb === 'false_positive' ? ' on' : ''}`, onclick: () => postFb('误报', 'false_positive') }),
-      btn('暂不修', { cls: `xs ghost${fb === 'wontfix' ? ' on' : ''}`, onclick: () => postFb('暂不修复', 'wontfix') }),
-      btn('抽屉详情', { cls: 'xs', onclick: () => APP.openDrawer('finding', { reviewId: rev.id, findingId: f.id, dropped }) })));
+      btn(L('有效', 'Valid'), { cls: `xs${fb === 'valid' ? ' on' : ''}`, onclick: () => postFb(L('有效', 'Valid'), 'valid') }),
+      btn(L('误报', 'False positive'), { cls: `xs${fb === 'false_positive' ? ' on' : ''}`, onclick: () => postFb(L('误报', 'False positive'), 'false_positive') }),
+      btn(L('暂不修', "Won't fix"), { cls: `xs ghost${fb === 'wontfix' ? ' on' : ''}`, onclick: () => postFb(L('暂不修复', "Won't fix"), 'wontfix') }),
+      btn(L('抽屉详情', 'Inspect'), { cls: 'xs', onclick: () => APP.openDrawer('finding', { reviewId: rev.id, findingId: f.id, dropped }) })));
 }
 
 function droppedList(dropped) {
   return h('div', { class: 'stack' },
-    h('div', { class: 'callout' }, '所有被 G1 / G2 / G3 门禁过滤的发现（含 disproved 与 fabricated）均在此保留可审计，绝不静默丢弃。如认为存在误杀，点开「抽屉详情」即可查看反证并申诉恢复。'),
+    h('div', { class: 'callout' }, L('所有被 G1 / G2 / G3 门禁过滤的发现（含 disproved 与 fabricated）均在此保留可审计，绝不静默丢弃。如认为存在误杀，点开「抽屉详情」即可查看反证并申诉恢复。', 'All findings filtered by G1 / G2 / G3 gates (including disproved and fabricated) are preserved here for full auditability and never silently dropped. Click "Inspect" to review counter-evidence and reinstate.')),
     dropped.length
       ? h('div', { class: 'card stack-sm' }, dropped.map(([r, af]) => h('div', { class: 'stack-xs' },
         h('div', { class: 'row muted', style: 'font-size:12px' }, h('code', null, r.id), span('tag soft-plum mono', r.report?.depth || 'D1'), r.report?.header?.author ? agentTag(r.report.header.author.agent) : null),
         findingRow(r, af, { dropped: true }))))
-      : h('div', { class: 'card' }, emptyState('没有被过滤的发现', '目前所有评审条目均已正常交付或折叠。')));
+      : h('div', { class: 'card' }, emptyState(L('没有被过滤的发现', 'No Dropped Findings'), L('目前所有评审条目均已正常交付或折叠。', 'All review findings so far passed gates or were collapsed as minor/nit.'))));
 }
 
 function precisionTable() {
@@ -525,21 +534,23 @@ function precisionTable() {
       type: 'button',
       class: `chip${UI.precAgent === a ? ' on' : ''}`,
       onclick: () => { UI.precAgent = a; loadPrecision(); },
-    }, a || '全部 Agent'))),
+    }, a || L('全部 Agent', 'All Agents')))),
     span('muted', 'Precision = valid / (valid + false_positive)'));
   if (S.precisionState === 'loading' && !S.precision) return h('div', { class: 'card' }, skeleton(4));
-  if (S.precisionState === 'err') return errorBanner(`准确率遥测加载失败：${S.precisionErr}`, '重试', loadPrecision);
-  if (!rows.length) return h('div', { class: 'stack' }, filterBar, h('div', { class: 'card' }, emptyState('暂无反馈遥测数据', '对评审条目点击「有效 / 误报 / 暂不修」后，将按模型与深度统计 Precision。')));
+  if (S.precisionState === 'err') return errorBanner(L(`准确率遥测加载失败：${S.precisionErr}`, `Failed to load precision telemetry: ${S.precisionErr}`), L('重试', 'Retry'), loadPrecision);
+  if (!rows.length) return h('div', { class: 'stack' }, filterBar, h('div', { class: 'card' }, emptyState(
+    L('暂无反馈遥测数据', 'No Feedback Telemetry Yet'),
+    L('对评审条目点击「有效 / 误报 / 暂不修」后，将按模型与深度统计 Precision。', 'Submit Valid / False positive / Won\'t fix feedback on findings to compute Precision by model and depth.'))));
   return h('div', { class: 'stack' }, filterBar,
     h('div', { class: 'card table-wrap' }, h('table', { class: 'tbl' },
-      h('thead', null, h('tr', null, ['Agent', 'Model', 'Depth', 'Category', '交付', '有效', '误报', '暂不修', '伪造', '证伪', 'Precision'].map((x, i) => h('th', { class: i > 3 ? 'num' : '' }, x)))),
+      h('thead', null, h('tr', null, ['Agent', 'Model', 'Depth', 'Category', L('交付', 'Delivered'), L('有效', 'Valid'), L('误报', 'FP'), L('暂不修', "Won't Fix"), L('伪造', 'Fabricated'), L('证伪', 'Disproved'), 'Precision'].map((x, i) => h('th', { class: i > 3 ? 'num' : '' }, x)))),
       h('tbody', null, rows.map((r) => h('tr', null,
         h('td', null, agentTag(r.agent)), h('td', { class: 'mono' }, r.model || '—'),
         h('td', null, span('tag soft-plum mono', r.depth)), h('td', null, r.category),
         ...['delivered', 'valid', 'false_positive', 'wontfix', 'fabricated', 'disproved'].map((k) => h('td', { class: 'num' }, r[k] ?? 0)),
         h('td', { class: 'num' }, r.precision == null ? span('muted', '—') : h('span', { class: 'row', style: 'justify-content:flex-end' }, bar(r.precision, r.precision < 0.5 ? 'low' : r.precision < 0.8 ? 'mid' : 'hi'), ` ${pct(r.precision)}`))))),
       h('tfoot', null, h('tr', null,
-        h('td', { colspan: 4 }, '合计'),
+        h('td', { colspan: 4 }, L('合计', 'Total')),
         ...['delivered', 'valid', 'false_positive', 'wontfix', 'fabricated', 'disproved'].map((k) => h('td', { class: 'num' }, sum(k))),
         h('td', { class: 'num' }, v + fp ? pct(v / (v + fp)) : '—'))))));
 }

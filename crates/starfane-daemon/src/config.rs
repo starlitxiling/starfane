@@ -10,6 +10,8 @@ use std::path::Path;
 pub const DEFAULT_EASYTIER_CIDR: &str = "10.144.144.0/24";
 /// Unassigned, non-ephemeral default Web console port (distinct from 7878/8080/3000 collisions).
 pub const DEFAULT_WEB_PORT: u16 = 27418;
+/// Default Web console display language configured at deployment (`"zh"` or `"en"`).
+pub const DEFAULT_WEB_LANG: &str = "zh";
 
 /// Optional extra scoped API token (e.g. read-only viewer or peer federation client).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +49,8 @@ pub struct WebConfig {
     pub scoped_tokens: Vec<ScopedTokenConfig>,
     /// Optional terminal monospace font family prepended in the Web console (e.g. `"JetBrainsMono Nerd Font"`).
     pub terminal_font: String,
+    /// Web console UI display language fixed at deployment (`"zh"` | `"en"`, defaults to `"zh"`).
+    pub lang: String,
 }
 impl Default for WebConfig {
     fn default() -> Self {
@@ -62,6 +66,7 @@ impl Default for WebConfig {
             presets: Vec::new(),
             scoped_tokens: Vec::new(),
             terminal_font: String::new(),
+            lang: DEFAULT_WEB_LANG.into(),
         }
     }
 }
@@ -138,8 +143,32 @@ pub fn ipv6_in_cidr(ip: Ipv6Addr, net: Ipv6Addr, prefix: u8) -> bool {
 }
 
 impl WebConfig {
-    /// Validate `web` config fields (`easytier_cidrs`, `allowed_cidrs`, `presets`, `allowed_hosts`).
+    /// Normalize configured deployment language to canonical `"zh"` or `"en"`.
+    pub fn normalized_lang(&self) -> Result<&'static str, String> {
+        let lower = self.lang.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "" | "zh" | "zh-cn" | "zh_cn" => Ok("zh"),
+            "en" | "en-us" | "en_us" => Ok("en"),
+            _ => Err(format!(
+                "invalid web.lang {:?} (supported: zh, en)",
+                self.lang
+            )),
+        }
+    }
+
+    /// Effective canonical language (`"zh"` or `"en"`), falling back to `"zh"` if unset.
+    pub fn effective_lang(&self) -> &'static str {
+        self.normalized_lang().unwrap_or(DEFAULT_WEB_LANG)
+    }
+
+    /// True when the deployed Web UI is configured for English (`web.lang = "en"`).
+    pub fn is_en(&self) -> bool {
+        self.effective_lang() == "en"
+    }
+
+    /// Validate `web` config fields (`lang`, `easytier_cidrs`, `allowed_cidrs`, `presets`, `allowed_hosts`).
     pub fn validate(&self) -> Result<(), String> {
+        self.normalized_lang()?;
         for cidr in &self.easytier_cidrs {
             parse_ipv4_cidr(cidr)
                 .map_err(|e| format!("invalid web.easytier_cidrs entry {cidr:?}: {e}"))?;
@@ -265,8 +294,74 @@ pub enum NotifyOwnership {
 pub enum NotifierKind {
     Feishu,
     Telegram,
+    Discord,
+    Slack,
+    Wecom,
+    Qq,
     Webhook,
     Macos,
+}
+
+impl NotifierKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Feishu => "feishu",
+            Self::Telegram => "telegram",
+            Self::Discord => "discord",
+            Self::Slack => "slack",
+            Self::Wecom => "wecom",
+            Self::Qq => "qq",
+            Self::Webhook => "webhook",
+            Self::Macos => "macos",
+        }
+    }
+}
+
+fn deserialize_opt_string_or_int<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptStringOrInt;
+    impl<'de> serde::de::Visitor<'de> for OptStringOrInt {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a string or integer")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            deserializer.deserialize_any(OptStringOrInt)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+    }
+
+    deserializer.deserialize_option(OptStringOrInt)
 }
 
 /// Opt-in pluggable notification channel configured in `~/.config/starfane/config.toml` (`[[notifiers]]`).
@@ -283,13 +378,40 @@ pub struct NotifierConfig {
     pub chat_id: String,
     pub allow_open_ids: Vec<String>,
     pub allow_chat_ids: Vec<String>,
-    /// Telegram bot token (prefer `bot_token_env` so tokens stay out of config files).
+    /// Bot token for Telegram or Slack Web API (prefer `bot_token_env` so tokens stay out of config files).
     pub bot_token: String,
     pub bot_token_env: String,
-    /// Webhook endpoint URL.
+    /// Optional forum/topic thread ID: positive integer for Telegram `message_thread_id`,
+    /// or snowflake/string ID appended as `?thread_id=...` for Discord webhooks.
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_int")]
+    pub thread_id: Option<String>,
+    /// Optional API base URL override (Telegram defaults to `https://api.telegram.org`,
+    /// Slack Web API defaults to `https://slack.com/api`).
+    pub api_base_url: Option<String>,
+    /// Incoming Webhook URL for Discord, Slack, or generic Webhook (prefer `webhook_url_env`).
+    pub webhook_url: Option<String>,
+    /// Env var name holding the Incoming Webhook URL for Discord, Slack, or generic Webhook.
+    pub webhook_url_env: Option<String>,
+    /// Optional Discord webhook display username (defaults to `"starfane"`).
+    pub username: Option<String>,
+    /// Slack Web API `chat.postMessage` target channel ID or name (e.g. `"C01234567"` or `"#ops"`).
+    pub channel: Option<String>,
+    /// Optional WeCom Group Robot `mentioned_list` (user IDs or `"@all"`).
+    pub mentioned_list: Vec<String>,
+    /// Optional WeCom Group Robot `mentioned_mobile_list` (mobile numbers or `"@all"`).
+    pub mentioned_mobile_list: Vec<String>,
+    /// Optional QQ OneBot v11 target group ID (accepts string or integer in TOML).
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_int")]
+    pub group_id: Option<String>,
+    /// Optional QQ OneBot v11 target private user ID (accepts string or integer in TOML).
+    #[serde(default, deserialize_with = "deserialize_opt_string_or_int")]
+    pub user_id: Option<String>,
+    /// Generic webhook endpoint URL (backward-compatible primary field for `kind = "webhook"`).
     pub url: String,
     /// Env var holding an optional webhook Bearer/secret header value.
     pub secret_env: String,
+    /// Optional extra HTTP headers sent by `kind = "webhook"` requests.
+    pub headers: BTreeMap<String, String>,
     /// Optional macOS notification sound name (e.g. `"Glass"`).
     pub sound: String,
 }
@@ -308,10 +430,413 @@ impl Default for NotifierConfig {
             allow_chat_ids: Vec::new(),
             bot_token: String::new(),
             bot_token_env: String::new(),
+            thread_id: None,
+            api_base_url: None,
+            webhook_url: None,
+            webhook_url_env: None,
+            username: None,
+            channel: None,
+            mentioned_list: Vec::new(),
+            mentioned_mobile_list: Vec::new(),
+            group_id: None,
+            user_id: None,
             url: String::new(),
             secret_env: String::new(),
+            headers: BTreeMap::new(),
             sound: String::new(),
         }
+    }
+}
+
+fn validate_http_url(label: &str, raw: &str) -> Result<(), String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(format!(
+            "{label} cannot contain whitespace or control characters"
+        ));
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| format!("{label} must start with http:// or https://"))?;
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() || authority.starts_with(':') {
+        return Err(format!("{label} must include a valid host"));
+    }
+    Ok(())
+}
+
+fn validate_env_var_name(label: &str, raw: &str) -> Result<(), String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !first_ok || !rest_ok {
+        return Err(format!(
+            "{label} {name:?} must be a valid environment variable name ([A-Za-z_][A-Za-z0-9_]*)"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_no_control_chars(label: &str, raw: &str) -> Result<(), String> {
+    if raw.chars().any(char::is_control) {
+        return Err(format!("{label} cannot contain control characters"));
+    }
+    Ok(())
+}
+
+impl NotifierConfig {
+    /// Parse `thread_id` as a positive Telegram `message_thread_id`.
+    pub fn telegram_thread_id(&self) -> Result<Option<i64>, String> {
+        let Some(raw) = self.thread_id.as_deref() else {
+            return Ok(None);
+        };
+        let t = raw.trim();
+        if t.is_empty() {
+            return Err(format!(
+                "telegram notifier {:?} thread_id cannot be empty",
+                self.id.trim()
+            ));
+        }
+        let parsed = t.parse::<i64>().map_err(|_| {
+            format!(
+                "telegram notifier {:?} thread_id {t:?} must be a positive integer",
+                self.id.trim()
+            )
+        })?;
+        if parsed <= 0 {
+            return Err(format!(
+                "telegram notifier {:?} thread_id {parsed} must be > 0",
+                self.id.trim()
+            ));
+        }
+        Ok(Some(parsed))
+    }
+
+    /// Parse a positive QQ OneBot v11 `group_id` or `user_id` integer.
+    pub fn parse_positive_u64_field(
+        &self,
+        field: &str,
+        value: Option<&str>,
+    ) -> Result<Option<u64>, String> {
+        let Some(raw) = value else {
+            return Ok(None);
+        };
+        let t = raw.trim();
+        if t.is_empty() {
+            return Err(format!(
+                "qq notifier {:?} {field} cannot be empty",
+                self.id.trim()
+            ));
+        }
+        let parsed = t.parse::<u64>().map_err(|_| {
+            format!(
+                "qq notifier {:?} {field} {t:?} must be a positive integer",
+                self.id.trim()
+            )
+        })?;
+        if parsed == 0 {
+            return Err(format!(
+                "qq notifier {:?} {field} must be > 0",
+                self.id.trim()
+            ));
+        }
+        Ok(Some(parsed))
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let id = self.id.trim();
+        if id.is_empty() || id.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(format!(
+                "invalid notifiers[].id {id:?} (must be non-empty without whitespace or control characters)"
+            ));
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+
+        let has_inline_token = !self.bot_token.trim().is_empty();
+        let has_env_token = !self.bot_token_env.trim().is_empty();
+        if has_inline_token
+            && self
+                .bot_token
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(format!(
+                "notifier {id:?} bot_token cannot contain whitespace or control characters"
+            ));
+        }
+        if has_env_token {
+            validate_env_var_name(
+                &format!("notifier {id:?} bot_token_env"),
+                &self.bot_token_env,
+            )?;
+        }
+
+        if let Some(ref raw_base) = self.api_base_url {
+            validate_http_url(&format!("notifier {id:?} api_base_url"), raw_base)?;
+        }
+        if let Some(ref raw_hook) = self.webhook_url {
+            validate_http_url(&format!("notifier {id:?} webhook_url"), raw_hook)?;
+        }
+        if let Some(ref raw_hook_env) = self.webhook_url_env {
+            validate_env_var_name(&format!("notifier {id:?} webhook_url_env"), raw_hook_env)?;
+        }
+
+        match self.kind {
+            NotifierKind::Feishu => {
+                validate_no_control_chars(
+                    &format!("feishu notifier {id:?} lark_cli"),
+                    &self.lark_cli,
+                )?;
+                validate_no_control_chars(
+                    &format!("feishu notifier {id:?} profile"),
+                    &self.profile,
+                )?;
+                validate_no_control_chars(
+                    &format!("feishu notifier {id:?} chat_id"),
+                    &self.chat_id,
+                )?;
+                if (id != "feishu-default" || !self.profile.trim().is_empty())
+                    && self.chat_id.trim().is_empty()
+                {
+                    return Err(format!("feishu notifier {id:?} requires non-empty chat_id"));
+                }
+            }
+            NotifierKind::Telegram => {
+                if !has_inline_token && !has_env_token {
+                    return Err(format!(
+                        "telegram notifier {id:?} requires bot_token or bot_token_env"
+                    ));
+                }
+                if self.chat_id.trim().is_empty() {
+                    return Err(format!(
+                        "telegram notifier {id:?} requires non-empty chat_id"
+                    ));
+                }
+                validate_no_control_chars(
+                    &format!("telegram notifier {id:?} chat_id"),
+                    &self.chat_id,
+                )?;
+                self.telegram_thread_id()?;
+            }
+            NotifierKind::Discord => {
+                let has_hook = self
+                    .webhook_url
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_hook_env = self
+                    .webhook_url_env
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                if !has_hook && !has_hook_env {
+                    return Err(format!(
+                        "discord notifier {id:?} requires webhook_url or webhook_url_env"
+                    ));
+                }
+                if let Some(ref user) = self.username {
+                    let u = user.trim();
+                    if u.is_empty() {
+                        return Err(format!("discord notifier {id:?} username cannot be empty"));
+                    }
+                    validate_no_control_chars(&format!("discord notifier {id:?} username"), u)?;
+                    if u.chars().count() > 80 {
+                        return Err(format!(
+                            "discord notifier {id:?} username must be <= 80 characters"
+                        ));
+                    }
+                }
+                if let Some(ref tid) = self.thread_id {
+                    let t = tid.trim();
+                    if t.is_empty()
+                        || !t
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    {
+                        return Err(format!(
+                            "discord notifier {id:?} thread_id {tid:?} must be non-empty ASCII [A-Za-z0-9_-]"
+                        ));
+                    }
+                }
+            }
+            NotifierKind::Slack => {
+                let has_hook = self
+                    .webhook_url
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_hook_env = self
+                    .webhook_url_env
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_webhook_mode = has_hook || has_hook_env;
+                let has_bot_mode = has_inline_token || has_env_token;
+                if let Some(ref ch) = self.channel {
+                    let c = ch.trim();
+                    if c.is_empty() {
+                        return Err(format!("slack notifier {id:?} channel cannot be empty"));
+                    }
+                    validate_no_control_chars(&format!("slack notifier {id:?} channel"), c)?;
+                }
+                let has_channel = self
+                    .channel
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+
+                if has_webhook_mode && has_bot_mode {
+                    return Err(format!(
+                        "slack notifier {id:?} cannot configure both webhook_url/webhook_url_env and bot_token/bot_token_env; choose either Incoming Webhook mode or Bot Web API mode"
+                    ));
+                }
+                if has_webhook_mode {
+                    if self.api_base_url.is_some() {
+                        return Err(format!(
+                            "slack notifier {id:?} api_base_url is only valid in Bot Web API mode"
+                        ));
+                    }
+                } else if has_bot_mode {
+                    if !has_channel {
+                        return Err(format!(
+                            "slack notifier {id:?} in Bot Web API mode requires non-empty channel"
+                        ));
+                    }
+                } else if has_channel || self.api_base_url.is_some() {
+                    return Err(format!(
+                        "slack notifier {id:?} requires bot_token or bot_token_env when channel or api_base_url is set"
+                    ));
+                } else {
+                    return Err(format!(
+                        "slack notifier {id:?} requires either webhook_url/webhook_url_env (Incoming Webhook mode) or bot_token/bot_token_env + channel (Bot Web API mode)"
+                    ));
+                }
+            }
+            NotifierKind::Wecom => {
+                let has_hook = self
+                    .webhook_url
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_hook_env = self
+                    .webhook_url_env
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                if !has_hook && !has_hook_env {
+                    return Err(format!(
+                        "wecom notifier {id:?} requires webhook_url or webhook_url_env"
+                    ));
+                }
+                for (field, list) in [
+                    ("mentioned_list", &self.mentioned_list),
+                    ("mentioned_mobile_list", &self.mentioned_mobile_list),
+                ] {
+                    for entry in list {
+                        if entry.trim().is_empty() {
+                            return Err(format!(
+                                "wecom notifier {id:?} {field} cannot contain empty entries"
+                            ));
+                        }
+                        validate_no_control_chars(
+                            &format!("wecom notifier {id:?} {field}"),
+                            entry,
+                        )?;
+                    }
+                }
+            }
+            NotifierKind::Qq => {
+                let has_hook = self
+                    .webhook_url
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_hook_env = self
+                    .webhook_url_env
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_webhook_mode = has_hook || has_hook_env;
+                let has_api_base = self
+                    .api_base_url
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let group_id =
+                    self.parse_positive_u64_field("group_id", self.group_id.as_deref())?;
+                let user_id = self.parse_positive_u64_field("user_id", self.user_id.as_deref())?;
+                let has_target = group_id.is_some() || user_id.is_some();
+
+                if !self.secret_env.trim().is_empty() {
+                    validate_env_var_name(
+                        &format!("qq notifier {id:?} secret_env"),
+                        &self.secret_env,
+                    )?;
+                }
+                if has_webhook_mode && has_api_base {
+                    return Err(format!(
+                        "qq notifier {id:?} cannot configure both webhook_url/webhook_url_env and api_base_url; choose either OneBot v11 HTTP API mode or Webhook gateway mode"
+                    ));
+                }
+                if has_api_base {
+                    if !has_target {
+                        return Err(format!(
+                            "qq notifier {id:?} in OneBot v11 mode requires group_id and/or user_id"
+                        ));
+                    }
+                } else if !has_webhook_mode {
+                    return Err(format!(
+                        "qq notifier {id:?} requires either api_base_url + group_id/user_id (OneBot v11 mode) or webhook_url/webhook_url_env (Webhook gateway mode)"
+                    ));
+                }
+            }
+            NotifierKind::Webhook => {
+                let has_url = !self.url.trim().is_empty();
+                let has_hook = self
+                    .webhook_url
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                let has_hook_env = self
+                    .webhook_url_env
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+                if has_url {
+                    validate_http_url(&format!("webhook notifier {id:?} url"), &self.url)?;
+                } else if !has_hook && !has_hook_env {
+                    return Err(format!(
+                        "webhook notifier {id:?} requires url (or webhook_url / webhook_url_env)"
+                    ));
+                }
+                if !self.secret_env.trim().is_empty() {
+                    validate_env_var_name(
+                        &format!("webhook notifier {id:?} secret_env"),
+                        &self.secret_env,
+                    )?;
+                }
+                for (k, v) in &self.headers {
+                    let hk = k.trim();
+                    if hk.is_empty()
+                        || hk
+                            .chars()
+                            .any(|c| c == ':' || c.is_whitespace() || c.is_control())
+                    {
+                        return Err(format!(
+                            "webhook notifier {id:?} has invalid header name {k:?}"
+                        ));
+                    }
+                    validate_no_control_chars(
+                        &format!("webhook notifier {id:?} header {hk:?}"),
+                        v,
+                    )?;
+                }
+            }
+            NotifierKind::Macos => {
+                validate_no_control_chars(&format!("macos notifier {id:?} sound"), &self.sound)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -536,10 +1061,8 @@ impl StarfaneConfig {
         self.tmux.backup.validate()?;
         let mut seen_notifiers = std::collections::HashSet::new();
         for n in &self.notifiers {
+            n.validate()?;
             let id = n.id.trim();
-            if id.is_empty() {
-                return Err("notifiers[].id cannot be empty".into());
-            }
             if !seen_notifiers.insert(id.to_string()) {
                 return Err(format!("duplicate notifiers[].id {id:?}"));
             }
@@ -724,14 +1247,25 @@ fn reject_secret_keys_in_team_notify(val: &toml::Value) -> Result<(), String> {
     const FORBIDDEN_KEYS: &[&str] = &[
         "token",
         "bot_token",
+        "bot_token_env",
         "secret",
         "secret_env",
         "app_secret",
         "webhook",
+        "webhook_url",
+        "webhook_url_env",
+        "api_base_url",
         "url",
         "password",
         "api_key",
         "chat_id",
+        "channel",
+        "group_id",
+        "user_id",
+        "mentioned_list",
+        "mentioned_mobile_list",
+        "thread_id",
+        "headers",
         "profile",
     ];
     match val {
@@ -832,10 +1366,23 @@ mod tests {
         let def = WebConfig::default();
         assert_eq!(def.bind, "127.0.0.1");
         assert_eq!(def.port, DEFAULT_WEB_PORT);
+        assert_eq!(def.lang, DEFAULT_WEB_LANG);
+        assert_eq!(def.effective_lang(), "zh");
+        assert!(!def.is_en());
         assert!(def.auth_enabled);
         assert!(def.allow_easytier);
         assert_eq!(def.easytier_cidrs, vec![DEFAULT_EASYTIER_CIDR]);
         assert!(!def.allow_tailscale);
+
+        let en_cfg: StarfaneConfig = toml::from_str("[web]\nlang = \"en-US\"\n").unwrap();
+        en_cfg.validate().unwrap();
+        assert_eq!(en_cfg.web.effective_lang(), "en");
+        assert!(en_cfg.web.is_en());
+        let zh_cfg: StarfaneConfig = toml::from_str("[web]\nlang = \"zh-CN\"\n").unwrap();
+        zh_cfg.validate().unwrap();
+        assert_eq!(zh_cfg.web.effective_lang(), "zh");
+        let bad_lang: StarfaneConfig = toml::from_str("[web]\nlang = \"fr\"\n").unwrap();
+        assert!(bad_lang.validate().is_err());
 
         let c: StarfaneConfig =
             toml::from_str("[web]\nport = 9000\n[feishu]\nenabled = true\n").unwrap();
@@ -1012,7 +1559,28 @@ claude_args = ["--dangerously-skip-permissions"]
                 .unwrap_or_else(|e| panic!("{name} full validate: {e}"));
             assert_eq!(cfg_full.web.scoped_tokens.len(), 1, "{name} scoped_tokens");
             assert!(cfg_full.web.scoped_tokens[0].read_only);
-            assert_eq!(cfg_full.notifiers.len(), 2, "{name} notifiers");
+            assert_eq!(cfg_full.notifiers.len(), 9, "{name} notifiers");
+            let kinds: Vec<NotifierKind> = cfg_full.notifiers.iter().map(|n| n.kind).collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    NotifierKind::Feishu,
+                    NotifierKind::Telegram,
+                    NotifierKind::Discord,
+                    NotifierKind::Slack,
+                    NotifierKind::Slack,
+                    NotifierKind::Wecom,
+                    NotifierKind::Qq,
+                    NotifierKind::Webhook,
+                    NotifierKind::Macos,
+                ],
+                "{name} notifier kinds"
+            );
+            assert_eq!(
+                cfg_full.notifiers[1].telegram_thread_id().unwrap(),
+                Some(42),
+                "{name} telegram thread_id"
+            );
             assert_eq!(cfg_full.notify_routes.len(), 1, "{name} notify_routes");
             assert_eq!(cfg_full.nodes.len(), 2, "{name} nodes");
             assert_eq!(cfg_full.nodes[0].kind, NodeKindConfig::Ssh);
@@ -1024,5 +1592,262 @@ claude_args = ["--dangerously-skip-permissions"]
         let team = TeamConfig::parse("[notify]\nnotifiers = [\"feishu-work\"]\n").unwrap();
         assert_eq!(team.notify_routes.len(), 1);
         assert_eq!(team.notify_routes[0].notifiers, vec!["feishu-work"]);
+    }
+
+    #[test]
+    fn notifier_config_parsing_and_validation() {
+        // Valid Telegram (integer thread_id + custom api_base_url), Discord, Slack webhook, Slack bot, Webhook, macOS.
+        let ok: StarfaneConfig = toml::from_str(
+            r#"
+[[notifiers]]
+id = "tg-main"
+kind = "telegram"
+bot_token_env = "TG_TOKEN"
+chat_id = "-100123456"
+thread_id = 99
+api_base_url = "https://tg-proxy.example.com"
+
+[[notifiers]]
+id = "discord-ops"
+kind = "discord"
+webhook_url_env = "DISCORD_HOOK"
+username = "starfane-bot"
+thread_id = "1234567890123456789"
+
+[[notifiers]]
+id = "slack-hook"
+kind = "slack"
+webhook_url_env = "SLACK_HOOK"
+
+[[notifiers]]
+id = "slack-bot"
+kind = "slack"
+bot_token_env = "SLACK_BOT_TOKEN"
+channel = "C01234567"
+api_base_url = "https://slack-proxy.example.com/api"
+
+[[notifiers]]
+id = "wecom-ops"
+kind = "wecom"
+webhook_url_env = "WECOM_HOOK"
+mentioned_list = ["alice", "@all"]
+mentioned_mobile_list = ["13800001111"]
+
+[[notifiers]]
+id = "qq-onebot"
+kind = "qq"
+api_base_url = "http://127.0.0.1:3000"
+group_id = 123456789
+user_id = "987654321"
+bot_token_env = "QQ_ONEBOT_TOKEN"
+
+[[notifiers]]
+id = "qq-hook"
+kind = "qq"
+webhook_url_env = "QQ_WEBHOOK"
+
+[[notifiers]]
+id = "hook-custom"
+kind = "webhook"
+url = "https://hooks.example.com/events"
+secret_env = "HOOK_SECRET"
+[notifiers.headers]
+X-Starfane-Env = "prod"
+
+[[notifiers]]
+id = "mac-local"
+kind = "macos"
+sound = "Glass"
+
+[[notifiers]]
+id = "disabled-incomplete"
+kind = "discord"
+enabled = false
+"#,
+        )
+        .unwrap();
+        ok.validate().unwrap();
+        assert_eq!(ok.notifiers[0].telegram_thread_id().unwrap(), Some(99));
+        assert_eq!(
+            ok.notifiers[1].thread_id.as_deref(),
+            Some("1234567890123456789")
+        );
+        assert_eq!(ok.notifiers[4].kind, NotifierKind::Wecom);
+        assert_eq!(ok.notifiers[4].mentioned_list, vec!["alice", "@all"]);
+        assert_eq!(ok.notifiers[5].kind, NotifierKind::Qq);
+        assert_eq!(ok.notifiers[5].group_id.as_deref(), Some("123456789"));
+        assert_eq!(ok.notifiers[5].user_id.as_deref(), Some("987654321"));
+        assert_eq!(ok.notifiers[6].kind, NotifierKind::Qq);
+        assert_eq!(ok.notifiers[7].headers["X-Starfane-Env"], "prod");
+
+        // String thread_id also works for Telegram.
+        let tg_str: StarfaneConfig = toml::from_str(
+            r#"
+[[notifiers]]
+id = "tg-str"
+kind = "telegram"
+bot_token = "123:abc"
+chat_id = "42"
+thread_id = "77"
+"#,
+        )
+        .unwrap();
+        tg_str.validate().unwrap();
+        assert_eq!(tg_str.notifiers[0].telegram_thread_id().unwrap(), Some(77));
+
+        // Invalid cases must fail loudly (never silently accepted).
+        let bad_cases = [
+            // Telegram missing token
+            r#"[[notifiers]]
+id = "tg-bad"
+kind = "telegram"
+chat_id = "123"
+"#,
+            // Telegram missing chat_id
+            r#"[[notifiers]]
+id = "tg-bad"
+kind = "telegram"
+bot_token_env = "TG_TOKEN"
+"#,
+            // Telegram non-positive thread_id
+            r#"[[notifiers]]
+id = "tg-bad"
+kind = "telegram"
+bot_token_env = "TG_TOKEN"
+chat_id = "123"
+thread_id = 0
+"#,
+            // Telegram non-numeric thread_id
+            r#"[[notifiers]]
+id = "tg-bad"
+kind = "telegram"
+bot_token_env = "TG_TOKEN"
+chat_id = "123"
+thread_id = "not-a-number"
+"#,
+            // Telegram invalid api_base_url scheme
+            r#"[[notifiers]]
+id = "tg-bad"
+kind = "telegram"
+bot_token_env = "TG_TOKEN"
+chat_id = "123"
+api_base_url = "ftp://example.com"
+"#,
+            // Discord missing webhook_url / webhook_url_env
+            r#"[[notifiers]]
+id = "dc-bad"
+kind = "discord"
+"#,
+            // Discord invalid thread_id query injection
+            r#"[[notifiers]]
+id = "dc-bad"
+kind = "discord"
+webhook_url = "https://discord.com/api/webhooks/1/tok"
+thread_id = "123&wait=true"
+"#,
+            // Discord username > 80 chars
+            r#"[[notifiers]]
+id = "dc-bad"
+kind = "discord"
+webhook_url = "https://discord.com/api/webhooks/1/tok"
+username = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+            // Slack missing both modes
+            r#"[[notifiers]]
+id = "sl-bad"
+kind = "slack"
+"#,
+            // Slack configuring BOTH webhook and bot token
+            r#"[[notifiers]]
+id = "sl-bad"
+kind = "slack"
+webhook_url_env = "SLACK_HOOK"
+bot_token_env = "SLACK_BOT"
+channel = "C123"
+"#,
+            // Slack bot mode missing channel
+            r#"[[notifiers]]
+id = "sl-bad"
+kind = "slack"
+bot_token_env = "SLACK_BOT"
+"#,
+            // Slack webhook mode with api_base_url
+            r#"[[notifiers]]
+id = "sl-bad"
+kind = "slack"
+webhook_url = "https://hooks.slack.com/services/T/B/X"
+api_base_url = "https://slack.com/api"
+"#,
+            // WeCom missing webhook_url / webhook_url_env
+            r#"[[notifiers]]
+id = "wc-bad"
+kind = "wecom"
+"#,
+            // WeCom empty mentioned_list entry
+            r#"[[notifiers]]
+id = "wc-bad"
+kind = "wecom"
+webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
+mentioned_list = ["   "]
+"#,
+            // QQ missing both OneBot api_base_url and webhook_url
+            r#"[[notifiers]]
+id = "qq-bad"
+kind = "qq"
+"#,
+            // QQ OneBot mode missing group_id / user_id
+            r#"[[notifiers]]
+id = "qq-bad"
+kind = "qq"
+api_base_url = "http://127.0.0.1:3000"
+"#,
+            // QQ OneBot mode invalid non-numeric group_id
+            r#"[[notifiers]]
+id = "qq-bad"
+kind = "qq"
+api_base_url = "http://127.0.0.1:3000"
+group_id = "not-numeric"
+"#,
+            // QQ ambiguous both webhook and OneBot api_base_url
+            r#"[[notifiers]]
+id = "qq-bad"
+kind = "qq"
+api_base_url = "http://127.0.0.1:3000"
+group_id = "12345"
+webhook_url = "https://qq-gateway.example.com/hook"
+"#,
+            // Webhook invalid header name
+            r#"[[notifiers]]
+id = "wh-bad"
+kind = "webhook"
+url = "https://hooks.example.com/ev"
+[notifiers.headers]
+"Bad:Header" = "v"
+"#,
+        ];
+        for (idx, src) in bad_cases.iter().enumerate() {
+            let cfg: StarfaneConfig =
+                toml::from_str(src).unwrap_or_else(|e| panic!("case {idx} should parse TOML: {e}"));
+            assert!(
+                cfg.validate().is_err(),
+                "case {idx} should fail validate():\n{src}"
+            );
+        }
+
+        // team.toml must reject all new secret/endpoint keys.
+        for key in [
+            "webhook_url",
+            "webhook_url_env",
+            "bot_token_env",
+            "api_base_url",
+            "channel",
+            "group_id",
+            "user_id",
+            "thread_id",
+        ] {
+            let src = format!("[notify]\nnotifiers = [\"ops\"]\n{key} = \"bad\"\n");
+            let err = TeamConfig::parse(&src).unwrap_err();
+            assert!(err.contains(key), "expected {key} in error: {err}");
+        }
     }
 }
