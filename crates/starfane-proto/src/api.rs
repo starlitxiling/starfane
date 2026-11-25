@@ -1,6 +1,6 @@
 //! `DaemonCommand` — shared by UDS, REST, Feishu and CLI (contracts §1.8).
 
-use crate::agent::AgentKind;
+use crate::agent::{AgentKind, Effort};
 use crate::artifact::handoff::{AccessMode, HandoffIntent, HandoffStatus, HandoffTarget};
 use crate::artifact::plan::PlanDoc;
 use crate::artifact::rca::RcaReport;
@@ -58,6 +58,11 @@ pub enum DaemonCommand {
         bind_token: Option<BindToken>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_hint: Option<SessionId>,
+        /// Ancestor PID chain of the calling process (self -> ppid -> ...), used as a
+        /// deterministic fallback when an agent CLI (e.g. Codex) strips `TMUX_PANE` from
+        /// MCP subprocesses.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pid_chain: Vec<u32>,
     },
     /// -> `Vec<InboxItem>`
     ReadInbox {
@@ -176,6 +181,24 @@ pub enum DaemonCommand {
         #[serde(default)]
         interactive: bool,
     },
+    /// -> `{"session_id": SessionId, "pane_id": PaneId, "tmux_target": String, "tmux_label": Option<String>, "agent": AgentKind, "model": Option<String>, "effort": Option<String>, "cwd": String}`
+    SpawnSession {
+        agent: AgentKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_session: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_session: Option<SessionId>,
+    },
     /// -> `{"message_id": String}`
     FeishuTest { text: String },
     /// -> `BackupSaveOutcome`
@@ -227,6 +250,7 @@ impl DaemonCommand {
             DaemonCommand::HumanVerdict { .. } => "human_verdict",
             DaemonCommand::GetPrecision { .. } => "get_precision",
             DaemonCommand::Dispatch { .. } => "dispatch",
+            DaemonCommand::SpawnSession { .. } => "spawn_session",
             DaemonCommand::FeishuTest { .. } => "feishu_test",
             DaemonCommand::TmuxBackup { .. } => "tmux_backup",
             DaemonCommand::TmuxRestore { .. } => "tmux_restore",

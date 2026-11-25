@@ -26,23 +26,27 @@ pub fn is_fixed_effort_agy_model(model: &str) -> bool {
 
 /// Resolve an AGY `(model, effort)` pair into the CLI `--model` identifier accepted by `agy`.
 /// - Fixed-effort models (e.g. `gemini-pro-orchestrator-neon`) are returned verbatim.
-/// - Models that already end with an effort suffix (`-low`/`-medium`/`-high`/`-xhigh`/`-max`) are returned verbatim.
-/// - Base models (e.g. `gemini-4-neon`) with `effort = Some(High)` become `gemini-4-neon-high`.
+/// - When `effort` is explicitly provided, any existing effort suffix (`-low`/`-medium`/`-high`/`-xhigh`/`-max`)
+///   is replaced so explicit caller overrides (e.g. `gemini-4-neon-high` + `Xhigh` -> `gemini-4-neon-xhigh`)
+///   are honored deterministically.
+/// - When `effort` is `None`, models that already carry a suffix (or bare models) are returned verbatim.
 pub fn resolve_agy_model_id(model: &str, effort: Option<Effort>) -> String {
     let m = model.trim();
     if is_fixed_effort_agy_model(m) {
         return m.to_string();
     }
+    let Some(e) = effort else {
+        return m.to_string();
+    };
     let lower = m.to_ascii_lowercase();
+    let mut base = m;
     for suffix in ["-low", "-medium", "-high", "-xhigh", "-max"] {
-        if lower.ends_with(suffix) {
-            return m.to_string();
+        if lower.ends_with(suffix) && m.len() > suffix.len() {
+            base = &m[..m.len() - suffix.len()];
+            break;
         }
     }
-    match effort {
-        Some(e) => format!("{m}-{}", e.as_str()),
-        None => m.to_string(),
-    }
+    format!("{base}-{}", e.as_str())
 }
 
 /// Default CLI flag granting full tool/command permissions in newly spawned interactive sessions.
@@ -345,6 +349,14 @@ mod tests {
         assert_eq!(
             orch_argv,
             vec!["agy", "--model", "gemini-pro-orchestrator-neon", "-i", "hi"]
+        );
+        assert_eq!(
+            resolve_agy_model_id("gemini-4-neon-high", Some(Effort::Xhigh)),
+            "gemini-4-neon-xhigh"
+        );
+        assert_eq!(
+            resolve_agy_model_id("gemini-4-neon-xhigh", None),
+            "gemini-4-neon-xhigh"
         );
     }
 

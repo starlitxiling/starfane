@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use starfane_proto::{AgentKind, SessionMetrics, SessionRecord};
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -23,6 +24,16 @@ const MIN_TPS_DURATION_MS: u64 = 100;
 const MAX_TPS_DURATION_MS: u64 = 300_000;
 /// Sanity upper bound on computed TPS to guard against clock skew / batched timestamps.
 const MAX_PLAUSIBLE_TPS: f64 = 5_000.0;
+/// Clock-granularity tolerance (5s) when comparing conversation/file timestamps against OS process
+/// start time (`ps -o etime=` has 1-second integer resolution).
+pub(crate) const PROCESS_BIRTH_SLACK_MS: u64 = 5_000;
+/// Maximum allowed skew (2m) between `~/.claude/sessions/<pid>.json`'s `startedAt` and OS process
+/// birth time before treating `<pid>.json` as a stale leftover from a recycled OS PID.
+const CLAUDE_PID_START_MAX_SKEW_MS: u64 = 120_000;
+/// Maximum bytes inspected per header line when extracting a transcript's creation timestamp.
+const MAX_BIRTH_HEADER_LINE_BYTES: usize = 64 * 1024;
+/// Maximum non-empty leading lines inspected to locate the earliest JSONL timestamp.
+const MAX_BIRTH_HEADER_LINES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DbSig {
@@ -390,16 +401,16 @@ pub(crate) struct CcSwitchCache {
 }
 
 impl CcSwitchCache {
-    /// Refresh from `~/.cc-switch/cc-switch.db` only when DB or WAL `(mtime, len)` changed.
+    /// Refresh from `<home>/.cc-switch/cc-switch.db` only when DB or WAL `(mtime, len)` changed.
     /// Uses incremental `WHERE rowid > last_max_rowid` queries after initial seed to avoid
     /// full-table `ROW_NUMBER()` + `GROUP BY` scans on every WAL flush.
-    pub(crate) fn refresh_if_needed(&mut self, now_ms: u64) {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    pub(crate) fn refresh_if_needed_in(&mut self, home: Option<&Path>, now_ms: u64) {
+        let Some(home) = home else {
             return;
         };
         let db_path = home.join(".cc-switch/cc-switch.db");
         if self.codex_default_window.is_none() {
-            self.codex_default_window = read_codex_default_context_window(&home);
+            self.codex_default_window = read_codex_default_context_window(home);
         }
         self.refresh_from_path(&db_path, now_ms);
     }
@@ -780,27 +791,295 @@ pub(crate) fn infer_context_window(
 }
 
 // ---------------------------------------------------------------------------
+// Process birth-time (`ps -o etime=`) & transcript birth-time guards
+// ---------------------------------------------------------------------------
+
+/// Parse POSIX `ps -o etime=` elapsed wall-clock string (`[[dd-]hh:]mm:ss` or `ss`) into seconds.
+/// Locale-independent and timezone-independent on both macOS (BSD `ps`) and Linux (`procps`).
+pub(crate) fn parse_ps_etime_secs(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (days, hms) = match trimmed.split_once('-') {
+        Some((d, rest)) => (d.trim().parse::<u64>().ok()?, rest.trim()),
+        None => (0u64, trimmed),
+    };
+    let parts: Vec<&str> = hms.split(':').collect();
+    let hms_secs = match parts.as_slice() {
+        [ss] => ss.parse::<u64>().ok()?,
+        [mm, ss] => {
+            let m = mm.parse::<u64>().ok()?;
+            let s = ss.parse::<u64>().ok()?;
+            if s >= 60 {
+                return None;
+            }
+            m.checked_mul(60)?.checked_add(s)?
+        }
+        [hh, mm, ss] => {
+            let h = hh.parse::<u64>().ok()?;
+            let m = mm.parse::<u64>().ok()?;
+            let s = ss.parse::<u64>().ok()?;
+            if m >= 60 || s >= 60 {
+                return None;
+            }
+            h.checked_mul(3600)?
+                .checked_add(m.checked_mul(60)?)?
+                .checked_add(s)?
+        }
+        _ => return None,
+    };
+    days.checked_mul(86_400)?.checked_add(hms_secs)
+}
+
+/// Pure parser for `LC_ALL=C ps -o pid=,etime= -p ...` stdout, mapping `pid -> birth_ms`.
+pub(crate) fn parse_ps_pid_etimes(output: &str, now_ms: u64) -> HashMap<u32, u64> {
+    let mut out = HashMap::new();
+    for line in output.lines() {
+        let mut cols = line.split_whitespace();
+        let Some(pid) = cols.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(etime_raw) = cols.next() else {
+            continue;
+        };
+        if let Some(elapsed_secs) = parse_ps_etime_secs(etime_raw) {
+            out.insert(
+                pid,
+                now_ms.saturating_sub(elapsed_secs.saturating_mul(1000)),
+            );
+        }
+    }
+    out
+}
+
+/// Query OS process start timestamps (epoch ms) for `pids` via a single `LC_ALL=C ps -o pid=,etime=`.
+pub(crate) fn query_pids_birth_ms(pids: &[u32], now_ms: u64) -> HashMap<u32, u64> {
+    let mut uniq: Vec<u32> = pids.iter().copied().filter(|&p| p > 0).collect();
+    if uniq.is_empty() {
+        return HashMap::new();
+    }
+    uniq.sort_unstable();
+    uniq.dedup();
+    let pid_arg = uniq
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let Ok(out) = Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-o", "pid=,etime=", "-p", &pid_arg])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if out.stdout.is_empty() {
+        return HashMap::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_ps_pid_etimes(&stdout, now_ms)
+}
+
+/// Normalize a SQLite/JSON integer timestamp (Unix seconds or milliseconds) into epoch ms.
+pub(crate) fn epoch_i64_to_ms(raw: i64) -> Option<u64> {
+    if raw <= 0 {
+        return None;
+    }
+    let val = raw as u64;
+    if val < 10_000_000_000 {
+        Some(val.saturating_mul(1000))
+    } else {
+        Some(val)
+    }
+}
+
+pub(crate) fn file_mtime_ms(path: &Path) -> Option<u64> {
+    let (mtime_ns, _) = file_signature(path)?;
+    (mtime_ns > 0).then_some((mtime_ns / 1_000_000) as u64)
+}
+
+/// True when `ts_ms` occurred at or after `min_birth_ms` (allowing `PROCESS_BIRTH_SLACK_MS`
+/// for 1s `ps -o etime=` rounding).
+pub(crate) fn is_post_birth_timestamp(ts_ms: u64, min_birth_ms: u64) -> bool {
+    ts_ms.saturating_add(PROCESS_BIRTH_SLACK_MS) >= min_birth_ms
+}
+
+fn read_capped_header_line<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<bool> {
+    buf.clear();
+    let mut saw_any = false;
+    loop {
+        let avail = reader.fill_buf()?;
+        if avail.is_empty() {
+            return Ok(saw_any);
+        }
+        saw_any = true;
+        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+            if buf.len() < max_bytes {
+                let take_copy = pos.min(max_bytes - buf.len());
+                buf.extend_from_slice(&avail[..take_copy]);
+            }
+            reader.consume(pos + 1);
+            return Ok(true);
+        }
+        let n = avail.len();
+        if buf.len() < max_bytes {
+            let take_copy = n.min(max_bytes - buf.len());
+            buf.extend_from_slice(&avail[..take_copy]);
+        }
+        reader.consume(n);
+    }
+}
+
+/// Extract the birth/creation timestamp (epoch ms) of a transcript JSONL file:
+/// 1. Scans up to the first `MAX_BIRTH_HEADER_LINES` JSONL entries for `"created_at"` (AGY),
+///    top-level `"timestamp"` (Claude/Codex), or `"payload.timestamp"` (Codex `session_meta`).
+/// 2. Falls back to filesystem `created()` (birthtime) or `modified()` metadata if header lines
+///    omit timestamps.
+pub(crate) fn transcript_birth_ms(path: &Path) -> Option<u64> {
+    if let Ok(file) = std::fs::File::open(path) {
+        let mut reader = BufReader::with_capacity(8 * 1024, file);
+        let mut line_buf = Vec::with_capacity(2048);
+        let mut inspected = 0usize;
+        while inspected < MAX_BIRTH_HEADER_LINES {
+            match read_capped_header_line(&mut reader, &mut line_buf, MAX_BIRTH_HEADER_LINE_BYTES) {
+                Ok(false) => break,
+                Ok(true) => {
+                    let s = String::from_utf8_lossy(&line_buf);
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    inspected += 1;
+                    if !trimmed.starts_with('{') {
+                        continue;
+                    }
+                    let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
+                        continue;
+                    };
+                    let ts = obj
+                        .get("created_at")
+                        .and_then(Value::as_str)
+                        .and_then(parse_iso8601_ms)
+                        .or_else(|| {
+                            obj.get("timestamp")
+                                .and_then(Value::as_str)
+                                .and_then(parse_iso8601_ms)
+                        })
+                        .or_else(|| {
+                            obj.get("payload")
+                                .and_then(|p| p.get("timestamp"))
+                                .and_then(Value::as_str)
+                                .and_then(parse_iso8601_ms)
+                        });
+                    if ts.is_some() {
+                        return ts;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    meta.created()
+        .ok()
+        .or_else(|| meta.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .filter(|&ms| ms > 0)
+}
+
+fn same_canonical_or_norm_dir(a: &str, b: &str) -> bool {
+    let na = a.trim().trim_end_matches('/');
+    let nb = b.trim().trim_end_matches('/');
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    if na == nb {
+        return true;
+    }
+    match (std::fs::canonicalize(na), std::fs::canonicalize(nb)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Exact existing-pane session/transcript resolvers (Claude, Codex, AGY)
 // ---------------------------------------------------------------------------
 
-/// Exact Claude subtree PIDs → `(session_id, transcript_path)` via `~/.claude/sessions/<pid>.json`.
+/// Exact Claude subtree PIDs → `(session_id, transcript_path)` via `~/.claude/sessions/<pid>.json`,
+/// verified against OS PID birth timestamps so recycled PIDs never attach stale dead sessions.
 pub(crate) fn resolve_claude_transcript_by_pids(pids: &[u32]) -> Option<(String, PathBuf)> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let births = query_pids_birth_ms(pids, starfane_proto::id::now_ms());
+    let no_claimed = HashSet::new();
+    resolve_claude_transcript_by_pids_in(&home, pids, &births, &no_claimed)
+}
+
+pub(crate) fn resolve_claude_transcript_by_pids_in(
+    home: &Path,
+    pids: &[u32],
+    pid_births: &HashMap<u32, u64>,
+    claimed_ids: &HashSet<String>,
+) -> Option<(String, PathBuf)> {
     for &pid in pids {
-        if let Some(hit) = resolve_claude_transcript_by_pid_in(&home, pid) {
+        if let Some(hit) = resolve_claude_transcript_by_pid_verified(
+            home,
+            pid,
+            pid_births.get(&pid).copied(),
+            claimed_ids,
+        ) {
             return Some(hit);
         }
     }
     None
 }
 
+#[cfg(test)]
 fn resolve_claude_transcript_by_pid_in(home: &Path, pid: u32) -> Option<(String, PathBuf)> {
+    let no_claimed = HashSet::new();
+    resolve_claude_transcript_by_pid_verified(home, pid, None, &no_claimed)
+}
+
+fn resolve_claude_transcript_by_pid_verified(
+    home: &Path,
+    pid: u32,
+    os_pid_birth_ms: Option<u64>,
+    claimed_ids: &HashSet<String>,
+) -> Option<(String, PathBuf)> {
     let sess_file = home.join(format!(".claude/sessions/{pid}.json"));
     let text = std::fs::read_to_string(&sess_file).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
+    if let Some(recorded_pid) = v.get("pid").and_then(Value::as_u64) {
+        if recorded_pid != u64::from(pid) {
+            return None;
+        }
+    }
     let sid = v.get("sessionId").and_then(Value::as_str)?.trim();
-    if sid.is_empty() || sid.contains('/') || sid.contains("..") {
+    if sid.is_empty() || sid.contains('/') || sid.contains("..") || claimed_ids.contains(sid) {
         return None;
+    }
+    if let Some(os_birth_ms) = os_pid_birth_ms {
+        if let Some(started_ms) = v
+            .get("startedAt")
+            .and_then(Value::as_i64)
+            .and_then(epoch_i64_to_ms)
+        {
+            if started_ms.abs_diff(os_birth_ms) > CLAUDE_PID_START_MAX_SKEW_MS {
+                return None;
+            }
+        } else if let Some(mtime_ms) = file_mtime_ms(&sess_file) {
+            if mtime_ms.saturating_add(86_400_000) < os_birth_ms {
+                return None;
+            }
+        }
     }
     let projects_dir = home.join(".claude/projects");
     if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
@@ -821,10 +1100,12 @@ fn resolve_claude_transcript_by_pid_in(home: &Path, pid: u32) -> Option<(String,
     None
 }
 
-/// Exact Codex resume UUID → rollout JSONL resolution under `~/.codex/sessions/YYYY/MM/DD/*<uuid>.jsonl`.
-pub(crate) fn resolve_codex_transcript_by_id(uuid: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    resolve_codex_transcript_by_id_in(&home, uuid)
+/// Exact Codex resume UUID → rollout JSONL resolution under `<home>/.codex/sessions/YYYY/MM/DD/*<uuid>.jsonl`.
+pub(crate) fn resolve_codex_transcript_by_id_opt_home(
+    home: Option<&Path>,
+    uuid: &str,
+) -> Option<PathBuf> {
+    resolve_codex_transcript_by_id_in(home?, uuid)
 }
 
 pub(crate) fn resolve_codex_transcript_by_id_in(home: &Path, uuid: &str) -> Option<PathBuf> {
@@ -868,25 +1149,38 @@ pub(crate) struct CodexThreadRow {
     pub cwd: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct CodexThreadCache {
     sig: Option<DbSig>,
+    db_path: Option<PathBuf>,
     rows: Vec<CodexThreadRow>,
 }
 
 impl CodexThreadCache {
-    pub(crate) fn refresh_if_needed(&mut self) {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    pub(crate) fn refresh_if_needed_in(&mut self, home: Option<&Path>) {
+        let Some(home) = home else {
             return;
         };
         let db_path = home.join(".codex/state_5.sqlite");
         let sig = db_signature(&db_path);
-        if sig.db.is_none() || self.sig.as_ref() == Some(&sig) {
+        if sig.db.is_none() {
+            if self.db_path.as_deref() != Some(db_path.as_path()) {
+                self.rows.clear();
+                self.sig = None;
+                self.db_path = Some(db_path);
+            }
             return;
         }
-        let sql = "SELECT id, rollout_path, cwd, name, COALESCE(archived, 0) AS archived, COALESCE(updated_at, 0) AS updated_at FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != '' ORDER BY archived ASC, updated_at DESC LIMIT 2000;";
+        if self.db_path.as_deref() == Some(db_path.as_path()) && self.sig.as_ref() == Some(&sig) {
+            return;
+        }
+        let sql = "SELECT id, rollout_path, cwd, name, COALESCE(archived, 0) AS archived, COALESCE(created_at, 0) AS created_at, COALESCE(updated_at, 0) AS updated_at FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != '' ORDER BY archived ASC, updated_at DESC LIMIT 2000;";
         let Some(json_out) = run_sqlite_json(&db_path, sql) else {
             return;
         };
@@ -895,15 +1189,21 @@ impl CodexThreadCache {
         };
         self.rows = rows;
         self.sig = Some(sig);
+        self.db_path = Some(db_path);
     }
 
-    pub(crate) fn match_pane(
+    pub(crate) fn match_pane_with_birth(
         &self,
         cwd: &str,
         tail: &str,
         claimed_ids: &HashSet<String>,
+        min_birth_ms: Option<u64>,
+        unique_in_cwd: bool,
     ) -> Option<(String, PathBuf)> {
-        match_codex_thread(&self.rows, cwd, tail, claimed_ids)
+        if !unique_in_cwd {
+            return None;
+        }
+        match_codex_thread_with_birth(&self.rows, cwd, tail, claimed_ids, min_birth_ms)
     }
 }
 
@@ -941,59 +1241,90 @@ pub(crate) fn extract_codex_status_title(tail: &str) -> Option<String> {
 }
 
 /// Strictly match a Codex pane against `state_5.sqlite` threads using its status-line title + `cwd`,
-/// skipping any thread id in `claimed_ids`. Never guesses on blank/new panes (no title hint → `None`).
+/// skipping any thread id in `claimed_ids` and enforcing `min_birth_ms` + uniqueness in `cwd`.
+/// Never guesses on blank/new panes (no title hint → `None`), never matches across unrelated `cwd`s,
+/// and never returns an ambiguous multi-match.
+#[cfg(test)]
 pub(crate) fn match_codex_thread(
     rows: &[CodexThreadRow],
     cwd: &str,
     tail: &str,
     claimed_ids: &HashSet<String>,
 ) -> Option<(String, PathBuf)> {
+    match_codex_thread_with_birth(rows, cwd, tail, claimed_ids, None)
+}
+
+pub(crate) fn match_codex_thread_with_birth(
+    rows: &[CodexThreadRow],
+    cwd: &str,
+    tail: &str,
+    claimed_ids: &HashSet<String>,
+    min_birth_ms: Option<u64>,
+) -> Option<(String, PathBuf)> {
     let hint = extract_codex_status_title(tail)?;
     let hint_clean = hint.trim_end_matches(['…', '.']).trim();
     if hint_clean.is_empty() {
         return None;
     }
-    let norm_cwd = cwd.trim_end_matches('/');
 
     let resolve_row = |r: &CodexThreadRow| -> Option<(String, PathBuf)> {
         if claimed_ids.contains(r.id.trim()) {
             return None;
         }
-        let p = PathBuf::from(r.rollout_path.as_deref()?);
-        if p.is_file() {
-            Some((r.id.clone(), p))
-        } else {
-            None
+        if !same_canonical_or_norm_dir(&r.cwd, cwd) {
+            return None;
         }
-    };
-
-    // Pass 1: exact `name == hint` AND matching `cwd`.
-    for r in rows {
-        let nm = r.name.as_deref().unwrap_or("").trim();
-        if !nm.is_empty() && nm == hint && r.cwd.trim_end_matches('/') == norm_cwd {
-            if let Some(hit) = resolve_row(r) {
-                return Some(hit);
+        let p = PathBuf::from(r.rollout_path.as_deref()?);
+        if !p.is_file() {
+            return None;
+        }
+        if let Some(birth_ms) = min_birth_ms {
+            let updated_ms = epoch_i64_to_ms(r.updated_at).or_else(|| file_mtime_ms(&p))?;
+            if !is_post_birth_timestamp(updated_ms, birth_ms) {
+                return None;
+            }
+            let created_ms = epoch_i64_to_ms(r.created_at).or_else(|| transcript_birth_ms(&p))?;
+            if !is_post_birth_timestamp(created_ms, birth_ms) {
+                return None;
             }
         }
-    }
-    // Pass 2: exact `name == hint` across any cwd (e.g. symlinked/worktree path difference).
+        Some((r.id.clone(), p))
+    };
+
+    // Pass 1: exact `name == hint` AND matching `cwd` (must be unambiguous).
+    let mut exact_hits = Vec::new();
     for r in rows {
         let nm = r.name.as_deref().unwrap_or("").trim();
         if !nm.is_empty() && nm == hint {
             if let Some(hit) = resolve_row(r) {
-                return Some(hit);
+                exact_hits.push(hit);
+                if exact_hits.len() > 1 {
+                    return None;
+                }
             }
         }
     }
-    // Pass 3: truncated title prefix match (`name.starts_with(hint_clean)`) ONLY when hint >= 8 chars + matching cwd.
+    if exact_hits.len() == 1 {
+        return exact_hits.pop();
+    }
+
+    // Pass 2: truncated title prefix match (`name.starts_with(hint_clean)`) ONLY when hint >= 8 chars
+    // + matching `cwd`, and strictly unambiguous (`len() == 1`).
     if hint_clean.chars().count() >= 8 {
+        let mut prefix_hits = Vec::new();
         for r in rows {
             let nm = r.name.as_deref().unwrap_or("").trim();
-            if nm.starts_with(hint_clean) && r.cwd.trim_end_matches('/') == norm_cwd {
+            if nm.starts_with(hint_clean) {
                 if let Some(hit) = resolve_row(r) {
-                    return Some(hit);
+                    prefix_hits.push(hit);
+                    if prefix_hits.len() > 1 {
+                        return None;
+                    }
                 }
             }
+        }
+        if prefix_hits.len() == 1 {
+            return prefix_hits.pop();
         }
     }
     None
@@ -1007,6 +1338,12 @@ pub(crate) struct AgyConvRow {
     pub workspace_uris: String,
     #[serde(default)]
     pub status: String,
+    #[serde(default)]
+    pub last_modified_time: String,
+    #[serde(default)]
+    pub last_user_input_time: String,
+    #[serde(default)]
+    pub step_count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1033,21 +1370,31 @@ pub(crate) struct AgyDiscoveredChild {
 #[derive(Debug, Default)]
 pub(crate) struct AgyConvCache {
     sig: Option<DbSig>,
+    db_path: Option<PathBuf>,
     rows: Vec<AgyConvRow>,
     children: Vec<AgyChildRow>,
 }
 
 impl AgyConvCache {
-    pub(crate) fn refresh_if_needed(&mut self) {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    pub(crate) fn refresh_if_needed_in(&mut self, home: Option<&Path>) {
+        let Some(home) = home else {
             return;
         };
         let db_path = home.join(".gemini/antigravity-cli/conversation_summaries.db");
         let sig = db_signature(&db_path);
-        if sig.db.is_none() || self.sig.as_ref() == Some(&sig) {
+        if sig.db.is_none() {
+            if self.db_path.as_deref() != Some(db_path.as_path()) {
+                self.rows.clear();
+                self.children.clear();
+                self.sig = None;
+                self.db_path = Some(db_path);
+            }
             return;
         }
-        let sql = "SELECT conversation_id, COALESCE(workspace_uris, '') AS workspace_uris, COALESCE(status, '') AS status FROM conversation_summaries WHERE nesting_depth = 0 ORDER BY last_modified_time DESC LIMIT 120;";
+        if self.db_path.as_deref() == Some(db_path.as_path()) && self.sig.as_ref() == Some(&sig) {
+            return;
+        }
+        let sql = "SELECT conversation_id, COALESCE(workspace_uris, '') AS workspace_uris, COALESCE(status, '') AS status, COALESCE(last_modified_time, '') AS last_modified_time, COALESCE(last_user_input_time, '') AS last_user_input_time, COALESCE(step_count, 0) AS step_count FROM conversation_summaries WHERE nesting_depth = 0 AND COALESCE(killed, 0) = 0 ORDER BY last_modified_time DESC LIMIT 120;";
         let Some(json_out) = run_sqlite_json(&db_path, sql) else {
             return;
         };
@@ -1061,6 +1408,7 @@ impl AgyConvCache {
         self.rows = rows;
         self.children = children;
         self.sig = Some(sig);
+        self.db_path = Some(db_path);
     }
 
     pub(crate) fn is_known_root(&self, id: &str) -> bool {
@@ -1074,25 +1422,33 @@ impl AgyConvCache {
             .is_some_and(|r| r.status.contains("IDLE") && !r.status.contains("RUNNING"))
     }
 
-    /// Match a discovered AGY pane to its most recent unclaimed root conversation ONLY when it
-    /// is the sole unclaimed live AGY pane in `cwd` (zero cross-pane misattribution).
-    pub(crate) fn match_unique_cwd_excluding(
+    /// Match an unlocked discovered AGY pane to an unclaimed root conversation ONLY when:
+    /// 1. It is the sole unresolved AGY pane in `cwd` (`unique_in_cwd == true`),
+    /// 2. The conversation was created AND modified at/after `min_birth_ms` (never attaching
+    ///    historical conversations that predate the pane's agent process!), AND
+    /// 3. Exactly ONE post-birth unclaimed conversation exists in `cwd` (zero ambiguity).
+    pub(crate) fn match_unique_cwd_excluding_in(
         &self,
+        home: Option<&Path>,
         cwd: &str,
         unique_in_cwd: bool,
         claimed_ids: &HashSet<String>,
+        min_birth_ms: Option<u64>,
     ) -> Option<(String, PathBuf)> {
         if !unique_in_cwd {
             return None;
         }
-        let home = std::env::var_os("HOME").map(PathBuf::from)?;
-        match_agy_conversation_in(&home, &self.rows, cwd, claimed_ids)
+        match_agy_conversation_with_birth_in(home?, &self.rows, cwd, claimed_ids, min_birth_ms)
     }
 
     /// Return Swarm / subagent child conversations whose `parent_conversation_id == parent_id`
     /// and whose `transcript.jsonl` exists on disk.
-    pub(crate) fn children_of(&self, parent_id: &str) -> Vec<AgyDiscoveredChild> {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    pub(crate) fn children_of_in(
+        &self,
+        home: Option<&Path>,
+        parent_id: &str,
+    ) -> Vec<AgyDiscoveredChild> {
+        let Some(home) = home else {
             return Vec::new();
         };
         let mut out = Vec::new();
@@ -1151,9 +1507,11 @@ pub(crate) fn resolve_agy_transcript_by_id_in(home: &Path, conv_id: &str) -> Opt
     full.is_file().then_some(full)
 }
 
-pub(crate) fn resolve_agy_transcript_by_id(conv_id: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    resolve_agy_transcript_by_id_in(&home, conv_id)
+pub(crate) fn resolve_agy_transcript_by_id_opt_home(
+    home: Option<&Path>,
+    conv_id: &str,
+) -> Option<PathBuf> {
+    resolve_agy_transcript_by_id_in(home?, conv_id)
 }
 
 /// Pure parser for `lsof -n -P -Fpn -p <pids>` output: extracts all open
@@ -1319,36 +1677,85 @@ impl AgyPresenceCache {
     }
 }
 
+#[cfg(test)]
 fn match_agy_conversation_in(
     home: &Path,
     rows: &[AgyConvRow],
     cwd: &str,
     claimed_ids: &HashSet<String>,
 ) -> Option<(String, PathBuf)> {
-    let target_uri = format!("file://{}", cwd.trim_end_matches('/'));
+    match_agy_conversation_with_birth_in(home, rows, cwd, claimed_ids, None)
+}
+
+pub(crate) fn match_agy_conversation_with_birth_in(
+    home: &Path,
+    rows: &[AgyConvRow],
+    cwd: &str,
+    claimed_ids: &HashSet<String>,
+    min_birth_ms: Option<u64>,
+) -> Option<(String, PathBuf)> {
+    let mut uri_candidates = vec![format!("file://{}", cwd.trim_end_matches('/'))];
+    if let Ok(canon) = std::fs::canonicalize(cwd) {
+        let canon_uri = format!("file://{}", canon.to_string_lossy().trim_end_matches('/'));
+        if !uri_candidates.contains(&canon_uri) {
+            uri_candidates.push(canon_uri);
+        }
+    }
+
+    let mut matches: Vec<(String, PathBuf)> = Vec::new();
     for r in rows {
         let sid = r.conversation_id.trim();
         if sid.is_empty() || sid.contains('/') || sid.contains("..") || claimed_ids.contains(sid) {
             continue;
         }
-        if !r.workspace_uris.contains(&target_uri) {
-            continue;
-        }
         // Check exact URI match inside JSON array string to avoid `/Users/demo` matching `/Users/demo/work/app-b`.
-        let quoted = format!("\"{target_uri}\"");
-        let quoted_slash = format!("\"{target_uri}/\"");
-        if !r.workspace_uris.contains(&quoted) && !r.workspace_uris.contains(&quoted_slash) {
+        let uri_matched = uri_candidates.iter().any(|u| {
+            let quoted = format!("\"{u}\"");
+            let quoted_slash = format!("\"{u}/\"");
+            r.workspace_uris.contains(&quoted) || r.workspace_uris.contains(&quoted_slash)
+        });
+        if !uri_matched {
             continue;
         }
-        let tr = home
-            .join(".gemini/antigravity-cli/brain")
-            .join(sid)
-            .join(".system_generated/logs/transcript.jsonl");
-        if tr.is_file() {
-            return Some((sid.to_string(), tr));
+        let Some(tr) = resolve_agy_transcript_by_id_in(home, sid) else {
+            continue;
+        };
+        if let Some(birth_ms) = min_birth_ms {
+            let Some((_, len)) = file_signature(&tr) else {
+                continue;
+            };
+            if r.step_count <= 0 && len == 0 {
+                continue;
+            }
+            if let Some(db_mod_ms) = parse_iso8601_ms(&r.last_modified_time) {
+                if !is_post_birth_timestamp(db_mod_ms, birth_ms) {
+                    continue;
+                }
+            }
+            if let Some(db_in_ms) = parse_iso8601_ms(&r.last_user_input_time) {
+                if !is_post_birth_timestamp(db_in_ms, birth_ms) {
+                    continue;
+                }
+            }
+            let Some(tr_birth_ms) = transcript_birth_ms(&tr) else {
+                continue;
+            };
+            if !is_post_birth_timestamp(tr_birth_ms, birth_ms) {
+                continue;
+            }
+            let Some(mtime_ms) = file_mtime_ms(&tr) else {
+                continue;
+            };
+            if !is_post_birth_timestamp(mtime_ms, birth_ms) {
+                continue;
+            }
+        }
+        matches.push((sid.to_string(), tr));
+        if matches.len() > 1 {
+            return None;
         }
     }
-    None
+    matches.pop()
 }
 
 /// Derive the canonical external `session_id` (used as key in `cc-switch.db`) for `session`.
@@ -2223,12 +2630,16 @@ mod tests {
                 rollout_path: Some(f1.to_string_lossy().into_owned()),
                 cwd: "/Users/demo/work/app-a".into(),
                 name: Some("检查仓库进度并同步远端".into()),
+                created_at: 0,
+                updated_at: 0,
             },
             CodexThreadRow {
                 id: "01a18191-2222-2222-2222-222222222222".into(),
                 rollout_path: Some(f2.to_string_lossy().into_owned()),
                 cwd: "/Users/demo/work/app-c".into(),
                 name: Some("查".into()),
+                created_at: 0,
+                updated_at: 0,
             },
         ];
 
@@ -2463,8 +2874,12 @@ mod tests {
             conversation_id: agy_id.into(),
             workspace_uris: r#"["file:///Users/demo"]"#.into(),
             status: String::new(),
+            last_modified_time: String::new(),
+            last_user_input_time: String::new(),
+            step_count: 1,
         }];
         let no_claimed = HashSet::new();
+        assert_eq!(rows_test_anchor_check(&agy_rows), 1);
         assert_eq!(
             match_agy_conversation_in(&home, &agy_rows, "/Users/demo", &no_claimed),
             Some((agy_id.into(), agy_tr.clone()))
@@ -2482,6 +2897,136 @@ mod tests {
             extract_session_id_from_transcript_path(AgentKind::Agy, &agy_tr).as_deref(),
             Some(agy_id)
         );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn rows_test_anchor_check(rows: &[AgyConvRow]) -> usize {
+        rows.len()
+    }
+
+    #[test]
+    fn process_birth_and_pid_recycling_guards_reject_stale_transcripts() {
+        assert_eq!(parse_ps_etime_secs("05"), Some(5));
+        assert_eq!(parse_ps_etime_secs("07:57"), Some(477));
+        assert_eq!(parse_ps_etime_secs("03:34:26"), Some(12_866));
+        assert_eq!(parse_ps_etime_secs("01-03:34:26"), Some(99_266));
+        assert_eq!(parse_ps_etime_secs("00:99"), None);
+        assert_eq!(parse_ps_etime_secs(""), None);
+
+        let now_ms = 1_795_587_600_000u64;
+        let ps_sample = "  92848       07:57\n  68521 01-03:34:26\n";
+        let births = parse_ps_pid_etimes(ps_sample, now_ms);
+        assert_eq!(births.get(&92848), Some(&(now_ms - 477_000)));
+        assert_eq!(births.get(&68521), Some(&(now_ms - 99_266_000)));
+
+        let home = std::env::temp_dir().join(format!(
+            "starfane-birth-guard-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        let cwd = "/Users/demo/.agent_session";
+
+        // 1. AGY: pre-birth conversation (`10:55` yesterday) is strictly rejected for a pane born at `14:13` today!
+        let old_agy_id = "4b808b49-48a6-4aaa-9eab-15d68e18f657";
+        let old_agy_tr = home
+            .join(".gemini/antigravity-cli/brain")
+            .join(old_agy_id)
+            .join(".system_generated/logs/transcript.jsonl");
+        std::fs::create_dir_all(old_agy_tr.parent().unwrap()).unwrap();
+        std::fs::write(
+            &old_agy_tr,
+            r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-24T02:55:39Z","content":"教我配置一下gh吧"}
+"#,
+        )
+        .unwrap();
+        let pane_birth_ms = parse_iso8601_ms("2026-11-25T06:13:18Z").unwrap();
+        let agy_rows = vec![AgyConvRow {
+            conversation_id: old_agy_id.into(),
+            workspace_uris: format!(r#"["file://{cwd}"]"#),
+            status: "CASCADE_RUN_STATUS_IDLE".into(),
+            last_modified_time: "2026-11-24 09:39:32.148245+00:00".into(),
+            last_user_input_time: "2026-11-24 09:39:06.702198+00:00".into(),
+            step_count: 65,
+        }];
+        assert!(
+            match_agy_conversation_with_birth_in(
+                &home,
+                &agy_rows,
+                cwd,
+                &HashSet::new(),
+                Some(pane_birth_ms),
+            )
+            .is_none(),
+            "pre-birth AGY conversation must never attach to newly spawned pane"
+        );
+
+        // Post-birth AGY conversation (`14:15` today >= `14:13` birth) attaches cleanly when unique!
+        let new_agy_id = "99999999-1111-2222-3333-444444444444";
+        let new_agy_tr = home
+            .join(".gemini/antigravity-cli/brain")
+            .join(new_agy_id)
+            .join(".system_generated/logs/transcript.jsonl");
+        std::fs::create_dir_all(new_agy_tr.parent().unwrap()).unwrap();
+        std::fs::write(
+            &new_agy_tr,
+            r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-25T06:15:00Z","content":"new prompt"}
+"#,
+        )
+        .unwrap();
+        let mut both_rows = vec![AgyConvRow {
+            conversation_id: new_agy_id.into(),
+            workspace_uris: format!(r#"["file://{cwd}"]"#),
+            status: "CASCADE_RUN_STATUS_IDLE".into(),
+            last_modified_time: "2026-11-25 06:15:05.000000+00:00".into(),
+            last_user_input_time: "2026-11-25 06:15:00.000000+00:00".into(),
+            step_count: 2,
+        }];
+        both_rows.extend(agy_rows);
+        assert_eq!(
+            match_agy_conversation_with_birth_in(
+                &home,
+                &both_rows,
+                cwd,
+                &HashSet::new(),
+                Some(pane_birth_ms),
+            ),
+            Some((new_agy_id.into(), new_agy_tr))
+        );
+
+        // 2. Claude: recycled OS PID (`78428.json` from days ago) is rejected when OS PID birth is today!
+        let enc = encode_claude_project_dir(cwd);
+        let cl_jsonl = home
+            .join(".claude/projects")
+            .join(enc)
+            .join("stale-claude-sid.jsonl");
+        std::fs::create_dir_all(cl_jsonl.parent().unwrap()).unwrap();
+        std::fs::write(&cl_jsonl, "{}\n").unwrap();
+        let cl_sess = home.join(".claude/sessions/78428.json");
+        std::fs::create_dir_all(cl_sess.parent().unwrap()).unwrap();
+        let stale_start_ms = pane_birth_ms - 86_400_000 * 5;
+        std::fs::write(
+            &cl_sess,
+            format!(
+                r#"{{"pid":78428,"sessionId":"stale-claude-sid","cwd":"{cwd}","startedAt":{stale_start_ms}}}"#
+            ),
+        )
+        .unwrap();
+        let mut pid_births = HashMap::new();
+        pid_births.insert(78428, pane_birth_ms);
+        assert!(
+            resolve_claude_transcript_by_pids_in(&home, &[78428], &pid_births, &HashSet::new())
+                .is_none(),
+            "recycled Claude PID must not bind stale <pid>.json"
+        );
+        // Matching PID birth within tolerance succeeds.
+        pid_births.insert(78428, stale_start_ms + 1_500);
+        assert!(resolve_claude_transcript_by_pids_in(
+            &home,
+            &[78428],
+            &pid_births,
+            &HashSet::new()
+        )
+        .is_some());
 
         let _ = std::fs::remove_dir_all(&home);
     }

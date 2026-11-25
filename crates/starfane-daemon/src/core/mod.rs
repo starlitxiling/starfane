@@ -207,6 +207,12 @@ impl Core {
         if state.cleanup_stale_message_inbox() {
             purged_any = true;
         }
+        if state.migrate_legacy_feishu_mute(startup_now) {
+            purged_any = true;
+        }
+        if state.prune_expired_mutes(startup_now) {
+            purged_any = true;
+        }
         let (events, _) = broadcast::channel(EVENT_CHANNEL);
         let (notice_tx, notice_rx) = mpsc::unbounded_channel();
         let tmux = starfane_tmux::Tmux::new(
@@ -534,14 +540,121 @@ impl Core {
         Ok(cat)
     }
 
-    pub fn set_feishu_mute(&self, until_ms: Option<u64>) {
-        lock(&self.inner.state).feishu_muted_until = until_ms;
-        self.mark_dirty();
+    /// Snapshot active global & per-channel notification mutes (pruning expired deadlines).
+    pub fn mute_snapshot(&self) -> crate::notify::MuteSnapshot {
+        let now_ms = id::now_ms();
+        let (snap, pruned) = {
+            let mut st = lock(&self.inner.state);
+            let pruned = st.prune_expired_mutes(now_ms);
+            (
+                crate::notify::MuteSnapshot {
+                    global_mute_until_ms: st.global_mute_until_ms,
+                    channel_mutes: st.channel_mutes.clone(),
+                },
+                pruned,
+            )
+        };
+        if pruned {
+            self.mark_dirty();
+        }
+        snap
     }
 
+    fn publish_notifiers(&self, snap: &crate::notify::MuteSnapshot) {
+        let global_mute_until_ms = snap.global_mute_until_ms;
+        let channel_mutes = snap.channel_mutes.clone();
+        self.publish(|seq| DaemonEvent::Notifiers {
+            seq,
+            global_mute_until_ms,
+            channel_mutes,
+        });
+    }
+
+    /// Set or clear global mute (`Some(until_ms)` mutes all channels; `None` unmutes global AND all per-channel mutes).
+    pub fn set_global_mute(&self, until_ms: Option<u64>) -> crate::notify::MuteSnapshot {
+        let now_ms = id::now_ms();
+        let snap = {
+            let mut st = lock(&self.inner.state);
+            st.prune_expired_mutes(now_ms);
+            match until_ms {
+                Some(ts) if ts > now_ms => {
+                    st.global_mute_until_ms = Some(ts);
+                }
+                _ => {
+                    st.global_mute_until_ms = None;
+                    st.feishu_muted_until = None;
+                    st.channel_mutes.clear();
+                }
+            }
+            st.prune_expired_mutes(now_ms);
+            crate::notify::MuteSnapshot {
+                global_mute_until_ms: st.global_mute_until_ms,
+                channel_mutes: st.channel_mutes.clone(),
+            }
+        };
+        self.mark_dirty();
+        self.publish_notifiers(&snap);
+        snap
+    }
+
+    /// Set or clear a per-channel mute for a configured notifier ID.
+    pub fn set_channel_mute(
+        &self,
+        id: &str,
+        until_ms: Option<u64>,
+    ) -> Result<crate::notify::MuteSnapshot, ApiError> {
+        let id = id.trim();
+        if !self.inner.notify_router.has_id(id) {
+            return Err(ApiError::not_found(format!("unknown notifier {id}")));
+        }
+        let now_ms = id::now_ms();
+        let snap = {
+            let mut st = lock(&self.inner.state);
+            st.prune_expired_mutes(now_ms);
+            match until_ms {
+                Some(ts) if ts > now_ms => {
+                    st.channel_mutes.insert(id.to_string(), ts);
+                }
+                _ => {
+                    st.channel_mutes.remove(id);
+                }
+            }
+            st.prune_expired_mutes(now_ms);
+            crate::notify::MuteSnapshot {
+                global_mute_until_ms: st.global_mute_until_ms,
+                channel_mutes: st.channel_mutes.clone(),
+            }
+        };
+        self.mark_dirty();
+        self.publish_notifiers(&snap);
+        Ok(snap)
+    }
+
+    /// Secret-free JSON snapshot for `GET /api/notifiers`.
+    pub fn notifiers_status_json(&self) -> serde_json::Value {
+        let now_ms = id::now_ms();
+        let mutes = self.mute_snapshot();
+        let ids = self.inner.notify_router.list_ids();
+        let details = self.inner.notify_router.list_statuses(&mutes, now_ms);
+        serde_json::json!({
+            "notifiers": ids,
+            "details": details,
+            "global_mute_until_ms": mutes.global_mute_until_ms,
+            "channel_mutes": mutes.channel_mutes,
+            "any_muted": mutes.any_muted(now_ms),
+        })
+    }
+
+    /// Backward-compatible Feishu mute API (updates global mute & emits SSE).
+    pub fn set_feishu_mute(&self, until_ms: Option<u64>) {
+        let _ = self.set_global_mute(until_ms);
+    }
+
+    /// Backward-compatible effective mute deadline for `feishu-default` (global OR per-channel).
     pub fn feishu_muted_until(&self) -> Option<u64> {
-        let st = lock(&self.inner.state);
-        st.feishu_muted_until.filter(|t| *t > id::now_ms())
+        let now_ms = id::now_ms();
+        self.mute_snapshot()
+            .effective_mute_until(crate::notify::DEFAULT_FEISHU_NOTIFIER_ID, now_ms)
     }
 
     /// Resolve a project by git-root basename / unique prefix / full path.
@@ -920,11 +1033,37 @@ impl Core {
         let has_user_font = crate::web::has_user_term_font().await;
         let mut v = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = v.as_object_mut() {
-            let val = self
-                .feishu_muted_until()
-                .map(serde_json::Value::from)
-                .unwrap_or(serde_json::Value::Null);
-            obj.insert("feishu_muted_until_ms".into(), val);
+            let now_ms = id::now_ms();
+            let mutes = self.mute_snapshot();
+            let feishu_eff =
+                mutes.effective_mute_until(crate::notify::DEFAULT_FEISHU_NOTIFIER_ID, now_ms);
+            let notifiers = self.inner.notify_router.list_statuses(&mutes, now_ms);
+            obj.insert(
+                "feishu_muted_until_ms".into(),
+                feishu_eff
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            obj.insert(
+                "global_mute_until_ms".into(),
+                mutes
+                    .global_mute_until_ms
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            obj.insert(
+                "channel_mutes".into(),
+                serde_json::to_value(&mutes.channel_mutes)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            );
+            obj.insert(
+                "any_muted".into(),
+                serde_json::Value::Bool(mutes.any_muted(now_ms)),
+            );
+            obj.insert(
+                "notifiers".into(),
+                serde_json::to_value(&notifiers).unwrap_or(serde_json::Value::Array(Vec::new())),
+            );
             obj.insert(
                 "hosts".into(),
                 serde_json::to_value(&hosts).unwrap_or(serde_json::Value::Array(Vec::new())),
@@ -1019,9 +1158,12 @@ impl Core {
     }
 
     /// Route & deliver an outbound notification through `NotifyRouter` (opt-in pluggable channels
-    /// + legacy Card 2.0 `feishu-default`), enforcing Split Ownership and `.starfane/team.toml` routes.
+    /// and legacy Card 2.0 `feishu-default`), enforcing Split Ownership, global/per-channel mutes,
+    /// and `.starfane/team.toml` routes.
     pub(crate) fn notify(&self, notice: Notice) {
-        if self.feishu_muted_until().is_some() {
+        let now_ms = id::now_ms();
+        let mutes = self.mute_snapshot();
+        if mutes.is_global_muted(now_ms) {
             return;
         }
         let (node, is_local_host, cwd, git_root, agent) = {
@@ -1070,31 +1212,39 @@ impl Core {
             agent,
         );
 
-        // 1. Fan out to opt-in pluggable notifiers (Telegram, Webhook, macOS, extra Feishu profiles).
+        // 1. Fan out to opt-in pluggable notifiers (skipping any individually muted channels).
         if self.inner.notify_router.has_pluggable_notifiers() {
             let core = self.clone();
             let notice_clone = notice.clone();
             let ctx_clone = ctx.clone();
             let tr_clone = team_routes.clone();
+            let mutes_clone = mutes.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    core.inner
+                    let _ = core
+                        .inner
                         .notify_router
-                        .dispatch_pluggable(&notice_clone, &ctx_clone, &tr_clone)
+                        .dispatch_pluggable_with_mutes(
+                            &notice_clone,
+                            &ctx_clone,
+                            &tr_clone,
+                            &mutes_clone,
+                            now_ms,
+                        )
                         .await;
                 });
             }
         }
 
-        // 2. Deliver primary interactive Feishu Card 2.0 when enabled and matched by router.
-        if !self
-            .inner
-            .notify_router
-            .should_deliver_primary_feishu(&ctx, &team_routes)
+        // 2. Deliver primary interactive Feishu Card 2.0 when unmuted, enabled, and matched by router.
+        if mutes.is_channel_muted(crate::notify::DEFAULT_FEISHU_NOTIFIER_ID, now_ms)
+            || !self
+                .inner
+                .notify_router
+                .should_deliver_primary_feishu(&ctx, &team_routes)
         {
             return;
         }
-        let now_ms = id::now_ms();
         let decision = {
             let mut st = lock(&self.inner.state);
             check_feishu_rate_limit(&mut st, now_ms)
@@ -1243,7 +1393,18 @@ impl Core {
                 pane,
                 bind_token,
                 session_hint,
-            } => to_json(self.resolve_identity(agent, cwd, pane, bind_token, session_hint)),
+                pid_chain,
+            } => to_json(
+                self.resolve_identity_with_pid_tree(
+                    agent,
+                    cwd,
+                    pane,
+                    bind_token,
+                    session_hint,
+                    pid_chain,
+                )
+                .await,
+            ),
             C::ReadInbox {
                 session_id,
                 mark_delivered,
@@ -1339,6 +1500,27 @@ impl Core {
                 .dispatch(target, text, attachments, allow, interactive)
                 .await
                 .and_then(to_json),
+            C::SpawnSession {
+                agent,
+                model,
+                effort,
+                project_root,
+                tmux_session,
+                name,
+                prompt,
+                from_session: _,
+            } => {
+                self.spawn_direct_session(
+                    agent,
+                    project_root,
+                    tmux_session,
+                    model,
+                    effort,
+                    prompt,
+                    name,
+                )
+                .await
+            }
             C::FeishuTest { text } => self.feishu_test(&text).await,
             C::TmuxBackup { force } => self.backup_tmux(force).await.and_then(to_json),
             C::TmuxRestore {

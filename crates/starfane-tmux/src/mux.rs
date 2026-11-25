@@ -69,6 +69,19 @@ pub trait TerminalMux: Send + Sync {
 
     fn cursor_line(&self, pane: &PaneId, cursor_y: u32) -> Result<String, TmuxError>;
 
+    /// Capture the current visible screen of `pane` (rows `0..pane_height`, matching `cursor_y`).
+    fn capture_visible_screen(&self, pane: &PaneId) -> Result<String, TmuxError> {
+        self.capture_pane(pane, &CaptureRequest::tail(40))
+            .map(|p| p.text)
+    }
+
+    /// Safely cancel tmux scrollback/copy-mode on `pane` without sending bytes to the PTY.
+    /// Returns `Ok(true)` when the pane is confirmed out of mode.
+    fn exit_copy_mode(&self, pane: &PaneId) -> Result<bool, TmuxError> {
+        let _ = pane;
+        Ok(false)
+    }
+
     fn paste_pointer_text(
         &self,
         pane: &PaneId,

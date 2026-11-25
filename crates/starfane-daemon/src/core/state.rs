@@ -98,6 +98,10 @@ pub(crate) struct State {
     pub worktrees: BTreeMap<PipelineId, WorktreeInfo>,
     #[serde(default)]
     pub feishu_muted_until: Option<u64>,
+    #[serde(default)]
+    pub global_mute_until_ms: Option<u64>,
+    #[serde(default)]
+    pub channel_mutes: BTreeMap<String, u64>,
     /// Feishu message id → pipeline (thread routing).
     #[serde(default)]
     pub feishu_msgs: BTreeMap<String, PipelineId>,
@@ -164,6 +168,8 @@ pub(crate) struct PersistentStateSnapshot {
     pub binds: BTreeMap<BindToken, PendingBind>,
     pub worktrees: BTreeMap<PipelineId, WorktreeInfo>,
     pub feishu_muted_until: Option<u64>,
+    pub global_mute_until_ms: Option<u64>,
+    pub channel_mutes: BTreeMap<String, u64>,
     pub feishu_msgs: BTreeMap<String, PipelineId>,
     pub feishu_session_msgs: BTreeMap<String, crate::notice::SessionReplyTarget>,
     pub feishu_session_msg_order: Vec<String>,
@@ -213,6 +219,8 @@ impl State {
             binds: self.binds.clone(),
             worktrees: self.worktrees.clone(),
             feishu_muted_until: self.feishu_muted_until,
+            global_mute_until_ms: self.global_mute_until_ms,
+            channel_mutes: self.channel_mutes.clone(),
             feishu_msgs: self.feishu_msgs.clone(),
             feishu_session_msgs: self.feishu_session_msgs.clone(),
             feishu_session_msg_order: self.feishu_session_msg_order.clone(),
@@ -221,6 +229,49 @@ impl State {
             unconfirmed: self.unconfirmed.clone(),
             host_display_names: self.host_display_names.clone(),
         }
+    }
+
+    /// One-time startup migration: promote legacy `feishu_muted_until` from older `state.json`
+    /// snapshots into `global_mute_until_ms` when no new mute fields are present.
+    pub fn migrate_legacy_feishu_mute(&mut self, now_ms: u64) -> bool {
+        if self.global_mute_until_ms.is_none()
+            && self.channel_mutes.is_empty()
+            && self.feishu_muted_until.is_some_and(|t| t > now_ms)
+        {
+            self.global_mute_until_ms = self.feishu_muted_until;
+            return true;
+        }
+        false
+    }
+
+    /// Prune expired mute deadlines (`<= now_ms`) and keep `feishu_muted_until` synced.
+    pub fn prune_expired_mutes(&mut self, now_ms: u64) -> bool {
+        let mut changed = false;
+        if self.global_mute_until_ms.is_some_and(|t| t <= now_ms) {
+            self.global_mute_until_ms = None;
+            changed = true;
+        }
+        let before = self.channel_mutes.len();
+        self.channel_mutes.retain(|_, &mut t| t > now_ms);
+        if self.channel_mutes.len() != before {
+            changed = true;
+        }
+        let eff_feishu = match (
+            self.global_mute_until_ms,
+            self.channel_mutes
+                .get(crate::notify::DEFAULT_FEISHU_NOTIFIER_ID)
+                .copied(),
+        ) {
+            (Some(g), Some(c)) => Some(g.max(c)),
+            (Some(g), None) => Some(g),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        if self.feishu_muted_until != eff_feishu {
+            self.feishu_muted_until = eff_feishu;
+            changed = true;
+        }
+        changed
     }
 
     /// Inbox key for a spawned session whose id is not known yet.

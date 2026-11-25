@@ -319,8 +319,19 @@ display_name = "Local"          # 运行期可通过 Web 弹窗或 POST /api/hos
 | `starfane pipeline new "<说明>"` | 解析自然语言阶段/模型绑定并拉起 Feature 工作流 |
 | `starfane debug "<现象; 绑定>"` | 启动两速查错流程（支持 `continue <id>` / `stop <id>`） |
 | `starfane review <show\|feedback\|verdict\|precision>` | 查看带证据校验的评审结论与历史误报率 |
+| `starfane mcp --agent <claude\|codex\|agy>` | 启动 stdio MCP 服务（由已注册的 Agent 自动拉起） |
 
-新增核心 Web / 联邦接口：`GET /api/hosts`、`POST /api/hosts/{id}/rename`、`GET /api/notifiers`、`POST /api/notifiers/{id}/test`、游标分页 `GET /api/sessions/{id}/transcript?limit=&before=&all=1`，以及全量滚动抓取 `GET /api/panes/{pane_id}/preview?lines=&before_line=&all=1`。
+### MCP 工具清单（`starfane mcp`）
+
+已注册的 `claude`、`codex`、`agy` 会话可直接调用 10 个原生 MCP 工具：
+
+- **`list_sessions`** — 查询活跃会话、窗格、模型、状态与流水线阶段
+- **`spawn_session`** — 在 `tmux` 中一键拉起交互式对等 Agent 会话（支持 `agent`、`model`、`effort`、`project_root`、`tmux_session`、`name`、`prompt`），返回 `session_id`、`pane_id`、`tmux_target`、`tmux_label`、`agent`、`model`、`effort` 与 `cwd`
+- **`create_handoff` / `read_inbox` / `ack_handoff`** — 跨 Agent 结构化交接与收件箱确认
+- **`submit_review` / `submit_falsifier_verdict` / `submit_triage` / `report_milestone`** — 提交带证据核验的评审、证伪、快筛、计划、根因分析与终报
+- **`start_pipeline`** — 解析自然语言绑定并发起需人工确认的 Feature / Debug 工作流
+
+新增核心 Web / 联邦接口：`GET /api/hosts`、`POST /api/hosts/{id}/rename`、`GET /api/notifiers`、`POST /api/notifiers/mute`、`POST /api/notifiers/{id}/test`、游标分页 `GET /api/sessions/{id}/transcript?limit=&before=&all=1`，以及全量滚动抓取 `GET /api/panes/{pane_id}/preview?lines=&before_line=&all=1`。
 
 ---
 

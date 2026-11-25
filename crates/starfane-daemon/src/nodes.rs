@@ -163,6 +163,25 @@ impl LocalMuxPool {
         }
     }
 
+    pub fn capture_visible_screen(&self, pane: &PaneId) -> Result<String, TmuxError> {
+        if Self::is_zellij_pane(pane) {
+            let zj = self.zellij.as_ref().ok_or_else(|| {
+                TmuxError::InvalidRequest("zellij mux is not enabled or unavailable".into())
+            })?;
+            zj.capture_visible_screen(pane)
+        } else {
+            self.tmux.capture_visible_screen(pane)
+        }
+    }
+
+    pub fn exit_copy_mode(&self, pane: &PaneId) -> Result<bool, TmuxError> {
+        if Self::is_zellij_pane(pane) {
+            Ok(false)
+        } else {
+            self.tmux.exit_copy_mode(pane)
+        }
+    }
+
     pub fn paste_pointer_text(
         &self,
         pane: &PaneId,
@@ -536,7 +555,7 @@ impl NodeProvider for SshMuxNodeProvider {
             // over SSH before pasting, matching local interactive delivery safety.
             let t_gate = tmux.clone();
             let p_gate = pane.clone();
-            let gate = tokio::task::spawn_blocking(move || {
+            let mut gate = tokio::task::spawn_blocking(move || {
                 let panes = t_gate.list_panes().map_err(|e| e.to_string())?;
                 let info = panes
                     .into_iter()
@@ -547,6 +566,35 @@ impl NodeProvider for SshMuxNodeProvider {
             .await
             .map_err(|e| ApiError::internal(format!("ssh gate task: {e}")))?
             .map_err(|e| ApiError::new(starfane_proto::ErrorCode::Unavailable, e))?;
+
+            // If blocked solely by tmux scrollback/copy-mode on an explicit interactive send,
+            // safely cancel copy-mode over SSH (`send-keys -X cancel`) and re-check the gate.
+            if !gate.passed && gate.failed_checks() == [starfane_proto::GateCheck::NotInMode] {
+                let t_exit = tmux.clone();
+                let p_exit = pane.clone();
+                let exited = tokio::task::spawn_blocking(move || t_exit.exit_copy_mode(&p_exit))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or(false);
+                if exited {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    let t_re = tmux.clone();
+                    let p_re = pane.clone();
+                    if let Ok(Ok(reprobed)) = tokio::task::spawn_blocking(move || {
+                        let panes = t_re.list_panes().map_err(|e| e.to_string())?;
+                        let info = panes
+                            .into_iter()
+                            .find(|p| p.pane_id == p_re)
+                            .ok_or_else(|| format!("remote pane {p_re} not found"))?;
+                        Ok::<_, String>(check_interactive_gate(&info))
+                    })
+                    .await
+                    {
+                        gate = reprobed;
+                    }
+                }
+            }
 
             if !gate.passed {
                 return Ok(DeliveryReport {
@@ -561,11 +609,12 @@ impl NodeProvider for SshMuxNodeProvider {
             let t1 = tmux.clone();
             let p1 = pane.clone();
             let txt = text.clone();
+            let effective_settle = starfane_tmux::adaptive_paste_settle_ms(settle_ms, &text);
             tokio::task::spawn_blocking(move || t1.paste_interactive_text(&p1, &txt))
                 .await
                 .map_err(|e| ApiError::internal(format!("ssh paste task: {e}")))?
                 .map_err(|e| ApiError::internal(format!("ssh paste: {e}")))?;
-            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+            tokio::time::sleep(Duration::from_millis(effective_settle)).await;
             let p2 = pane.clone();
             tokio::task::spawn_blocking(move || tmux.submit_enter(&p2))
                 .await

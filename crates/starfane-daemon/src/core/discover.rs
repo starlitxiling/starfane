@@ -3,12 +3,13 @@
 
 use super::metrics::{
     canonical_external_session_id, extract_agy_effort_from_model, infer_session_effort,
-    merge_cc_switch_with_fallback, metrics_meaningfully_equal, parse_status_line_metrics,
-    query_lsof_agy_presence_all, resolve_agy_transcript_by_id, resolve_claude_transcript_by_pids,
-    resolve_codex_transcript_by_id, AgyDiscoveredChild,
+    is_post_birth_timestamp, merge_cc_switch_with_fallback, metrics_meaningfully_equal,
+    parse_status_line_metrics, query_lsof_agy_presence_all, query_pids_birth_ms,
+    resolve_agy_transcript_by_id_opt_home, resolve_claude_transcript_by_pids_in,
+    resolve_codex_transcript_by_id_opt_home, transcript_birth_ms, AgyDiscoveredChild,
 };
 use super::state::{is_subagent_active, PaneWatch, State};
-use super::transcript::resolve_transcript_path;
+use super::transcript::resolve_transcript_path_with_home;
 use super::{lock, util, Core};
 use starfane_proto::*;
 use starfane_tmux::{CaptureRequest, DiscoveredPane, PanePreview};
@@ -43,8 +44,15 @@ struct TailCacheEntry {
     tail: String,
 }
 
+#[derive(Debug, Clone)]
+struct SpawnedPaneMeta {
+    spawned_at_ms: u64,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
 /// Off-state cache eliminating redundant `ps -eo` and `tmux capture-pane` subprocesses during
-/// steady-state 3-second discovery ticks.
+/// steady-state 3-second discovery ticks, plus OS process birth-time & spawn provenance tracking.
 #[derive(Debug, Default)]
 pub(crate) struct DiscoveryScanCache {
     panes_sig: Vec<PaneFingerprint>,
@@ -52,6 +60,13 @@ pub(crate) struct DiscoveryScanCache {
     cached_discovered: Vec<DiscoveredPane>,
     ticks_since_ps: u32,
     tail_cache: HashMap<PaneId, TailCacheEntry>,
+    pid_birth_ms: HashMap<u32, u64>,
+    pane_agent_pid: HashMap<PaneId, u32>,
+    pane_first_seen_ms: HashMap<PaneId, u64>,
+    pane_birth_ms: HashMap<PaneId, u64>,
+    authoritative_panes: HashSet<PaneId>,
+    spawned_panes: HashMap<PaneId, SpawnedPaneMeta>,
+    pub(crate) home_override: Option<PathBuf>,
 }
 
 /// Number of unchanged 3-second polling ticks (~9s) before a `Working` legacy pane is
@@ -150,11 +165,125 @@ pub(crate) struct SyncDelta {
     pub changed: bool,
 }
 
-/// Pure reconciliation of discovered tmux panes into daemon `State`.
+#[derive(Debug, Clone)]
+struct ClaimedSessionRef {
+    sid: SessionId,
+    agent: AgentKind,
+    pane: Option<PaneId>,
+    discovered_only: bool,
+    transcript_path: Option<String>,
+}
+
+fn snapshot_claim_refs(st: &State) -> Vec<ClaimedSessionRef> {
+    st.sessions
+        .values()
+        .filter(|s| !s.is_subagent && s.is_local_host())
+        .map(|s| ClaimedSessionRef {
+            sid: s.session_id.clone(),
+            agent: s.agent,
+            pane: (s.state != SessionState::Ended)
+                .then(|| s.pane.clone())
+                .flatten(),
+            discovered_only: s.discovered_only,
+            transcript_path: s.transcript_path.clone(),
+        })
+        .collect()
+}
+
+fn is_transcript_claimed_in_refs(
+    refs: &[ClaimedSessionRef],
+    owner_sid: &SessionId,
+    owner_pane: Option<&PaneId>,
+    owner_agent: AgentKind,
+    candidate_tp: &str,
+) -> bool {
+    for r in refs {
+        if r.sid == *owner_sid || r.agent != owner_agent {
+            continue;
+        }
+        if !r.discovered_only {
+            if r.pane.as_ref() != owner_pane
+                && super::state::transcript_matches_session(
+                    r.agent,
+                    &r.sid,
+                    r.transcript_path.as_deref(),
+                    Some(candidate_tp),
+                )
+            {
+                return true;
+            }
+        } else if r.pane.is_some()
+            && r.pane.as_ref() != owner_pane
+            && r.transcript_path.as_deref() == Some(candidate_tp)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `candidate_tp` is already owned by a real hook session (active OR `Ended`) on
+/// another/no pane, or by a sibling live `discovered_only` pane.
+pub(crate) fn is_transcript_claimed_by_other(
+    st: &State,
+    owner: &SessionRecord,
+    candidate_tp: &str,
+) -> bool {
+    let refs = snapshot_claim_refs(st);
+    is_transcript_claimed_in_refs(
+        &refs,
+        &owner.session_id,
+        owner.pane.as_ref(),
+        owner.agent,
+        candidate_tp,
+    )
+}
+
+fn collect_claimed_agent_entries(st: &State, agent: AgentKind) -> Vec<(String, Option<PaneId>)> {
+    let mut out = Vec::new();
+    for s in st.sessions.values() {
+        if s.agent != agent || s.is_subagent || !s.is_local_host() {
+            continue;
+        }
+        // Any `Ended` session has no live pane owner (`None`), so heuristic matchers on ANY pane
+        // must treat its external session ID as already-claimed historical state.
+        let eff_pane = (s.state != SessionState::Ended)
+            .then(|| s.pane.clone())
+            .flatten();
+        if let Some(eid) = canonical_external_session_id(s) {
+            out.push((eid, eff_pane.clone()));
+        }
+        if !s.discovered_only && !s.session_id.as_str().starts_with("tmux-") {
+            out.push((s.session_id.0.clone(), eff_pane));
+        }
+    }
+    out
+}
+
+fn excluded_ids_for_pane(entries: &[(String, Option<PaneId>)], pane: &PaneId) -> HashSet<String> {
+    entries
+        .iter()
+        .filter(|(_, owner_pane)| owner_pane.as_ref() != Some(pane))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Pure reconciliation of discovered tmux panes into daemon `State` (test convenience wrapper).
+#[cfg(test)]
 pub(crate) fn reconcile_discovered_panes(
     st: &mut State,
     discovered: &[DiscoveredPane],
     live_pane_ids: &HashSet<PaneId>,
+    now_ms: u64,
+) -> SyncDelta {
+    reconcile_discovered_panes_with_restarts(st, discovered, live_pane_ids, &HashSet::new(), now_ms)
+}
+
+pub(crate) fn reconcile_discovered_panes_with_restarts(
+    st: &mut State,
+    discovered: &[DiscoveredPane],
+    live_pane_ids: &HashSet<PaneId>,
+    restarted_panes: &HashSet<PaneId>,
     now_ms: u64,
 ) -> SyncDelta {
     let mut updated = Vec::new();
@@ -164,6 +293,25 @@ pub(crate) fn reconcile_discovered_panes(
     for dp in discovered {
         if dp.pane_dead {
             continue;
+        }
+        // If a brand-new agent process PID replaced an earlier CLI inside the same live shell pane,
+        // retire any leftover real session from the exited PID before binding the new process.
+        if restarted_panes.contains(&dp.pane_id) {
+            for s in st.sessions.values_mut() {
+                if !s.is_subagent
+                    && !s.discovered_only
+                    && s.is_local_host()
+                    && s.pane.as_ref() == Some(&dp.pane_id)
+                    && s.state != SessionState::Ended
+                    && now_ms.saturating_sub(s.last_event_ms) >= 1_000
+                {
+                    s.state = SessionState::Ended;
+                    super::state::clear_tmux_binding(s);
+                    s.state_since_ms = now_ms;
+                    updated.push(s.clone());
+                    changed = true;
+                }
+            }
         }
         // Check if a real (hook-backed) live root session is already bound to this pane.
         // For Shell panes (when `include_shell_panes = true`), any live real agent session on
@@ -243,7 +391,7 @@ pub(crate) fn reconcile_discovered_panes(
         match st.sessions.get_mut(&leg_id) {
             Some(rec) => {
                 let mut rec_changed = false;
-                if rec.agent != dp.agent {
+                if rec.agent != dp.agent || restarted_panes.contains(&dp.pane_id) {
                     rec.agent = dp.agent;
                     rec.model = dp.model.clone();
                     rec.effort = None;
@@ -251,6 +399,7 @@ pub(crate) fn reconcile_discovered_panes(
                     rec.metrics = None;
                     rec.last_message = None;
                     rec.last_error = None;
+                    rec.state_since_ms = now_ms;
                     rec_changed = true;
                 }
                 if rec.tmux_target.as_deref() != Some(dp.tmux_target.as_str()) {
@@ -274,20 +423,27 @@ pub(crate) fn reconcile_discovered_panes(
                         rec.model = dp.model.clone();
                         rec_changed = true;
                     }
-                } else if dp.model.is_some() && rec.model.is_none() {
+                } else if dp.model.is_some()
+                    && (rec.model.is_none()
+                        || (rec.transcript_path.is_none() && rec.model != dp.model))
+                {
                     rec.model = dp.model.clone();
+                    if rec.transcript_path.is_none() {
+                        rec.effort = None;
+                    }
                     rec_changed = true;
                 }
-                if rec.effort.is_none() {
-                    let eff = dp.effort.clone().or_else(|| {
-                        (rec.agent == AgentKind::Agy)
-                            .then(|| rec.model.as_deref().and_then(extract_agy_effort_from_model))
-                            .flatten()
-                    });
-                    if eff.is_some() {
-                        rec.effort = eff;
-                        rec_changed = true;
-                    }
+                let dp_eff = dp.effort.clone().or_else(|| {
+                    (rec.agent == AgentKind::Agy)
+                        .then(|| rec.model.as_deref().and_then(extract_agy_effort_from_model))
+                        .flatten()
+                });
+                if dp_eff.is_some()
+                    && (rec.effort.is_none()
+                        || (rec.transcript_path.is_none() && rec.effort != dp_eff))
+                {
+                    rec.effort = dp_eff;
+                    rec_changed = true;
                 }
                 if rec.state == SessionState::Ended {
                     rec.state = SessionState::Idle;
@@ -474,7 +630,8 @@ pub(crate) fn reconcile_discovered_panes(
 }
 
 /// Pure state transition for a legacy pane's tail-hash poll.
-/// Returns `Some((session, heuristic_turn_complete_event))` when state changed.
+/// Returns `Some((session, heuristic_event))` when state changed (including folder-trust
+/// approval prompts mapped to `SessionState::NeedsPermission` and heuristic `TurnComplete`).
 pub(crate) fn apply_legacy_tail_hash(
     st: &mut State,
     sid: &SessionId,
@@ -488,6 +645,82 @@ pub(crate) fn apply_legacy_tail_hash(
         return None;
     }
 
+    if let Some(reason) = starfane_tmux::detect_folder_trust_prompt(rec.agent, tail) {
+        st.pane_watch.insert(
+            pane.clone(),
+            PaneWatch {
+                last_hash: h,
+                stable_ticks: 0,
+            },
+        );
+        if rec.state != SessionState::NeedsPermission || rec.last_error.as_deref() != Some(reason) {
+            rec.state = SessionState::NeedsPermission;
+            rec.last_error = Some(reason.to_string());
+            rec.state_since_ms = now_ms;
+            rec.last_event_ms = now_ms;
+            let ev = NormalizedEvent {
+                v: PROTO_VERSION,
+                id: EventId::new(id::new_id(id::prefix::EVENT)),
+                ts_ms: now_ms,
+                agent: rec.agent,
+                kind: EventKind::NeedsPermission,
+                confidence: Confidence::Heuristic,
+                session_id: rec.session_id.clone(),
+                subagent_id: None,
+                pane: rec.pane.clone(),
+                cwd: rec.cwd.clone(),
+                model: rec.model.clone(),
+                native_event: "tmux_trust_prompt_heuristic".into(),
+                transcript_path: None,
+                bind_token: None,
+                detail: EventDetail {
+                    error: Some(reason.to_string()),
+                    ..EventDetail::default()
+                },
+            };
+            return Some((rec.clone(), Some(ev)));
+        }
+        return None;
+    }
+
+    if let Some(reason) = starfane_tmux::detect_codex_update_prompt(rec.agent, tail) {
+        st.pane_watch.insert(
+            pane.clone(),
+            PaneWatch {
+                last_hash: h,
+                stable_ticks: 0,
+            },
+        );
+        if rec.state != SessionState::NeedsInput || rec.last_error.as_deref() != Some(reason) {
+            rec.state = SessionState::NeedsInput;
+            rec.last_error = Some(reason.to_string());
+            rec.state_since_ms = now_ms;
+            rec.last_event_ms = now_ms;
+            let ev = NormalizedEvent {
+                v: PROTO_VERSION,
+                id: EventId::new(id::new_id(id::prefix::EVENT)),
+                ts_ms: now_ms,
+                agent: rec.agent,
+                kind: EventKind::NeedsInput,
+                confidence: Confidence::Heuristic,
+                session_id: rec.session_id.clone(),
+                subagent_id: None,
+                pane: rec.pane.clone(),
+                cwd: rec.cwd.clone(),
+                model: rec.model.clone(),
+                native_event: "tmux_startup_modal_heuristic".into(),
+                transcript_path: None,
+                bind_token: None,
+                detail: EventDetail {
+                    error: Some(reason.to_string()),
+                    ..EventDetail::default()
+                },
+            };
+            return Some((rec.clone(), Some(ev)));
+        }
+        return None;
+    }
+
     match st.pane_watch.get_mut(pane) {
         None => {
             st.pane_watch.insert(
@@ -497,12 +730,28 @@ pub(crate) fn apply_legacy_tail_hash(
                     stable_ticks: 0,
                 },
             );
+            if matches!(
+                rec.state,
+                SessionState::NeedsPermission | SessionState::NeedsInput
+            ) {
+                rec.state = SessionState::Idle;
+                rec.last_error = None;
+                rec.state_since_ms = now_ms;
+                rec.last_event_ms = now_ms;
+                return Some((rec.clone(), None));
+            }
             None
         }
         Some(watch) => {
             if watch.last_hash != h {
                 watch.last_hash = h;
                 watch.stable_ticks = 0;
+                if matches!(
+                    rec.state,
+                    SessionState::NeedsPermission | SessionState::NeedsInput
+                ) {
+                    rec.last_error = None;
+                }
                 if rec.state != SessionState::Working {
                     rec.state = SessionState::Working;
                     rec.state_since_ms = now_ms;
@@ -540,8 +789,14 @@ pub(crate) fn apply_legacy_tail_hash(
                         };
                         return Some((rec.clone(), Some(ev)));
                     }
-                    if rec.state == SessionState::Starting {
+                    if matches!(
+                        rec.state,
+                        SessionState::Starting
+                            | SessionState::NeedsPermission
+                            | SessionState::NeedsInput
+                    ) {
                         rec.state = SessionState::Idle;
+                        rec.last_error = None;
                         rec.state_since_ms = now_ms;
                         rec.last_event_ms = now_ms;
                         return Some((rec.clone(), None));
@@ -624,6 +879,49 @@ where
 }
 
 impl Core {
+    pub(crate) fn effective_home_dir(&self) -> Option<PathBuf> {
+        if let Some(ov) = lock(&self.inner.discovery_cache).home_override.clone() {
+            return Some(ov);
+        }
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+
+    /// Override `$HOME` resolution for isolated multi-session integration tests without mutating
+    /// process-global environment variables.
+    #[doc(hidden)]
+    pub fn set_home_dir_override(&self, home: Option<PathBuf>) {
+        lock(&self.inner.discovery_cache).home_override = home;
+    }
+
+    /// True when `session` is a non-authoritative `discovered_only` pane record whose attached
+    /// `path` was created strictly before the pane's process/spawn birth time.
+    pub(crate) fn is_legacy_transcript_pre_birth(
+        &self,
+        session: &SessionRecord,
+        path: &Path,
+    ) -> bool {
+        if !session.discovered_only || session.is_subagent {
+            return false;
+        }
+        let Some(pane) = session.pane.as_ref() else {
+            return false;
+        };
+        let min_birth_ms = {
+            let dc = lock(&self.inner.discovery_cache);
+            if dc.authoritative_panes.contains(pane) {
+                return false;
+            }
+            dc.pane_birth_ms
+                .get(pane)
+                .copied()
+                .or_else(|| dc.spawned_panes.get(pane).map(|m| m.spawned_at_ms))
+        };
+        let Some(birth_ms) = min_birth_ms else {
+            return false;
+        };
+        transcript_birth_ms(path).is_some_and(|tb| !is_post_birth_timestamp(tb, birth_ms))
+    }
+
     /// Scan tmux for existing agent panes, sync into `State`, and run heuristic completion checks.
     ///
     /// Hot-path guarantees:
@@ -714,9 +1012,56 @@ impl Core {
         };
 
         let now = id::now_ms();
-        let (delta, resolved_panes, claimed_codex_entries, claimed_agy_ids_init) = {
+        let home_dir = self.effective_home_dir();
+        let restarted_panes = {
+            let mut dc = lock(&self.inner.discovery_cache);
+            dc.pane_agent_pid.retain(|pid, _| live_ids.contains(pid));
+            dc.pane_first_seen_ms
+                .retain(|pid, _| live_ids.contains(pid));
+            dc.pane_birth_ms.retain(|pid, _| live_ids.contains(pid));
+            dc.authoritative_panes.retain(|pid| live_ids.contains(pid));
+            dc.spawned_panes.retain(|pid, _| live_ids.contains(pid));
+            let mut restarted = HashSet::new();
+            for dp in &discovered {
+                if dp.pane_dead {
+                    continue;
+                }
+                dc.pane_first_seen_ms
+                    .entry(dp.pane_id.clone())
+                    .or_insert(now);
+                let eff_pid = dp
+                    .agent_pid
+                    .or_else(|| dp.subtree_pids.first().copied())
+                    .filter(|&p| p > 0);
+                if let Some(cur_pid) = eff_pid {
+                    if let Some(prev_pid) = dc.pane_agent_pid.insert(dp.pane_id.clone(), cur_pid) {
+                        if prev_pid != cur_pid {
+                            restarted.insert(dp.pane_id.clone());
+                            dc.pane_first_seen_ms.insert(dp.pane_id.clone(), now);
+                            dc.tail_cache.remove(&dp.pane_id);
+                            dc.spawned_panes.remove(&dp.pane_id);
+                        }
+                    }
+                }
+            }
+            restarted
+        };
+
+        let (
+            delta,
+            resolved_panes,
+            claimed_claude_entries,
+            claimed_codex_entries,
+            claimed_agy_entries,
+        ) = {
             let mut st = lock(&self.inner.state);
-            let delta = reconcile_discovered_panes(&mut st, &discovered, &live_ids, now);
+            let delta = reconcile_discovered_panes_with_restarts(
+                &mut st,
+                &discovered,
+                &live_ids,
+                &restarted_panes,
+                now,
+            );
             let resolved_panes: HashSet<PaneId> = st
                 .sessions
                 .values()
@@ -729,34 +1074,15 @@ impl Core {
                 })
                 .filter_map(|s| s.pane.clone())
                 .collect();
-            let claimed_codex_entries: Vec<(String, Option<PaneId>)> = st
-                .sessions
-                .values()
-                .filter(|s| {
-                    s.agent == AgentKind::Codex
-                        && !s.is_subagent
-                        && s.is_local_host()
-                        && s.state != SessionState::Ended
-                })
-                .filter_map(|s| canonical_external_session_id(s).map(|id| (id, s.pane.clone())))
-                .collect();
-            let claimed_agy_ids_init: HashSet<String> = st
-                .sessions
-                .values()
-                .filter(|s| {
-                    s.agent == AgentKind::Agy
-                        && !s.is_subagent
-                        && !s.discovered_only
-                        && s.is_local_host()
-                        && s.state != SessionState::Ended
-                })
-                .map(|s| s.session_id.0.clone())
-                .collect();
+            let claimed_claude_entries = collect_claimed_agent_entries(&st, AgentKind::Claude);
+            let claimed_codex_entries = collect_claimed_agent_entries(&st, AgentKind::Codex);
+            let claimed_agy_entries = collect_claimed_agent_entries(&st, AgentKind::Agy);
             (
                 delta,
                 resolved_panes,
+                claimed_claude_entries,
                 claimed_codex_entries,
-                claimed_agy_ids_init,
+                claimed_agy_entries,
             )
         };
 
@@ -769,11 +1095,12 @@ impl Core {
         }
 
         // Exact PID-subtree / resume-UUID transcript resolution + batched/fingerprint-cached
-        // tail captures + off-lock SQLite & `lsof` queries.
+        // tail captures + off-lock SQLite, `ps -o etime=`, & `lsof` queries.
         struct PaneScanTarget {
             pane: PaneId,
             agent: AgentKind,
             cwd: String,
+            agent_pid: Option<u32>,
             subtree_pids: Vec<u32>,
             resume_id: Option<String>,
             is_legacy: bool,
@@ -796,6 +1123,7 @@ impl Core {
                 pane: d.pane_id.clone(),
                 agent: d.agent,
                 cwd: d.cwd.clone(),
+                agent_pid: d.agent_pid,
                 subtree_pids: if !d.subtree_pids.is_empty() {
                     d.subtree_pids.clone()
                 } else {
@@ -812,21 +1140,48 @@ impl Core {
         let now_inst = std::time::Instant::now();
         let poll_now = id::now_ms();
         let core_cap = self.clone();
+        let home_for_scan = home_dir.clone();
 
         struct OffLockScanResult {
             tails: HashMap<PaneId, String>,
             exact_paths: HashMap<PaneId, PathBuf>,
             authoritative_panes: HashSet<PaneId>,
             agy_lock_conv_by_pane: HashMap<PaneId, String>,
+            pane_birth_by_pane: HashMap<PaneId, u64>,
+            spawned_meta_by_pane: HashMap<PaneId, SpawnedPaneMeta>,
         }
 
         let off_lock = tokio::task::spawn_blocking(move || {
             let mut tails: HashMap<PaneId, String> = HashMap::new();
             let mut exact_paths: HashMap<PaneId, PathBuf> = HashMap::new();
-            let mut codex_needing_match: Vec<(PaneId, String)> = Vec::new();
-            let mut agy_targets: Vec<(PaneId, String, Vec<u32>)> = Vec::new();
+            let mut codex_needing_match: Vec<(PaneId, String, u64)> = Vec::new();
+            let mut agy_targets: Vec<(PaneId, String, Vec<u32>, u64)> = Vec::new();
             let mut batch_capture_targets: Vec<(PaneId, usize)> = Vec::new();
             let mut target_meta: HashMap<PaneId, (u32, u32, u32, bool, String)> = HashMap::new();
+
+            // 1. Refresh OS process birth timestamps (`ps -o pid=,etime=`) for newly seen live PIDs,
+            //    pruning dead PIDs so recycled OS PIDs never hit stale birth timestamps.
+            let all_live_pids: HashSet<u32> = pane_targets
+                .iter()
+                .flat_map(|t| t.subtree_pids.iter().copied().chain(t.agent_pid))
+                .filter(|&p| p > 0)
+                .collect();
+            let missing_birth_pids: Vec<u32> = {
+                let mut dc = lock(&core_cap.inner.discovery_cache);
+                dc.pid_birth_ms.retain(|pid, _| all_live_pids.contains(pid));
+                all_live_pids
+                    .iter()
+                    .copied()
+                    .filter(|pid| !dc.pid_birth_ms.contains_key(pid))
+                    .collect()
+            };
+            if !missing_birth_pids.is_empty() {
+                let queried = query_pids_birth_ms(&missing_birth_pids, poll_now);
+                let mut dc = lock(&core_cap.inner.discovery_cache);
+                for (pid, bms) in queried {
+                    dc.pid_birth_ms.insert(pid, bms);
+                }
+            }
 
             let all_agy_pids: Vec<u32> = pane_targets
                 .iter()
@@ -846,25 +1201,70 @@ impl Core {
                 query_lsof_agy_presence_all(&stale_agy_pids)
             };
 
+            let mut pane_birth_by_pane: HashMap<PaneId, u64> = HashMap::new();
+            let mut spawned_meta_by_pane: HashMap<PaneId, SpawnedPaneMeta> = HashMap::new();
+            let mut authoritative_panes: HashSet<PaneId> = HashSet::new();
+
             {
                 let mut dc = lock(&core_cap.inner.discovery_cache);
+                let pid_births_snap = dc.pid_birth_ms.clone();
                 for t in &pane_targets {
+                    let proc_birth = t
+                        .agent_pid
+                        .and_then(|pid| pid_births_snap.get(&pid).copied())
+                        .or_else(|| {
+                            t.subtree_pids
+                                .iter()
+                                .filter_map(|pid| pid_births_snap.get(pid).copied())
+                                .max()
+                        });
+                    let spawned_meta = dc.spawned_panes.get(&t.pane).cloned();
+                    if let Some(sm) = &spawned_meta {
+                        spawned_meta_by_pane.insert(t.pane.clone(), sm.clone());
+                    }
+                    let first_seen = dc
+                        .pane_first_seen_ms
+                        .get(&t.pane)
+                        .copied()
+                        .unwrap_or(poll_now);
+                    let eff_birth_ms =
+                        match (proc_birth, spawned_meta.as_ref().map(|m| m.spawned_at_ms)) {
+                            (Some(pb), Some(sb)) => pb.max(sb),
+                            (Some(pb), None) => pb,
+                            (None, Some(sb)) => sb,
+                            (None, None) => first_seen,
+                        };
+                    pane_birth_by_pane.insert(t.pane.clone(), eff_birth_ms);
+
                     if t.agent == AgentKind::Claude {
-                        if let Some((_, p)) = resolve_claude_transcript_by_pids(&t.subtree_pids) {
-                            exact_paths.insert(t.pane.clone(), p);
+                        if let Some(home) = home_for_scan.as_deref() {
+                            let exclude = excluded_ids_for_pane(&claimed_claude_entries, &t.pane);
+                            if let Some((_, p)) = resolve_claude_transcript_by_pids_in(
+                                home,
+                                &t.subtree_pids,
+                                &pid_births_snap,
+                                &exclude,
+                            ) {
+                                exact_paths.insert(t.pane.clone(), p);
+                                authoritative_panes.insert(t.pane.clone());
+                            }
                         }
                     } else if t.agent == AgentKind::Codex {
-                        if let Some(p) = t
-                            .resume_id
-                            .as_deref()
-                            .and_then(resolve_codex_transcript_by_id)
-                        {
+                        if let Some(p) = t.resume_id.as_deref().and_then(|uid| {
+                            resolve_codex_transcript_by_id_opt_home(home_for_scan.as_deref(), uid)
+                        }) {
                             exact_paths.insert(t.pane.clone(), p);
+                            authoritative_panes.insert(t.pane.clone());
                         } else {
-                            codex_needing_match.push((t.pane.clone(), t.cwd.clone()));
+                            codex_needing_match.push((t.pane.clone(), t.cwd.clone(), eff_birth_ms));
                         }
                     } else if t.agent == AgentKind::Agy {
-                        agy_targets.push((t.pane.clone(), t.cwd.clone(), t.subtree_pids.clone()));
+                        agy_targets.push((
+                            t.pane.clone(),
+                            t.cwd.clone(),
+                            t.subtree_pids.clone(),
+                            eff_birth_ms,
+                        ));
                     }
                     if should_capture_tail_for_scan(
                         t.pane_in_mode,
@@ -939,7 +1339,6 @@ impl Core {
 
             // Refresh SQLite caches + presence cache completely outside `Mutex<State>`.
             let mut agy_lock_conv_by_pane: HashMap<PaneId, String> = HashMap::new();
-            let mut authoritative_panes: HashSet<PaneId> = exact_paths.keys().cloned().collect();
             {
                 let mut tc = lock(&core_cap.inner.telemetry);
                 if !stale_agy_pids.is_empty() {
@@ -947,19 +1346,31 @@ impl Core {
                         .update_all(&stale_agy_pids, &lsof_map, now_inst);
                 }
                 if !codex_needing_match.is_empty() {
-                    tc.codex_threads_cache.refresh_if_needed();
+                    tc.codex_threads_cache
+                        .refresh_if_needed_in(home_for_scan.as_deref());
+                    let mut codex_cwd_counts: HashMap<String, usize> = HashMap::new();
+                    for (_, cwd, _) in &codex_needing_match {
+                        *codex_cwd_counts
+                            .entry(cwd.trim_end_matches('/').to_string())
+                            .or_insert(0) += 1;
+                    }
                     let mut newly_claimed_codex_ids: HashSet<String> = HashSet::new();
-                    for (pane, cwd) in &codex_needing_match {
+                    for (pane, cwd, birth_ms) in &codex_needing_match {
+                        let unique = codex_cwd_counts
+                            .get(cwd.trim_end_matches('/'))
+                            .copied()
+                            .unwrap_or(0)
+                            == 1;
                         if let Some(tail) = tails.get(pane) {
-                            let mut exclude: HashSet<String> = claimed_codex_entries
-                                .iter()
-                                .filter(|(_, p)| p.as_ref() != Some(pane))
-                                .map(|(id, _)| id.clone())
-                                .collect();
+                            let mut exclude = excluded_ids_for_pane(&claimed_codex_entries, pane);
                             exclude.extend(newly_claimed_codex_ids.iter().cloned());
-                            if let Some((cid, p)) =
-                                tc.codex_threads_cache.match_pane(cwd, tail, &exclude)
-                            {
+                            if let Some((cid, p)) = tc.codex_threads_cache.match_pane_with_birth(
+                                cwd,
+                                tail,
+                                &exclude,
+                                Some(*birth_ms),
+                                unique,
+                            ) {
                                 newly_claimed_codex_ids.insert(cid);
                                 exact_paths.insert(pane.clone(), p);
                             }
@@ -967,49 +1378,66 @@ impl Core {
                     }
                 }
                 if !agy_targets.is_empty() {
-                    tc.agy_convs_cache.refresh_if_needed();
-                    let mut claimed_agy_ids = claimed_agy_ids_init;
-                    let mut unmatched_agy: Vec<(PaneId, String)> = Vec::new();
-                    for (pane, cwd, pids) in &agy_targets {
+                    tc.agy_convs_cache
+                        .refresh_if_needed_in(home_for_scan.as_deref());
+                    let mut newly_claimed_agy_ids: HashSet<String> = HashSet::new();
+                    let mut unmatched_agy: Vec<(PaneId, String, u64)> = Vec::new();
+                    for (pane, cwd, pids, birth_ms) in &agy_targets {
                         if let Some(conv_id) = tc
                             .agy_presence_cache
                             .find_for_pids_preferring_roots(pids, &tc.agy_convs_cache)
                         {
-                            claimed_agy_ids.insert(conv_id.clone());
+                            newly_claimed_agy_ids.insert(conv_id.clone());
                             agy_lock_conv_by_pane.insert(pane.clone(), conv_id.clone());
-                            if let Some(p) = resolve_agy_transcript_by_id(&conv_id) {
+                            authoritative_panes.insert(pane.clone());
+                            if let Some(p) = resolve_agy_transcript_by_id_opt_home(
+                                home_for_scan.as_deref(),
+                                &conv_id,
+                            ) {
                                 exact_paths.insert(pane.clone(), p);
-                                authoritative_panes.insert(pane.clone());
                             }
                         } else {
-                            unmatched_agy.push((pane.clone(), cwd.clone()));
+                            unmatched_agy.push((pane.clone(), cwd.clone(), *birth_ms));
                         }
                     }
                     if !unmatched_agy.is_empty() {
                         let mut unclaimed_cwd_counts: HashMap<String, usize> = HashMap::new();
-                        for (_, cwd) in &unmatched_agy {
+                        for (_, cwd, _) in &unmatched_agy {
                             *unclaimed_cwd_counts
                                 .entry(cwd.trim_end_matches('/').to_string())
                                 .or_insert(0) += 1;
                         }
-                        for (pane, cwd) in &unmatched_agy {
+                        for (pane, cwd, birth_ms) in &unmatched_agy {
                             let unique = unclaimed_cwd_counts
                                 .get(cwd.trim_end_matches('/'))
                                 .copied()
                                 .unwrap_or(0)
                                 == 1;
-                            if let Some((cid, p)) = tc.agy_convs_cache.match_unique_cwd_excluding(
-                                cwd,
-                                unique,
-                                &claimed_agy_ids,
-                            ) {
-                                claimed_agy_ids.insert(cid);
+                            let mut exclude = excluded_ids_for_pane(&claimed_agy_entries, pane);
+                            exclude.extend(newly_claimed_agy_ids.iter().cloned());
+                            if let Some((cid, p)) =
+                                tc.agy_convs_cache.match_unique_cwd_excluding_in(
+                                    home_for_scan.as_deref(),
+                                    cwd,
+                                    unique,
+                                    &exclude,
+                                    Some(*birth_ms),
+                                )
+                            {
+                                newly_claimed_agy_ids.insert(cid);
                                 exact_paths.entry(pane.clone()).or_insert(p);
                             }
                         }
                     }
                 }
-                tc.cc_switch_cache.refresh_if_needed(poll_now);
+                tc.cc_switch_cache
+                    .refresh_if_needed_in(home_for_scan.as_deref(), poll_now);
+            }
+
+            {
+                let mut dc = lock(&core_cap.inner.discovery_cache);
+                dc.pane_birth_ms = pane_birth_by_pane.clone();
+                dc.authoritative_panes = authoritative_panes.clone();
             }
 
             OffLockScanResult {
@@ -1017,6 +1445,8 @@ impl Core {
                 exact_paths,
                 authoritative_panes,
                 agy_lock_conv_by_pane,
+                pane_birth_by_pane,
+                spawned_meta_by_pane,
             }
         })
         .await;
@@ -1026,6 +1456,8 @@ impl Core {
             exact_paths,
             authoritative_panes,
             agy_lock_conv_by_pane,
+            pane_birth_by_pane,
+            spawned_meta_by_pane,
         }) = off_lock
         else {
             return;
@@ -1173,6 +1605,90 @@ impl Core {
                 }
             }
 
+            // Actively self-heal any `discovered_only` session holding an unverified pre-birth or
+            // cross-session-claimed `transcript_path` / `metrics` (e.g. from pre-fix snapshots).
+            let claim_refs = snapshot_claim_refs(&st);
+            for rec in st.sessions.values_mut() {
+                if !rec.discovered_only
+                    || rec.is_subagent
+                    || !rec.is_local_host()
+                    || rec.state == SessionState::Ended
+                {
+                    continue;
+                }
+                let Some(pane) = rec.pane.clone() else {
+                    continue;
+                };
+                let is_auth = authoritative_panes.contains(&pane);
+                let min_birth = pane_birth_by_pane.get(&pane).copied();
+                let invalid_tp = rec.transcript_path.as_deref().is_some_and(|tp| {
+                    let claimed_elsewhere = is_transcript_claimed_in_refs(
+                        &claim_refs,
+                        &rec.session_id,
+                        Some(&pane),
+                        rec.agent,
+                        tp,
+                    );
+                    let p = Path::new(tp);
+                    let missing = !p.is_file();
+                    let pre_birth = !is_auth
+                        && min_birth.is_some_and(|b| {
+                            transcript_birth_ms(p).is_none_or(|tb| !is_post_birth_timestamp(tb, b))
+                        });
+                    claimed_elsewhere || missing || pre_birth
+                });
+
+                let mut scrubbed = false;
+                if invalid_tp {
+                    rec.transcript_path = None;
+                    rec.metrics = None;
+                    scrubbed = true;
+                } else if rec.transcript_path.is_none() {
+                    let invalid_metrics = rec.metrics.as_ref().is_some_and(|m| {
+                        m.source == "cc_switch"
+                            || m.source == "transcript"
+                            || (!is_auth
+                                && min_birth
+                                    .is_some_and(|b| !is_post_birth_timestamp(m.updated_ms, b)))
+                    });
+                    if invalid_metrics {
+                        rec.metrics = None;
+                        scrubbed = true;
+                    }
+                }
+
+                if scrubbed {
+                    let fallback_model = spawned_meta_by_pane
+                        .get(&pane)
+                        .and_then(|sm| sm.model.clone())
+                        .or_else(|| {
+                            discovered_by_pane
+                                .get(&pane)
+                                .and_then(|dp| dp.model.clone())
+                        });
+                    let fallback_effort = spawned_meta_by_pane
+                        .get(&pane)
+                        .and_then(|sm| sm.effort.clone())
+                        .or_else(|| {
+                            discovered_by_pane
+                                .get(&pane)
+                                .and_then(|dp| dp.effort.clone())
+                        })
+                        .or_else(|| {
+                            (rec.agent == AgentKind::Agy)
+                                .then(|| {
+                                    fallback_model
+                                        .as_deref()
+                                        .and_then(extract_agy_effort_from_model)
+                                })
+                                .flatten()
+                        });
+                    rec.model = fallback_model;
+                    rec.effort = fallback_effort;
+                    metrics_updated.push(rec.clone());
+                }
+            }
+
             for (sid, pane) in &delta.active_legacy {
                 if let Some(tail) = tails.get(pane) {
                     if let Some(tr) = apply_legacy_tail_hash(&mut st, sid, pane, tail, poll_now) {
@@ -1214,7 +1730,7 @@ impl Core {
                     sid: s.session_id.clone(),
                     agent: s.agent,
                     pane: s.pane.clone(),
-                    tp: resolve_transcript_path(s),
+                    tp: resolve_transcript_path_with_home(home_dir.as_deref(), s),
                     ext_sid: canonical_external_session_id(s),
                 })
                 .collect();
@@ -1241,13 +1757,16 @@ impl Core {
         }
 
         let core_tel = self.clone();
+        let home_for_children = home_dir.clone();
         let (agy_batches, computed_metrics) = tokio::task::spawn_blocking(move || {
             let agy_batches: Vec<AgyChildrenBatch> = {
                 let tc = lock(&core_tel.inner.telemetry);
                 agy_roots
                     .into_iter()
                     .map(|r| {
-                        let kids = tc.agy_convs_cache.children_of(&r.ext_id);
+                        let kids = tc
+                            .agy_convs_cache
+                            .children_of_in(home_for_children.as_deref(), &r.ext_id);
                         let root_is_idle = tc.agy_convs_cache.root_is_idle(&r.ext_id);
                         AgyChildrenBatch {
                             root_sid: r.sid,
@@ -1299,7 +1818,6 @@ impl Core {
         // Short State mutation #2: apply precomputed AGY subagent & metrics updates in microseconds.
         {
             let mut st = lock(&self.inner.state);
-            let home_dir = std::env::var_os("HOME").map(PathBuf::from);
 
             for batch in agy_batches {
                 let AgyChildrenBatch {
@@ -1424,6 +1942,27 @@ impl Core {
 
             for item in computed_metrics {
                 if let Some(rec) = st.sessions.get_mut(&item.sid) {
+                    // Guard non-authoritative `discovered_only` sessions against any pre-birth
+                    // telemetry/model leakage from cc-switch or transcripts.
+                    if rec.discovered_only {
+                        let is_auth = rec
+                            .pane
+                            .as_ref()
+                            .is_some_and(|p| authoritative_panes.contains(p));
+                        let min_birth = rec
+                            .pane
+                            .as_ref()
+                            .and_then(|p| pane_birth_by_pane.get(p).copied());
+                        if !is_auth {
+                            if let (Some(b), Some(comb)) = (min_birth, item.combined.as_ref()) {
+                                if comb.source != "status_line"
+                                    && !is_post_birth_timestamp(comb.updated_ms, b)
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let mut changed_rec = false;
                     let valid_tr = item
                         .tr_model
@@ -1538,18 +2077,21 @@ impl Core {
         if session.is_subagent || session.state == SessionState::Ended {
             return;
         }
+        let home_dir = self.effective_home_dir();
         let ext_sid = canonical_external_session_id(&session);
-        let path = resolve_transcript_path(&session);
+        let path = resolve_transcript_path_with_home(home_dir.as_deref(), &session);
         if path.is_none() && ext_sid.is_none() {
             return;
         }
         let agent = session.agent;
         let now_ms = id::now_ms();
         let core = self.clone();
+        let home_for_cc = home_dir.clone();
         let (cc, tr, tr_model, tr_effort) = tokio::task::spawn_blocking(move || {
             let cc = {
                 let mut tc = lock(&core.inner.telemetry);
-                tc.cc_switch_cache.refresh_if_needed(now_ms);
+                tc.cc_switch_cache
+                    .refresh_if_needed_in(home_for_cc.as_deref(), now_ms);
                 ext_sid
                     .as_deref()
                     .and_then(|eid| tc.cc_switch_cache.get(eid))
@@ -1565,7 +2107,6 @@ impl Core {
         .unwrap_or((None, None, None, None));
 
         let updated = {
-            let home_dir = std::env::var_os("HOME").map(PathBuf::from);
             let mut st = lock(&self.inner.state);
             let Some(rec) = st.sessions.get_mut(sid) else {
                 return;
@@ -1707,7 +2248,7 @@ impl Core {
                 "cannot spawn plain shell via coding-agent launcher",
             ));
         }
-        let home_env = std::env::var_os("HOME").map(PathBuf::from);
+        let home_env = self.effective_home_dir();
         let cwd = self.resolve_spawn_cwd_in(home_env.as_deref(), project_root.as_deref())?;
 
         let target_session = match tmux_session
@@ -1763,6 +2304,13 @@ impl Core {
             .map(|t| t.spawn_args.get(&agent).cloned().unwrap_or_default())
             .unwrap_or_default();
         starfane_adapters::ensure_bypass_permission_arg(agent, &mut extra);
+        starfane_adapters::ensure_ancestor_trust_args(
+            agent,
+            Path::new(&cwd),
+            home_env.as_deref(),
+            &mut extra,
+        );
+        starfane_adapters::ensure_codex_mcp_env_vars_arg(agent, home_env.as_deref(), &mut extra);
 
         let prompt_clean = prompt
             .as_deref()
@@ -1770,12 +2318,24 @@ impl Core {
             .filter(|s| !s.is_empty())
             .map(|s| util::sanitize_line(s, self.inner.cfg.gate.max_pointer_len.max(1000)));
 
+        let effective_model = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|m| {
+                if agent == AgentKind::Agy {
+                    starfane_adapters::resolve_agy_model_id(m, effort)
+                } else {
+                    m.to_string()
+                }
+            });
+
         let argv = if let Some(p) = prompt_clean {
             starfane_adapters::build_l4_spawn_cmd(&starfane_adapters::SpawnRequest {
                 agent,
                 bin,
                 cwd: PathBuf::from(&cwd),
-                model: model.clone(),
+                model: effective_model.clone(),
                 effort,
                 name: Some(win_label.clone()),
                 prompt: p,
@@ -1787,13 +2347,14 @@ impl Core {
                 agent,
                 &bin,
                 &cwd,
-                model.as_deref(),
+                effective_model.as_deref(),
                 effort,
                 Some(&win_label),
                 &extra,
             )
         };
 
+        let spawn_ms = id::now_ms();
         let core = self.clone();
         let cwd_clone = cwd.clone();
         let sess_clone = target_session.clone();
@@ -1804,7 +2365,7 @@ impl Core {
                 create_session: true,
                 window_name: win_name,
                 cwd: PathBuf::from(&cwd_clone),
-                env: Vec::new(),
+                env: vec![("STARFANE_SPAWNED_AT_MS".into(), spawn_ms.to_string())],
                 argv,
             })?;
             let (tmux_target, tmux_label) = core
@@ -1835,14 +2396,26 @@ impl Core {
         };
         let sid = legacy_session_id(&pane);
         let now = id::now_ms();
-        let home_dir = std::env::var_os("HOME").map(PathBuf::from);
         let initial_effort = infer_session_effort(
             agent,
-            model.as_deref(),
+            effective_model.as_deref(),
             effort.map(|e| e.as_str()),
             None,
-            home_dir.as_deref(),
+            home_env.as_deref(),
         );
+        {
+            let mut dc = lock(&self.inner.discovery_cache);
+            dc.pane_first_seen_ms.insert(pane.clone(), spawn_ms);
+            dc.pane_birth_ms.insert(pane.clone(), spawn_ms);
+            dc.spawned_panes.insert(
+                pane.clone(),
+                SpawnedPaneMeta {
+                    spawned_at_ms: spawn_ms,
+                    model: effective_model.clone(),
+                    effort: initial_effort.clone(),
+                },
+            );
+        }
         let rec = SessionRecord {
             session_id: sid.clone(),
             agent,
@@ -1850,7 +2423,7 @@ impl Core {
             pane_resolution: PaneResolution::Env,
             cwd: Some(cwd),
             git_root,
-            model,
+            model: effective_model,
             effort: initial_effort,
             state: SessionState::Starting,
             state_since_ms: now,
@@ -1878,6 +2451,9 @@ impl Core {
                 "tmux".to_string()
             }),
         };
+        let resp_model = rec.model.clone();
+        let resp_effort = rec.effort.clone();
+        let resp_cwd = rec.cwd.clone();
         lock(&self.inner.state)
             .sessions
             .insert(sid.clone(), rec.clone());
@@ -1886,10 +2462,14 @@ impl Core {
         self.refresh_attention();
 
         Ok(serde_json::json!({
+            "session_id": sid,
             "pane_id": pane,
             "tmux_target": tmux_target,
             "tmux_label": tmux_label,
-            "session_id": sid,
+            "agent": agent,
+            "model": resp_model,
+            "effort": resp_effort,
+            "cwd": resp_cwd,
         }))
     }
 }
@@ -2674,5 +3254,112 @@ mod tests {
             st.sessions[&remote_sid].tmux_label.as_deref(),
             Some("work-app")
         );
+    }
+
+    #[test]
+    fn legacy_tail_hash_marks_codex_claude_and_agy_folder_trust_screens_as_needs_permission() {
+        let cases = [
+            (
+                "%31",
+                AgentKind::Codex,
+                "  Folder access\n  /Users/wujie/Work/repo\n\n  Trust this folder? Codex can read, edit, and run files here.\n\n› 1. Trust and continue\n  2. Back to Agent Command Center\n  enter continue · esc back\n",
+                "codex waiting for folder trust approval",
+                "› Ask Codex to do anything\n  GPT-6.2-Sol xhigh · ~/Work/repo\n  ← for agents · ? for shortcuts\n",
+            ),
+            (
+                "%32",
+                AgentKind::Claude,
+                " Accessing workspace:\n /Users/wujie/Work/repo\n Quick safety check: Is this a project you created or one you trust?\n Claude Code'll be able to read, edit, and execute files here.\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n",
+                "claude waiting for folder trust approval",
+                "❯ \n? for shortcuts\n",
+            ),
+            (
+                "%33",
+                AgentKind::Agy,
+                "Accessing workspace:\n/Users/wujie/Work/repo\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n> Yes, I trust this folder\n  No, exit\n  ↑/↓ Navigate · enter Confirm\n",
+                "agy waiting for folder trust approval",
+                "> Auto mode: edits & safe commands auto-approved\n? for shortcuts    auto · Gemini 4 Neon · xhigh\n",
+            ),
+        ];
+
+        for (pane_str, agent, trust_tail, expected_reason, normal_tail) in cases {
+            let mut st = State::default();
+            let pane = PaneId::new(pane_str);
+            let sid = legacy_session_id(&pane);
+            let live: HashSet<PaneId> = [pane.clone()].into_iter().collect();
+            reconcile_discovered_panes(
+                &mut st,
+                &[mk_dp(pane_str, "agent-session:0.0", agent, None)],
+                &live,
+                1_000,
+            );
+            assert_eq!(st.sessions[&sid].state, SessionState::Idle);
+
+            // Trust prompt immediately flips Idle -> NeedsPermission + emits heuristic event.
+            let (rec, ev_opt) = apply_legacy_tail_hash(&mut st, &sid, &pane, trust_tail, 2_000)
+                .expect("expected NeedsPermission transition");
+            assert_eq!(rec.state, SessionState::NeedsPermission, "{agent}");
+            assert_eq!(rec.last_error.as_deref(), Some(expected_reason), "{agent}");
+            let ev = ev_opt.expect("expected NeedsPermission event");
+            assert_eq!(ev.kind, EventKind::NeedsPermission);
+            assert_eq!(ev.native_event, "tmux_trust_prompt_heuristic");
+            assert_eq!(ev.detail.error.as_deref(), Some(expected_reason));
+
+            // Subsequent identical polls while waiting on trust do NOT re-emit duplicate events.
+            assert!(apply_legacy_tail_hash(&mut st, &sid, &pane, trust_tail, 5_000).is_none());
+            assert_eq!(st.sessions[&sid].state, SessionState::NeedsPermission);
+
+            // Once user approves trust manually and normal TUI appears, last_error clears and state recovers.
+            let (rec_work, ev_work) =
+                apply_legacy_tail_hash(&mut st, &sid, &pane, normal_tail, 8_000)
+                    .expect("expected recovery transition");
+            assert_eq!(rec_work.state, SessionState::Working, "{agent}");
+            assert_eq!(rec_work.last_error, None, "{agent}");
+            assert!(ev_work.is_none());
+
+            // After LEGACY_STABLE_TICKS unchanged normal ticks -> Idle cleanly.
+            assert!(apply_legacy_tail_hash(&mut st, &sid, &pane, normal_tail, 11_000).is_none());
+            assert!(apply_legacy_tail_hash(&mut st, &sid, &pane, normal_tail, 14_000).is_none());
+            let (rec_idle, _) =
+                apply_legacy_tail_hash(&mut st, &sid, &pane, normal_tail, 17_000).unwrap();
+            assert_eq!(rec_idle.state, SessionState::Idle, "{agent}");
+            assert_eq!(rec_idle.last_error, None, "{agent}");
+        }
+    }
+
+    #[test]
+    fn legacy_tail_hash_marks_codex_update_modal_as_needs_input_and_recovers() {
+        let mut st = State::default();
+        let pane = PaneId::new("%34");
+        let sid = legacy_session_id(&pane);
+        let live: HashSet<PaneId> = [pane.clone()].into_iter().collect();
+        reconcile_discovered_panes(
+            &mut st,
+            &[mk_dp("%34", "agent-session:0.0", AgentKind::Codex, None)],
+            &live,
+            1_000,
+        );
+
+        let update_tail = "  Update available · 0.167.2 → 0.172.0\n  Release notes: https://github.com/openai/codex/releases/latest\n\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\n\n  enter continue · esc skip\n";
+        let (rec, ev_opt) = apply_legacy_tail_hash(&mut st, &sid, &pane, update_tail, 2_000)
+            .expect("expected NeedsInput transition");
+        assert_eq!(rec.state, SessionState::NeedsInput);
+        assert_eq!(
+            rec.last_error.as_deref(),
+            Some("codex waiting on update prompt")
+        );
+        let ev = ev_opt.expect("expected NeedsInput event");
+        assert_eq!(ev.kind, EventKind::NeedsInput);
+        assert_eq!(ev.native_event, "tmux_startup_modal_heuristic");
+
+        // No duplicate event while still on the update modal.
+        assert!(apply_legacy_tail_hash(&mut st, &sid, &pane, update_tail, 5_000).is_none());
+
+        // Dismissed -> clears last_error and settles to Idle.
+        let ready_tail = "› Ask Codex to do anything\n  GPT-6.2-Sol high · ~/Work/workflow\n  ← for agents · ? for shortcuts\n";
+        let (rec_work, _) = apply_legacy_tail_hash(&mut st, &sid, &pane, ready_tail, 8_000)
+            .expect("recovery transition");
+        assert_eq!(rec_work.state, SessionState::Working);
+        assert_eq!(rec_work.last_error, None);
     }
 }

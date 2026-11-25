@@ -19,6 +19,7 @@ import {
   COMPACT_TRANSCRIPT_THRESHOLD,
   S,
   UI,
+  applyNotifiersSnapshot,
   currentSession,
   enc,
   hashMessage,
@@ -29,7 +30,6 @@ import {
   pvKeyOf,
   pvModeOf,
   pvReqSeq,
-  setMute,
   setPreviewEntry,
   setTranscriptEntry,
   stateText,
@@ -144,7 +144,6 @@ export async function syncStateSilent() {
     const st = await api('GET', '/api/state');
     const prevSig = sessionsDiffSig(S.sessions);
     const prevHostsSig = hostsDiffSig([...S.hosts.values()]);
-    const prevMute = S.muteUntil;
     const prevAttn = S.attention.length;
     const prevPipe = [...S.pipelines.values()].map((p) => `${p.id}:${p.status}:${p.updated_ms || 0}`).sort().join(',');
     const nextSessions = new Map();
@@ -171,8 +170,8 @@ export async function syncStateSilent() {
     for (const p of st.pipelines || []) if (p && p.id) nextPipelines.set(p.id, p);
     const nextPipe = [...nextPipelines.values()].map((p) => `${p.id}:${p.status}:${p.updated_ms || 0}`).sort().join(',');
     const nextAttn = st.attention || [];
-    const nextMute = typeof st.feishu_muted_until_ms === 'number' ? st.feishu_muted_until_ms : (st.feishu_muted_until_ms === null ? 0 : S.muteUntil);
-    const changed = prevSig !== nextSig || prevHostsSig !== nextHostsSig || prevPipe !== nextPipe || prevAttn !== nextAttn.length || prevMute !== nextMute;
+    const notifyChanged = applyNotifiersSnapshot(st);
+    const changed = prevSig !== nextSig || prevHostsSig !== nextHostsSig || prevPipe !== nextPipe || prevAttn !== nextAttn.length || notifyChanged;
     S.lastSeq = Math.max(S.lastSeq, st.event_seq || 0);
     if (st.terminal_font || st.has_user_term_font) applyTerminalFontConfig(st.terminal_font || '', !!st.has_user_term_font);
     if (changed) {
@@ -180,7 +179,6 @@ export async function syncStateSilent() {
       S.pipelines = nextPipelines;
       S.attention = nextAttn;
       if (Array.isArray(st.hosts)) upsertHosts(st.hosts);
-      if (nextMute !== prevMute) setMute(nextMute);
       pickDefaultSession();
       APP.schedulePassive();
       const subQs = UI.showEnded ? { subagents: 1, ended: 1 } : { subagents: 1 };
@@ -213,12 +211,14 @@ export async function loadAll() {
     (st.sessions || []).forEach(upsertSession);
     (st.pipelines || []).forEach(upsertPipeline);
     S.attention = st.attention || [];
-    if (typeof st.feishu_muted_until_ms === 'number') setMute(st.feishu_muted_until_ms);
-    else if (st.feishu_muted_until_ms === null) setMute(0);
+    applyNotifiersSnapshot(st);
     S.loaded = true;
     S.loadError = null;
     S.authNeeded = false;
     pickDefaultSession();
+    if (!Array.isArray(st.notifiers) && !Array.isArray(st.details)) {
+      loadNotifiers({ silent: true });
+    }
     const subQs = UI.showEnded ? { subagents: 1, ended: 1 } : { subagents: 1 };
     api('GET', `/api/sessions${qs(subQs)}`)
       .then((list) => {
@@ -684,6 +684,7 @@ function handleEvent(type, d) {
       break;
     case 'pipeline': upsertPipeline(d.pipeline); break;
     case 'attention': S.attention = d.items || []; break;
+    case 'notifiers': applyNotifiersSnapshot(d); break;
     case 'resync': syncStateSilent(); return;
     case 'review': refreshReview(d.review_id); break;
     case 'artifact': if (d.kind === 'review' && S.reviewsState === 'ok') loadReviews(); break;
@@ -745,6 +746,82 @@ export async function loadTmuxSessions() {
     const data = await api('GET', '/api/tmux/sessions');
     if (Array.isArray(data?.sessions)) { S.tmuxSessions = data.sessions; APP.schedule(); }
   } catch (e) { console.warn('GET /api/tmux/sessions failed', e); }
+}
+
+function isMissingRouteError(e) {
+  return e instanceof ApiError && (e.status === 405 || (e.status === 404 && /no such route/i.test(e.message || '')));
+}
+
+export async function loadNotifiers({ silent = false } = {}) {
+  try {
+    const data = await api('GET', '/api/notifiers');
+    const changed = applyNotifiersSnapshot(data);
+    if (changed || !silent) {
+      if (silent) APP.schedulePassive();
+      else APP.schedule();
+    }
+    return data;
+  } catch (e) {
+    if (silent) {
+      console.warn('GET /api/notifiers failed', e);
+      return null;
+    }
+    throw e;
+  }
+}
+
+export async function muteNotifiersApi({ target = 'all', minutes, until_ms } = {}) {
+  const cleanTarget = String(target || 'all').trim() || 'all';
+  const body = { target: cleanTarget };
+  if (minutes !== undefined) body.minutes = minutes;
+  if (until_ms !== undefined) body.until_ms = until_ms;
+  try {
+    return await api('POST', '/api/notifiers/mute', body);
+  } catch (e) {
+    if (isMissingRouteError(e)) {
+      if (cleanTarget === 'all' || cleanTarget === 'feishu-default') {
+        const legacyBody = {};
+        if (minutes !== undefined) legacyBody.minutes = minutes;
+        if (until_ms !== undefined) legacyBody.until_ms = until_ms;
+        try {
+          return await api('POST', '/api/feishu/mute', legacyBody);
+        } catch (legacyErr) {
+          if (isMissingRouteError(legacyErr)) {
+            throw new ApiError(
+              'unavailable',
+              L('当前 daemon 未启用 Web 通知静音接口', 'Web notification mute API is not enabled on this daemon'),
+              legacyErr.status,
+            );
+          }
+          throw legacyErr;
+        }
+      }
+      throw new ApiError(
+        'unavailable',
+        L('当前 daemon 暂不支持按单渠道静音，请升级或选择「全部通知渠道」', 'This daemon version does not support per-channel mute yet; upgrade or select "All channels"'),
+        e.status,
+      );
+    }
+    if (e instanceof ApiError && e.status === 404) {
+      loadNotifiers({ silent: true });
+    }
+    throw e;
+  }
+}
+
+export async function testNotifierApi(id, text) {
+  const cleanId = String(id || '').trim();
+  if (!cleanId) {
+    throw new ApiError('bad_request', L('缺少通知渠道 ID', 'Missing notification channel ID'), 400);
+  }
+  try {
+    return await api('POST', `/api/notifiers/${enc(cleanId)}/test`, { text });
+  } catch (e) {
+    if (cleanId === 'feishu-default' && isMissingRouteError(e)) {
+      return api('POST', '/api/feishu/test', { text });
+    }
+    throw e;
+  }
 }
 
 export async function loadSlashCommands(agent) {

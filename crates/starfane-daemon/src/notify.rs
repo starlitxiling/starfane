@@ -42,12 +42,75 @@ const WECOM_TEXT_MAX_BYTES: usize = 2048;
 const QQ_MAX_TEXT_CHARS: usize = 4500;
 const ERROR_BODY_PREVIEW_MAX_CHARS: usize = 300;
 
-/// Public secret-free summary of a configured notifier returned by `GET /api/notifiers`.
+/// Active global and per-channel mute deadlines (Unix-ms timestamps).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MuteSnapshot {
+    pub global_mute_until_ms: Option<u64>,
+    pub channel_mutes: BTreeMap<String, u64>,
+}
+
+impl MuteSnapshot {
+    /// Prune expired mute deadlines (`<= now_ms`). Returns `true` if any entry was removed.
+    pub fn prune_expired(&mut self, now_ms: u64) -> bool {
+        let mut changed = false;
+        if self.global_mute_until_ms.is_some_and(|t| t <= now_ms) {
+            self.global_mute_until_ms = None;
+            changed = true;
+        }
+        let before = self.channel_mutes.len();
+        self.channel_mutes.retain(|_, &mut t| t > now_ms);
+        if self.channel_mutes.len() != before {
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn is_global_muted(&self, now_ms: u64) -> bool {
+        self.global_mute_until_ms.is_some_and(|t| t > now_ms)
+    }
+
+    /// Per-channel mute deadline (excluding global mute).
+    pub fn channel_mute_until(&self, id: &str, now_ms: u64) -> Option<u64> {
+        self.channel_mutes.get(id).copied().filter(|&t| t > now_ms)
+    }
+
+    /// Effective mute deadline for `id`: `max(global_mute_until_ms, channel_mutes[id])`.
+    pub fn effective_mute_until(&self, id: &str, now_ms: u64) -> Option<u64> {
+        let global = self.global_mute_until_ms.filter(|&t| t > now_ms);
+        let channel = self.channel_mute_until(id, now_ms);
+        match (global, channel) {
+            (Some(g), Some(c)) => Some(g.max(c)),
+            (Some(g), None) => Some(g),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        }
+    }
+
+    pub fn is_channel_muted(&self, id: &str, now_ms: u64) -> bool {
+        self.effective_mute_until(id, now_ms).is_some()
+    }
+
+    pub fn any_muted(&self, now_ms: u64) -> bool {
+        self.is_global_muted(now_ms) || self.channel_mutes.values().any(|&t| t > now_ms)
+    }
+}
+
+/// Public secret-free summary of a configured notifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NotifierSummary {
     pub id: String,
     pub kind: NotifierKind,
     pub ownership: NotifyOwnership,
+}
+
+/// Public secret-free runtime status of a configured notifier (including active mute deadlines).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NotifierStatus {
+    pub id: String,
+    pub kind: NotifierKind,
+    pub ownership: NotifyOwnership,
+    pub muted_until_ms: Option<u64>,
+    pub channel_muted_until_ms: Option<u64>,
 }
 
 /// Pluggable outbound notification channel (Feishu profile, Telegram, Discord, Slack, Webhook, macOS native).
@@ -194,6 +257,10 @@ impl NotifyRouter {
         self.notifiers.get(id).cloned()
     }
 
+    pub fn has_id(&self, id: &str) -> bool {
+        self.ownership_by_id.contains_key(id)
+    }
+
     pub fn list_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.ownership_by_id.keys().cloned().collect();
         ids.sort();
@@ -212,6 +279,20 @@ impl NotifyRouter {
                     kind,
                     ownership,
                 })
+            })
+            .collect()
+    }
+
+    /// Secret-free status entries including active effective & per-channel mute deadlines.
+    pub fn list_statuses(&self, mutes: &MuteSnapshot, now_ms: u64) -> Vec<NotifierStatus> {
+        self.list_summaries()
+            .into_iter()
+            .map(|s| NotifierStatus {
+                muted_until_ms: mutes.effective_mute_until(&s.id, now_ms),
+                channel_muted_until_ms: mutes.channel_mute_until(&s.id, now_ms),
+                id: s.id,
+                kind: s.kind,
+                ownership: s.ownership,
             })
             .collect()
     }
@@ -269,16 +350,35 @@ impl NotifyRouter {
             .any(|id| id == DEFAULT_FEISHU_NOTIFIER_ID)
     }
 
-    /// Fan out `notice` concurrently to all resolved pluggable notifiers (excluding `feishu-default`,
-    /// which `lark.rs` delivers), isolating per-channel failures so one broken channel never blocks
-    /// healthy ones. Returns per-channel delivery outcomes in resolved target order.
-    pub async fn dispatch_pluggable_report(
+    /// Resolve target notifier IDs excluding channels muted at `now_ms`.
+    pub fn resolve_active_targets(
+        &self,
+        ctx: &NotifyRouteContext,
+        team_routes: &[TeamNotifyRoute],
+        mutes: &MuteSnapshot,
+        now_ms: u64,
+    ) -> Vec<String> {
+        if mutes.is_global_muted(now_ms) {
+            return Vec::new();
+        }
+        self.resolve_targets(ctx, team_routes)
+            .into_iter()
+            .filter(|id| !mutes.is_channel_muted(id, now_ms))
+            .collect()
+    }
+
+    /// Fan out `notice` concurrently to all resolved unmuted pluggable notifiers (excluding
+    /// `feishu-default`, which `lark.rs` delivers), isolating per-channel failures so one broken
+    /// channel never blocks healthy ones.
+    pub async fn dispatch_pluggable_with_mutes(
         &self,
         notice: &Notice,
         ctx: &NotifyRouteContext,
         team_routes: &[TeamNotifyRoute],
+        mutes: &MuteSnapshot,
+        now_ms: u64,
     ) -> Vec<(String, Result<Option<String>, ApiError>)> {
-        let targets = self.resolve_targets(ctx, team_routes);
+        let targets = self.resolve_active_targets(ctx, team_routes, mutes, now_ms);
         let mut handles = Vec::new();
         for id in targets {
             if id == DEFAULT_FEISHU_NOTIFIER_ID && self.has_legacy_feishu {
@@ -311,6 +411,20 @@ impl NotifyRouter {
             }
         }
         results
+    }
+
+    /// Fan out `notice` concurrently to all resolved pluggable notifiers (excluding `feishu-default`,
+    /// which `lark.rs` delivers), isolating per-channel failures so one broken channel never blocks
+    /// healthy ones. Returns per-channel delivery outcomes in resolved target order.
+    pub async fn dispatch_pluggable_report(
+        &self,
+        notice: &Notice,
+        ctx: &NotifyRouteContext,
+        team_routes: &[TeamNotifyRoute],
+    ) -> Vec<(String, Result<Option<String>, ApiError>)> {
+        let mutes = MuteSnapshot::default();
+        self.dispatch_pluggable_with_mutes(notice, ctx, team_routes, &mutes, 0)
+            .await
     }
 
     /// Fan out `notice` to all resolved pluggable notifiers (excluding `feishu-default`, which `lark.rs` delivers).
@@ -2371,5 +2485,33 @@ url = "https://hooks.example.com/secret"
             no_sound,
             "display notification \"内容已完成\" with title \"中文标题\""
         );
+    }
+
+    #[test]
+    fn mute_snapshot_pruning_and_effective_precedence() {
+        let now = 1_764_050_000_000u64;
+        let mut m = MuteSnapshot {
+            global_mute_until_ms: Some(now - 1),
+            channel_mutes: BTreeMap::from([
+                ("expired".to_string(), now),
+                ("tg-ops".to_string(), now + 60_000),
+            ]),
+        };
+        assert!(m.prune_expired(now));
+        assert_eq!(m.global_mute_until_ms, None);
+        assert!(!m.channel_mutes.contains_key("expired"));
+        assert!(m.is_channel_muted("tg-ops", now));
+        assert!(!m.is_channel_muted("discord-ops", now));
+        assert!(m.any_muted(now));
+
+        // Global mute overrides unmuted channels and takes max over shorter per-channel mutes.
+        m.global_mute_until_ms = Some(now + 120_000);
+        assert_eq!(m.effective_mute_until("tg-ops", now), Some(now + 120_000));
+        assert_eq!(m.channel_mute_until("tg-ops", now), Some(now + 60_000));
+        assert_eq!(
+            m.effective_mute_until("discord-ops", now),
+            Some(now + 120_000)
+        );
+        assert_eq!(m.channel_mute_until("discord-ops", now), None);
     }
 }

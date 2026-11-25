@@ -180,6 +180,7 @@ async fn ingest_aggregates_sessions_and_subagents() {
             pane: Some(PaneId::new("%2")),
             bind_token: None,
             session_hint: None,
+            pid_chain: Vec::new(),
         },
     )
     .await;
@@ -193,6 +194,7 @@ async fn ingest_aggregates_sessions_and_subagents() {
             pane: None,
             bind_token: None,
             session_hint: None,
+            pid_chain: Vec::new(),
         },
     )
     .await;

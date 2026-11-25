@@ -1,7 +1,7 @@
 // starfane web console — zero-build ES module entry point
 import { HEALTH_POLL_MS, PREVIEW_POLL_MS, TICK_MS, TOKEN_KEY, VIEWS } from './js/constants.js';
 import { L, getLang } from './js/i18n.js';
-import { $, emptyState, errorBanner, h, muteRemain, skeleton } from './js/dom.js';
+import { $, emptyState, errorBanner, h, skeleton } from './js/dom.js';
 import {
   connectSSE,
   loadAll,
@@ -45,6 +45,7 @@ import {
   enc,
   isFinished,
   muted,
+  notifyTopSig,
   onLeaveSession,
   pvKeyOf,
   pvModeOf,
@@ -100,9 +101,8 @@ function computeTopSig(alerts) {
     (n, r) => n + (r.findings || []).filter((f) => f.falsifier?.verdict === 'needs_human' && !f.feedback).length,
     0,
   );
-  const m = muted();
   const upMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
-  return `${getLang()}|${UI.view}|${cs}|${S.conn}|${S.version}|${S.lastSeq}|${upMin}|${liveSessions}|${alerts}|${activePipes}|${pendingVerdicts}|${m ? muteRemain(S.muteUntil) : 0}|${UI.muteMenu ? 1 : 0}|${S.muteUntil}`;
+  return `${getLang()}|${UI.view}|${cs}|${S.conn}|${S.version}|${S.lastSeq}|${upMin}|${liveSessions}|${alerts}|${activePipes}|${pendingVerdicts}|${notifyTopSig()}`;
 }
 
 function renderView() {
@@ -333,7 +333,7 @@ async function boot() {
   setInterval(() => {
     if (document.hidden) return;
     syncStateSilent();
-    if (UI.view === 'workspace' && !UI.drawer && !muted()) return;
+    if (UI.view === 'workspace' && !UI.drawer && !muted() && computeTopSig(alertCount()) === lastTopSig) return;
     const sel = window.getSelection?.();
     if (sel && !sel.isCollapsed && $('.term-viewport')?.contains(sel.anchorNode)) return;
     schedulePassive();

@@ -6,7 +6,9 @@
 
 use starfane_proto::{AgentKind, GateCheck, PaneId, PaneResolution, SessionState, StageKind};
 use starfane_tmux::{
-    check_injection_gate, is_bare_slash_command, is_user_watching, parse_client_line,
+    adaptive_paste_settle_ms, check_injection_gate, check_injection_gate_with_screen,
+    detect_blocking_startup_prompt, detect_codex_update_prompt, detect_folder_trust_prompt,
+    is_bare_slash_command, is_paste_stuck_in_prompt, is_user_watching, parse_client_line,
     parse_clients, parse_pane_line, parse_panes, pid_ancestors, resolve_pane,
     validate_pointer_text, ClientInfo, GateConfig, PaneHint, PaneInfo, PaneStatus, SpawnWindow,
     Tmux, TmuxError, FIELD_SEP,
@@ -290,6 +292,282 @@ fn gate_draft_vs_unrecognised_detail() {
     assert!(d.detail.unwrap().contains("draft"));
     let u = gate(&p, &[], SessionState::Idle, AgentKind::Claude, "~/repo $");
     assert!(u.detail.unwrap().contains("not a recognised idle prompt"));
+}
+
+#[test]
+fn gate_blocks_folder_trust_prompts_for_codex_claude_and_agy() {
+    let p = pane("%1");
+    let cfg = GateConfig::default();
+
+    let codex_screen = "\
+  Folder access
+  /Users/wujie/Work/workflow
+
+  Trust this folder? Codex can read, edit, and run files here, subject to your permission
+  settings. Folder settings can run code automatically, even without a model request. Continue
+  only if you trust these files. Your trust decision will be saved.
+
+› 1. Trust and continue
+  2. Back to Agent Command Center
+
+  enter continue · esc back
+";
+    assert_eq!(
+        detect_folder_trust_prompt(AgentKind::Codex, codex_screen),
+        Some("codex waiting for folder trust approval")
+    );
+    // Even if cursor sits on a blank row below the Codex trust menu, screen check catches it!
+    let r_codex = check_injection_gate_with_screen(
+        &p,
+        &[],
+        SessionState::Idle,
+        AgentKind::Codex,
+        "",
+        Some(codex_screen),
+        &cfg,
+        NOW,
+    );
+    assert!(!r_codex.passed);
+    assert_eq!(r_codex.failed_checks(), vec![GateCheck::InputEmpty]);
+    assert!(r_codex
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("codex waiting for folder trust approval"));
+
+    // Single-line cursor on Codex trust option or older prompt text also fails with trust reason.
+    for line in [
+        "› 1. Trust and continue",
+        "Trust this folder?",
+        "Do you trust the contents of this directory?",
+        "Folder access",
+    ] {
+        let r = gate(&p, &[], SessionState::Idle, AgentKind::Codex, line);
+        assert!(!r.passed, "{line:?}");
+        assert_eq!(r.failed_checks(), vec![GateCheck::InputEmpty], "{line:?}");
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap()
+                .contains("codex waiting for folder trust approval"),
+            "{line:?}: {:?}",
+            r.detail
+        );
+    }
+
+    let claude_screen = "\
+────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+ /Users/wujie/Work/new_repo
+ Quick safety check: Is this a project you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel
+";
+    assert_eq!(
+        detect_folder_trust_prompt(AgentKind::Claude, claude_screen),
+        Some("claude waiting for folder trust approval")
+    );
+    let r_claude = check_injection_gate_with_screen(
+        &p,
+        &[],
+        SessionState::Idle,
+        AgentKind::Claude,
+        "❯ No, exit",
+        Some(claude_screen),
+        &cfg,
+        NOW,
+    );
+    assert!(!r_claude.passed);
+    assert_eq!(r_claude.failed_checks(), vec![GateCheck::InputEmpty]);
+    assert!(r_claude
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("claude waiting for folder trust approval"));
+
+    for line in [
+        "Do you trust the files in this folder?",
+        "Quick safety check: Is this a project you created or one you trust?",
+        "❯ Yes, I trust this folder",
+    ] {
+        let r = gate(&p, &[], SessionState::Idle, AgentKind::Claude, line);
+        assert!(!r.passed, "{line:?}");
+        assert!(r
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("claude waiting for folder trust approval"));
+    }
+
+    let agy_screen = "\
+Accessing workspace:
+/private/tmp/untrusted
+Do you trust the contents of this project?
+Antigravity CLI requires permission to read, edit, and execute files here.
+> Yes, I trust this folder
+  No, exit
+  ↑/↓ Navigate · enter Confirm
+                                                        Gemini 4 Neon · xhigh
+";
+    assert_eq!(
+        detect_folder_trust_prompt(AgentKind::Agy, agy_screen),
+        Some("agy waiting for folder trust approval")
+    );
+    let r_agy = check_injection_gate_with_screen(
+        &p,
+        &[],
+        SessionState::Idle,
+        AgentKind::Agy,
+        "Gemini 4 Neon · xhigh",
+        Some(agy_screen),
+        &cfg,
+        NOW,
+    );
+    assert!(!r_agy.passed);
+    assert_eq!(r_agy.failed_checks(), vec![GateCheck::InputEmpty]);
+    assert!(r_agy
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("agy waiting for folder trust approval"));
+
+    // False-positive guard: normal chat output discussing trust prompts alongside active chat chrome
+    // MUST NOT be misclassified as a trust dialog!
+    let normal_codex_chat = "\
+• Fixed detection of `Folder access` / `Trust this folder?` / `Trust and continue`.
+
+› Ask Codex to do anything
+
+  GPT-6.2-Sol xhigh · ~/Work/workflow
+  ← for agents · ? for shortcuts
+";
+    assert_eq!(
+        detect_folder_trust_prompt(AgentKind::Codex, normal_codex_chat),
+        None
+    );
+    let r_normal = check_injection_gate_with_screen(
+        &p,
+        &[],
+        SessionState::Idle,
+        AgentKind::Codex,
+        "› Ask Codex to do anything",
+        Some(normal_codex_chat),
+        &cfg,
+        NOW,
+    );
+    assert!(r_normal.passed, "{r_normal:?}");
+
+    let normal_agy_chat = "\
+Implemented trust detection for 'Do you trust the contents of this project?' and 'Yes, I trust this folder'.
+────────────────────────────────────────
+> 
+────────────────────────────────────────
+? for shortcuts    auto · Gemini 4 Neon · xhigh
+";
+    assert_eq!(
+        detect_folder_trust_prompt(AgentKind::Agy, normal_agy_chat),
+        None
+    );
+}
+
+#[test]
+fn gate_blocks_codex_update_available_startup_modal() {
+    let p = pane("%1");
+    let cfg = GateConfig::default();
+
+    let update_screen = "\
+  Update available · 0.167.2 → 0.172.0
+  Release notes: https://github.com/openai/codex/releases/latest
+
+› 1. Update now (runs `npm install -g @openai/codex`)
+  2. Skip
+  3. Skip until next version
+
+  enter continue · esc skip
+";
+    assert_eq!(
+        detect_codex_update_prompt(AgentKind::Codex, update_screen),
+        Some("codex waiting on update prompt")
+    );
+    assert_eq!(
+        detect_blocking_startup_prompt(AgentKind::Codex, update_screen),
+        Some("codex waiting on update prompt")
+    );
+    assert_eq!(
+        detect_codex_update_prompt(AgentKind::Claude, update_screen),
+        None
+    );
+
+    // Even when cursor sits on a blank row below the update modal, screen check blocks injection.
+    let r = check_injection_gate_with_screen(
+        &p,
+        &[],
+        SessionState::Idle,
+        AgentKind::Codex,
+        "",
+        Some(update_screen),
+        &cfg,
+        NOW,
+    );
+    assert!(!r.passed);
+    assert_eq!(r.failed_checks(), vec![GateCheck::InputEmpty]);
+    assert!(r
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("codex waiting on update prompt"));
+
+    // Single-line cursor on the `› 1. Update now` option is also blocked cleanly.
+    for line in [
+        "› 1. Update now (runs `npm install -g @openai/codex`)",
+        "Update available · 0.167.2 → 0.172.0",
+        "enter continue · esc skip",
+    ] {
+        let r_line = gate(&p, &[], SessionState::Idle, AgentKind::Codex, line);
+        assert!(!r_line.passed, "{line:?}");
+        assert_eq!(
+            r_line.failed_checks(),
+            vec![GateCheck::InputEmpty],
+            "{line:?}"
+        );
+        assert!(
+            r_line
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("codex waiting on update prompt"),
+            "{line:?}: {:?}",
+            r_line.detail
+        );
+    }
+
+    // False-positive guard: normal Codex chat mentioning Update available alongside chat chrome.
+    let normal_chat = "\
+• Fixed handling of `Update available · 0.167.2 → 0.172.0` and `› 1. Update now`.
+
+› Ask Codex to do anything
+
+  GPT-6.2-Sol xhigh · ~/Work/workflow
+  ← for agents · ? for shortcuts
+";
+    assert_eq!(
+        detect_codex_update_prompt(AgentKind::Codex, normal_chat),
+        None
+    );
+    let r_ok = check_injection_gate_with_screen(
+        &p,
+        &[],
+        SessionState::Idle,
+        AgentKind::Codex,
+        "› Ask Codex to do anything",
+        Some(normal_chat),
+        &cfg,
+        NOW,
+    );
+    assert!(r_ok.passed, "{r_ok:?}");
 }
 
 #[test]
@@ -1443,4 +1721,155 @@ fn sandbox_batch_capture_and_paginated_scrollback() {
     assert!(full.text.contains("LINE_120"));
     assert!(!full.has_more);
     assert_eq!(full.start_line, 0);
+}
+
+#[test]
+fn claude_placeholder_prompt_and_adaptive_settle_and_stuck_detection() {
+    // 1. Claude Code 2.1 ghost placeholder hint counts as empty only when cursor sits at prompt start.
+    let mut claude_pane = pane("%23");
+    claude_pane.cursor_x = 2;
+    let r_empty = gate(
+        &claude_pane,
+        &[],
+        SessionState::Idle,
+        AgentKind::Claude,
+        "❯\u{a0}Try \"fix lint errors\"",
+    );
+    assert!(
+        r_empty.passed,
+        "placeholder should count as empty: {r_empty:?}"
+    );
+
+    claude_pane.cursor_x = 22;
+    let r_typed = gate(
+        &claude_pane,
+        &[],
+        SessionState::Idle,
+        AgentKind::Claude,
+        "❯\u{a0}Try \"fix lint errors\"",
+    );
+    assert_eq!(r_typed.failed_checks(), vec![GateCheck::InputEmpty]);
+
+    // 2. Adaptive paste settle scales up for multiline/long payloads while keeping short lines fast.
+    assert_eq!(adaptive_paste_settle_ms(0, "a\nb\nc"), 0);
+    assert_eq!(adaptive_paste_settle_ms(250, "hello"), 250);
+    let multiline = "第一行说明\n第二行说明\n第三行说明\n第四行很长的追问内容";
+    let ml_settle = adaptive_paste_settle_ms(250, multiline);
+    assert!(
+        (400..=900).contains(&ml_settle),
+        "unexpected multiline settle: {ml_settle}"
+    );
+    let huge = format!("{}\n{}", "x".repeat(2000), "y\n".repeat(20));
+    assert_eq!(adaptive_paste_settle_ms(250, &huge), 900);
+    assert_eq!(adaptive_paste_settle_ms(1200, &huge), 1200);
+
+    // 3. Stuck-in-prompt detection catches unsubmitted text & paste badges without false positives.
+    let pre_agy = "前一条助手回复\n────────────────────\n>\n────────────────────\n? for shortcuts";
+    let stuck_agy = "前一条助手回复\n────────────────────\n> 当前接 Sharpa 时的两个注意项：需要改成4踏板\n────────────────────\n? for shortcuts";
+    assert!(is_paste_stuck_in_prompt(
+        AgentKind::Agy,
+        pre_agy,
+        stuck_agy,
+        2,
+        "当前接 Sharpa 时的两个注意项：需要改成4踏板"
+    ));
+
+    let pre_claude = "assistant reply\n────────────────────\n❯ \n────────────────────";
+    let stuck_badge =
+        "assistant reply\n────────────────────\n❯ [Pasted text #1 +4 lines]\n────────────────────";
+    assert!(is_paste_stuck_in_prompt(
+        AgentKind::Claude,
+        pre_claude,
+        stuck_badge,
+        2,
+        "line1\nline2\nline3\nline4"
+    ));
+
+    // Submitted message scrolled above divider while cursor sits on clean empty prompt -> NOT stuck.
+    let submitted_agy = "> 当前接 Sharpa 时的两个注意项：需要改成4踏板\n────────────────────\n>\n────────────────────\n? for shortcuts";
+    assert!(!is_paste_stuck_in_prompt(
+        AgentKind::Agy,
+        pre_agy,
+        submitted_agy,
+        2,
+        "当前接 Sharpa 时的两个注意项：需要改成4踏板"
+    ));
+
+    // Active thinking/streaming state below submitted prompt -> NOT stuck.
+    let thinking_agy =
+        "> 当前接 Sharpa 时的两个注意项：需要改成4踏板\n⠋ Thinking... (esc to interrupt)";
+    assert!(!is_paste_stuck_in_prompt(
+        AgentKind::Agy,
+        pre_agy,
+        thinking_agy,
+        1,
+        "当前接 Sharpa 时的两个注意项：需要改成4踏板"
+    ));
+
+    // Shell panes are never flagged for retry-Enter.
+    assert!(!is_paste_stuck_in_prompt(
+        AgentKind::Shell,
+        pre_agy,
+        stuck_agy,
+        2,
+        "当前接 Sharpa 时的两个注意项：需要改成4踏板"
+    ));
+}
+
+#[test]
+fn exit_copy_mode_recovers_scrolled_tmux_pane() {
+    let Some(sb) = Sandbox::new() else {
+        return;
+    };
+    let ready = sb.file("ready_cm");
+    let got = sb.file("got_cm");
+    let script = format!(
+        ": > '{ready}'; IFS= read -r line; printf '%s' \"$line\" > '{got}'; sleep 30",
+        ready = ready.display(),
+        got = got.display()
+    );
+    let p = spawn_sh(&sb, "agy-cm", &script, "B-CM");
+    wait_exists(&ready, "copy-mode pane ready");
+
+    // Enter tmux copy-mode (reproducing user scrolling up on an alt=0 AGY pane).
+    let st = std::process::Command::new(&sb.tmux.bin)
+        .args([
+            "-L",
+            sb.tmux.socket_name.as_deref().unwrap(),
+            "copy-mode",
+            "-t",
+            p.as_str(),
+        ])
+        .status()
+        .expect("tmux copy-mode");
+    assert!(st.success());
+    let before = sb
+        .tmux
+        .list_panes()
+        .unwrap()
+        .into_iter()
+        .find(|x| x.pane_id == p)
+        .unwrap();
+    assert!(before.in_mode, "pane must be in copy-mode");
+    assert_eq!(sb.tmux.pane_mode(&p).unwrap(), "copy-mode");
+
+    // Safely cancel copy-mode and inject message without leaking keys into PTY.
+    assert!(sb.tmux.exit_copy_mode(&p).unwrap());
+    let after = sb
+        .tmux
+        .list_panes()
+        .unwrap()
+        .into_iter()
+        .find(|x| x.pane_id == p)
+        .unwrap();
+    assert!(!after.in_mode, "pane must have exited copy-mode");
+
+    let cfg = GateConfig::default();
+    sb.tmux
+        .inject_interactive(&p, "RECOVERED_AFTER_COPY_MODE", &cfg)
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(wait_for(&got, "delivered line after copy-mode")).unwrap(),
+        "RECOVERED_AFTER_COPY_MODE"
+    );
 }

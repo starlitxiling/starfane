@@ -172,6 +172,7 @@ pub fn router(core: Core) -> Router {
         .route("/api/hosts", get(list_hosts))
         .route("/api/hosts/{id}/rename", post(rename_host))
         .route("/api/notifiers", get(list_notifiers))
+        .route("/api/notifiers/mute", post(notifiers_mute))
         .route("/api/notifiers/{id}/test", post(test_notifier))
         .layer(middleware::from_fn_with_state(core.clone(), auth));
     Router::new()
@@ -1345,12 +1346,7 @@ async fn rename_host(State(core): State<Core>, Path(id): Path<String>, body: Byt
 }
 
 async fn list_notifiers(State(core): State<Core>) -> Response {
-    let ids = core.notify_router().list_ids();
-    let details = core.notify_router().list_summaries();
-    respond(Ok(serde_json::json!({
-        "notifiers": ids,
-        "details": details,
-    })))
+    respond(Ok(core.notifiers_status_json()))
 }
 
 async fn test_notifier(State(core): State<Core>, Path(id): Path<String>, body: Bytes) -> Response {
@@ -1374,24 +1370,33 @@ async fn test_notifier(State(core): State<Core>, Path(id): Path<String>, body: B
     respond(r.await)
 }
 
-/// Maximum custom Feishu mute duration: 7 days (10,080 minutes).
+/// Maximum custom notification mute duration: 7 days (10,080 minutes).
 pub const MAX_MUTE_MINUTES: u64 = 10_080;
 const MAX_MUTE_MS: u64 = MAX_MUTE_MINUTES * 60_000;
 
 #[derive(Deserialize)]
 struct MuteBody {
     #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
     minutes: Option<u64>,
     #[serde(default)]
-    until_ms: Option<u64>,
+    until_ms: Option<i64>,
 }
 
 fn resolve_mute_until(
     minutes: Option<u64>,
-    until_ms: Option<u64>,
+    until_ms: Option<i64>,
     now_ms: u64,
 ) -> Result<Option<u64>, ApiError> {
-    if let Some(ts) = until_ms {
+    if let Some(raw_ts) = until_ms {
+        if raw_ts == 0 {
+            return Ok(None);
+        }
+        if raw_ts < 0 {
+            return Err(ApiError::bad_request("until_ms must be >= 0"));
+        }
+        let ts = raw_ts as u64;
         if ts <= now_ms {
             return Err(ApiError::bad_request("until_ms must be in the future"));
         }
@@ -1414,16 +1419,62 @@ fn resolve_mute_until(
     }
 }
 
+async fn notifiers_mute(State(core): State<Core>, body: Bytes) -> Response {
+    let r = (|| {
+        let b: MuteBody = parse_body(&body)?;
+        let now_ms = id::now_ms();
+        let until = resolve_mute_until(b.minutes, b.until_ms, now_ms)?;
+        let raw_target = b.target.as_deref().map(str::trim).unwrap_or("all");
+        let target_label = if raw_target.is_empty() || raw_target.eq_ignore_ascii_case("all") {
+            let _ = core.set_global_mute(until);
+            "all".to_string()
+        } else {
+            let _ = core.set_channel_mute(raw_target, until)?;
+            raw_target.to_string()
+        };
+        core.audit(
+            "web",
+            serde_json::json!({
+                "action": "notifiers_mute",
+                "target": target_label,
+                "minutes": b.minutes,
+                "until_ms": until,
+            }),
+        );
+        let snap = core.mute_snapshot();
+        let ids = core.notify_router().list_ids();
+        let details = core.notify_router().list_statuses(&snap, now_ms);
+        let feishu_eff =
+            snap.effective_mute_until(crate::notify::DEFAULT_FEISHU_NOTIFIER_ID, now_ms);
+        Ok(serde_json::json!({
+            "target": target_label,
+            "muted_until_ms": until,
+            "global_mute_until_ms": snap.global_mute_until_ms,
+            "channel_mutes": snap.channel_mutes,
+            "any_muted": snap.any_muted(now_ms),
+            "feishu_muted_until_ms": feishu_eff,
+            "notifiers": ids,
+            "details": details,
+        }))
+    })();
+    respond(r)
+}
+
 async fn feishu_mute(State(core): State<Core>, body: Bytes) -> Response {
     let r = (|| {
         let b: MuteBody = parse_body(&body)?;
-        let until = resolve_mute_until(b.minutes, b.until_ms, id::now_ms())?;
-        core.set_feishu_mute(until);
+        let now_ms = id::now_ms();
+        let until = resolve_mute_until(b.minutes, b.until_ms, now_ms)?;
+        let snap = core.set_global_mute(until);
         core.audit(
             "web",
             serde_json::json!({"mute_minutes": b.minutes, "until_ms": until}),
         );
-        Ok(serde_json::json!({"feishu_muted_until_ms": until}))
+        Ok(serde_json::json!({
+            "feishu_muted_until_ms": until,
+            "global_mute_until_ms": snap.global_mute_until_ms,
+            "any_muted": snap.any_muted(now_ms),
+        }))
     })();
     respond(r)
 }
@@ -1633,12 +1684,14 @@ mod tests {
 
         let future = now + 3_600_000;
         assert_eq!(
-            resolve_mute_until(None, Some(future), now).unwrap(),
+            resolve_mute_until(None, Some(future as i64), now).unwrap(),
             Some(future)
         );
-        assert!(resolve_mute_until(None, Some(now), now).is_err());
-        assert!(resolve_mute_until(None, Some(now - 1), now).is_err());
-        assert!(resolve_mute_until(None, Some(now + MAX_MUTE_MS + 1), now).is_err());
+        assert_eq!(resolve_mute_until(None, Some(0), now).unwrap(), None);
+        assert!(resolve_mute_until(None, Some(-1), now).is_err());
+        assert!(resolve_mute_until(None, Some(now as i64), now).is_err());
+        assert!(resolve_mute_until(None, Some((now - 1) as i64), now).is_err());
+        assert!(resolve_mute_until(None, Some((now + MAX_MUTE_MS + 1) as i64), now).is_err());
         assert!(resolve_mute_until(None, None, now).is_err());
     }
 

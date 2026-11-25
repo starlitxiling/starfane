@@ -1383,14 +1383,21 @@ impl Core {
         sid: &SessionId,
         query: TranscriptQuery,
     ) -> Result<TranscriptResponse, ApiError> {
-        let session = {
+        let (session, claimed_by_other) = {
             let st = lock(&self.inner.state);
-            st.sessions
+            let s = st
+                .sessions
                 .get(sid)
                 .cloned()
-                .ok_or_else(|| ApiError::not_found(format!("session {sid}")))?
+                .ok_or_else(|| ApiError::not_found(format!("session {sid}")))?;
+            let stolen = s.discovered_only
+                && !s.is_subagent
+                && s.transcript_path
+                    .as_deref()
+                    .is_some_and(|tp| super::discover::is_transcript_claimed_by_other(&st, &s, tp));
+            (s, stolen)
         };
-        if session.agent.is_shell() {
+        if session.agent.is_shell() || claimed_by_other {
             return Ok(TranscriptResponse::none(None));
         }
         if !session.is_local_host() {
@@ -1412,10 +1419,15 @@ impl Core {
             return Ok(TranscriptResponse::none(session.metrics.clone()));
         }
         let core = self.clone();
+        let home_dir = self.effective_home_dir();
         tokio::task::spawn_blocking(move || {
-            let Some(path) = resolve_transcript_path(&session) else {
+            let Some(path) = resolve_transcript_path_with_home(home_dir.as_deref(), &session)
+            else {
                 return TranscriptResponse::none(session.metrics.clone());
             };
+            if core.is_legacy_transcript_pre_birth(&session, &path) {
+                return TranscriptResponse::none(None);
+            }
             let now_ms = starfane_proto::id::now_ms();
             let mut tc = lock(&core.inner.transcript_index);
             tc.get_page_or_sync(session.agent, &path, query, session.metrics.clone(), now_ms)
@@ -1463,6 +1475,14 @@ pub(crate) fn load_session_transcript(session: &SessionRecord, limit: usize) -> 
 ///    - AGY: `~/.gemini/antigravity-cli/brain/<session_id>/.system_generated/logs/transcript.jsonl`
 ///    - Claude: `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`
 pub(crate) fn resolve_transcript_path(session: &SessionRecord) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_transcript_path_with_home(home.as_deref(), session)
+}
+
+pub(crate) fn resolve_transcript_path_with_home(
+    home: Option<&Path>,
+    session: &SessionRecord,
+) -> Option<PathBuf> {
     if let Some(p) = session
         .transcript_path
         .as_deref()
@@ -1478,8 +1498,7 @@ pub(crate) fn resolve_transcript_path(session: &SessionRecord) -> Option<PathBuf
         }
     }
 
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    resolve_transcript_path_in(&home, session)
+    resolve_transcript_path_in(home?, session)
 }
 
 pub(crate) fn resolve_transcript_path_in(home: &Path, session: &SessionRecord) -> Option<PathBuf> {

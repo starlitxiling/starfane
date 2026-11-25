@@ -102,6 +102,9 @@ export const S = {
   transcripts: new Map(),
   activity: [],
   muteUntil: Number(localStorage.getItem('starfane_mute_until') || 0),
+  channelMutes: {},
+  notifiers: [],
+  notifiersLoaded: false,
 };
 
 export const UI = {
@@ -138,6 +141,7 @@ export const UI = {
   outlineCollapsed: localStorage.getItem(OUTLINE_COLLAPSED_KEY) === '1',
   jumpLockUntil: 0,
   muteMenu: false,
+  muteTarget: 'all',
   muteCustomVal: '45',
   muteCustomUnit: 'm',
   muteTimeVal: '',
@@ -443,13 +447,174 @@ export function subagentDisplayName(c) {
 }
 
 export function setMute(until) {
-  S.muteUntil = until || 0;
+  S.muteUntil = typeof until === 'number' && Number.isFinite(until) && until > 0 ? until : 0;
   try {
     localStorage.setItem('starfane_mute_until', String(S.muteUntil));
   } catch { /* ignore */ }
 }
 
-export const muted = () => S.muteUntil > Date.now();
+function cleanMuteMs(v) {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+function normalizeNotifierItem(item, globalUntil, channelMutes) {
+  if (typeof item === 'string') {
+    const id = item.trim();
+    if (!id) return null;
+    const chUntil = cleanMuteMs(channelMutes[id]);
+    const eff = Math.max(globalUntil || 0, chUntil);
+    return {
+      id,
+      kind: id.startsWith('feishu') ? 'feishu' : 'webhook',
+      ownership: 'node_local',
+      channel_muted_until_ms: chUntil || null,
+      muted_until_ms: eff || null,
+    };
+  }
+  if (!item || typeof item !== 'object') return null;
+  const id = String(item.id || '').trim();
+  if (!id) return null;
+  const chUntil = cleanMuteMs(channelMutes[id] ?? item.channel_muted_until_ms);
+  const eff = Math.max(globalUntil || 0, chUntil, cleanMuteMs(item.muted_until_ms));
+  return {
+    id,
+    kind: String(item.kind || 'webhook').toLowerCase(),
+    ownership: String(item.ownership || 'node_local'),
+    channel_muted_until_ms: chUntil || null,
+    muted_until_ms: eff || null,
+  };
+}
+
+export function notifiersDiffSig() {
+  const chMutes = Object.entries(S.channelMutes || {})
+    .filter(([, v]) => cleanMuteMs(v) > 0)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join(',');
+  const list = (S.notifiers || [])
+    .map((n) => `${n.id}|${n.kind}|${n.ownership}|${n.channel_muted_until_ms || 0}|${n.muted_until_ms || 0}`)
+    .join(';');
+  return `${S.notifiersLoaded ? 1 : 0}|${S.muteUntil || 0}|${chMutes}|${list}`;
+}
+
+export function applyNotifiersSnapshot(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const beforeSig = notifiersDiffSig();
+
+  const hasGlobal = Object.prototype.hasOwnProperty.call(payload, 'global_mute_until_ms');
+  const hasChannelMutes = payload.channel_mutes && typeof payload.channel_mutes === 'object' && !Array.isArray(payload.channel_mutes);
+  const hasDetails = Array.isArray(payload.details);
+  const hasNotifiers = Array.isArray(payload.notifiers);
+
+  if (hasGlobal) {
+    setMute(cleanMuteMs(payload.global_mute_until_ms));
+  } else if (!hasChannelMutes && !hasDetails && Object.prototype.hasOwnProperty.call(payload, 'feishu_muted_until_ms')) {
+    setMute(cleanMuteMs(payload.feishu_muted_until_ms));
+  }
+
+  if (hasChannelMutes) {
+    const nextMutes = {};
+    for (const [k, v] of Object.entries(payload.channel_mutes)) {
+      const id = String(k || '').trim();
+      const ms = cleanMuteMs(v);
+      if (id && ms > 0) nextMutes[id] = ms;
+    }
+    S.channelMutes = nextMutes;
+  }
+
+  let rawList = null;
+  if (hasDetails) {
+    rawList = payload.details;
+  } else if (hasNotifiers) {
+    // In GET /api/state, `notifiers` is the full detail object array (or [] when 0 configured).
+    // In legacy GET /api/notifiers without `details`, `notifiers` may be string[].
+    rawList = payload.notifiers;
+  }
+
+  if (rawList !== null) {
+    if (!hasChannelMutes) {
+      const derived = {};
+      for (const item of rawList) {
+        if (item && typeof item === 'object' && item.id) {
+          const ms = cleanMuteMs(item.channel_muted_until_ms);
+          if (ms > 0) derived[String(item.id)] = ms;
+        }
+      }
+      S.channelMutes = derived;
+    }
+    const normalized = rawList
+      .map((item) => normalizeNotifierItem(item, S.muteUntil, S.channelMutes))
+      .filter(Boolean)
+      .sort((a, b) => a.id.localeCompare(b.id));
+    S.notifiers = normalized;
+    S.notifiersLoaded = true;
+  } else if (hasGlobal || hasChannelMutes) {
+    // SSE `notifiers` event updates mute timestamps without re-sending the static channel list.
+    S.notifiers = (S.notifiers || []).map((n) => {
+      const chUntil = cleanMuteMs(S.channelMutes[n.id]);
+      const eff = Math.max(S.muteUntil || 0, chUntil);
+      return {
+        ...n,
+        channel_muted_until_ms: chUntil || null,
+        muted_until_ms: eff || null,
+      };
+    });
+  }
+
+  if (UI.muteTarget !== 'all' && !S.notifiers.some((n) => n.id === UI.muteTarget)) {
+    UI.muteTarget = 'all';
+  }
+
+  return notifiersDiffSig() !== beforeSig;
+}
+
+export const globalMuted = (now = Date.now()) => S.muteUntil > now;
+
+export function channelMuteUntil(id, now = Date.now()) {
+  if (!id) return 0;
+  const ms = cleanMuteMs(S.channelMutes?.[id]);
+  return ms > now ? ms : 0;
+}
+
+export function effectiveMuteUntil(id, now = Date.now()) {
+  const g = S.muteUntil > now ? S.muteUntil : 0;
+  const c = channelMuteUntil(id, now);
+  return Math.max(g, c);
+}
+
+export function activeChannelMuteIds(now = Date.now()) {
+  const known = S.notifiers.length ? new Set(S.notifiers.map((n) => n.id)) : null;
+  const ids = [];
+  for (const [id, v] of Object.entries(S.channelMutes || {})) {
+    const ms = cleanMuteMs(v);
+    if (ms > now && (!known || known.has(id))) ids.push(id);
+  }
+  ids.sort();
+  return ids;
+}
+
+export function mutedChannelCount(now = Date.now()) {
+  if (globalMuted(now)) return S.notifiers.length;
+  return activeChannelMuteIds(now).length;
+}
+
+export const anyMuted = (now = Date.now()) => globalMuted(now) || activeChannelMuteIds(now).length > 0;
+export const muted = () => anyMuted();
+
+export function notifyTopSig() {
+  const now = Date.now();
+  const minBucket = (ts) => (ts > now ? Math.ceil((ts - now) / 60000) : 0);
+  const gBucket = minBucket(S.muteUntil);
+  const chBuckets = activeChannelMuteIds(now)
+    .map((id) => `${id}:${minBucket(channelMuteUntil(id, now))}`)
+    .join(',');
+  const busyKeys = [...UI.busy]
+    .filter((k) => k === 'mute' || k.startsWith('mute:') || k.startsWith('notify-test:'))
+    .sort()
+    .join(',');
+  return `${notifiersDiffSig()}|${gBucket}|${chBuckets}|${UI.muteMenu ? 1 : 0}|${UI.muteTarget}|${busyKeys}`;
+}
+
 export const connState = () => (S.healthFails >= 2 ? 'down' : S.conn);
 
 export function rootSessions() {

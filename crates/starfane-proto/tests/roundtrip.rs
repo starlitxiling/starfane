@@ -131,6 +131,7 @@ fn daemon_commands_roundtrip() {
             pane: None,
             bind_token: Some(BindToken::new("B-1")),
             session_hint: None,
+            pid_chain: vec![4200, 4100],
         },
         DaemonCommand::ConfirmPipeline {
             pipeline_id: PipelineId::new("P-1"),

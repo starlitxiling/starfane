@@ -1,6 +1,6 @@
-// starfane web console — top navigation bar & Feishu mute popover
-import { VIEWS, viewLabel } from './constants.js';
-import { L } from './i18n.js';
+// starfane web console — top navigation bar & multi-channel notification mute popover
+import { VIEWS, notifierKindLabel, viewLabel } from './constants.js';
+import { L, getLang } from './i18n.js';
 import {
   $,
   btn,
@@ -14,43 +14,219 @@ import {
   toast,
   tomorrowAt9Ms,
 } from './dom.js';
-import { ApiError, act, api } from './api.js';
+import { act, loadNotifiers, muteNotifiersApi, testNotifierApi } from './api.js';
 import {
   APP,
   S,
   UI,
+  activeChannelMuteIds,
   alertCount,
   allPipelines,
+  applyNotifiersSnapshot,
+  channelMuteUntil,
   connState,
+  effectiveMuteUntil,
+  globalMuted,
   isFinished,
-  muted,
+  mutedChannelCount,
+  notifiersDiffSig,
   rootSessions,
   setMute,
 } from './store.js';
 
-export function applyMuteRemote(payload, label, fallbackUntil) {
-  return act('mute', async () => {
-    let r;
-    try {
-      r = await api('POST', '/api/feishu/mute', payload);
-    } catch (e) {
-      if (e instanceof ApiError && (e.status === 404 || e.status === 405)) {
-        throw new ApiError('unavailable', L('当前 daemon 未启用 Web 静音接口，可在飞书发送「静音 30m」', 'Web mute API is not enabled on this daemon; send "mute 30m" in Feishu'), e.status);
-      }
-      throw e;
+const KIND_CLASS_SET = new Set(['feishu', 'telegram', 'discord', 'slack', 'wecom', 'qq', 'webhook', 'macos']);
+
+function safeKindClass(kind) {
+  const k = String(kind || '').toLowerCase();
+  return KIND_CLASS_SET.has(k) ? k : 'webhook';
+}
+
+function muteToastText(target, until) {
+  const isAll = !target || target === 'all';
+  if (!until) {
+    return isAll
+      ? L('已恢复全部渠道通知', 'All notification channels resumed')
+      : L(`已恢复渠道 ${target} 通知`, `Notifications resumed for ${target}`);
+  }
+  const untilStr = muteUntilLabel(until);
+  return isAll
+    ? L(`全部通知已静音（至 ${untilStr}，Web 不受影响）`, `All notifications muted (until ${untilStr}; Web unaffected)`)
+    : L(`渠道 ${target} 已静音（至 ${untilStr}，Web 不受影响）`, `Channel ${target} muted (until ${untilStr}; Web unaffected)`);
+}
+
+export function applyMuteRemote(payload, fallbackUntil = 0, opts = {}) {
+  const target = String(payload?.target || 'all').trim() || 'all';
+  const busyKey = opts.busyKey || 'mute';
+  return act(busyKey, async () => {
+    const r = await muteNotifiersApi({
+      target,
+      ...(payload?.minutes !== undefined ? { minutes: payload.minutes } : {}),
+      ...(payload?.until_ms !== undefined ? { until_ms: payload.until_ms } : {}),
+    });
+    if (r && typeof r === 'object') {
+      applyNotifiersSnapshot(r);
     }
-    const until = typeof r?.feishu_muted_until_ms === 'number'
-      ? r.feishu_muted_until_ms
-      : (r?.feishu_muted_until_ms === null ? 0 : fallbackUntil);
-    setMute(until);
-    UI.muteMenu = false;
-    return until;
-  }, (until) => (until ? L(`${label}（至 ${muteUntilLabel(until)}，Web 不受影响）`, `${label} (until ${muteUntilLabel(until)}; Web unaffected)`) : L('已恢复飞书通知', 'Feishu notifications resumed')));
+    let resolvedUntil = 0;
+    if (typeof r?.muted_until_ms === 'number') {
+      resolvedUntil = r.muted_until_ms;
+    } else if (r?.muted_until_ms === null) {
+      resolvedUntil = 0;
+    } else if (target === 'all') {
+      resolvedUntil = typeof r?.global_mute_until_ms === 'number'
+        ? r.global_mute_until_ms
+        : (r?.global_mute_until_ms === null
+          ? 0
+          : (typeof r?.feishu_muted_until_ms === 'number'
+            ? r.feishu_muted_until_ms
+            : (r?.feishu_muted_until_ms === null ? 0 : fallbackUntil)));
+      if (!Object.prototype.hasOwnProperty.call(r || {}, 'global_mute_until_ms')) {
+        setMute(resolvedUntil);
+      }
+    } else {
+      resolvedUntil = channelMuteUntil(target) || fallbackUntil;
+    }
+    return { target, until: resolvedUntil };
+  }, ({ target: t, until }) => muteToastText(t, until));
+}
+
+function sendChannelTest(ch) {
+  const busyKey = `notify-test:${ch.id}`;
+  const kindLbl = notifierKindLabel(ch.kind);
+  return act(
+    busyKey,
+    () => testNotifierApi(ch.id, L('starfane Web 控制台测试通知', 'starfane Web Console test notification')),
+    () => L(`已向 ${ch.id}（${kindLbl}）发送测试通知`, `Test notification sent to ${ch.id} (${kindLbl})`),
+  );
+}
+
+function buildChannelRow(ch, { isGlobal, now }) {
+  const ownUntil = channelMuteUntil(ch.id, now);
+  const effUntil = effectiveMuteUntil(ch.id, now);
+  const isMuted = effUntil > 0;
+  const kindLbl = notifierKindLabel(ch.kind);
+  const kindCls = safeKindClass(ch.kind);
+
+  let statusLine;
+  if (isGlobal && ownUntil > S.muteUntil) {
+    statusLine = L(`全局静音 · 单渠道至 ${muteUntilLabel(ownUntil)}`, `Global mute · Channel until ${muteUntilLabel(ownUntil)}`);
+  } else if (isGlobal) {
+    statusLine = L(`已全局静音至 ${muteUntilLabel(S.muteUntil)}`, `Globally muted until ${muteUntilLabel(S.muteUntil)}`);
+  } else if (ownUntil > 0) {
+    statusLine = L(`静音至 ${muteUntilLabel(ownUntil)}（${muteRemain(ownUntil)}）`, `Muted until ${muteUntilLabel(ownUntil)} (${muteRemain(ownUntil)})`);
+  } else {
+    statusLine = L('开启', 'Active');
+  }
+
+  const unmuteBtn = (!isGlobal && ownUntil > 0)
+    ? btn(L('取消静音', 'Unmute'), {
+      cls: 'xs ghost mute-ch-unmute',
+      busyKey: `mute:${ch.id}`,
+      title: L(`恢复 ${ch.id} 通知`, `Unmute ${ch.id}`),
+      onclick: () => applyMuteRemote({ target: ch.id, minutes: 0 }, 0, { busyKey: `mute:${ch.id}` }),
+    })
+    : null;
+
+  const testBtn = btn(L('测试', 'Test'), {
+    cls: 'xs mute-ch-test',
+    busyKey: `notify-test:${ch.id}`,
+    title: L(`向 ${ch.id} 发送测试通知`, `Send test notification to ${ch.id}`),
+    onclick: () => sendChannelTest(ch),
+  });
+
+  return h('div', { class: `mute-ch-item${isMuted ? ' is-muted' : ''}` },
+    h('div', { class: 'mute-ch-main' },
+      h('div', { class: 'mute-ch-top' },
+        h('i', { class: `dot ${isMuted ? 'dot-needs_permission' : 'dot-live'}` }),
+        h('span', { class: 'mute-ch-id trunc', title: ch.id }, ch.id),
+        span(`tag mute-kind mute-kind-${kindCls}`, kindLbl)),
+      h('div', { class: 'mute-ch-state tabular' }, statusLine)),
+    h('div', { class: 'mute-ch-acts' }, unmuteBtn, testBtn));
 }
 
 export function buildMutePopover() {
-  const m = muted();
+  const now = Date.now();
+  const isGlobal = globalMuted(now);
+  const activeChIds = activeChannelMuteIds(now);
+  const channels = S.notifiers || [];
+  const hasChannels = channels.length > 0;
+  const currentTarget = hasChannels && channels.some((c) => c.id === UI.muteTarget) ? UI.muteTarget : 'all';
+  if (UI.muteTarget !== currentTarget) UI.muteTarget = currentTarget;
+  const getTarget = () => (hasChannels ? (UI.muteTarget || 'all') : 'all');
+
   if (!UI.muteTimeVal) UI.muteTimeVal = defaultMuteTimeStr();
+
+  const header = h('div', { class: 'mute-head' },
+    h('div', { class: 'mute-title' },
+      span(null, L('通知与静音设置', 'Notifications & Mute')),
+      span('tag tabular', String(channels.length))),
+    h('button', {
+      type: 'button',
+      class: 'mute-close',
+      'aria-label': L('关闭通知设置', 'Close notification settings'),
+      title: L('关闭', 'Close'),
+      onclick: () => { UI.muteMenu = false; APP.rerender(); },
+    }, '×'));
+
+  let statusBanner = null;
+  if (isGlobal || activeChIds.length > 0) {
+    const bannerMain = isGlobal
+      ? L(`全部渠道已静音至 ${muteUntilLabel(S.muteUntil)}`, `All channels muted until ${muteUntilLabel(S.muteUntil)}`)
+      : L(`${activeChIds.length} 个渠道已静音`, `${activeChIds.length} channel${activeChIds.length === 1 ? '' : 's'} muted`);
+    const bannerSub = isGlobal && activeChIds.length > 0
+      ? L(`另含 ${activeChIds.length} 个单渠道静音设置`, `Plus ${activeChIds.length} per-channel mute${activeChIds.length === 1 ? '' : 's'}`)
+      : (isGlobal
+        ? L(`剩余 ${muteRemain(S.muteUntil)} · Web 控制台不受影响`, `${muteRemain(S.muteUntil)} left · Web console unaffected`)
+        : L('点击下方渠道可单独恢复，或一键恢复全部', 'Unmute individually below or resume all channels'));
+    const unmuteLabel = (!isGlobal || activeChIds.length > 0)
+      ? L('取消全部静音', 'Unmute all')
+      : L('立即取消静音', 'Unmute now');
+    statusBanner = h('div', { class: 'mute-status' },
+      h('div', { class: 'mute-status-text' },
+        h('span', { class: 'tabular' }, bannerMain),
+        h('span', { class: 'mute-status-sub tabular' }, bannerSub)),
+      btn(unmuteLabel, {
+        cls: 'xs',
+        busyKey: 'mute',
+        onclick: () => applyMuteRemote({ target: 'all', minutes: 0 }, 0),
+      }));
+  }
+
+  const orderedChannels = [...channels].sort((a, b) => {
+    const am = channelMuteUntil(a.id, now) > 0 ? 0 : 1;
+    const bm = channelMuteUntil(b.id, now) > 0 ? 0 : 1;
+    return am - bm || a.id.localeCompare(b.id);
+  });
+
+  const channelsSection = h('div', { class: 'mute-sec' },
+    h('div', { class: 'mute-sec-head' },
+      span('mute-lbl', L('已配置渠道', 'Configured channels')),
+      hasChannels ? span('mute-hint', L('测试不受静音影响', 'Test bypasses mute')) : null),
+    hasChannels
+      ? h('div', { class: 'mute-ch-list' }, orderedChannels.map((ch) => buildChannelRow(ch, { isGlobal, now })))
+      : h('div', { class: 'mute-empty' },
+        L('暂未配置外部通知渠道。可在 ', 'No notification channels configured yet. Add '),
+        h('code', null, 'config.toml'),
+        L(' 的 ', ' entries under '),
+        h('code', null, '[[notifiers]]'),
+        L(' 中配置飞书、Telegram、Discord、Slack、企微、QQ、Webhook 或 macOS 通知。', ' to enable Feishu, Telegram, Discord, Slack, WeCom, QQ, Webhook, or macOS notifications.')));
+
+  const targetSec = hasChannels
+    ? h('div', { class: 'mute-sec' },
+      span('mute-lbl', L('静音范围', 'Mute scope')),
+      h('select', {
+        class: 'inp sm mute-target',
+        'aria-label': L('静音目标范围', 'Mute target scope'),
+        value: currentTarget,
+        onchange: (e) => { UI.muteTarget = e.target.value || 'all'; APP.schedule(); },
+      },
+      h('option', { value: 'all', selected: currentTarget === 'all' }, L('全部通知渠道', 'All channels')),
+      ...channels.map((ch) => h(
+        'option',
+        { value: ch.id, selected: currentTarget === ch.id },
+        `${ch.id} (${notifierKindLabel(ch.kind)})`,
+      ))))
+    : null;
+
   const numInp = h('input', {
     type: 'number',
     min: '1',
@@ -71,18 +247,27 @@ export function buildMutePopover() {
 
   const submitCustom = () => {
     const raw = Number(numInp.value);
-    if (!Number.isFinite(raw) || raw <= 0) { toast(L('请输入大于 0 的时长', 'Enter a duration greater than 0'), 'warn'); return; }
+    if (!Number.isFinite(raw) || raw <= 0) {
+      toast(L('请输入大于 0 的时长', 'Enter a duration greater than 0'), 'warn');
+      return;
+    }
     const mins = unitSel.value === 'h' ? Math.round(raw * 60) : Math.round(raw);
-    if (mins < 1 || mins > 10080) { toast(L('静音时长须在 1 分钟至 7 天之间', 'Mute duration must be between 1 minute and 7 days'), 'warn'); return; }
-    const lbl = unitSel.value === 'h' ? L(`飞书通知已静音 ${raw} 小时`, `Feishu muted for ${raw}h`) : L(`飞书通知已静音 ${mins} 分钟`, `Feishu muted for ${mins}m`);
-    applyMuteRemote({ minutes: mins }, lbl, Date.now() + mins * 60000);
+    if (mins < 1 || mins > 10080) {
+      toast(L('静音时长须在 1 分钟至 7 天之间', 'Mute duration must be between 1 minute and 7 days'), 'warn');
+      return;
+    }
+    applyMuteRemote({ target: getTarget(), minutes: mins }, Date.now() + mins * 60000);
   };
-  numInp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitCustom(); } });
+  numInp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); submitCustom(); }
+  });
 
   const timeHint = span('dim tabular', '');
   const syncTimeHint = () => {
     const ts = timeStrToUntilMs(UI.muteTimeVal);
-    timeHint.textContent = ts ? L(`将静音至 ${muteUntilLabel(ts)}`, `Will mute until ${muteUntilLabel(ts)}`) : L('请选择有效时间', 'Choose a valid time');
+    timeHint.textContent = ts
+      ? L(`将静音至 ${muteUntilLabel(ts)}`, `Will mute until ${muteUntilLabel(ts)}`)
+      : L('请选择有效时间', 'Choose a valid time');
   };
   const timeInp = h('input', {
     type: 'time',
@@ -94,39 +279,107 @@ export function buildMutePopover() {
   syncTimeHint();
   const submitTime = () => {
     const ts = timeStrToUntilMs(timeInp.value);
-    if (!ts) { toast(L('请选择有效的截止时刻', 'Choose a valid cutoff time'), 'warn'); return; }
-    applyMuteRemote({ until_ms: ts }, L('飞书通知已静音', 'Feishu muted'), ts);
+    if (!ts) {
+      toast(L('请选择有效的截止时刻', 'Choose a valid cutoff time'), 'warn');
+      return;
+    }
+    applyMuteRemote({ target: getTarget(), until_ms: ts }, ts);
   };
+
+  const muteBusy = UI.busy.has('mute');
   const presets = [
-    [L('15 分钟', '15 min'), () => applyMuteRemote({ minutes: 15 }, L('飞书通知已静音 15 分钟', 'Feishu muted for 15 min'), Date.now() + 900000)],
-    [L('30 分钟', '30 min'), () => applyMuteRemote({ minutes: 30 }, L('飞书通知已静音 30 分钟', 'Feishu muted for 30 min'), Date.now() + 1800000)],
-    [L('1 小时', '1 hour'), () => applyMuteRemote({ minutes: 60 }, L('飞书通知已静音 1 小时', 'Feishu muted for 1 hour'), Date.now() + 3600000)],
-    [L('2 小时', '2 hours'), () => applyMuteRemote({ minutes: 120 }, L('飞书通知已静音 2 小时', 'Feishu muted for 2 hours'), Date.now() + 7200000)],
-    [L('至明早 09:00', 'Until tomorrow 09:00'), () => { const ts = tomorrowAt9Ms(); applyMuteRemote({ until_ms: ts }, L('飞书通知已静音', 'Feishu muted'), ts); }],
+    [L('15 分钟', '15 min'), () => applyMuteRemote({ target: getTarget(), minutes: 15 }, Date.now() + 900000)],
+    [L('30 分钟', '30 min'), () => applyMuteRemote({ target: getTarget(), minutes: 30 }, Date.now() + 1800000)],
+    [L('1 小时', '1 hour'), () => applyMuteRemote({ target: getTarget(), minutes: 60 }, Date.now() + 3600000)],
+    [L('2 小时', '2 hours'), () => applyMuteRemote({ target: getTarget(), minutes: 120 }, Date.now() + 7200000)],
+    [L('至明早 09:00', 'Until tomorrow 09:00'), () => {
+      const ts = tomorrowAt9Ms();
+      applyMuteRemote({ target: getTarget(), until_ms: ts }, ts);
+    }],
   ];
-  return h('div', { class: 'mute-pop', role: 'dialog', 'aria-label': L('飞书通知静音设置', 'Feishu notification mute settings') },
-    m ? h('div', { class: 'mute-status' },
-      h('span', { class: 'tabular' }, L(`已静音至 ${muteUntilLabel(S.muteUntil)}`, `Muted until ${muteUntilLabel(S.muteUntil)}`)),
-      btn(L('立即取消静音', 'Unmute now'), { cls: 'xs', busyKey: 'mute', onclick: () => applyMuteRemote({ minutes: 0 }, '', 0) })) : null,
-    h('div', { class: 'mute-sec' },
-      span('mute-lbl', L('快捷静音', 'Quick mute')),
-      h('div', { class: 'mute-presets' }, presets.map(([l, fn]) => h('button', { type: 'button', class: 'mute-preset', onclick: fn }, l)))),
-    h('div', { class: 'mute-sec' },
-      span('mute-lbl', L('自定义时长', 'Custom duration')),
-      h('div', { class: 'mute-row' }, numInp, unitSel, btn(L('应用静音', 'Apply'), { cls: 'primary sm', busyKey: 'mute', onclick: submitCustom }))),
-    h('div', { class: 'mute-sec' },
-      h('div', { class: 'row', style: 'justify-content:space-between' }, span('mute-lbl', L('指定截止时刻', 'Until time')), timeHint),
-      h('div', { class: 'mute-row' }, timeInp, btn(L('静音至此', 'Mute until'), { cls: 'sm', busyKey: 'mute', onclick: submitTime }))),
-    h('div', { class: 'mute-sep' }),
-    h('button', {
+
+  return h('div', {
+    class: 'mute-pop',
+    role: 'dialog',
+    'aria-label': L('通知静音与渠道设置', 'Notification mute & channel settings'),
+  },
+  header,
+  statusBanner,
+  channelsSection,
+  h('div', { class: 'mute-sep' }),
+  targetSec,
+  h('div', { class: 'mute-sec' },
+    span('mute-lbl', L('快捷静音', 'Quick mute')),
+    h('div', { class: 'mute-presets' }, presets.map(([l, fn]) => h('button', {
       type: 'button',
-      class: 'mute-foot-btn',
-      onclick: () => {
-        UI.muteMenu = false;
-        APP.schedule();
-        act('feishu-test', () => api('POST', '/api/feishu/test', { text: L('starfane Web 控制台测试通知', 'starfane Web Console test notification') }), L('测试卡片已发送', 'Test card sent'));
-      },
-    }, L('发送飞书测试卡片', 'Send Feishu test card')));
+      class: 'mute-preset',
+      disabled: muteBusy,
+      onclick: fn,
+    }, l)))),
+  h('div', { class: 'mute-sec' },
+    span('mute-lbl', L('自定义时长', 'Custom duration')),
+    h('div', { class: 'mute-row' }, numInp, unitSel, btn(L('应用静音', 'Apply'), { cls: 'primary sm', busyKey: 'mute', onclick: submitCustom }))),
+  h('div', { class: 'mute-sec' },
+    h('div', { class: 'row', style: 'justify-content:space-between' }, span('mute-lbl', L('指定截止时刻', 'Until time')), timeHint),
+    h('div', { class: 'mute-row' }, timeInp, btn(L('静音至此', 'Mute until'), { cls: 'sm', busyKey: 'mute', onclick: submitTime }))));
+}
+
+function buildTopbarPillState(now) {
+  const channels = S.notifiers || [];
+  const count = channels.length;
+  const isGlobal = globalMuted(now);
+  const partialIds = activeChannelMuteIds(now);
+  const partialCount = mutedChannelCount(now);
+
+  if (isGlobal) {
+    return {
+      cls: 'btn sm pill on mute-pill-muted',
+      title: L(
+        `全部通知已静音至 ${muteUntilLabel(S.muteUntil)}`,
+        `All notifications muted until ${muteUntilLabel(S.muteUntil)}`,
+      ),
+      kids: [
+        h('i', { class: 'dot dot-needs_permission' }),
+        L(`通知已静音 · ${muteRemain(S.muteUntil)}`, `Muted · ${muteRemain(S.muteUntil)}`),
+      ],
+    };
+  }
+  if (partialCount > 0) {
+    const tipList = partialIds
+      .map((id) => `${id} (${muteUntilLabel(channelMuteUntil(id, now))})`)
+      .join(', ');
+    return {
+      cls: 'btn sm pill on mute-pill-partial',
+      title: L(`部分通知渠道已静音：${tipList}`, `Channels muted: ${tipList}`),
+      kids: [
+        h('i', { class: 'dot dot-needs_permission' }),
+        L(`通知 · ${partialCount} 渠道静音`, `Notify · ${partialCount} muted`),
+      ],
+    };
+  }
+  if (S.notifiersLoaded && count === 0) {
+    return {
+      cls: 'btn sm pill mute-pill-none',
+      title: L('未配置外部通知渠道，点击查看配置说明', 'No external notification channels configured; click for setup info'),
+      kids: [
+        h('i', { class: 'dot dot-idle' }),
+        L('通知：未配置', 'Notify: None'),
+      ],
+    };
+  }
+  const activeText = count > 1
+    ? L(`通知：开启 (${count})`, `Notify: On (${count})`)
+    : L('通知：开启', 'Notify: On');
+  return {
+    cls: 'btn sm pill',
+    title: count > 0
+      ? L(`已启用 ${count} 个通知渠道，点击设置静音或发送测试`, `${count} notification channel${count === 1 ? '' : 's'} active; click to mute or test`)
+      : L('打开通知静音与渠道设置', 'Open notification mute & channel settings'),
+    kids: [
+      ...(count > 0 ? [h('i', { class: 'dot dot-live' })] : []),
+      activeText,
+    ],
+  };
 }
 
 export function renderTop() {
@@ -149,7 +402,13 @@ export function renderTop() {
     const muteBtn = h('button', {
       type: 'button',
       class: 'btn sm pill',
-      onclick: () => { UI.muteMenu = !UI.muteMenu; APP.rerender(); },
+      'aria-haspopup': 'dialog',
+      'aria-expanded': 'false',
+      onclick: () => {
+        UI.muteMenu = !UI.muteMenu;
+        if (UI.muteMenu) loadNotifiers({ silent: true });
+        APP.rerender();
+      },
     });
     const mutePopSlot = h('div');
     const muteWrap = h('div', { class: 'mute-wrap' }, muteBtn, mutePopSlot);
@@ -171,13 +430,22 @@ export function renderTop() {
   }, viewLabel(v), counts[v] ? span(`nav-count${v === 'inbox' ? ' attn' : ''}`, counts[v]) : null)));
   TOP.connPill.title = connTip;
   TOP.connPill.replaceChildren(h('i', { class: `dot dot-${cs}` }), connTxt);
-  const m = muted();
-  TOP.muteBtn.title = m ? L(`飞书通知已静音至 ${muteUntilLabel(S.muteUntil)}`, `Feishu muted until ${muteUntilLabel(S.muteUntil)}`) : L('设置飞书通知静音', 'Feishu notification mute settings');
-  TOP.muteBtn.className = `btn sm pill${m ? ' on' : ''}`;
-  TOP.muteBtn.replaceChildren(...(m
-    ? [h('i', { class: 'dot dot-needs_permission' }), L(`已静音 · ${muteRemain(S.muteUntil)}`, `Muted · ${muteRemain(S.muteUntil)}`)]
-    : [L('飞书通知：开启', 'Feishu: On')]));
-  const popKey = UI.muteMenu ? `open:${m ? S.muteUntil : 0}` : 'closed';
+
+  const now = Date.now();
+  const pill = buildTopbarPillState(now);
+  TOP.muteBtn.title = pill.title;
+  TOP.muteBtn.className = pill.cls;
+  TOP.muteBtn.setAttribute('aria-expanded', UI.muteMenu ? 'true' : 'false');
+  TOP.muteBtn.replaceChildren(...pill.kids);
+
+  const busySig = [...UI.busy]
+    .filter((k) => k === 'mute' || k.startsWith('mute:') || k.startsWith('notify-test:'))
+    .sort()
+    .join(',');
+  const activeMask = `${globalMuted(now) ? 1 : 0}:${activeChannelMuteIds(now).join(',')}`;
+  const popKey = UI.muteMenu
+    ? `open:${getLang()}:${notifiersDiffSig()}:${activeMask}:${UI.muteTarget}:${busySig}`
+    : 'closed';
   if (TOP.popKey !== popKey) {
     TOP.popKey = popKey;
     if (UI.muteMenu) TOP.mutePopSlot.replaceChildren(buildMutePopover());

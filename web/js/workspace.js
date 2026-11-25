@@ -26,6 +26,7 @@ import {
   ctxTone,
   deliveryText,
   emptyState,
+  errText,
   errorBanner,
   field,
   fmtBytes,
@@ -104,6 +105,64 @@ import {
 } from './terminal.js';
 
 const TIMELINE_CHUNK_SIZE = 20;
+const composerDeliveryIssues = new Map();
+
+function describeDeliveryIssue(r) {
+  if (!r || typeof r !== 'object') {
+    return L('服务端未返回投递结果', 'Server did not return a delivery report');
+  }
+  const rawDetail = String(r.gate?.detail || '').trim();
+  const detailLow = rawDetail.toLowerCase();
+  const failedChecks = Array.isArray(r.gate?.checks)
+    ? r.gate.checks.filter((pair) => Array.isArray(pair) && pair[1] === false).map((pair) => pair[0])
+    : [];
+  const ack = String(r.ack || '');
+
+  if (ack === 'stuck_in_prompt' || detailLow.includes('stuck in terminal input box')) {
+    return L(
+      '文本可能仍停留在终端输入框未提交，请点击「查看终端」核对或点击「重试发送」',
+      'Message may still be sitting unsubmitted in the terminal input box — inspect terminal or click Retry',
+    );
+  }
+  if (ack === 'copy_mode_race' || detailLow.includes('entered copy-mode during injection')) {
+    return L(
+      '发送瞬间终端进入了 tmux 复制/滚动模式，点击「重试发送」将自动退出并重新注入',
+      'Pane entered tmux copy-mode during injection — click Retry to auto-exit copy-mode and resend',
+    );
+  }
+  if (detailLow.includes('copy-mode') || failedChecks.includes('not_in_mode')) {
+    return L(
+      '终端 pane 正处于 tmux 交互模式/复制模式，无法直接写入；请退出该模式后重试',
+      'Terminal pane is in a tmux interactive/copy mode and cannot accept input; exit that mode and retry',
+    );
+  }
+  if (detailLow.includes('synchronize-panes') || failedChecks.includes('not_synchronized')) {
+    return L(
+      '该 tmux 窗口已开启 synchronize-panes（同步输入），为避免误发到其他 pane 已拦截',
+      'This tmux window has synchronize-panes enabled — blocked to avoid broadcasting to other panes',
+    );
+  }
+  if (
+    detailLow.includes('pane is dead')
+    || detailLow.includes('exited during injection')
+    || detailLow.includes('disappeared during injection')
+    || detailLow.includes('not found')
+    || failedChecks.includes('pane_alive')
+  ) {
+    return L(
+      `目标终端 pane 已退出或不可用${rawDetail ? `（${rawDetail}）` : ''}`,
+      `Target terminal pane has exited or is unavailable${rawDetail ? ` (${rawDetail})` : ''}`,
+    );
+  }
+  if (r.status === 'queued') {
+    return L(
+      `消息仅暂存到收件箱，未能直接注入终端${rawDetail ? `（${rawDetail}）` : ''}`,
+      `Message was queued in inbox only and not injected into the terminal${rawDetail ? ` (${rawDetail})` : ''}`,
+    );
+  }
+  if (rawDetail) return rawDetail;
+  return deliveryText(r);
+}
 
 export function updateOutputClock(sessionId) {
   if (UI.view !== 'workspace' || currentSession()?.session_id !== sessionId) return;
@@ -1395,46 +1454,159 @@ export function createWorkspaceShell() {
     h('div', { class: 'mode-seg', role: 'tablist', 'aria-label': L('输入模式', 'Composer mode') }, modeBtns),
     modeHint);
   const attachBar = h('div', { class: 'attach-bar ws-hidden' });
+  const deliveryAlertEl = h('div', { class: 'ws-hidden' });
   const ta = h('textarea', {
     id: 'composer-input',
     rows: '2',
     class: 'composer-ta',
     placeholder: L('发消息给当前会话…（输入 / 唤出命令，Cmd+Enter 发送）', 'Message this session… (/ for commands, Cmd+Enter to send)'),
   });
+  const renderDeliveryAlert = (sess) => {
+    const sid = sess?.session_id || comp.sid;
+    const s = sess || (sid ? S.sessions.get(sid) : null);
+    const issue = sid ? composerDeliveryIssues.get(sid) : null;
+    const lang = getLang();
+    const busy = sid ? UI.busy.has(`send:${sid}`) : false;
+    const visible = Boolean(issue && UI.composerMode === 'direct' && s && !s.is_subagent && s.state !== 'ended');
+    const sig = visible
+      ? `${sid}|${issue.status}|${issue.ts}|${issue.reason}|${s.pane || ''}|${busy ? 1 : 0}|${lang}`
+      : '';
+    if (deliveryAlertEl.dataset.sig === sig && deliveryAlertEl.classList.contains('ws-hidden') === !visible) return;
+    deliveryAlertEl.dataset.sig = sig;
+    if (!visible) {
+      deliveryAlertEl.classList.add('ws-hidden');
+      deliveryAlertEl.replaceChildren();
+      return;
+    }
+    const isErr = issue.status === 'failed' || issue.status === 'error';
+    const title = issue.status === 'unconfirmed'
+      ? L('投递未确认 · 草稿已保留', 'Delivery unconfirmed · Draft preserved')
+      : (issue.status === 'queued'
+        ? L('未能直接注入终端 · 草稿已保留', 'Not injected into terminal · Draft preserved')
+        : L('消息未送达 · 草稿已保留', 'Message not delivered · Draft preserved'));
+    deliveryAlertEl.classList.remove('ws-hidden');
+    deliveryAlertEl.replaceChildren(
+      h('div', {
+        class: `callout ${isErr ? 'err' : 'warn'}`,
+        'data-delivery-issue': issue.status,
+        style: 'display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:8px 12px;margin:0',
+      },
+      h('div', { class: 'stack-xs grow', style: 'min-width:0' },
+        h('strong', { style: 'font-size:12.5px' }, title),
+        h('span', { style: 'font-size:12px;word-break:break-word' }, issue.reason)),
+      h('div', { class: 'row-nowrap', style: 'gap:6px;flex-shrink:0' },
+        btn(L('重试发送', 'Retry'), { cls: 'sm', busyKey: `send:${sid}`, onclick: () => sendDirect() }),
+        s.pane ? btn(L('查看终端', 'Inspect terminal'), {
+          cls: 'ghost xs',
+          onclick: () => {
+            UI.outputMode = 'raw';
+            loadPreview(s.pane, { mode: pvModeOf(s.pane), silent: false });
+            APP.rerender();
+          },
+        }) : null,
+        btn(L('关闭', 'Dismiss'), {
+          cls: 'ghost xs',
+          onclick: () => {
+            composerDeliveryIssues.delete(sid);
+            renderDeliveryAlert(s);
+          },
+        }))),
+    );
+  };
   const sendDirect = () => {
     const sid = comp.sid;
     const s = sid ? S.sessions.get(sid) : null;
     if (!s) return;
+    if (UI.busy.has(`send:${sid}`)) return;
     const dk = `ws:msg:${sid}`;
-    const text = (ta.value || '').trim();
-    const atts = UI.attachments.get(sid) || [];
-    if (atts.some((a) => a.status === 'uploading')) { toast(L('图片仍在上传中，请稍候再发送', 'Image still uploading, please wait'), 'warn'); return; }
-    if (!text && !atts.length) { toast(L('请输入要发送的内容、图片或粘贴片段', 'Enter a message, image, or pasted snippet'), 'warn'); return; }
+    const rawBefore = ta.value || '';
+    const text = rawBefore.trim();
+    const attsSnapshot = [...(UI.attachments.get(sid) || [])];
+    const sentAttIds = new Set(attsSnapshot.map((a) => a.id));
+    if (attsSnapshot.some((a) => a.status === 'uploading')) { toast(L('图片仍在上传中，请稍候再发送', 'Image still uploading, please wait'), 'warn'); return; }
+    if (!text && !attsSnapshot.length) { toast(L('请输入要发送的内容、图片或粘贴片段', 'Enter a message, image, or pasted snippet'), 'warn'); return; }
+    UI.drafts.set(dk, rawBefore);
     closeSlashMenu();
     act(`send:${sid}`, async () => {
       const payload = { target: { type: 'session', id: sid }, text, interactive: true };
-      if (atts.length) {
-        payload.attachments = atts.map((a) => (a.kind === 'image'
+      if (attsSnapshot.length) {
+        payload.attachments = attsSnapshot.map((a) => (a.kind === 'image'
           ? { kind: 'image', title: a.title, path: a.path, ...(a.token ? { token: a.token } : {}) }
           : { kind: 'text', title: a.title, content: a.content, ...(a.token ? { token: a.token } : {}) }));
       }
-      const r = await api('POST', '/api/dispatch', payload);
-      UI.drafts.delete(dk);
-      UI.attachments.delete(sid);
-      if (comp.sid === sid) {
-        ta.value = '';
-        ta.style.height = 'auto';
-        autoGrow(ta);
-        syncTaMetrics();
-        comp.lastSel = { sid, start: 0, end: 0 };
-        renderAttachBar(sid);
+      let r;
+      try {
+        r = await api('POST', '/api/dispatch', payload);
+      } catch (e) {
+        // Preserve draft and attachments on network/HTTP error and surface 1-click Retry.
+        if (!UI.drafts.has(dk) && rawBefore) UI.drafts.set(dk, rawBefore);
+        composerDeliveryIssues.set(sid, {
+          status: 'error',
+          reason: errText(e),
+          report: null,
+          ts: Date.now(),
+        });
+        renderDeliveryAlert(S.sessions.get(sid) || s);
+        throw e;
       }
+
+      const delivered = Boolean(r && (r.status === 'delivered' || r.status === 'sent'));
+      if (!delivered) {
+        // NEVER silently wipe composer draft or attachments when delivery failed, queued, or unconfirmed.
+        if (!UI.drafts.has(dk) && rawBefore) UI.drafts.set(dk, rawBefore);
+        composerDeliveryIssues.set(sid, {
+          status: r?.status || 'failed',
+          reason: describeDeliveryIssue(r),
+          report: r,
+          ts: Date.now(),
+        });
+        renderDeliveryAlert(S.sessions.get(sid) || s);
+        if (comp.sid === sid) ta.focus({ preventScroll: true });
+        return r;
+      }
+
+      composerDeliveryIssues.delete(sid);
+      const curAtts = UI.attachments.get(sid) || [];
+      const keptAtts = curAtts.filter((a) => !sentAttIds.has(a.id));
+      if (keptAtts.length) UI.attachments.set(sid, keptAtts);
+      else UI.attachments.delete(sid);
+
+      if (comp.sid === sid) {
+        // Only clear the textarea if the user has not already started typing a new message in-flight.
+        if (ta.value === rawBefore) {
+          UI.drafts.delete(dk);
+          ta.value = '';
+          ta.style.height = 'auto';
+          autoGrow(ta);
+          syncTaMetrics();
+          comp.lastSel = { sid, start: 0, end: 0 };
+        } else {
+          UI.drafts.set(dk, ta.value);
+        }
+        renderAttachBar(sid);
+      } else if (draft(dk) === rawBefore) {
+        UI.drafts.delete(dk);
+      }
+      renderDeliveryAlert(S.sessions.get(sid) || s);
       if (s.pane) {
         setTimeout(() => loadSessionOutput(s, { silent: true }), 550);
         setTimeout(() => loadSessionOutput(s, { silent: true }), 1600);
+        setTimeout(() => loadSessionOutput(s, { silent: true }), 3200);
       }
       return r;
-    }, (r) => ({ msg: L(`已发送：${deliveryText(r)}`, `Sent: ${deliveryText(r)}`), kind: r && (r.status === 'failed' || r.status === 'unconfirmed') ? 'warn' : 'ok' }));
+    }, (r) => {
+      if (r && (r.status === 'delivered' || r.status === 'sent')) {
+        return { msg: L(`已发送：${deliveryText(r)}`, `Sent: ${deliveryText(r)}`), kind: 'ok' };
+      }
+      const reason = describeDeliveryIssue(r);
+      if (r?.status === 'unconfirmed') {
+        return { msg: L(`投递未确认（草稿已保留）：${reason}`, `Delivery unconfirmed (draft preserved): ${reason}`), kind: 'warn' };
+      }
+      if (r?.status === 'queued') {
+        return { msg: L(`未能直接注入终端（草稿已保留）：${reason}`, `Not injected into terminal (draft preserved): ${reason}`), kind: 'warn' };
+      }
+      return { msg: L(`发送失败（草稿已保留）：${reason}`, `Send failed (draft preserved): ${reason}`), kind: 'err' };
+    });
   };
   const syncTaMetrics = () => {
     lastTaLen = ta.value.length;
@@ -1528,7 +1700,7 @@ export function createWorkspaceShell() {
       }
       if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSlashMenu(); return; }
     }
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.isComposing) { e.preventDefault(); sendDirect(); }
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); sendDirect(); }
   });
   const imgInput = h('input', {
     type: 'file',
@@ -1551,7 +1723,7 @@ export function createWorkspaceShell() {
   const directRow = h('div', { class: 'composer-direct-row' }, ta, h('div', { class: 'composer-actions' }, imgInput, imgBtn, sendBtn));
   const pipeSlot = h('div', { class: 'stack-sm ws-hidden' });
   const readonlyHint = h('div', { class: 'comp-readonly ws-hidden' });
-  const card = h('div', { class: 'composer-card' }, slashEl, readonlyHint, modeBar, attachBar, directRow, pipeSlot);
+  const card = h('div', { class: 'composer-card' }, slashEl, readonlyHint, modeBar, deliveryAlertEl, attachBar, directRow, pipeSlot);
   let dragDepth = 0;
   card.addEventListener('dragenter', (e) => {
     if (UI.composerMode !== 'direct' || !e.dataTransfer?.types?.includes('Files')) return;
@@ -1579,7 +1751,7 @@ export function createWorkspaceShell() {
     }
   });
   const dock = h('div', { class: 'composer-dock' }, card);
-  const comp = { dock, card, slashEl, readonlyHint, modeBtns, modeHint, attachBar, directRow, ta, imgBtn, sendBtn, pipeSlot, sid: null, agent: null, lastSel: null, syncTaMetrics };
+  const comp = { dock, card, slashEl, readonlyHint, modeBtns, modeHint, deliveryAlertEl, renderDeliveryAlert, attachBar, directRow, ta, imgBtn, sendBtn, pipeSlot, sid: null, agent: null, lastSel: null, syncTaMetrics };
   const convCol = h('div', { class: 'ws-conv-col' }, reopenBtn, chatStage, dock);
   const bodySplit = h('div', { class: 'ws-body-split' }, convCol);
   const emptyMain = emptyState(L('选择一个会话开始对话', 'Select a Session to Start'), L('从左侧点击任意正在运行的 tmux / Zellij 会话，即可查看实时终端并直接发送指令。', 'Pick any running tmux or Zellij session on the left to inspect output and send messages.'),
@@ -1953,9 +2125,11 @@ export function patchWorkspace(W) {
     C.imgBtn.disabled = !!readOnlyMsg;
     C.sendBtn.classList.toggle('is-busy', sending);
     C.sendBtn.disabled = sending || !!readOnlyMsg;
+    C.renderDeliveryAlert(s);
     renderAttachBar(s.session_id);
   } else {
     C.directRow.classList.add('ws-hidden');
+    C.deliveryAlertEl.classList.add('ws-hidden');
     C.attachBar.classList.add('ws-hidden');
     C.pipeSlot.classList.remove('ws-hidden');
     closeSlashMenu();

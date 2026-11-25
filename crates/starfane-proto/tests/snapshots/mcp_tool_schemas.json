@@ -1099,5 +1099,61 @@
       "type": "object"
     },
     "name": "start_pipeline"
+  },
+  {
+    "description": "Spawn a live interactive coding-agent session (claude, codex, or agy) in a tmux window and return its session_id, pane_id, tmux_target, tmux_label, agent, model, effort, and cwd so you can immediately collaborate via create_handoff or list_sessions.",
+    "inputSchema": {
+      "properties": {
+        "agent": {
+          "description": "Coding agent CLI to launch interactively.",
+          "enum": [
+            "claude",
+            "codex",
+            "agy"
+          ],
+          "type": "string"
+        },
+        "effort": {
+          "description": "Optional reasoning effort level.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "type": "string"
+        },
+        "from_session": {
+          "description": "Optional explicit caller session id; overrides the cached identity.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Optional model id (e.g. 'gpt-6.2-astra', 'gemini-4-carbon', 'opus').",
+          "type": "string"
+        },
+        "name": {
+          "description": "Optional tmux window name (auto-numbered '<agent>-<N>' when omitted).",
+          "type": "string"
+        },
+        "project_root": {
+          "description": "Optional working directory or project name; defaults to caller's cwd or ~/.agent_session.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Optional single-line initial prompt passed on interactive launch.",
+          "type": "string"
+        },
+        "tmux_session": {
+          "description": "Optional tmux session group name (defaults to 'agent-session').",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "type": "object"
+    },
+    "name": "spawn_session"
   }
 ]

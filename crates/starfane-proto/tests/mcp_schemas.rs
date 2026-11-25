@@ -1,6 +1,6 @@
 //! MCP tool schema contract tests (contracts §7.3 / §10).
 //!
-//! * exactly 9 tools with the frozen names and required fields;
+//! * exactly 10 tools with the frozen names and required fields;
 //! * snapshot of the full schema at `tests/snapshots/mcp_tool_schemas.json`
 //!   (regenerate with `STARFANE_UPDATE_SNAPSHOTS=1 cargo test -p starfane-proto`);
 //! * example tool arguments deserialize into the proto types.
@@ -30,7 +30,7 @@ fn required(t: &Value) -> Vec<String> {
 }
 
 #[test]
-fn nine_tools_with_frozen_names() {
+fn ten_tools_with_frozen_names() {
     let names: Vec<String> = tools()
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
@@ -47,6 +47,7 @@ fn nine_tools_with_frozen_names() {
             "submit_triage",
             "report_milestone",
             "start_pipeline",
+            "spawn_session",
         ]
     );
 }
@@ -96,6 +97,7 @@ fn required_fields_match_contract() {
         ("submit_triage", &["triage"]),
         ("report_milestone", &["kind"]),
         ("start_pipeline", &["goal"]),
+        ("spawn_session", &["agent"]),
     ];
     for (name, req) in cases {
         let got = required(&tool(name));
@@ -273,5 +275,64 @@ fn start_pipeline_bindings_are_shorthands() {
     );
     for s in ["claude:opus@high", "codex", "agy /swarm"] {
         StageBinding::from_shorthand(s).unwrap();
+    }
+}
+
+#[test]
+fn spawn_session_schema_and_command_roundtrip() {
+    let schema = tool("spawn_session");
+    let props = schema["inputSchema"]["properties"].as_object().unwrap();
+    assert_eq!(props["agent"]["enum"], json!(["claude", "codex", "agy"]));
+    assert_eq!(
+        props["effort"]["enum"],
+        json!(["low", "medium", "high", "xhigh", "max"])
+    );
+    for key in [
+        "agent",
+        "model",
+        "effort",
+        "project_root",
+        "tmux_session",
+        "name",
+        "prompt",
+        "from_session",
+    ] {
+        assert!(props.contains_key(key), "spawn_session missing prop {key}");
+    }
+
+    let cmd: DaemonCommand = serde_json::from_value(json!({
+        "cmd": "spawn_session",
+        "agent": "codex",
+        "model": "gpt-6.2-astra",
+        "effort": "xhigh",
+        "project_root": "/repo",
+        "tmux_session": "agent-session",
+        "name": "codex-audit",
+        "prompt": "starfane: read_inbox",
+        "from_session": "s-caller"
+    }))
+    .unwrap();
+    assert_eq!(cmd.name(), "spawn_session");
+    match cmd {
+        DaemonCommand::SpawnSession {
+            agent,
+            model,
+            effort,
+            project_root,
+            tmux_session,
+            name,
+            prompt,
+            from_session,
+        } => {
+            assert_eq!(agent, AgentKind::Codex);
+            assert_eq!(model.as_deref(), Some("gpt-6.2-astra"));
+            assert_eq!(effort, Some(Effort::Xhigh));
+            assert_eq!(project_root.as_deref(), Some("/repo"));
+            assert_eq!(tmux_session.as_deref(), Some("agent-session"));
+            assert_eq!(name.as_deref(), Some("codex-audit"));
+            assert_eq!(prompt.as_deref(), Some("starfane: read_inbox"));
+            assert_eq!(from_session, Some(SessionId::new("s-caller")));
+        }
+        other => panic!("unexpected {other:?}"),
     }
 }

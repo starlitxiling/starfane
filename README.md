@@ -326,7 +326,17 @@ display_name = "Local"          # Mutable at runtime via POST /api/hosts/{id}/re
 | `starfane mcp --agent <claude\|codex\|agy>` | Run stdio MCP server (invoked automatically by registered agents) |
 | `starfane emit --agent X` | Sub-10ms synchronous hook event forwarder (invoked by agent hooks) |
 
-Key new Web/Federation REST endpoints include `GET /api/hosts`, `POST /api/hosts/{id}/rename`, `GET /api/notifiers`, `POST /api/notifiers/{id}/test`, cursor-paginated `GET /api/sessions/{id}/transcript?limit=&before=&all=1`, and full-history `GET /api/panes/{pane_id}/preview?lines=&before_line=&all=1`.
+### MCP Tools (`starfane mcp`)
+
+Registered agents (`claude`, `codex`, `agy`) receive 10 first-class stdio MCP tools:
+
+- **`list_sessions`** — list live sessions, panes, models, states, and pipeline stages
+- **`spawn_session`** — spawn a live interactive `claude` / `codex` / `agy` tmux session (`agent`, optional `model`, `effort`, `project_root`, `tmux_session`, `name`, `prompt`) and return `session_id`, `pane_id`, `tmux_target`, `tmux_label`, `agent`, `model`, `effort`, and `cwd`
+- **`create_handoff` / `read_inbox` / `ack_handoff`** — structured cross-agent handoffs and inbox delivery
+- **`submit_review` / `submit_falsifier_verdict` / `submit_triage` / `report_milestone`** — evidence-gated review, falsifier, triage, plan, RCA, and final-report submissions
+- **`start_pipeline`** — parse natural-language bindings and start a human-confirmed Feature or Debug pipeline
+
+Key new Web/Federation REST endpoints include `GET /api/hosts`, `POST /api/hosts/{id}/rename`, `GET /api/notifiers`, `POST /api/notifiers/mute`, `POST /api/notifiers/{id}/test`, cursor-paginated `GET /api/sessions/{id}/transcript?limit=&before=&all=1`, and full-history `GET /api/panes/{pane_id}/preview?lines=&before_line=&all=1`.
 
 ---
 

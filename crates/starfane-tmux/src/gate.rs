@@ -103,6 +103,170 @@ pub fn is_user_watching(
     }
 }
 
+/// Detect whether terminal screen text (visible screen capture, tail capture, or a single cursor
+/// line) displays an interactive folder/workspace trust confirmation prompt for `agent`.
+///
+/// Returns a clear human-readable reason (e.g. `"codex waiting for folder trust approval"`) when
+/// a trust dialog is active, or `None` otherwise. In multi-line captures, active TUI chat chrome
+/// (`? for shortcuts`, `esc to interrupt`, `context left`, `Ask Codex to do anything`) suppresses
+/// false positives when a normal conversation merely mentions trust-prompt text.
+pub fn detect_folder_trust_prompt(agent: AgentKind, text: &str) -> Option<&'static str> {
+    if agent == AgentKind::Shell || text.trim().is_empty() {
+        return None;
+    }
+    let non_empty: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return None;
+    }
+    let single_line = non_empty.len() == 1;
+    let lower = text.to_ascii_lowercase();
+
+    if !single_line
+        && (lower.contains("? for shortcuts")
+            || lower.contains("esc to interrupt")
+            || lower.contains("ctrl+c to interrupt")
+            || lower.contains("context left")
+            || lower.contains("ask codex to do anything"))
+    {
+        return None;
+    }
+
+    match agent {
+        AgentKind::Codex => {
+            let has_question = lower.contains("trust this folder?")
+                || lower.contains("do you trust the contents of this directory?")
+                || lower.contains("do you trust the contents of this folder?");
+            let has_header = lower.contains("folder access");
+            let has_action = lower.contains("trust and continue")
+                || lower.contains("back to agent command center")
+                || (lower.contains("yes, continue") && lower.contains("trust"))
+                || non_empty.iter().any(|l| {
+                    let ll = l.to_ascii_lowercase();
+                    ll.contains("trust and continue")
+                        || (ll.starts_with("› 1.") && ll.contains("trust"))
+                });
+            let hit = if single_line {
+                has_question
+                    || has_action
+                    || (has_header && lower.contains("trust"))
+                    || non_empty[0].eq_ignore_ascii_case("folder access")
+            } else {
+                (has_question && (has_action || has_header || lower.contains("enter continue")))
+                    || (has_header && has_action)
+                    || (has_question && lower.contains("trust decision"))
+            };
+            hit.then_some("codex waiting for folder trust approval")
+        }
+        AgentKind::Claude => {
+            let has_question = lower.contains("do you trust the files in this folder?")
+                || lower.contains("is this a project you created or one you trust?")
+                || lower.contains("quick safety check");
+            let has_action = lower.contains("yes, i trust this folder")
+                || lower.contains("yes, proceed")
+                || (lower.contains("no, exit") && lower.contains("trust"))
+                || non_empty.iter().any(|l| {
+                    let ll = l.to_ascii_lowercase();
+                    ll.contains("yes, i trust this folder")
+                        || (ll.starts_with('❯') && ll.contains("no, exit"))
+                });
+            let has_context = lower.contains("accessing workspace")
+                || lower.contains("claude code'll be able to read, edit, and execute files here")
+                || lower.contains("enter to confirm");
+            let hit = if single_line {
+                has_question
+                    || lower.contains("yes, i trust this folder")
+                    || (non_empty[0].starts_with('❯')
+                        && non_empty[0].to_ascii_lowercase().contains("no, exit"))
+            } else {
+                (has_question && (has_action || has_context))
+                    || (lower.contains("yes, i trust this folder") && has_context)
+            };
+            hit.then_some("claude waiting for folder trust approval")
+        }
+        AgentKind::Agy => {
+            let has_question = lower.contains("do you trust the contents of this project?")
+                || lower.contains("trust this workspace")
+                || lower.contains("trust this folder")
+                || lower.contains("trust folder");
+            let has_action = lower.contains("yes, i trust this folder")
+                || lower.contains("yes, trust")
+                || non_empty.iter().any(|l| {
+                    let ll = l.to_ascii_lowercase();
+                    ll.starts_with('>') && ll.contains("trust")
+                });
+            let has_context = lower.contains("accessing workspace")
+                || lower.contains(
+                    "antigravity cli requires permission to read, edit, and execute files here",
+                )
+                || (lower.contains("no, exit") && lower.contains("navigate"))
+                || lower.contains("enter confirm");
+            let hit = if single_line {
+                has_question || has_action
+            } else {
+                (has_question && (has_action || has_context)) || (has_action && has_context)
+            };
+            hit.then_some("agy waiting for folder trust approval")
+        }
+        AgentKind::Shell => None,
+    }
+}
+
+/// Detect Codex's interactive `Update available` startup modal (`Update available · ... /
+/// › 1. Update now / 2. Skip / enter continue · esc skip`) so `starfane` never treats its `›`
+/// menu marker as an empty idle prompt or injects keystrokes (which could trigger an unwanted
+/// npm update).
+pub fn detect_codex_update_prompt(agent: AgentKind, text: &str) -> Option<&'static str> {
+    if agent != AgentKind::Codex || text.trim().is_empty() {
+        return None;
+    }
+    let non_empty: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return None;
+    }
+    let single_line = non_empty.len() == 1;
+    let lower = text.to_ascii_lowercase();
+
+    if !single_line
+        && (lower.contains("? for shortcuts")
+            || lower.contains("esc to interrupt")
+            || lower.contains("ctrl+c to interrupt")
+            || lower.contains("context left")
+            || lower.contains("ask codex to do anything"))
+    {
+        return None;
+    }
+
+    let has_header = lower.contains("update available");
+    let has_action = lower.contains("update now")
+        || lower.contains("skip until next version")
+        || lower.contains("enter continue · esc skip")
+        || non_empty.iter().any(|l| {
+            let ll = l.to_ascii_lowercase();
+            ll.starts_with("› 1. update now") || ll.starts_with("1. update now")
+        });
+    let hit = if single_line {
+        (has_header && (lower.contains('·') || lower.contains('→') || lower.contains("->")))
+            || has_action
+    } else {
+        has_header && (has_action || lower.contains("release notes:"))
+    };
+    hit.then_some("codex waiting on update prompt")
+}
+
+/// Detect any interactive blocking startup modal (folder-trust confirmation across Codex/Claude/AGY,
+/// or Codex's `Update available` startup chooser) where text injection must be blocked.
+pub fn detect_blocking_startup_prompt(agent: AgentKind, text: &str) -> Option<&'static str> {
+    detect_folder_trust_prompt(agent, text).or_else(|| detect_codex_update_prompt(agent, text))
+}
+
 /// Strip an idle prompt prefix from the cursor line and report whether the remaining input
 /// area is blank. `None` = the line does not look like this agent's idle prompt.
 fn input_area_is_empty(
@@ -111,6 +275,9 @@ fn input_area_is_empty(
     line: &str,
     prompts: &[String],
 ) -> Option<bool> {
+    if detect_blocking_startup_prompt(agent, line).is_some() {
+        return Some(false);
+    }
     let is_filler =
         |c: char| c.is_whitespace() || c == '\u{a0}' || c == '│' || c == '┃' || c == '║';
     for p in prompts {
@@ -128,9 +295,235 @@ fn input_area_is_empty(
         {
             return Some(true);
         }
+        if agent == AgentKind::Claude && pane.cursor_x <= 4 {
+            let trimmed = rest.trim_start();
+            if trimmed.starts_with("Try \"") || trimmed.starts_with("Try '") {
+                return Some(true);
+            }
+        }
         return Some(rest.chars().all(is_filler));
     }
     None
+}
+
+/// Compute the settle pause between bracketed paste and Enter (`C-m`), scaling up
+/// modestly for multi-line or long payloads so TUI paste-burst detectors (Claude
+/// `isPasting`, Codex `PasteBurst`, AGY Ink paste handler) finish settling before
+/// submit arrives.
+pub fn adaptive_paste_settle_ms(base_ms: u64, text: &str) -> u64 {
+    if base_ms == 0 {
+        return 0;
+    }
+    let chars = text.chars().count() as u64;
+    let newlines = text.bytes().filter(|&b| b == b'\n').count() as u64;
+    let mut extra = 0u64;
+    if newlines > 0 {
+        extra += 150 + newlines.saturating_sub(1).min(10) * 20;
+    }
+    if chars > 160 {
+        extra += ((chars - 160) / 200).min(6) * 50;
+    }
+    let cap = base_ms.max(900);
+    base_ms.saturating_add(extra).min(cap)
+}
+
+/// True when `line` is a horizontal TUI divider rule (e.g. `──────` bordering an input box).
+fn is_tui_divider_line(line: &str) -> bool {
+    let t = line.trim();
+    t.chars().count() >= 8
+        && t.chars().all(|c| {
+            matches!(
+                c,
+                '─' | '━'
+                    | '═'
+                    | '-'
+                    | '_'
+                    | '┌'
+                    | '┐'
+                    | '└'
+                    | '┘'
+                    | '╭'
+                    | '╮'
+                    | '╰'
+                    | '╯'
+            )
+        })
+}
+
+/// True when `line` starts with a recognized prompt marker for `agent`.
+fn line_starts_with_agent_prompt(agent: AgentKind, raw: &str) -> bool {
+    let prefixes: &[&str] = match agent {
+        AgentKind::Claude => &["❯\u{a0}", "❯ ", "❯", "> ", "│ > "],
+        AgentKind::Codex => &["› ", "›"],
+        AgentKind::Agy => &["> ", ">"],
+        AgentKind::Shell => return false,
+    };
+    let line = raw.trim_start_matches(['│', '┃', '║', ' ']);
+    prefixes
+        .iter()
+        .any(|p| line.starts_with(p) || (line.trim_end() == p.trim_end() && !p.trim().is_empty()))
+}
+
+/// Extract the active TUI input-box lines containing `cursor_y` from a visible screen capture.
+/// Returns `None` if `cursor_y` does not sit inside an active agent prompt box (e.g. during
+/// streaming/spinner output or in a non-TUI shell), preventing false-positive duplicate Enters.
+fn extract_active_input_box_at_cursor(
+    agent: AgentKind,
+    screen: &str,
+    cursor_y: u32,
+) -> Option<String> {
+    if agent == AgentKind::Shell {
+        return None;
+    }
+    let lines: Vec<&str> = screen.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let cy = (cursor_y as usize).min(lines.len().saturating_sub(1));
+    // Walk up from cursor_y (at most 8 lines) without crossing a TUI horizontal divider rule.
+    let min_up = cy.saturating_sub(8);
+    let mut prompt_idx: Option<usize> = None;
+    for i in (min_up..=cy).rev() {
+        let line = lines[i];
+        if is_tui_divider_line(line) {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("esc to interrupt") || lower.contains("ctrl+c to interrupt") {
+            return None;
+        }
+        if line_starts_with_agent_prompt(agent, line) {
+            prompt_idx = Some(i);
+            break;
+        }
+    }
+    let start = prompt_idx?;
+    let max_down = (cy + 2).min(lines.len().saturating_sub(1));
+    let mut box_lines = Vec::new();
+    for &raw in &lines[start..=max_down] {
+        if is_tui_divider_line(raw) {
+            break;
+        }
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if !box_lines.is_empty()
+            && (lower.starts_with("? for shortcuts")
+                || trimmed.starts_with("● Swarm(")
+                || lower.contains("context left")
+                || lower.contains("esc to interrupt"))
+        {
+            break;
+        }
+        box_lines.push(raw);
+    }
+    Some(box_lines.join("\n"))
+}
+
+/// Extract distinctive fragments (>= 6 chars) from `pasted_text` for stuck-in-prompt checks.
+fn paste_needles(pasted_text: &str) -> Vec<String> {
+    let mut needles = Vec::new();
+    let mut push_slice = |s: &str| {
+        let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let chars: Vec<char> = collapsed.chars().collect();
+        if chars.len() >= 6 {
+            let head: String = chars.iter().take(24).collect();
+            if !needles.contains(&head) {
+                needles.push(head);
+            }
+            if chars.len() > 24 {
+                let tail: String = chars[chars.len().saturating_sub(24)..].iter().collect();
+                if !needles.contains(&tail) {
+                    needles.push(tail);
+                }
+            }
+        }
+    };
+    let non_empty: Vec<&str> = pasted_text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let Some(first) = non_empty.first() {
+        push_slice(first);
+    }
+    if let Some(last) = non_empty.last() {
+        push_slice(last);
+    }
+    needles
+}
+
+/// Detect whether `pasted_text` is still sitting unsubmitted in the TUI prompt input box
+/// after `submit_enter` (e.g. because `C-m` was absorbed by a TUI paste-burst handler).
+///
+/// Conservative by design to avoid false-positive duplicate Enters:
+/// - Always `false` for `Shell` or empty captures.
+/// - Always `false` if `cursor_y` is not inside an active prompt box or the box is empty.
+/// - Returns `true` ONLY when the active input box at `cursor_y` contains a distinctive
+///   fragment of `pasted_text` OR a newly-appeared TUI paste badge (`[Pasted text` /
+///   `[Pasted Content`) that was NOT already present in `pre_screen`.
+pub fn is_paste_stuck_in_prompt(
+    agent: AgentKind,
+    pre_screen: &str,
+    post_screen: &str,
+    post_cursor_y: u32,
+    pasted_text: &str,
+) -> bool {
+    if agent == AgentKind::Shell || post_screen.trim().is_empty() {
+        return false;
+    }
+    let Some(post_box) = extract_active_input_box_at_cursor(agent, post_screen, post_cursor_y)
+    else {
+        return false;
+    };
+    let post_first = post_box.lines().next().unwrap_or("");
+    let cfg = GateConfig::default();
+    if let Some(prompts) = cfg.idle_prompts.get(&agent) {
+        let probe_pane = PaneInfo {
+            pane_id: starfane_proto::PaneId::new("%0"),
+            session_name: String::new(),
+            window_id: String::new(),
+            window_index: 0,
+            pane_index: 0,
+            pane_pid: 0,
+            current_command: String::new(),
+            current_path: String::new(),
+            pane_active: true,
+            window_active: true,
+            session_attached: 0,
+            in_mode: false,
+            dead: false,
+            synchronized: false,
+            alternate_on: false,
+            cursor_x: 2,
+            cursor_y: post_cursor_y,
+            window_name: String::new(),
+            session_group: String::new(),
+            history_size: 0,
+            pane_height: 24,
+        };
+        let rest_blank = post_box.lines().skip(1).all(|l| l.trim().is_empty());
+        if rest_blank && input_area_is_empty(agent, &probe_pane, post_first, prompts) == Some(true)
+        {
+            return false;
+        }
+    }
+
+    let post_norm: String = post_box.split_whitespace().collect::<Vec<_>>().join(" ");
+    let pre_norm: String = pre_screen.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    const PASTE_BADGES: &[&str] = &["[Pasted text", "[Pasted Content", "[pasted text"];
+    for badge in PASTE_BADGES {
+        if post_norm.contains(badge) && !pre_norm.contains(badge) {
+            return true;
+        }
+    }
+
+    for needle in paste_needles(pasted_text) {
+        if post_norm.contains(&needle) && !pre_norm.contains(&needle) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Pure injection gate (§4). Checks, in order: PaneAlive, NotInMode, NotSynchronized,
@@ -143,6 +536,23 @@ pub fn check_injection_gate(
     state: SessionState,
     agent: AgentKind,
     cursor_line: &str,
+    cfg: &GateConfig,
+    now_s: u64,
+) -> GateReport {
+    check_injection_gate_with_screen(pane, clients, state, agent, cursor_line, None, cfg, now_s)
+}
+
+/// Variant of [`check_injection_gate`] that also inspects an optional visible-screen capture so
+/// folder-trust dialogs (whose cursor may sit on a blank line or footer row) always fail
+/// `InputEmpty` with an explicit trust-approval reason.
+#[allow(clippy::too_many_arguments)]
+pub fn check_injection_gate_with_screen(
+    pane: &PaneInfo,
+    clients: &[ClientInfo],
+    state: SessionState,
+    agent: AgentKind,
+    cursor_line: &str,
+    visible_screen: Option<&str>,
     cfg: &GateConfig,
     now_s: u64,
 ) -> GateReport {
@@ -170,22 +580,31 @@ pub fn check_injection_gate(
         None => true,
     };
 
-    let input_empty = match cfg.idle_prompts.get(&agent) {
-        Some(prompts) => match input_area_is_empty(agent, pane, cursor_line, prompts) {
-            Some(empty) => {
-                if !empty {
-                    notes.push("input box holds a draft".to_string());
+    let modal_block = visible_screen
+        .and_then(|screen| detect_blocking_startup_prompt(agent, screen))
+        .or_else(|| detect_blocking_startup_prompt(agent, cursor_line));
+
+    let input_empty = if let Some(reason) = modal_block {
+        notes.push(reason.to_string());
+        false
+    } else {
+        match cfg.idle_prompts.get(&agent) {
+            Some(prompts) => match input_area_is_empty(agent, pane, cursor_line, prompts) {
+                Some(empty) => {
+                    if !empty {
+                        notes.push("input box holds a draft".to_string());
+                    }
+                    empty
                 }
-                empty
-            }
+                None => {
+                    notes.push("cursor line is not a recognised idle prompt".to_string());
+                    false
+                }
+            },
             None => {
-                notes.push("cursor line is not a recognised idle prompt".to_string());
+                notes.push(format!("no idle prompts configured for {agent}"));
                 false
             }
-        },
-        None => {
-            notes.push(format!("no idle prompts configured for {agent}"));
-            false
         }
     };
 

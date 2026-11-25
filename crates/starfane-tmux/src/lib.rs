@@ -30,7 +30,9 @@ pub use discover::{
 pub use error::TmuxError;
 pub use exec::{ExecOutput, ExecTransport, LocalExec, SshExec, DEFAULT_SSH_TIMEOUT};
 pub use gate::{
-    check_injection_gate, check_interactive_gate, is_bare_slash_command, is_user_watching,
+    adaptive_paste_settle_ms, check_injection_gate, check_injection_gate_with_screen,
+    check_interactive_gate, detect_blocking_startup_prompt, detect_codex_update_prompt,
+    detect_folder_trust_prompt, is_bare_slash_command, is_paste_stuck_in_prompt, is_user_watching,
     validate_interactive_text, validate_pointer_text, GateConfig,
 };
 pub use model::{
@@ -257,6 +259,70 @@ impl Tmux {
         Ok(out.trim_end_matches(['\n', '\r']).to_string())
     }
 
+    /// Capture only the currently visible screen rows (`0..pane_height`) so row index `cursor_y`
+    /// lines up 1-to-1 with `PaneInfo.cursor_y`.
+    pub fn capture_visible_screen(&self, pane: &PaneId) -> Result<String, TmuxError> {
+        valid_pane(pane)?;
+        self.run(&["capture-pane", "-p", "-t", pane.as_str()], None)
+    }
+
+    /// Query `#{pane_mode}` for `pane` (empty when not in any tmux mode).
+    pub fn pane_mode(&self, pane: &PaneId) -> Result<String, TmuxError> {
+        valid_pane(pane)?;
+        let out = self.run(
+            &["display-message", "-p", "-t", pane.as_str(), "#{pane_mode}"],
+            None,
+        )?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Safely exit tmux scrollback `copy-mode` / `view-mode` on `pane` via `send-keys -X cancel`
+    /// without forwarding any bytes to the underlying PTY application.
+    /// Returns `Ok(true)` when the pane is confirmed out of mode (`pane_in_mode == 0`), or
+    /// `Ok(false)` when the pane is in a non-cancellable interactive chooser (e.g. `tree-mode`)
+    /// or remains in mode after cancel.
+    pub fn exit_copy_mode(&self, pane: &PaneId) -> Result<bool, TmuxError> {
+        valid_pane(pane)?;
+        let state = self.run(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "#{pane_in_mode}\x1f#{pane_mode}",
+            ],
+            None,
+        )?;
+        let trimmed = state.trim_end_matches(['\n', '\r']);
+        let (in_mode_raw, mode_raw) = trimmed
+            .split_once(model::FIELD_SEP)
+            .unwrap_or((trimmed, ""));
+        if in_mode_raw.trim() == "0" {
+            return Ok(true);
+        }
+        let mode = mode_raw.trim();
+        if !mode.is_empty() && !matches!(mode, "copy-mode" | "view-mode") {
+            return Ok(false);
+        }
+        if let Err(e) = self.run(&["send-keys", "-t", pane.as_str(), "-X", "cancel"], None) {
+            let lower = e.to_string().to_ascii_lowercase();
+            if !lower.contains("not in a mode") {
+                return Err(e);
+            }
+        }
+        let after = self.run(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "#{pane_in_mode}",
+            ],
+            None,
+        )?;
+        Ok(after.trim() == "0")
+    }
+
     /// Paste validated pointer `text` into `pane` using bracketed paste (`paste-buffer -d -p`)
     /// without blocking for the settle pause or sending Enter. Callers on async runtimes should
     /// pair this with `tokio::time::sleep(cfg.paste_settle_ms)` followed by [`Tmux::submit_enter`].
@@ -316,7 +382,7 @@ impl Tmux {
     }
 
     /// Inject explicit interactive user input via bracketed paste (`paste-buffer -d -p`) +
-    /// settle pause + `C-m`. Allows multi-line or slash text once validated by
+    /// adaptive settle pause + `C-m`. Allows multi-line or slash text once validated by
     /// [`validate_interactive_text`]; callers must still enforce [`check_interactive_gate`].
     pub fn inject_interactive(
         &self,
@@ -325,7 +391,8 @@ impl Tmux {
         cfg: &GateConfig,
     ) -> Result<(), TmuxError> {
         self.paste_interactive_text(pane, text)?;
-        thread::sleep(Duration::from_millis(cfg.paste_settle_ms));
+        let settle = adaptive_paste_settle_ms(cfg.paste_settle_ms, text);
+        thread::sleep(Duration::from_millis(settle));
         self.submit_enter(pane)
     }
 
@@ -694,6 +761,14 @@ impl TerminalMux for Tmux {
 
     fn cursor_line(&self, pane: &PaneId, cursor_y: u32) -> Result<String, TmuxError> {
         Tmux::cursor_line(self, pane, cursor_y)
+    }
+
+    fn capture_visible_screen(&self, pane: &PaneId) -> Result<String, TmuxError> {
+        Tmux::capture_visible_screen(self, pane)
+    }
+
+    fn exit_copy_mode(&self, pane: &PaneId) -> Result<bool, TmuxError> {
+        Tmux::exit_copy_mode(self, pane)
     }
 
     fn paste_pointer_text(

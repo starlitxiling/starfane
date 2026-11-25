@@ -8,6 +8,7 @@ use crate::id::{ArtifactId, PipelineId, ReviewId};
 use crate::pipeline::{ArtifactKind, PipelineSpec};
 use crate::session::{HostRecord, SessionRecord};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -49,6 +50,13 @@ pub enum DaemonEvent {
         seq: u64,
         host: HostRecord,
     },
+    Notifiers {
+        seq: u64,
+        #[serde(default)]
+        global_mute_until_ms: Option<u64>,
+        #[serde(default)]
+        channel_mutes: BTreeMap<String, u64>,
+    },
 }
 
 impl DaemonEvent {
@@ -61,7 +69,8 @@ impl DaemonEvent {
             | DaemonEvent::Review { seq, .. }
             | DaemonEvent::Delivery { seq, .. }
             | DaemonEvent::Attention { seq, .. }
-            | DaemonEvent::Host { seq, .. } => *seq,
+            | DaemonEvent::Host { seq, .. }
+            | DaemonEvent::Notifiers { seq, .. } => *seq,
         }
     }
 
@@ -76,6 +85,7 @@ impl DaemonEvent {
             DaemonEvent::Delivery { .. } => "delivery",
             DaemonEvent::Attention { .. } => "attention",
             DaemonEvent::Host { .. } => "host",
+            DaemonEvent::Notifiers { .. } => "notifiers",
         }
     }
 
@@ -112,5 +122,18 @@ mod tests {
         let back: DaemonEvent =
             serde_json::from_str(f.lines().nth(2).unwrap().trim_start_matches("data: ")).unwrap();
         assert_eq!(back, e);
+
+        let mut mutes = BTreeMap::new();
+        mutes.insert("tg-ops".to_string(), 1_764_054_000_000);
+        let ne = DaemonEvent::Notifiers {
+            seq: 43,
+            global_mute_until_ms: None,
+            channel_mutes: mutes,
+        };
+        let nf = ne.to_sse_frame().unwrap();
+        assert!(nf.starts_with("id: 43\nevent: notifiers\ndata: "));
+        let nback: DaemonEvent =
+            serde_json::from_str(nf.lines().nth(2).unwrap().trim_start_matches("data: ")).unwrap();
+        assert_eq!(nback, ne);
     }
 }

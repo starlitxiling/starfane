@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 use starfane_proto::mcp::{negotiate_protocol_version, MCP_TOOL_NAMES};
 use starfane_proto::{
     mcp_tool_schemas, AgentKind, ApiError, ArtifactPayload, AuthorRef, BindToken,
-    CreatePipelineReq, DaemonCommand, EvidenceQuote, FalsifierSubmission, FalsifierVerdict,
+    CreatePipelineReq, DaemonCommand, Effort, EvidenceQuote, FalsifierSubmission, FalsifierVerdict,
     FinalReport, FindingId, HandoffDraft, HandoffId, HandoffStatus, IdentityResolution, PaneId,
     PipelineSource, PlanDoc, PlaybookKind, RcaReport, ReviewId, ReviewReport, SessionId,
     SessionRecord, Severity, StageBinding, StageKind, TriageReport, Via,
@@ -148,6 +148,9 @@ pub struct CallerEnv {
     pub cwd: Option<String>,
     pub pane: Option<PaneId>,
     pub bind_token: Option<BindToken>,
+    /// Ancestor PID chain (`self -> ppid -> ...`) for deterministic tmux/zellij pane matching
+    /// when an agent CLI (e.g. Codex) strips `TMUX_PANE` from MCP subprocesses.
+    pub pid_chain: Vec<u32>,
 }
 
 impl CallerEnv {
@@ -159,12 +162,15 @@ impl CallerEnv {
                 None
             }
         };
+        let pane = starfane_proto::EnvCtx::capture().pane_id();
+        let pid_chain = starfane_tmux::pid_ancestors(std::process::id(), 16);
         CallerEnv {
             cwd,
-            pane: non_empty_env("TMUX_PANE").map(PaneId::new),
+            pane,
             bind_token: non_empty_env(starfane_proto::paths::ENV_BIND)
                 .or_else(|| non_empty_env("BATON_BIND"))
                 .map(BindToken::new),
+            pid_chain,
         }
     }
 }
@@ -533,6 +539,7 @@ impl<T: Transport> McpServer<T> {
             pane: self.env.pane.clone(),
             bind_token: self.env.bind_token.clone(),
             session_hint: None,
+            pid_chain: self.env.pid_chain.clone(),
         })?;
         let resolution: IdentityResolution = parse_as(resolution, "identity resolution")?;
         match resolution {
@@ -617,6 +624,7 @@ impl<T: Transport> McpServer<T> {
             "report_milestone" => self.tool_report_milestone(args),
             "submit_falsifier_verdict" => self.tool_falsifier(args),
             "start_pipeline" => self.tool_start_pipeline(args),
+            "spawn_session" => self.tool_spawn_session(args),
             other => Err(ToolError::new(format!("unknown tool: {other}"))),
         }
     }
@@ -845,6 +853,69 @@ impl<T: Transport> McpServer<T> {
         let pipeline = self.call(DaemonCommand::CreatePipeline { req })?;
         Ok(json!({ "pipeline": pipeline, "parsed": parsed, "needs_confirmation": true }))
     }
+
+    fn tool_spawn_session(&mut self, args: &Args) -> Result<Value, ToolError> {
+        let raw_agent = req_str(args, "agent", "")?.trim();
+        let agent = match AgentKind::parse(raw_agent) {
+            Some(a) if !a.is_shell() => a,
+            _ => {
+                return Err(ToolError::new(format!(
+                    "argument `agent` must be one of claude|codex|agy, got {raw_agent:?}"
+                )))
+            }
+        };
+        let model = opt_str(args, "model")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let effort = match opt_str(args, "effort")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => Some(Effort::parse(s).ok_or_else(|| {
+                ToolError::new(format!(
+                    "argument `effort` must be one of low|medium|high|xhigh|max, got {s:?}"
+                ))
+            })?),
+            None => None,
+        };
+        let project_root = opt_str(args, "project_root")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.env
+                    .cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            });
+        let tmux_session = opt_str(args, "tmux_session")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let name = opt_str(args, "name")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let prompt = opt_str(args, "prompt")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let from_session = self.known_caller(args)?;
+
+        self.call(DaemonCommand::SpawnSession {
+            agent,
+            model,
+            effort,
+            project_root,
+            tmux_session,
+            name,
+            prompt,
+            from_session,
+        })
+    }
 }
 
 fn req_value_of(obj: &Value, key: &str, what: &str) -> Result<Value, ToolError> {
@@ -917,6 +988,7 @@ mod tests {
                 cwd: Some("/tmp/proj".into()),
                 pane: Some(PaneId::new("%3")),
                 bind_token: None,
+                pid_chain: vec![4200, 4100],
             },
             StubTransport {
                 calls: Vec::new(),
@@ -997,13 +1069,13 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_nine_tools() {
+    fn tools_list_has_ten_tools() {
         let mut s = server(default_responder());
         let r = s
             .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
             .unwrap();
         let tools = r["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, MCP_TOOL_NAMES);
         assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object"));
@@ -1078,6 +1150,28 @@ mod tests {
                 "list_sessions",
                 json!({"include_subagents": "yes"}),
                 "boolean",
+            ),
+            ("spawn_session", json!({}), "`agent`"),
+            (
+                "spawn_session",
+                json!({"agent": "shell"}),
+                "claude|codex|agy",
+            ),
+            ("spawn_session", json!({"agent": "gpt"}), "claude|codex|agy"),
+            (
+                "spawn_session",
+                json!({"agent": "codex", "effort": "ultra"}),
+                "low|medium|high|xhigh|max",
+            ),
+            (
+                "spawn_session",
+                json!({"agent": "codex", "model": 123}),
+                "string",
+            ),
+            (
+                "spawn_session",
+                json!({"agent": "codex", "from_session": 42}),
+                "string",
             ),
         ];
         for (tool, args, needle) in cases {
@@ -1335,6 +1429,146 @@ mod tests {
             Some("gpt-5")
         );
         assert_eq!(req.source.utterance.as_deref(), Some("add button"));
+    }
+
+    #[test]
+    fn spawn_session_forwards_all_args_and_returns_structured_json() {
+        let mut s = server(Box::new(|cmd| match cmd {
+            DaemonCommand::SpawnSession { .. } => Ok(json!({
+                "session_id": "tmux-%52",
+                "pane_id": "%52",
+                "tmux_target": "agent-session:1.0",
+                "tmux_label": "agent-session-codex-audit",
+                "agent": "codex",
+                "model": "gpt-6.2-astra",
+                "effort": "xhigh",
+                "cwd": "/Users/wujie/Work/workflow"
+            })),
+            _ => Ok(json!({})),
+        }));
+        let r = call_tool(
+            &mut s,
+            "spawn_session",
+            json!({
+                "agent": "codex",
+                "model": "gpt-6.2-astra",
+                "effort": "xhigh",
+                "project_root": "/Users/wujie/Work/workflow",
+                "tmux_session": "agent-session",
+                "name": "codex-audit",
+                "prompt": "starfane: read_inbox",
+                "from_session": "s-caller"
+            }),
+        );
+        assert_eq!(r["isError"], false, "{r}");
+        assert_eq!(r["structuredContent"]["session_id"], "tmux-%52");
+        assert_eq!(r["structuredContent"]["pane_id"], "%52");
+        assert_eq!(r["structuredContent"]["tmux_target"], "agent-session:1.0");
+        assert_eq!(
+            r["structuredContent"]["tmux_label"],
+            "agent-session-codex-audit"
+        );
+        assert_eq!(r["structuredContent"]["agent"], "codex");
+        assert_eq!(r["structuredContent"]["model"], "gpt-6.2-astra");
+        assert_eq!(r["structuredContent"]["effort"], "xhigh");
+        assert_eq!(r["structuredContent"]["cwd"], "/Users/wujie/Work/workflow");
+
+        match &s.transport.calls[..] {
+            [DaemonCommand::SpawnSession {
+                agent,
+                model,
+                effort,
+                project_root,
+                tmux_session,
+                name,
+                prompt,
+                from_session,
+            }] => {
+                assert_eq!(*agent, AgentKind::Codex);
+                assert_eq!(model.as_deref(), Some("gpt-6.2-astra"));
+                assert_eq!(*effort, Some(Effort::Xhigh));
+                assert_eq!(project_root.as_deref(), Some("/Users/wujie/Work/workflow"));
+                assert_eq!(tmux_session.as_deref(), Some("agent-session"));
+                assert_eq!(name.as_deref(), Some("codex-audit"));
+                assert_eq!(prompt.as_deref(), Some("starfane: read_inbox"));
+                assert_eq!(from_session.as_ref().map(|x| x.as_str()), Some("s-caller"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_session_defaults_project_root_to_caller_cwd_or_none() {
+        // 1. CallerEnv has cwd -> defaults project_root to caller's cwd.
+        let mut s = server(default_responder());
+        let r = call_tool(&mut s, "spawn_session", json!({"agent": "agy"}));
+        assert_eq!(r["isError"], false, "{r}");
+        assert!(matches!(
+            &s.transport.calls[..],
+            [DaemonCommand::SpawnSession {
+                agent: AgentKind::Agy,
+                project_root: Some(p),
+                ..
+            }] if p == "/tmp/proj"
+        ));
+
+        // 2. CallerEnv has no cwd -> sends project_root: None (daemon falls back to ~/.agent_session).
+        let mut s_no_cwd = McpServer::new(
+            AgentKind::Claude,
+            CallerEnv::default(),
+            StubTransport {
+                calls: Vec::new(),
+                responder: default_responder(),
+            },
+        );
+        let r2 = call_tool(&mut s_no_cwd, "spawn_session", json!({"agent": "claude"}));
+        assert_eq!(r2["isError"], false, "{r2}");
+        assert!(matches!(
+            &s_no_cwd.transport.calls[..],
+            [DaemonCommand::SpawnSession {
+                agent: AgentKind::Claude,
+                project_root: None,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn resolve_identity_forwards_pid_chain_when_pane_env_is_stripped() {
+        let mut s = McpServer::new(
+            AgentKind::Codex,
+            CallerEnv {
+                cwd: Some("/tmp/shared".into()),
+                pane: None,
+                bind_token: None,
+                pid_chain: vec![55000, 28301, 8403],
+            },
+            StubTransport {
+                calls: Vec::new(),
+                responder: Box::new(|cmd| match cmd {
+                    DaemonCommand::ResolveIdentity { .. } => {
+                        Ok(json!({"status": "resolved", "session_id": "s-pid", "via": "pid_tree"}))
+                    }
+                    DaemonCommand::ReadInbox { .. } => Ok(json!([])),
+                    _ => Ok(json!({})),
+                }),
+            },
+        );
+        let r = call_tool(&mut s, "read_inbox", json!({}));
+        assert_eq!(r["isError"], false, "{r}");
+        match &s.transport.calls[0] {
+            DaemonCommand::ResolveIdentity {
+                agent,
+                pane,
+                pid_chain,
+                ..
+            } => {
+                assert_eq!(*agent, AgentKind::Codex);
+                assert_eq!(*pane, None);
+                assert_eq!(pid_chain, &vec![55000, 28301, 8403]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

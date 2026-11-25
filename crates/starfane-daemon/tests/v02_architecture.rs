@@ -369,8 +369,9 @@ async fn live_peer_federation_failover_transcript_proxy_and_degraded_resilience(
 
     // Proxy interactive dispatch from Hub -> real Peer `/api/dispatch`:
     // Peer accepts the exact `DispatchBody` schema, checks its local tmux gate (which fails since
-    // peer tmux is `/usr/bin/false`), falls back to L0 inbox (`status: "queued"`), and Hub returns
-    // the Peer's real `DeliveryReport` with host-qualified pane `"mac-xiling:%4"`!
+    // peer tmux is `/usr/bin/false`), returns `status: "failed"` (`l2_inject`) without dumping a
+    // ghost entry into L0 inbox, and Hub returns the Peer's real `DeliveryReport` with host-qualified
+    // pane `"mac-xiling:%4"`!
     let disp_report = hub_core
         .handle(starfane_proto::DaemonCommand::Dispatch {
             target: starfane_proto::DispatchTarget::Session {
@@ -383,8 +384,8 @@ async fn live_peer_federation_failover_transcript_proxy_and_degraded_resilience(
         })
         .await
         .expect("Hub -> Peer /api/dispatch must succeed with valid DispatchBody schema");
-    assert_eq!(disp_report["status"], "queued");
-    assert_eq!(disp_report["level"], "l0_inbox");
+    assert_eq!(disp_report["status"], "failed");
+    assert_eq!(disp_report["level"], "l2_inject");
     assert_eq!(disp_report["pane"], "mac-xiling:%4");
     assert_eq!(disp_report["gate"]["passed"], false);
 

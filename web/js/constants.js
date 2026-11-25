@@ -15,7 +15,20 @@ export const AGENT_DISPLAY = { claude: 'Claude', codex: 'Codex', agy: 'AGY', she
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const DEPTHS = ['D0', 'D1', 'D2', 'D3'];
 export const SEVERITIES = ['blocker', 'major', 'minor', 'nit'];
-export const SSE_TYPES = ['event', 'session', 'host', 'pipeline', 'artifact', 'review', 'delivery', 'attention', 'resync'];
+export const SSE_TYPES = ['event', 'session', 'host', 'pipeline', 'artifact', 'review', 'delivery', 'attention', 'notifiers', 'resync'];
+export const NOTIFIER_KINDS = ['feishu', 'telegram', 'discord', 'slack', 'wecom', 'qq', 'webhook', 'macos'];
+export function notifierKindLabel(kind) {
+  return {
+    feishu: L('飞书', 'Feishu'),
+    telegram: 'Telegram',
+    discord: 'Discord',
+    slack: 'Slack',
+    wecom: L('企微', 'WeCom'),
+    qq: 'QQ',
+    webhook: 'Webhook',
+    macos: 'macOS',
+  }[String(kind || '').toLowerCase()] || String(kind || 'channel');
+}
 export function stageLabel(k) {
   return {
     plan: 'Plan',
@@ -119,7 +132,7 @@ export function starfaneSlash() {
   return [
     { cmd: '/feature', args_hint: '', desc: L('切换为新功能协作模式', 'Switch to feature pipeline mode'), group: 'starfane', action: 'mode_feature' },
     { cmd: '/debug', args_hint: '', desc: L('切换为两速查错模式', 'Switch to two-speed debug mode'), group: 'starfane', action: 'mode_debug' },
-    { cmd: '/mute', args_hint: '', desc: L('打开飞书通知静音设置', 'Open Feishu notification mute settings'), group: 'starfane', action: 'open_mute' },
+    { cmd: '/mute', args_hint: '', desc: L('打开通知静音与渠道设置', 'Open notification mute & channel settings'), group: 'starfane', action: 'open_mute' },
     { cmd: '/terminal', args_hint: '', desc: L('切换阅读视图 / 原始终端', 'Toggle reading / raw terminal view'), group: 'starfane', action: 'toggle_terminal' },
     { cmd: '/drawer', args_hint: '', desc: L('展开当前会话详情抽屉', 'Open current session inspector drawer'), group: 'starfane', action: 'open_drawer' },
   ];

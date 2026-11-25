@@ -384,7 +384,11 @@ pub fn starfane_commands_for_lang(is_en: bool) -> Vec<SlashCommand> {
                 "mode_feature",
             ),
             starfane_cmd("/debug", "Switch to Two-Speed Debug mode", "mode_debug"),
-            starfane_cmd("/mute", "Open Feishu notification mute menu", "open_mute"),
+            starfane_cmd(
+                "/mute",
+                "Open notification mute & channel settings",
+                "open_mute",
+            ),
             starfane_cmd(
                 "/terminal",
                 "Toggle reading view / raw terminal",
@@ -400,7 +404,7 @@ pub fn starfane_commands_for_lang(is_en: bool) -> Vec<SlashCommand> {
     vec![
         starfane_cmd("/feature", "切换为新功能协作模式", "mode_feature"),
         starfane_cmd("/debug", "切换为排查 Debug 协作模式", "mode_debug"),
-        starfane_cmd("/mute", "打开飞书通知静音设置", "open_mute"),
+        starfane_cmd("/mute", "打开通知静音与渠道设置", "open_mute"),
         starfane_cmd("/terminal", "切换阅读视图 / 原始终端", "toggle_terminal"),
         starfane_cmd("/drawer", "展开当前会话详情抽屉", "open_drawer"),
     ]

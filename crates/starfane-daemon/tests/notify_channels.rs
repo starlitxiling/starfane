@@ -1300,3 +1300,372 @@ async fn web_api_notifiers_list_and_test_endpoints() {
     mock_srv.abort();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn unified_global_and_per_channel_mute_enforcement_http_api_and_sse() {
+    #[derive(Default)]
+    struct MultiState {
+        hits: Mutex<Vec<String>>,
+    }
+    async fn handler(
+        State(st): State<Arc<MultiState>>,
+        AxumPath(path): AxumPath<String>,
+        Json(_body): Json<Value>,
+    ) -> (StatusCode, String) {
+        let full = format!("/{path}");
+        st.hits.lock().unwrap().push(full.clone());
+        if full.starts_with("/bot") {
+            (
+                StatusCode::OK,
+                r#"{"ok":true,"result":{"message_id":101}}"#.into(),
+            )
+        } else if full.starts_with("/discord") {
+            (StatusCode::NO_CONTENT, String::new())
+        } else if full.starts_with("/slack") {
+            (StatusCode::OK, "ok".into())
+        } else if full.starts_with("/wecom") {
+            (StatusCode::OK, r#"{"errcode":0,"errmsg":"ok"}"#.into())
+        } else if full.starts_with("/onebot") {
+            (
+                StatusCode::OK,
+                r#"{"status":"ok","retcode":0,"data":{"message_id":202}}"#.into(),
+            )
+        } else {
+            (StatusCode::OK, r#"{"ok":true}"#.into())
+        }
+    }
+
+    let root = mk_dir("unified-mute");
+    let mock_st = Arc::new(MultiState::default());
+    let mock_app = Router::new()
+        .route("/{*path}", post(handler))
+        .with_state(mock_st.clone());
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    let mock_srv = tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_app).await;
+    });
+
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+
+    let mut cfg = StarfaneConfig {
+        web: WebConfig {
+            bind: "127.0.0.1".into(),
+            port: api_addr.port(),
+            auth_enabled: false,
+            ..WebConfig::default()
+        },
+        notifiers: vec![
+            NotifierConfig {
+                id: "tg-ops".into(),
+                kind: NotifierKind::Telegram,
+                enabled: true,
+                ownership: NotifyOwnership::Hub,
+                bot_token: "111:AAA".into(),
+                chat_id: "123".into(),
+                api_base_url: Some(format!("http://{mock_addr}")),
+                ..NotifierConfig::default()
+            },
+            NotifierConfig {
+                id: "discord-ops".into(),
+                kind: NotifierKind::Discord,
+                enabled: true,
+                ownership: NotifyOwnership::Hub,
+                webhook_url: Some(format!("http://{mock_addr}/discord/1/tok")),
+                ..NotifierConfig::default()
+            },
+            NotifierConfig {
+                id: "slack-ops".into(),
+                kind: NotifierKind::Slack,
+                enabled: true,
+                ownership: NotifyOwnership::Hub,
+                webhook_url: Some(format!("http://{mock_addr}/slack/hook")),
+                ..NotifierConfig::default()
+            },
+            NotifierConfig {
+                id: "wecom-ops".into(),
+                kind: NotifierKind::Wecom,
+                enabled: true,
+                ownership: NotifyOwnership::Hub,
+                webhook_url: Some(format!("http://{mock_addr}/wecom/send")),
+                ..NotifierConfig::default()
+            },
+            NotifierConfig {
+                id: "qq-ops".into(),
+                kind: NotifierKind::Qq,
+                enabled: true,
+                ownership: NotifyOwnership::Hub,
+                api_base_url: Some(format!("http://{mock_addr}/onebot")),
+                group_id: Some("123456".into()),
+                ..NotifierConfig::default()
+            },
+            NotifierConfig {
+                id: "webhook-ops".into(),
+                kind: NotifierKind::Webhook,
+                enabled: true,
+                ownership: NotifyOwnership::Hub,
+                url: format!("http://{mock_addr}/hook"),
+                ..NotifierConfig::default()
+            },
+        ],
+        ..StarfaneConfig::default()
+    };
+    cfg.paths.tmux = "/usr/bin/false".into();
+    cfg.zellij.enabled = false;
+    cfg.validate().unwrap();
+
+    let core = Core::new(&DaemonConfig {
+        state_dir: root.join("state"),
+        socket: root.join("state/starfaned.sock"),
+        config: cfg,
+        web_dir: None,
+        foreground: true,
+    })
+    .unwrap();
+    let mut sse_rx = core.subscribe();
+
+    let app = starfane_daemon::web::router(core.clone());
+    let api_srv = tokio::spawn(async move {
+        let _ = axum::serve(
+            api_listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
+    });
+
+    let post_json = |path: &str, payload: &str| {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            api_addr.port(),
+            api_addr.port(),
+            payload.len()
+        )
+    };
+    let get_req = |path: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            api_addr.port()
+        )
+    };
+
+    let ctx = NotifyRouteContext {
+        node: "local".into(),
+        is_local_host: true,
+        node_ownership: NotifyOwnership::NodeLocal,
+        project: Some("workflow".into()),
+        cwd: Some("/repo/workflow".into()),
+        agent: Some(AgentKind::Claude),
+        event_kind: NoticeKind::TurnComplete,
+    };
+    let notice = sample_notice(NoticeKind::TurnComplete, "Mute Check", "Body");
+
+    // 1. Initial GET /api/state exposes all 6 notifiers + unmuted state in 1 round-trip.
+    let (st_state, _, body_state) = raw_http(api_addr, &get_req("/api/state")).await;
+    assert_eq!(st_state, 200, "{body_state}");
+    let sv: Value = serde_json::from_str(&body_state).unwrap();
+    assert_eq!(sv["data"]["any_muted"], false);
+    assert!(sv["data"]["global_mute_until_ms"].is_null());
+    assert_eq!(sv["data"]["notifiers"].as_array().unwrap().len(), 6);
+
+    // 2. Per-channel mute on `discord-ops` suppresses ONLY Discord while other 5 channels still deliver,
+    //    emits SSE `notifiers` event, AND `POST /api/notifiers/discord-ops/test` still works!
+    let (st_ch, _, body_ch) = raw_http(
+        api_addr,
+        &post_json(
+            "/api/notifiers/mute",
+            r#"{"target":"discord-ops","minutes":30}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st_ch, 200, "{body_ch}");
+    let chv: Value = serde_json::from_str(&body_ch).unwrap();
+    assert_eq!(chv["data"]["target"], "discord-ops");
+    assert!(chv["data"]["global_mute_until_ms"].is_null());
+    assert_eq!(chv["data"]["any_muted"], true);
+    assert!(
+        chv["data"]["channel_mutes"]["discord-ops"]
+            .as_u64()
+            .unwrap()
+            > id::now_ms()
+    );
+
+    // Confirm SSE broadcast fired.
+    let mut saw_sse_ch = false;
+    while let Ok(ev) = sse_rx.try_recv() {
+        if let starfane_proto::DaemonEvent::Notifiers {
+            global_mute_until_ms,
+            channel_mutes,
+            ..
+        } = ev
+        {
+            if global_mute_until_ms.is_none() && channel_mutes.contains_key("discord-ops") {
+                saw_sse_ch = true;
+            }
+        }
+    }
+    assert!(
+        saw_sse_ch,
+        "per-channel mute must broadcast SSE DaemonEvent::Notifiers"
+    );
+
+    mock_st.hits.lock().unwrap().clear();
+    let rep_partial = core
+        .notify_router()
+        .dispatch_pluggable_with_mutes(&notice, &ctx, &[], &core.mute_snapshot(), id::now_ms())
+        .await;
+    assert_eq!(rep_partial.len(), 5, "only 5 unmuted channels should fire");
+    assert!(!rep_partial.iter().any(|(id, _)| id == "discord-ops"));
+    assert!(rep_partial.iter().all(|(_, r)| r.is_ok()));
+
+    // `send_test` on muted `discord-ops` MUST still succeed!
+    let (st_test_dc, _, body_test_dc) = raw_http(
+        api_addr,
+        &post_json(
+            "/api/notifiers/discord-ops/test",
+            r#"{"text":"still works"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st_test_dc, 200, "{body_test_dc}");
+
+    // 2b. Per-channel unmute on `discord-ops` clears ONLY `discord-ops` & restores all 6 channels.
+    let (st_ch_unm, _, body_ch_unm) = raw_http(
+        api_addr,
+        &post_json(
+            "/api/notifiers/mute",
+            r#"{"target":"discord-ops","minutes":0}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st_ch_unm, 200, "{body_ch_unm}");
+    let ch_unm_v: Value = serde_json::from_str(&body_ch_unm).unwrap();
+    assert_eq!(ch_unm_v["data"]["any_muted"], false);
+    assert_eq!(ch_unm_v["data"]["channel_mutes"], json!({}));
+    let rep_after_ch_unm = core
+        .notify_router()
+        .dispatch_pluggable_with_mutes(&notice, &ctx, &[], &core.mute_snapshot(), id::now_ms())
+        .await;
+    assert_eq!(rep_after_ch_unm.len(), 6);
+
+    // Re-mute `wecom-ops` individually before global mute, to verify global unmute clears BOTH!
+    let (st_wc_m, _, _) = raw_http(
+        api_addr,
+        &post_json(
+            "/api/notifiers/mute",
+            r#"{"target":"wecom-ops","minutes":45}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st_wc_m, 200);
+
+    // 3. Global mute (`target: "all"`) suppresses ALL 6 channels while `send_test` still works!
+    let (st_all, _, body_all) = raw_http(
+        api_addr,
+        &post_json("/api/notifiers/mute", r#"{"target":"all","minutes":60}"#),
+    )
+    .await;
+    assert_eq!(st_all, 200, "{body_all}");
+    let av: Value = serde_json::from_str(&body_all).unwrap();
+    assert!(av["data"]["global_mute_until_ms"].as_u64().unwrap() > id::now_ms());
+    assert_eq!(av["data"]["any_muted"], true);
+
+    mock_st.hits.lock().unwrap().clear();
+    let rep_global = core
+        .notify_router()
+        .dispatch_pluggable_with_mutes(&notice, &ctx, &[], &core.mute_snapshot(), id::now_ms())
+        .await;
+    assert!(
+        rep_global.is_empty(),
+        "global mute must suppress all channels"
+    );
+    assert!(mock_st.hits.lock().unwrap().is_empty());
+
+    let (st_test_tg, _, body_test_tg) = raw_http(
+        api_addr,
+        &post_json(
+            "/api/notifiers/tg-ops/test",
+            r#"{"text":"global muted test"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st_test_tg, 200, "{body_test_tg}");
+
+    // 4. Unmute all via `until_ms: 0` clears global + per-channel mutes & restores delivery immediately!
+    let (st_unm, _, body_unm) = raw_http(
+        api_addr,
+        &post_json("/api/notifiers/mute", r#"{"target":"all","until_ms":0}"#),
+    )
+    .await;
+    assert_eq!(st_unm, 200, "{body_unm}");
+    let uv: Value = serde_json::from_str(&body_unm).unwrap();
+    assert!(uv["data"]["global_mute_until_ms"].is_null());
+    assert_eq!(uv["data"]["channel_mutes"], json!({}));
+    assert_eq!(uv["data"]["any_muted"], false);
+
+    mock_st.hits.lock().unwrap().clear();
+    let rep_resumed = core
+        .notify_router()
+        .dispatch_pluggable_with_mutes(&notice, &ctx, &[], &core.mute_snapshot(), id::now_ms())
+        .await;
+    assert_eq!(
+        rep_resumed.len(),
+        6,
+        "all 6 channels must resume after unmute"
+    );
+    assert!(rep_resumed.iter().all(|(_, r)| r.is_ok()));
+
+    // 5. Validation errors + unknown notifier target (404).
+    let (st_404, _, _) = raw_http(
+        api_addr,
+        &post_json(
+            "/api/notifiers/mute",
+            r#"{"target":"no-such-ch","minutes":10}"#,
+        ),
+    )
+    .await;
+    assert_eq!(st_404, 404);
+    let (st_400_max, _, _) = raw_http(
+        api_addr,
+        &post_json("/api/notifiers/mute", r#"{"target":"all","minutes":10081}"#),
+    )
+    .await;
+    assert_eq!(st_400_max, 400);
+    let (st_400_neg, _, _) = raw_http(
+        api_addr,
+        &post_json("/api/notifiers/mute", r#"{"target":"all","until_ms":-5}"#),
+    )
+    .await;
+    assert_eq!(st_400_neg, 400);
+    let (st_400_empty, _, _) = raw_http(api_addr, &post_json("/api/notifiers/mute", r#"{}"#)).await;
+    assert_eq!(st_400_empty, 400);
+
+    // 6. Legacy `POST /api/feishu/mute` remains 100% backward compatible & syncs global mute!
+    let (st_fm, _, body_fm) = raw_http(
+        api_addr,
+        &post_json("/api/feishu/mute", r#"{"minutes":15}"#),
+    )
+    .await;
+    assert_eq!(st_fm, 200, "{body_fm}");
+    let fmv: Value = serde_json::from_str(&body_fm).unwrap();
+    assert!(fmv["data"]["feishu_muted_until_ms"].as_u64().unwrap() > id::now_ms());
+    assert!(fmv["data"]["global_mute_until_ms"].as_u64().unwrap() > id::now_ms());
+    assert_eq!(fmv["data"]["any_muted"], true);
+
+    let (st_list, _, body_list) = raw_http(api_addr, &get_req("/api/notifiers")).await;
+    assert_eq!(st_list, 200, "{body_list}");
+    let lv: Value = serde_json::from_str(&body_list).unwrap();
+    assert_eq!(lv["data"]["any_muted"], true);
+    assert!(lv["data"]["global_mute_until_ms"].as_u64().unwrap() > id::now_ms());
+
+    let (st_fu, _, body_fu) =
+        raw_http(api_addr, &post_json("/api/feishu/mute", r#"{"minutes":0}"#)).await;
+    assert_eq!(st_fu, 200, "{body_fu}");
+    let fuv: Value = serde_json::from_str(&body_fu).unwrap();
+    assert!(fuv["data"]["feishu_muted_until_ms"].is_null());
+    assert_eq!(fuv["data"]["any_muted"], false);
+
+    api_srv.abort();
+    mock_srv.abort();
+    let _ = std::fs::remove_dir_all(&root);
+}

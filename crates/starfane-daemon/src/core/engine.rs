@@ -127,6 +127,86 @@ impl Core {
             .collect()
     }
 
+    pub(crate) async fn resolve_identity_with_pid_tree(
+        &self,
+        agent: AgentKind,
+        cwd: Option<String>,
+        pane: Option<PaneId>,
+        bind_token: Option<BindToken>,
+        hint: Option<SessionId>,
+        pid_chain: Vec<u32>,
+    ) -> IdentityResolution {
+        if let Some(exact) =
+            self.resolve_identity_exact(agent, pane.as_ref(), bind_token.as_ref(), hint.as_ref())
+        {
+            return exact;
+        }
+        // When an agent CLI (e.g. Codex) strips TMUX_PANE / ZELLIJ_PANE_ID from MCP subprocesses,
+        // walk the caller's ancestor PID chain against live mux panes before falling back to CWD.
+        if pane.is_none() && !pid_chain.is_empty() {
+            let core = self.clone();
+            let resolved_pane = tokio::task::spawn_blocking(move || {
+                let panes = core.inner.mux.list_all_panes().ok()?;
+                let hint = starfane_tmux::PaneHint {
+                    agent,
+                    env_pane: None,
+                    pid_chain,
+                    cwd: None,
+                };
+                match starfane_tmux::resolve_pane(&panes, &hint) {
+                    (Some(p), PaneResolution::PidTree) => Some(p),
+                    _ => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(p) = resolved_pane {
+                let st = lock(&self.inner.state);
+                if let Some(s) = st.session_for_pane(&p).filter(|s| s.agent == agent) {
+                    return IdentityResolution::Resolved {
+                        session_id: s.session_id.clone(),
+                        via: PaneResolution::PidTree,
+                    };
+                }
+            }
+        }
+        self.resolve_identity(agent, cwd, pane, bind_token, hint)
+    }
+
+    fn resolve_identity_exact(
+        &self,
+        agent: AgentKind,
+        pane: Option<&PaneId>,
+        bind_token: Option<&BindToken>,
+        hint: Option<&SessionId>,
+    ) -> Option<IdentityResolution> {
+        let st = lock(&self.inner.state);
+        if let Some(tok) = bind_token {
+            if let Some(sid) = st.binds.get(tok).and_then(|b| b.session_id.clone()) {
+                return Some(IdentityResolution::Resolved {
+                    session_id: sid,
+                    via: PaneResolution::BindToken,
+                });
+            }
+        }
+        if let Some(h) = hint.filter(|h| st.sessions.contains_key(*h)) {
+            return Some(IdentityResolution::Resolved {
+                session_id: h.clone(),
+                via: PaneResolution::Env,
+            });
+        }
+        if let Some(p) = pane {
+            if let Some(s) = st.session_for_pane(p).filter(|s| s.agent == agent) {
+                return Some(IdentityResolution::Resolved {
+                    session_id: s.session_id.clone(),
+                    via: PaneResolution::Env,
+                });
+            }
+        }
+        None
+    }
+
     pub(crate) fn resolve_identity(
         &self,
         agent: AgentKind,

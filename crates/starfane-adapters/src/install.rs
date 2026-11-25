@@ -159,6 +159,11 @@ pub fn install_plan(
              Approve the new starfane hook entries on next Codex launch (starfane never edits config.toml `notify`)."
                 .to_string(),
         );
+        notes.push(
+            "Optional for multi-pane Codex MCP: add `env_vars = [\"TMUX_PANE\", \"TMUX\", \"ZELLIJ_PANE_ID\", \"ZELLIJ_SESSION_NAME\"]` \
+             under `[mcp_servers.starfane]` in ~/.codex/config.toml (starfane also falls back to PID-tree pane resolution automatically)."
+                .to_string(),
+        );
     }
     if agent == AgentKind::Agy && opts.agy_permission_heuristic {
         notes.push(

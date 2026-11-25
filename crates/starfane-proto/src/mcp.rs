@@ -11,7 +11,7 @@ pub const MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-
 pub const MCP_LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Tool names in `tools/list` order.
-pub const MCP_TOOL_NAMES: [&str; 9] = [
+pub const MCP_TOOL_NAMES: [&str; 10] = [
     "list_sessions",
     "create_handoff",
     "read_inbox",
@@ -21,6 +21,7 @@ pub const MCP_TOOL_NAMES: [&str; 9] = [
     "submit_triage",
     "report_milestone",
     "start_pipeline",
+    "spawn_session",
 ];
 
 /// Pick the protocol version to answer `initialize` with.
@@ -311,7 +312,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
     })
 }
 
-/// The 9 MCP tools (`tools/list` payload entries), in [`MCP_TOOL_NAMES`] order.
+/// The 10 MCP tools (`tools/list` payload entries), in [`MCP_TOOL_NAMES`] order.
 pub fn mcp_tool_schemas() -> Value {
     let tools = vec![
         tool(
@@ -423,6 +424,29 @@ pub fn mcp_tool_schemas() -> Value {
                 "from_session": from_session()
             }),
             &["goal"],
+        ),
+        tool(
+            "spawn_session",
+            "Spawn a live interactive coding-agent session (claude, codex, or agy) in a tmux window and return its session_id, pane_id, tmux_target, tmux_label, agent, model, effort, and cwd so you can immediately collaborate via create_handoff or list_sessions.",
+            json!({
+                "agent": {
+                    "type": "string",
+                    "enum": ["claude", "codex", "agy"],
+                    "description": "Coding agent CLI to launch interactively."
+                },
+                "model": string_desc("Optional model id (e.g. 'gpt-6.2-astra', 'gemini-4-carbon', 'opus')."),
+                "effort": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": "Optional reasoning effort level."
+                },
+                "project_root": string_desc("Optional working directory or project name; defaults to caller's cwd or ~/.agent_session."),
+                "tmux_session": string_desc("Optional tmux session group name (defaults to 'agent-session')."),
+                "name": string_desc("Optional tmux window name (auto-numbered '<agent>-<N>' when omitted)."),
+                "prompt": string_desc("Optional single-line initial prompt passed on interactive launch."),
+                "from_session": from_session()
+            }),
+            &["agent"],
         ),
     ];
     Value::Array(tools)

@@ -4,9 +4,32 @@
 use super::state::{BindPurpose, PendingBind, State};
 use super::{lock, util, Core};
 use starfane_proto::*;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
+
+type PaneInjectLockMap = HashMap<(usize, PaneId), Weak<tokio::sync::Mutex<()>>>;
+
+/// Per-(Core, Pane) async serialization lock so concurrent dispatches to the same pane never
+/// interleave `paste-buffer`, paste-settle delay, and `submit_enter`. Weak entries auto-prune
+/// once no dispatch is in flight.
+fn acquire_pane_inject_lock(core_key: usize, pane: &PaneId) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<PaneInjectLockMap>> = OnceLock::new();
+    let map_mutex = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = lock(map_mutex);
+    if map.len() > 64 {
+        map.retain(|_, w| w.strong_count() > 0);
+    }
+    let key = (core_key, pane.clone());
+    if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let arc = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(key, Arc::downgrade(&arc));
+    arc
+}
 
 /// Long text thresholds above which `Dispatch` persists content to `<state_dir>/inputs/paste-<id>.md`
 /// and injects a clean single-line file pointer instead of overflowing the terminal paste buffer
@@ -465,7 +488,7 @@ impl Core {
         target: &DispatchTarget,
         text: &str,
     ) -> Result<DeliveryReport, ApiError> {
-        let (session_id, pane, discovered_only) = self.resolve_interactive_target(target)?;
+        let (session_id, pane, discovered_only, agent) = self.resolve_interactive_target(target)?;
 
         // Remote SSH or Peer host interactive dispatch proxy.
         let (host_opt, local_pane) = starfane_tmux::split_host_prefix(pane.as_str());
@@ -493,49 +516,147 @@ impl Core {
                 .await;
         }
 
-        let core = self.clone();
-        let pane_for_gate = pane.clone();
-        let gate = tokio::task::spawn_blocking(move || {
-            let panes = core.inner.mux.list_all_panes().map_err(|e| e.to_string())?;
-            let info = panes
-                .into_iter()
-                .find(|p| p.pane_id == pane_for_gate)
-                .ok_or_else(|| format!("pane {pane_for_gate} not found"))?;
-            Ok::<_, String>(starfane_tmux::check_interactive_gate(&info))
-        })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .unwrap_or_else(|e| GateReport::from_checks(vec![(GateCheck::PaneAlive, false)], Some(e)));
+        // Serialize concurrent injections into the same pane so paste + settle + Enter never interleave.
+        let core_key = Arc::as_ptr(&self.inner) as usize;
+        let pane_lock = acquire_pane_inject_lock(core_key, &pane);
+        let _pane_guard = pane_lock.lock().await;
+
+        let probe_pane = |pane_target: PaneId| {
+            let core = self.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let panes = core.inner.mux.list_all_panes().map_err(|e| e.to_string())?;
+                    let info = panes
+                        .into_iter()
+                        .find(|p| p.pane_id == pane_target)
+                        .ok_or_else(|| format!("pane {pane_target} not found"))?;
+                    let gate = starfane_tmux::check_interactive_gate(&info);
+                    Ok::<_, String>((gate, info))
+                })
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))
+            }
+        };
+
+        let mut gate = match probe_pane(pane.clone()).await? {
+            Ok((g, _)) => g,
+            Err(e) => GateReport::from_checks(vec![(GateCheck::PaneAlive, false)], Some(e)),
+        };
+
+        // Explicit user-initiated interactive send: when blocked ONLY by tmux scrollback
+        // `copy-mode` / `view-mode` (common on non-alt-screen agents like AGY after scrolling),
+        // safely exit copy-mode via `send-keys -X cancel` (zero bytes sent to PTY) and re-probe.
+        let mut exited_copy_mode = false;
+        if !gate.passed && gate.failed_checks() == [GateCheck::NotInMode] {
+            let core_exit = self.clone();
+            let pane_exit = pane.clone();
+            let exited =
+                tokio::task::spawn_blocking(move || core_exit.inner.mux.exit_copy_mode(&pane_exit))
+                    .await
+                    .ok()
+                    .and_then(|r| match r {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            log::warn!("interactive dispatch: exit_copy_mode({pane}) failed: {e}");
+                            None
+                        }
+                    })
+                    .unwrap_or(false);
+            if exited {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                if let Ok((reprobed, _)) = probe_pane(pane.clone()).await? {
+                    gate = reprobed;
+                    if gate.passed {
+                        exited_copy_mode = true;
+                        log::info!(
+                            "interactive dispatch: exited tmux copy-mode on {pane} before injecting"
+                        );
+                    }
+                }
+            }
+        }
 
         if !gate.passed {
-            if let Some(sid) = &session_id {
-                self.enqueue_message_fallback(sid, text);
-            }
+            // Do NOT silently dump explicit interactive messages into L0Inbox (interactive agents
+            // never auto-poll MCP read_inbox, and leaving a ghost entry risks late duplicate replay).
+            // Return Failed with the exact gate reason so the Web UI preserves the user's draft.
+            log::warn!(
+                "interactive dispatch to {pane} blocked by gate: {:?}",
+                gate.detail
+            );
             return Ok(DeliveryReport {
-                level: DeliveryLevel::L0Inbox,
-                status: DeliveryStatus::Queued,
+                level: DeliveryLevel::L2Inject,
+                status: DeliveryStatus::Failed,
                 gate: Some(gate),
                 pane: Some(pane),
                 ack: None,
             });
         }
 
+        let clean_text = text.replace('\r', "");
+        let base_settle_ms = self.gate_config().paste_settle_ms;
+        let settle_ms = starfane_tmux::adaptive_paste_settle_ms(base_settle_ms, &clean_text);
+
+        // Capture lightweight pre-paste screen for TUI agents so we can detect if Enter was
+        // absorbed by paste-burst handling and safely retry submit before declaring delivery.
+        let tui_agent =
+            agent.filter(|a| matches!(a, AgentKind::Claude | AgentKind::Codex | AgentKind::Agy));
+        let pre_screen = if tui_agent.is_some() {
+            let core_cap = self.clone();
+            let pane_cap = pane.clone();
+            tokio::task::spawn_blocking(move || {
+                core_cap
+                    .inner
+                    .mux
+                    .capture_visible_screen(&pane_cap)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Never inject keystrokes/Enter into an interactive folder-trust or update startup modal.
+        if let (Some(tui_kind), false) = (tui_agent, pre_screen.trim().is_empty()) {
+            if let Some(reason) =
+                starfane_tmux::detect_blocking_startup_prompt(tui_kind, &pre_screen)
+            {
+                log::warn!("interactive dispatch to {pane} blocked: {reason}");
+                let mut checks = gate.checks;
+                checks.push((GateCheck::InputEmpty, false));
+                return Ok(DeliveryReport {
+                    level: DeliveryLevel::L2Inject,
+                    status: DeliveryStatus::Failed,
+                    gate: Some(GateReport::from_checks(checks, Some(reason.to_string()))),
+                    pane: Some(pane),
+                    ack: None,
+                });
+            }
+        }
+
+        let mut ack_rx = match (&session_id, tui_agent) {
+            (Some(sid), Some(_)) if !discovered_only => Some(self.register_ack(sid)),
+            _ => None,
+        };
+
         let core_paste = self.clone();
         let pane_for_paste = pane.clone();
-        let clean_text = text.replace('\r', "");
-        let settle_ms = self.gate_config().paste_settle_ms;
+        let paste_text = clean_text.clone();
         let pasted = tokio::task::spawn_blocking(move || {
             core_paste
                 .inner
                 .mux
-                .paste_interactive_text(&pane_for_paste, &clean_text)
+                .paste_interactive_text(&pane_for_paste, &paste_text)
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
         let injected = match pasted {
             Ok(()) => {
-                tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+                if settle_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+                }
                 let core_enter = self.clone();
                 let pane_for_enter = pane.clone();
                 tokio::task::spawn_blocking(move || {
@@ -549,8 +670,61 @@ impl Core {
 
         match injected {
             Ok(()) => {
-                // Direct L2 injection already delivered the text to the pane; do NOT leave
-                // an unread item behind in `st.inbox` so `read_inbox` never replays old messages.
+                // Post-injection verification for TUI agents with a real visible screen capture:
+                // detect copy-mode races, dead panes, or pasted text stuck unsubmitted in the
+                // input box (and safely retry `C-m` up to 2 times before reporting Unconfirmed).
+                if let Some(tui_kind) = tui_agent {
+                    if !pre_screen.trim().is_empty() {
+                        let verify_outcome = self
+                            .verify_and_retry_interactive_submit(
+                                &pane,
+                                tui_kind,
+                                &pre_screen,
+                                &clean_text,
+                                &mut ack_rx,
+                            )
+                            .await?;
+                        match verify_outcome {
+                            InteractiveVerify::Confirmed => {
+                                return Ok(DeliveryReport {
+                                    level: DeliveryLevel::L2Inject,
+                                    status: DeliveryStatus::Delivered,
+                                    gate: Some(gate),
+                                    pane: Some(pane),
+                                    ack: Some(if exited_copy_mode {
+                                        "exited_copy_mode_confirmed".to_string()
+                                    } else {
+                                        "confirmed".to_string()
+                                    }),
+                                });
+                            }
+                            InteractiveVerify::Proceed => {}
+                            InteractiveVerify::Failed(reason) => {
+                                log::warn!(
+                                    "interactive dispatch to {pane} failed post-check: {reason}"
+                                );
+                                return Ok(DeliveryReport {
+                                    level: DeliveryLevel::L2Inject,
+                                    status: DeliveryStatus::Failed,
+                                    gate: Some(GateReport::from_checks(gate.checks, Some(reason))),
+                                    pane: Some(pane),
+                                    ack: None,
+                                });
+                            }
+                            InteractiveVerify::Unconfirmed { ack, reason } => {
+                                log::warn!("interactive dispatch to {pane} unconfirmed: {reason}");
+                                return Ok(DeliveryReport {
+                                    level: DeliveryLevel::L2Inject,
+                                    status: DeliveryStatus::Unconfirmed,
+                                    gate: Some(GateReport::from_checks(gate.checks, Some(reason))),
+                                    pane: Some(pane),
+                                    ack: Some(ack),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 Ok(DeliveryReport {
                     level: DeliveryLevel::L2Inject,
                     status: DeliveryStatus::Delivered,
@@ -558,6 +732,8 @@ impl Core {
                     pane: Some(pane),
                     ack: Some(if discovered_only {
                         "unverified_legacy".to_string()
+                    } else if exited_copy_mode {
+                        "exited_copy_mode".to_string()
                     } else {
                         "sent".to_string()
                     }),
@@ -565,9 +741,7 @@ impl Core {
             }
             Err(starfane_tmux::TmuxError::InvalidText(m)) => Err(ApiError::bad_request(m)),
             Err(e) => {
-                if let Some(sid) = &session_id {
-                    self.enqueue_message_fallback(sid, text);
-                }
+                log::warn!("interactive inject into {pane} failed: {e}");
                 Ok(DeliveryReport {
                     level: DeliveryLevel::L2Inject,
                     status: DeliveryStatus::Failed,
@@ -582,31 +756,95 @@ impl Core {
         }
     }
 
-    fn enqueue_message_fallback(&self, sid: &SessionId, text: &str) {
-        let item_id = id::new_id("M");
-        let snapshot = {
-            let mut st = lock(&self.inner.state);
-            st.push_inbox(
-                sid,
-                InboxItem {
-                    id: item_id,
-                    kind: InboxKind::Message,
-                    from: None,
-                    created_ms: id::now_ms(),
-                    title: util::sanitize_line(text, 60),
-                    body_md: text.to_string(),
-                    stage: None,
-                    artifact: None,
-                    handoff_id: None,
-                    review_id: None,
-                },
+    async fn verify_and_retry_interactive_submit(
+        &self,
+        pane: &PaneId,
+        agent: AgentKind,
+        pre_screen: &str,
+        clean_text: &str,
+        ack_rx: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    ) -> Result<InteractiveVerify, ApiError> {
+        // Retry schedule: initial observe (220ms), retry #1 (250ms settle + 260ms observe),
+        // retry #2 (350ms settle + 280ms observe). Any Working hook ACK returns immediately.
+        const OBSERVE_WINDOWS_MS: [u64; 3] = [220, 260, 280];
+        const RETRY_SETTLE_MS: [u64; 2] = [250, 350];
+
+        for (attempt, &observe_ms) in OBSERVE_WINDOWS_MS.iter().enumerate() {
+            if wait_or_ack(ack_rx, Duration::from_millis(observe_ms)).await {
+                return Ok(InteractiveVerify::Confirmed);
+            }
+
+            let core_chk = self.clone();
+            let pane_chk = pane.clone();
+            let probed = tokio::task::spawn_blocking(move || {
+                let panes = core_chk.inner.mux.list_all_panes().ok()?;
+                let info = panes.into_iter().find(|p| p.pane_id == pane_chk)?;
+                let screen = core_chk
+                    .inner
+                    .mux
+                    .capture_visible_screen(&pane_chk)
+                    .unwrap_or_default();
+                Some((info, screen))
+            })
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+
+            let Some((post_pane, post_screen)) = probed else {
+                return Ok(InteractiveVerify::Failed(format!(
+                    "pane {pane} disappeared during injection"
+                )));
+            };
+            if post_pane.dead {
+                return Ok(InteractiveVerify::Failed(
+                    "pane exited during injection".to_string(),
+                ));
+            }
+            if post_pane.in_mode {
+                return Ok(InteractiveVerify::Unconfirmed {
+                    ack: "copy_mode_race".to_string(),
+                    reason: "pane entered copy-mode during injection".to_string(),
+                });
+            }
+
+            let stuck = starfane_tmux::is_paste_stuck_in_prompt(
+                agent,
+                pre_screen,
+                &post_screen,
+                post_pane.cursor_y,
+                clean_text,
             );
-            st.sessions.get(sid).cloned()
-        };
-        self.mark_dirty();
-        if let Some(s) = snapshot {
-            self.publish_session(s);
+            if !stuck {
+                return Ok(InteractiveVerify::Proceed);
+            }
+
+            if let Some(&retry_settle) = RETRY_SETTLE_MS.get(attempt) {
+                log::info!(
+                    "interactive dispatch to {pane}: text still in input box, retrying Enter (attempt {})",
+                    attempt + 1
+                );
+                if wait_or_ack(ack_rx, Duration::from_millis(retry_settle)).await {
+                    return Ok(InteractiveVerify::Confirmed);
+                }
+                let core_re = self.clone();
+                let pane_re = pane.clone();
+                let res =
+                    tokio::task::spawn_blocking(move || core_re.inner.mux.submit_enter(&pane_re))
+                        .await
+                        .map_err(|e| ApiError::internal(e.to_string()))?;
+                if let Err(e) = res {
+                    return Ok(InteractiveVerify::Failed(format!(
+                        "retry enter failed: {e}"
+                    )));
+                }
+            } else {
+                return Ok(InteractiveVerify::Unconfirmed {
+                    ack: "stuck_in_prompt".to_string(),
+                    reason: "text appears stuck in terminal input box after submit retries"
+                        .to_string(),
+                });
+            }
         }
+        Ok(InteractiveVerify::Proceed)
     }
 
     fn consume_delivered_message(&self, sid: &SessionId, item_id: &str) {
@@ -630,7 +868,7 @@ impl Core {
     fn resolve_interactive_target(
         &self,
         target: &DispatchTarget,
-    ) -> Result<(Option<SessionId>, PaneId, bool), ApiError> {
+    ) -> Result<(Option<SessionId>, PaneId, bool, Option<AgentKind>), ApiError> {
         let st = lock(&self.inner.state);
         match target {
             DispatchTarget::Session { id } => {
@@ -648,11 +886,16 @@ impl Core {
                     .pane
                     .clone()
                     .ok_or_else(|| ApiError::not_found(format!("session {id} has no tmux pane")))?;
-                Ok((Some(id.clone()), pane, s.discovered_only))
+                Ok((Some(id.clone()), pane, s.discovered_only, Some(s.agent)))
             }
             DispatchTarget::Pane { id } => match st.session_for_pane(id) {
-                Some(s) => Ok((Some(s.session_id.clone()), id.clone(), s.discovered_only)),
-                None => Ok((None, id.clone(), true)),
+                Some(s) => Ok((
+                    Some(s.session_id.clone()),
+                    id.clone(),
+                    s.discovered_only,
+                    Some(s.agent),
+                )),
+                None => Ok((None, id.clone(), true, None)),
             },
             DispatchTarget::Stage { pipeline_id, stage } => {
                 let p = st
@@ -665,12 +908,17 @@ impl Core {
                 if let Some(sid) = &stage_spec.session_id {
                     if let Some(s) = st.sessions.get(sid) {
                         if let Some(pane) = &s.pane {
-                            return Ok((Some(sid.clone()), pane.clone(), s.discovered_only));
+                            return Ok((
+                                Some(sid.clone()),
+                                pane.clone(),
+                                s.discovered_only,
+                                Some(s.agent),
+                            ));
                         }
                     }
                 }
                 if let Some(pane) = &stage_spec.pane {
-                    return Ok((stage_spec.session_id.clone(), pane.clone(), true));
+                    return Ok((stage_spec.session_id.clone(), pane.clone(), true, None));
                 }
                 Err(ApiError::new(
                     ErrorCode::Conflict,
@@ -862,12 +1110,14 @@ impl Core {
                 .mux
                 .cursor_line(&pane, info.cursor_y)
                 .map_err(|e| e.to_string())?;
-            Ok::<_, String>(starfane_tmux::check_injection_gate(
+            let screen = core.inner.mux.capture_visible_screen(&pane).ok();
+            Ok::<_, String>(starfane_tmux::check_injection_gate_with_screen(
                 &info,
                 &clients,
                 state,
                 agent,
                 &line,
+                screen.as_deref(),
                 &cfg,
                 id::now_ms() / 1000,
             ))
@@ -964,9 +1214,26 @@ impl Core {
     /// On idle: retry delivery for undelivered inbox items.
     /// For a single short queued user message (≤ 300 chars, single-line, no attachment pointer),
     /// injects the message text directly instead of wrapping it in a `read_inbox` pointer.
+    /// Stale ad-hoc `InboxKind::Message` items older than 10 minutes are expired from auto-poking
+    /// so previously retyped prompts are never unexpectedly replayed later.
     pub(crate) async fn poke_pending_inbox(&self, session_id: &SessionId) {
-        let (pending_count, direct_msg) = {
-            let st = lock(&self.inner.state);
+        const MAX_MESSAGE_POKE_AGE_MS: u64 = 10 * 60 * 1000;
+        let now_ms = id::now_ms();
+        let (pending_count, direct_msg, expired_any) = {
+            let mut st = lock(&self.inner.state);
+            let mut expired_any = false;
+            if let Some(entries) = st.inbox.get_mut(session_id) {
+                for e in entries.iter_mut() {
+                    if !e.delivered
+                        && e.poke_pending
+                        && e.item.kind == InboxKind::Message
+                        && now_ms.saturating_sub(e.item.created_ms) > MAX_MESSAGE_POKE_AGE_MS
+                    {
+                        e.poke_pending = false;
+                        expired_any = true;
+                    }
+                }
+            }
             let pending: Vec<&super::state::InboxEntry> = st
                 .inbox
                 .get(session_id)
@@ -991,8 +1258,11 @@ impl Core {
             } else {
                 None
             };
-            (pending.len(), direct)
+            (pending.len(), direct, expired_any)
         };
+        if expired_any {
+            self.mark_dirty();
+        }
         if pending_count == 0 {
             return;
         }
@@ -1008,6 +1278,9 @@ impl Core {
         let core = self.clone();
         let sid = session_id.clone();
         tokio::spawn(async move {
+            // Brief settle after Stop/TurnComplete so TUI finishes redrawing its idle prompt
+            // before `check_gate` inspects `cursor_line`.
+            tokio::time::sleep(Duration::from_millis(400)).await;
             let report = core
                 .deliver_line(&sid, &line, &[DeliveryLevel::L2Inject])
                 .await;
@@ -1034,6 +1307,18 @@ impl Core {
                 Vec::new()
             });
         starfane_adapters::ensure_bypass_permission_arg(plan.agent, &mut extra);
+        let home_env = self.effective_home_dir();
+        starfane_adapters::ensure_ancestor_trust_args(
+            plan.agent,
+            std::path::Path::new(&plan.cwd),
+            home_env.as_deref(),
+            &mut extra,
+        );
+        starfane_adapters::ensure_codex_mcp_env_vars_arg(
+            plan.agent,
+            home_env.as_deref(),
+            &mut extra,
+        );
         let argv = starfane_adapters::build_l4_spawn_cmd(&starfane_adapters::SpawnRequest {
             agent: plan.agent,
             bin,
@@ -1134,6 +1419,36 @@ impl Core {
     /// Inbox key for a target: the live session, else the pending bind key.
     pub(crate) fn inbox_key_for_bind(token: &BindToken) -> SessionId {
         State::bind_inbox_key(token)
+    }
+}
+
+enum InteractiveVerify {
+    Confirmed,
+    Proceed,
+    Failed(String),
+    Unconfirmed { ack: String, reason: String },
+}
+
+/// Wait up to `dur`, returning `true` immediately if the session's Working ACK arrives.
+async fn wait_or_ack(
+    ack_rx: &mut Option<tokio::sync::oneshot::Receiver<()>>,
+    dur: Duration,
+) -> bool {
+    if let Some(rx) = ack_rx.as_mut() {
+        match tokio::time::timeout(dur, rx).await {
+            Ok(Ok(())) => {
+                *ack_rx = None;
+                true
+            }
+            Ok(Err(_)) => {
+                *ack_rx = None;
+                false
+            }
+            Err(_) => false,
+        }
+    } else {
+        tokio::time::sleep(dur).await;
+        false
     }
 }
 
