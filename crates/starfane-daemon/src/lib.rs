@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod nodes;
 pub mod notice;
 pub mod notify;
+pub mod remote_mirror;
 pub mod store;
 pub mod uds;
 pub mod web;

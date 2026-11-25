@@ -29,7 +29,7 @@ const MAX_PLAUSIBLE_TPS: f64 = 5_000.0;
 pub(crate) const PROCESS_BIRTH_SLACK_MS: u64 = 5_000;
 /// Maximum allowed skew (2m) between `~/.claude/sessions/<pid>.json`'s `startedAt` and OS process
 /// birth time before treating `<pid>.json` as a stale leftover from a recycled OS PID.
-const CLAUDE_PID_START_MAX_SKEW_MS: u64 = 120_000;
+pub(crate) const CLAUDE_PID_START_MAX_SKEW_MS: u64 = 120_000;
 /// Maximum bytes inspected per header line when extracting a transcript's creation timestamp.
 const MAX_BIRTH_HEADER_LINE_BYTES: usize = 64 * 1024;
 /// Maximum non-empty leading lines inspected to locate the earliest JSONL timestamp.
@@ -222,10 +222,9 @@ pub(crate) fn extract_codex_turn_context(text: &str) -> (Option<String>, Option<
     (model, effort)
 }
 
-/// Read default `model_reasoning_effort` from `<home>/.codex/config.toml`.
-pub(crate) fn read_codex_default_effort(home: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(home.join(".codex/config.toml")).ok()?;
-    let val: toml::Value = toml::from_str(&text).ok()?;
+/// Parse default `model_reasoning_effort` from a Codex `config.toml` string (zero local disk IO).
+pub fn parse_codex_default_effort_toml(text: &str) -> Option<String> {
+    let val: toml::Value = toml::from_str(text).ok()?;
     val.get("model_reasoning_effort")
         .and_then(toml::Value::as_str)
         .map(str::trim)
@@ -233,11 +232,16 @@ pub(crate) fn read_codex_default_effort(home: &Path) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-/// Read default effort level from `<home>/.claude/settings.json` (`modelSettings.<model>.effortLevel`
-/// with fallback to top-level `effortLevel`).
-pub(crate) fn read_claude_default_effort(home: &Path, model: Option<&str>) -> Option<String> {
-    let text = std::fs::read_to_string(home.join(".claude/settings.json")).ok()?;
-    let obj: Value = serde_json::from_str(&text).ok()?;
+/// Read default `model_reasoning_effort` from `<home>/.codex/config.toml`.
+pub(crate) fn read_codex_default_effort(home: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(home.join(".codex/config.toml")).ok()?;
+    parse_codex_default_effort_toml(&text)
+}
+
+/// Parse default effort level from a Claude `settings.json` string (`modelSettings.<model>.effortLevel`
+/// with fallback to top-level `effortLevel`, zero local disk IO).
+pub fn parse_claude_default_effort_json(text: &str, model: Option<&str>) -> Option<String> {
+    let obj: Value = serde_json::from_str(text).ok()?;
     if let (Some(m), Some(ms)) = (
         model.map(str::trim).filter(|s| !s.is_empty()),
         obj.get("modelSettings").and_then(Value::as_object),
@@ -257,6 +261,13 @@ pub(crate) fn read_claude_default_effort(home: &Path, model: Option<&str>) -> Op
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase)
+}
+
+/// Read default effort level from `<home>/.claude/settings.json` (`modelSettings.<model>.effortLevel`
+/// with fallback to top-level `effortLevel`).
+pub(crate) fn read_claude_default_effort(home: &Path, model: Option<&str>) -> Option<String> {
+    let text = std::fs::read_to_string(home.join(".claude/settings.json")).ok()?;
+    parse_claude_default_effort_json(&text, model)
 }
 
 /// Infer the best reasoning/thinking effort for a session from explicit flags, JSONL `turn_context`,
@@ -1141,7 +1152,7 @@ pub(crate) fn resolve_codex_transcript_by_id_in(home: &Path, uuid: &str) -> Opti
 
 /// Cached read-only snapshot of `~/.codex/state_5.sqlite` `threads` table.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct CodexThreadRow {
+pub struct CodexThreadRow {
     pub id: String,
     #[serde(default)]
     pub rollout_path: Option<String>,
@@ -1332,7 +1343,7 @@ pub(crate) fn match_codex_thread_with_birth(
 
 /// Cached read-only snapshot of `~/.gemini/antigravity-cli/conversation_summaries.db` root conversations.
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct AgyConvRow {
+pub struct AgyConvRow {
     pub conversation_id: String,
     #[serde(default)]
     pub workspace_uris: String,
@@ -1347,7 +1358,7 @@ pub(crate) struct AgyConvRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct AgyChildRow {
+pub struct AgyChildRow {
     pub conversation_id: String,
     #[serde(default)]
     pub parent_conversation_id: String,
@@ -2353,7 +2364,7 @@ fn round_1dp(v: f32) -> Option<f32> {
 
 /// Parse context-window percentage and explicit `(1M context)`/`[1M]` tags from the
 /// bottom lines of a `capture-pane` snapshot. Never invents values.
-pub(crate) fn parse_status_line_metrics(
+pub fn parse_status_line_metrics(
     agent: AgentKind,
     tail: &str,
     now_ms: u64,
@@ -2529,6 +2540,683 @@ pub(crate) fn metrics_meaningfully_equal(
         }
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Remote zero-install SSH pure parsers (zero local disk IO)
+// ---------------------------------------------------------------------------
+
+/// Normalize a POSIX directory path string without touching the local filesystem.
+fn norm_remote_dir(dir: &str) -> &str {
+    let trimmed = dir.trim();
+    if trimmed == "/" {
+        "/"
+    } else {
+        trimmed.trim_end_matches('/')
+    }
+}
+
+fn remote_dir_matches(candidate: &str, remote_cwd: &str, remote_canon_cwd: Option<&str>) -> bool {
+    let nc = norm_remote_dir(candidate);
+    if nc.is_empty() {
+        return false;
+    }
+    let nw = norm_remote_dir(remote_cwd);
+    if !nw.is_empty() && nc == nw {
+        return true;
+    }
+    if let Some(canon) = remote_canon_cwd
+        .map(norm_remote_dir)
+        .filter(|s| !s.is_empty())
+    {
+        if nc == canon {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parsed remote Claude `~/.claude/sessions/<pid>.json` entry (zero local disk IO).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteClaudeSessionFile {
+    pub pid: u32,
+    pub session_id: String,
+    pub cwd: Option<String>,
+    pub started_at_ms: Option<u64>,
+}
+
+/// Pure parser for remote Claude `~/.claude/sessions/<pid>.json` payloads.
+/// Rejects malformed JSON, mismatched `expected_pid`, or invalid/path-traversal `sessionId`.
+pub fn parse_claude_pid_session_json(
+    json_text: &str,
+    expected_pid: Option<u32>,
+) -> Option<RemoteClaudeSessionFile> {
+    let v: Value = serde_json::from_str(json_text.trim()).ok()?;
+    let recorded_pid = v
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok());
+    let pid = match (recorded_pid, expected_pid) {
+        (Some(rec), Some(exp)) if rec != exp => return None,
+        (Some(rec), _) => rec,
+        (None, Some(exp)) => exp,
+        (None, None) => return None,
+    };
+    let sid = v.get("sessionId").and_then(Value::as_str)?.trim();
+    if sid.is_empty()
+        || sid.contains('/')
+        || sid.contains('\\')
+        || sid.contains("..")
+        || sid.bytes().any(|b| b == 0 || b == b'\n' || b == b'\r')
+    {
+        return None;
+    }
+    let cwd = v
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let started_at_ms = v
+        .get("startedAt")
+        .and_then(Value::as_i64)
+        .and_then(epoch_i64_to_ms)
+        .or_else(|| {
+            v.get("startedAt")
+                .and_then(Value::as_str)
+                .and_then(parse_iso8601_ms)
+        });
+    Some(RemoteClaudeSessionFile {
+        pid,
+        session_id: sid.to_string(),
+        cwd,
+        started_at_ms,
+    })
+}
+
+/// Verify that a parsed remote Claude `<pid>.json` is neither already claimed nor a stale
+/// leftover from a recycled remote OS PID (evaluated strictly in the remote host clock domain).
+pub fn verify_remote_claude_pid_session(
+    entry: &RemoteClaudeSessionFile,
+    os_pid_birth_ms: Option<u64>,
+    file_mtime_ms: Option<u64>,
+    claimed_ids: &HashSet<String>,
+) -> bool {
+    if claimed_ids.contains(entry.session_id.as_str()) {
+        return false;
+    }
+    if let Some(os_birth_ms) = os_pid_birth_ms {
+        if let Some(started_ms) = entry.started_at_ms {
+            if started_ms.abs_diff(os_birth_ms) > CLAUDE_PID_START_MAX_SKEW_MS {
+                return false;
+            }
+        } else if let Some(mtime_ms) = file_mtime_ms {
+            if mtime_ms.saturating_add(86_400_000) < os_birth_ms {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Build the canonical remote Claude transcript path `<remote_home>/.claude/projects/<enc>/<sid>.jsonl`.
+pub fn claude_remote_transcript_path(remote_home: &str, cwd: &str, session_id: &str) -> String {
+    let home = norm_remote_dir(remote_home);
+    let enc = encode_claude_project_dir(cwd);
+    format!("{home}/.claude/projects/{enc}/{session_id}.jsonl")
+}
+
+/// Parsed Codex rollout JSONL first-line `session_meta` header (`{id, timestamp, cwd}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSessionMeta {
+    pub id: String,
+    pub timestamp_ms: Option<u64>,
+    pub cwd: Option<String>,
+}
+
+/// Pure parser for a Codex rollout JSONL first line (`type == "session_meta"`).
+/// Extracts `{id, timestamp, cwd}` from `payload` (with fallback to top-level fields) without touching local disk.
+pub fn parse_codex_session_meta_line(line: &str) -> Option<CodexSessionMeta> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let obj: Value = serde_json::from_str(trimmed).ok()?;
+    if obj.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = obj.get("payload").unwrap_or(&obj);
+    let id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("id").and_then(Value::as_str))?
+        .trim();
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains("..")
+        || id.bytes().any(|b| b == 0 || b == b'\n' || b == b'\r')
+    {
+        return None;
+    }
+    let parse_ts_val = |v: &Value| -> Option<u64> {
+        v.as_str()
+            .and_then(parse_iso8601_ms)
+            .or_else(|| v.as_i64().and_then(epoch_i64_to_ms))
+    };
+    let timestamp_ms = payload
+        .get("timestamp")
+        .and_then(parse_ts_val)
+        .or_else(|| obj.get("timestamp").and_then(parse_ts_val));
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("cwd").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(CodexSessionMeta {
+        id: id.to_string(),
+        timestamp_ms,
+        cwd,
+    })
+}
+
+/// Pure remote Codex rollout candidate (built from zero-`sqlite3` POSIX `session_meta` headers + `sf_stat`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCodexRolloutCandidate {
+    pub id: String,
+    pub remote_path: String,
+    pub cwd: String,
+    pub birth_ms: Option<u64>,
+    pub mtime_ms: Option<u64>,
+}
+
+/// Strictly match a remote Codex pane against zero-`sqlite3` POSIX `session_meta` rollout candidates
+/// under `unique_in_cwd && !claimed && post_birth` rules (zero local disk IO).
+/// Returns `Some((id, remote_path))` ONLY when exactly ONE candidate matches.
+pub fn match_remote_codex_rollouts(
+    candidates: &[RemoteCodexRolloutCandidate],
+    remote_cwd: &str,
+    remote_canon_cwd: Option<&str>,
+    claimed_ids: &HashSet<String>,
+    min_birth_ms: Option<u64>,
+    unique_in_cwd: bool,
+) -> Option<(String, String)> {
+    if !unique_in_cwd {
+        return None;
+    }
+    let mut matches: Vec<(String, String)> = Vec::new();
+    for cand in candidates {
+        let id = cand.id.trim();
+        let path = cand.remote_path.trim();
+        if id.is_empty()
+            || path.is_empty()
+            || id.contains('/')
+            || id.contains("..")
+            || claimed_ids.contains(id)
+        {
+            continue;
+        }
+        if !remote_dir_matches(&cand.cwd, remote_cwd, remote_canon_cwd) {
+            continue;
+        }
+        if let Some(birth_ms) = min_birth_ms {
+            let Some(cand_birth) = cand.birth_ms else {
+                continue;
+            };
+            if !is_post_birth_timestamp(cand_birth, birth_ms) {
+                continue;
+            }
+            if let Some(mtime_ms) = cand.mtime_ms {
+                if !is_post_birth_timestamp(mtime_ms, birth_ms) {
+                    continue;
+                }
+            }
+        }
+        matches.push((id.to_string(), path.to_string()));
+        if matches.len() > 1 {
+            return None;
+        }
+    }
+    matches.pop()
+}
+
+/// Pure parser for Codex `state_5.sqlite` `threads` rows emitted as JSON (`sqlite3 -json`).
+pub fn parse_codex_thread_rows_json(json_text: &str) -> Vec<CodexThreadRow> {
+    let trimmed = json_text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<CodexThreadRow>>(trimmed).unwrap_or_default()
+}
+
+/// Pure parser for Codex `state_5.sqlite` `threads` rows emitted as TSV or unit-separated (`\x1f`) lines.
+/// Supports both 6-column (`id, rollout_path, cwd, name, created_at, updated_at`) and
+/// 7-column (`id, rollout_path, cwd, name, archived, created_at, updated_at`) projections.
+pub fn parse_codex_thread_rows_delimited(text: &str, sep: char) -> Vec<CodexThreadRow> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(sep).collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let id = cols[0].trim();
+        let rollout = cols[1].trim();
+        let cwd = cols[2].trim();
+        if id.is_empty() || rollout.is_empty() || id.contains('/') || id.contains("..") {
+            continue;
+        }
+        let name = cols
+            .get(3)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (created_at, updated_at) = if cols.len() >= 7 {
+            (
+                cols[5].trim().parse::<i64>().unwrap_or(0),
+                cols[6].trim().parse::<i64>().unwrap_or(0),
+            )
+        } else {
+            (
+                cols.get(4)
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(0),
+                cols.get(5)
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(0),
+            )
+        };
+        out.push(CodexThreadRow {
+            id: id.to_string(),
+            rollout_path: Some(rollout.to_string()),
+            cwd: cwd.to_string(),
+            name,
+            created_at,
+            updated_at,
+        });
+    }
+    out
+}
+
+/// Pure remote version of `match_codex_thread_with_birth` (zero local disk IO).
+/// Matches status-bar title + remote `cwd`, enforcing `unique_in_cwd`, `!claimed_ids`, and
+/// remote-clock `min_birth_ms` without calling local `std::fs::canonicalize` or `Path::is_file`.
+pub fn match_remote_codex_threads(
+    rows: &[CodexThreadRow],
+    remote_cwd: &str,
+    remote_canon_cwd: Option<&str>,
+    tail: &str,
+    claimed_ids: &HashSet<String>,
+    min_birth_ms: Option<u64>,
+    unique_in_cwd: bool,
+) -> Option<(String, String)> {
+    if !unique_in_cwd {
+        return None;
+    }
+    let hint = extract_codex_status_title(tail)?;
+    let hint_clean = hint.trim_end_matches(['…', '.']).trim();
+    if hint_clean.is_empty() {
+        return None;
+    }
+
+    let resolve_row = |r: &CodexThreadRow| -> Option<(String, String)> {
+        let id = r.id.trim();
+        if id.is_empty() || id.contains('/') || id.contains("..") || claimed_ids.contains(id) {
+            return None;
+        }
+        if !remote_dir_matches(&r.cwd, remote_cwd, remote_canon_cwd) {
+            return None;
+        }
+        let path = r.rollout_path.as_deref()?.trim();
+        if path.is_empty() {
+            return None;
+        }
+        if let Some(birth_ms) = min_birth_ms {
+            let updated_ms = epoch_i64_to_ms(r.updated_at)?;
+            if !is_post_birth_timestamp(updated_ms, birth_ms) {
+                return None;
+            }
+            let created_ms = epoch_i64_to_ms(r.created_at)?;
+            if !is_post_birth_timestamp(created_ms, birth_ms) {
+                return None;
+            }
+        }
+        Some((id.to_string(), path.to_string()))
+    };
+
+    // Pass 1: exact `name == hint` AND matching `cwd` (strictly unambiguous).
+    let mut exact_hits = Vec::new();
+    for r in rows {
+        let nm = r.name.as_deref().unwrap_or("").trim();
+        if !nm.is_empty() && nm == hint {
+            if let Some(hit) = resolve_row(r) {
+                exact_hits.push(hit);
+                if exact_hits.len() > 1 {
+                    return None;
+                }
+            }
+        }
+    }
+    if exact_hits.len() == 1 {
+        return exact_hits.pop();
+    }
+
+    // Pass 2: truncated title prefix match (`name.starts_with(hint_clean)`) when hint >= 8 chars.
+    if hint_clean.chars().count() >= 8 {
+        let mut prefix_hits = Vec::new();
+        for r in rows {
+            let nm = r.name.as_deref().unwrap_or("").trim();
+            if nm.starts_with(hint_clean) {
+                if let Some(hit) = resolve_row(r) {
+                    prefix_hits.push(hit);
+                    if prefix_hits.len() > 1 {
+                        return None;
+                    }
+                }
+            }
+        }
+        if prefix_hits.len() == 1 {
+            return prefix_hits.pop();
+        }
+    }
+    None
+}
+
+/// Pure parser for AGY `conversation_summaries` root rows emitted as JSON (`sqlite3 -json`).
+pub fn parse_agy_conv_rows_json(json_text: &str) -> Vec<AgyConvRow> {
+    let trimmed = json_text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<AgyConvRow>>(trimmed).unwrap_or_default()
+}
+
+/// Pure parser for AGY `conversation_summaries` root rows emitted as TSV (`'\t'`) or
+/// unit-separated (`'\x1f'`) delimited lines:
+/// `conversation_id <sep> workspace_uris <sep> status <sep> last_modified_time <sep> last_user_input_time <sep> step_count`
+pub fn parse_agy_conv_rows_delimited(text: &str, sep: char) -> Vec<AgyConvRow> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(sep).collect();
+        let cid = cols.first().map(|s| s.trim()).unwrap_or("");
+        if cid.is_empty() || cid.contains('/') || cid.contains("..") {
+            continue;
+        }
+        out.push(AgyConvRow {
+            conversation_id: cid.to_string(),
+            workspace_uris: cols.get(1).map(|s| s.trim()).unwrap_or("").to_string(),
+            status: cols.get(2).map(|s| s.trim()).unwrap_or("").to_string(),
+            last_modified_time: cols.get(3).map(|s| s.trim()).unwrap_or("").to_string(),
+            last_user_input_time: cols.get(4).map(|s| s.trim()).unwrap_or("").to_string(),
+            step_count: cols
+                .get(5)
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0),
+        });
+    }
+    out
+}
+
+/// Pure parser for AGY `conversation_summaries` `nesting_depth = 1` child rows emitted as JSON.
+pub fn parse_agy_child_rows_json(json_text: &str) -> Vec<AgyChildRow> {
+    let trimmed = json_text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<AgyChildRow>>(trimmed).unwrap_or_default()
+}
+
+/// Pure parser for AGY `conversation_summaries` `nesting_depth = 1` child rows emitted as TSV/delimited lines:
+/// `conversation_id <sep> parent_conversation_id <sep> agent_name <sep> status <sep> killed`
+pub fn parse_agy_child_rows_delimited(text: &str, sep: char) -> Vec<AgyChildRow> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split(sep).collect();
+        let cid = cols.first().map(|s| s.trim()).unwrap_or("");
+        let parent = cols.get(1).map(|s| s.trim()).unwrap_or("");
+        if cid.is_empty() || parent.is_empty() || cid.contains('/') || cid.contains("..") {
+            continue;
+        }
+        out.push(AgyChildRow {
+            conversation_id: cid.to_string(),
+            parent_conversation_id: parent.to_string(),
+            agent_name: cols.get(2).map(|s| s.trim()).unwrap_or("").to_string(),
+            status: cols.get(3).map(|s| s.trim()).unwrap_or("").to_string(),
+            killed: cols
+                .get(4)
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0),
+        });
+    }
+    out
+}
+
+fn extract_agy_presence_stem(path_str: &str) -> Option<String> {
+    let p = path_str.trim();
+    if !p.contains("/presence/") || !p.ends_with(".lock") {
+        return None;
+    }
+    let stem = Path::new(p).file_stem()?.to_str()?;
+    if stem.len() >= 16
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        Some(stem.to_string())
+    } else {
+        None
+    }
+}
+
+/// Pure parser for remote AGY `presence/<uuid>.lock` output from EITHER:
+/// - Linux `/proc/$pid/fd` (`ls -l /proc/<pid>/fd`, `<pid>\t<path>`, `<pid> ... -> <path>`, or `/proc/<pid>/fd:` headers), OR
+/// - macOS/BSD `lsof -n -P -Fpn` (`p<pid>` / `n<path>`).
+pub fn parse_proc_fd_agy_presence(output: &str) -> HashMap<u32, Vec<String>> {
+    let mut map: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut current_pid: Option<u32> = None;
+
+    let mut push_lock = |pid: u32, path_str: &str| {
+        if let Some(stem) = extract_agy_presence_stem(path_str) {
+            let entry = map.entry(pid).or_default();
+            if !entry.iter().any(|s| s == &stem) {
+                entry.push(stem);
+            }
+        }
+    };
+
+    for raw in output.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // `lsof -Fpn` lines: `p<pid>` / `n<path>`
+        if let Some(rest) = line.strip_prefix('p') {
+            if let Ok(pid) = rest.trim().parse::<u32>() {
+                current_pid = Some(pid);
+                continue;
+            }
+        }
+        if let Some(path_str) = line.strip_prefix('n') {
+            if let Some(pid) = current_pid {
+                push_lock(pid, path_str);
+                continue;
+            }
+        }
+        // Header lines like `/proc/12345/fd:` or `12345:`
+        if let Some(hdr) = line.strip_suffix(':') {
+            if let Some(after_proc) = hdr.strip_prefix("/proc/") {
+                if let Some(pid_part) = after_proc.split('/').next() {
+                    if let Ok(pid) = pid_part.parse::<u32>() {
+                        current_pid = Some(pid);
+                        continue;
+                    }
+                }
+            } else if let Ok(pid) = hdr.trim().parse::<u32>() {
+                current_pid = Some(pid);
+                continue;
+            }
+        }
+        // Tab or space delimited `<pid> <path>` or `<pid> ... -> <target>`
+        if let Some((first, rest)) = line.split_once(['\t', ' ']) {
+            if let Ok(pid) = first.trim().parse::<u32>() {
+                let target = rest
+                    .rsplit_once("->")
+                    .map(|(_, rhs)| rhs.trim())
+                    .unwrap_or_else(|| rest.trim());
+                push_lock(pid, target);
+                continue;
+            }
+        }
+        // `ls -l` symlink line under a `/proc/<pid>/fd:` header: `lrwx... 12 -> /path/.../presence/<uuid>.lock`
+        if let Some((_, rhs)) = line.rsplit_once("->") {
+            if let Some(pid) = current_pid {
+                push_lock(pid, rhs.trim());
+            }
+        }
+    }
+
+    map
+}
+
+/// Build the canonical remote AGY compact transcript path
+/// `<remote_home>/.gemini/antigravity-cli/brain/<conv_id>/.system_generated/logs/transcript.jsonl`.
+pub fn agy_remote_transcript_path(remote_home: &str, conv_id: &str) -> String {
+    let home = norm_remote_dir(remote_home);
+    format!(
+        "{home}/.gemini/antigravity-cli/brain/{conv_id}/.system_generated/logs/transcript.jsonl"
+    )
+}
+
+/// Pure remote version of `match_agy_conversation_with_birth_in` (zero local disk IO).
+/// Enforces `unique_in_cwd`, `!claimed_ids`, exact `workspace_uris` match, and remote-clock
+/// `min_birth_ms` (against DB timestamps + `step_count > 0`). Returns `Some((conv_id, remote_path))`
+/// ONLY when strictly unambiguous (`len() == 1`).
+pub fn match_remote_agy_conversation(
+    remote_home: &str,
+    rows: &[AgyConvRow],
+    remote_cwd: &str,
+    remote_canon_cwd: Option<&str>,
+    claimed_ids: &HashSet<String>,
+    min_birth_ms: Option<u64>,
+    unique_in_cwd: bool,
+) -> Option<(String, String)> {
+    if !unique_in_cwd {
+        return None;
+    }
+    let mut uri_candidates = Vec::with_capacity(2);
+    let nw = norm_remote_dir(remote_cwd);
+    if !nw.is_empty() {
+        uri_candidates.push(format!("file://{nw}"));
+    }
+    if let Some(canon) = remote_canon_cwd
+        .map(norm_remote_dir)
+        .filter(|s| !s.is_empty())
+    {
+        let canon_uri = format!("file://{canon}");
+        if !uri_candidates.contains(&canon_uri) {
+            uri_candidates.push(canon_uri);
+        }
+    }
+    if uri_candidates.is_empty() {
+        return None;
+    }
+
+    let mut matches: Vec<(String, String)> = Vec::new();
+    for r in rows {
+        let sid = r.conversation_id.trim();
+        if sid.is_empty() || sid.contains('/') || sid.contains("..") || claimed_ids.contains(sid) {
+            continue;
+        }
+        let uri_matched = uri_candidates.iter().any(|u| {
+            let quoted = format!("\"{u}\"");
+            let quoted_slash = format!("\"{u}/\"");
+            r.workspace_uris.contains(&quoted) || r.workspace_uris.contains(&quoted_slash)
+        });
+        if !uri_matched {
+            continue;
+        }
+        if let Some(birth_ms) = min_birth_ms {
+            if r.step_count <= 0 {
+                continue;
+            }
+            let Some(db_mod_ms) = parse_iso8601_ms(&r.last_modified_time) else {
+                continue;
+            };
+            if !is_post_birth_timestamp(db_mod_ms, birth_ms) {
+                continue;
+            }
+            if let Some(db_in_ms) = parse_iso8601_ms(&r.last_user_input_time) {
+                if !is_post_birth_timestamp(db_in_ms, birth_ms) {
+                    continue;
+                }
+            }
+        }
+        matches.push((
+            sid.to_string(),
+            agy_remote_transcript_path(remote_home, sid),
+        ));
+        if matches.len() > 1 {
+            return None;
+        }
+    }
+    matches.pop()
+}
+
+/// Discovered remote AGY Swarm / subagent child conversation (zero local disk IO).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAgyChild {
+    pub conversation_id: String,
+    pub agent_name: Option<String>,
+    pub state: starfane_proto::SessionState,
+    pub remote_transcript_path: String,
+}
+
+/// Convert remote `AgyChildRow` entries matching `parent_id` into `RemoteAgyChild` descriptors.
+pub fn remote_agy_children_of(
+    remote_home: &str,
+    children: &[AgyChildRow],
+    parent_id: &str,
+) -> Vec<RemoteAgyChild> {
+    let mut out = Vec::new();
+    for c in children {
+        if c.parent_conversation_id != parent_id {
+            continue;
+        }
+        let sid = c.conversation_id.trim();
+        if sid.is_empty() || sid.contains('/') || sid.contains("..") {
+            continue;
+        }
+        let state = if c.killed != 0 {
+            starfane_proto::SessionState::Ended
+        } else if c.status.contains("RUNNING") {
+            starfane_proto::SessionState::Working
+        } else {
+            starfane_proto::SessionState::Idle
+        };
+        let agent_name = {
+            let n = c.agent_name.trim();
+            (!n.is_empty()).then(|| n.to_string())
+        };
+        out.push(RemoteAgyChild {
+            conversation_id: sid.to_string(),
+            agent_name,
+            state,
+            remote_transcript_path: agy_remote_transcript_path(remote_home, sid),
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3381,5 +4069,229 @@ n/Users/demo/.gemini/antigravity-cli/brain/other/file.txt
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_zero_install_pure_parsers_claude_codex_agy_and_status() {
+        // 1. Remote Claude `<pid>.json` parsing + recycled-PID skew + claimed exclusion.
+        let birth_ms = 1_795_600_000_000u64;
+        let cl_json = format!(
+            r#"{{"pid":4242,"sessionId":"cl-sid-99","cwd":"/home/ubuntu/repo","startedAt":{}}}"#,
+            birth_ms - 1_500
+        );
+        let parsed = parse_claude_pid_session_json(&cl_json, Some(4242)).unwrap();
+        assert_eq!(parsed.pid, 4242);
+        assert_eq!(parsed.session_id, "cl-sid-99");
+        assert_eq!(parsed.cwd.as_deref(), Some("/home/ubuntu/repo"));
+        assert_eq!(parsed.started_at_ms, Some(birth_ms - 1_500));
+        assert_eq!(
+            claude_remote_transcript_path("/home/ubuntu/", "/home/ubuntu/repo", "cl-sid-99"),
+            "/home/ubuntu/.claude/projects/-home-ubuntu-repo/cl-sid-99.jsonl"
+        );
+        // PID mismatch rejected.
+        assert!(parse_claude_pid_session_json(&cl_json, Some(9999)).is_none());
+        // Path traversal sessionId rejected.
+        assert!(parse_claude_pid_session_json(
+            r#"{"pid":4242,"sessionId":"../etc/passwd","cwd":"/home/ubuntu"}"#,
+            Some(4242)
+        )
+        .is_none());
+        // Valid birth window passes, recycled PID (1 day old) fails, claimed fails.
+        assert!(verify_remote_claude_pid_session(
+            &parsed,
+            Some(birth_ms),
+            None,
+            &HashSet::new()
+        ));
+        assert!(!verify_remote_claude_pid_session(
+            &parsed,
+            Some(birth_ms + 86_400_000),
+            None,
+            &HashSet::new()
+        ));
+        let mut claimed = HashSet::new();
+        claimed.insert("cl-sid-99".to_string());
+        assert!(!verify_remote_claude_pid_session(
+            &parsed,
+            Some(birth_ms),
+            None,
+            &claimed
+        ));
+
+        // 2. Remote Codex `session_meta` first-line parser + pure-POSIX zero-sqlite3 matcher.
+        let meta_line = r#"{"timestamp":"2026-11-25T08:15:00.000Z","type":"session_meta","payload":{"id":"01a18088-1111-1111-1111-111111111111","timestamp":"2026-11-25T08:15:00.000Z","cwd":"/home/ubuntu/work"}}"#;
+        let sm = parse_codex_session_meta_line(meta_line).unwrap();
+        assert_eq!(sm.id, "01a18088-1111-1111-1111-111111111111");
+        assert_eq!(sm.cwd.as_deref(), Some("/home/ubuntu/work"));
+        let sm_ts = sm.timestamp_ms.unwrap();
+        assert!(parse_codex_session_meta_line(r#"{"type":"turn_context","payload":{}}"#).is_none());
+
+        let rollouts = vec![
+            RemoteCodexRolloutCandidate {
+                id: "old-rollout".into(),
+                remote_path: "/home/ubuntu/.codex/sessions/2026/11/24/r-old.jsonl".into(),
+                cwd: "/home/ubuntu/work".into(),
+                birth_ms: Some(sm_ts - 86_400_000),
+                mtime_ms: Some(sm_ts - 86_400_000),
+            },
+            RemoteCodexRolloutCandidate {
+                id: sm.id.clone(),
+                remote_path: "/home/ubuntu/.codex/sessions/2026/11/25/r-new.jsonl".into(),
+                cwd: "/home/ubuntu/work".into(),
+                birth_ms: Some(sm_ts),
+                mtime_ms: Some(sm_ts + 2_000),
+            },
+        ];
+        assert_eq!(
+            match_remote_codex_rollouts(
+                &rollouts,
+                "/home/ubuntu/work",
+                None,
+                &HashSet::new(),
+                Some(sm_ts - 1_000),
+                true,
+            ),
+            Some((
+                sm.id.clone(),
+                "/home/ubuntu/.codex/sessions/2026/11/25/r-new.jsonl".into()
+            ))
+        );
+        assert!(match_remote_codex_rollouts(
+            &rollouts,
+            "/home/ubuntu/work",
+            None,
+            &HashSet::new(),
+            Some(sm_ts - 1_000),
+            false,
+        )
+        .is_none());
+        let mut cx_claimed = HashSet::new();
+        cx_claimed.insert(sm.id.clone());
+        assert!(match_remote_codex_rollouts(
+            &rollouts,
+            "/home/ubuntu/work",
+            None,
+            &cx_claimed,
+            Some(sm_ts - 1_000),
+            true,
+        )
+        .is_none());
+
+        // 3. Remote Codex SQLite delimited (TSV) + JSON + pure remote matcher.
+        let cx_tsv = format!(
+            "cx-1\t/home/ubuntu/.codex/sessions/2026/11/25/r1.jsonl\t/home/ubuntu/work\t排查远端延迟问题\t{}\t{}\n",
+            (sm_ts / 1000) as i64,
+            ((sm_ts + 5_000) / 1000) as i64
+        );
+        let cx_rows = parse_codex_thread_rows_delimited(&cx_tsv, '\t');
+        assert_eq!(cx_rows.len(), 1);
+        let cx_tail = "  GPT-6.2-Sol high · ~/work · 排查远端延迟问题\n";
+        assert_eq!(
+            match_remote_codex_threads(
+                &cx_rows,
+                "/home/ubuntu/work/",
+                None,
+                cx_tail,
+                &HashSet::new(),
+                Some(sm_ts - 1_000),
+                true,
+            ),
+            Some((
+                "cx-1".into(),
+                "/home/ubuntu/.codex/sessions/2026/11/25/r1.jsonl".into()
+            ))
+        );
+        assert!(match_remote_codex_threads(
+            &cx_rows,
+            "/home/ubuntu/work",
+            None,
+            cx_tail,
+            &HashSet::new(),
+            Some(sm_ts + 60_000),
+            true,
+        )
+        .is_none());
+
+        // 4. Remote AGY `conversation_summaries` delimited rows (root + Swarm child) + `/proc/$pid/fd` parser.
+        let agy_tsv = "conv-old\t[\"file:///home/ubuntu/work\"]\tCASCADE_RUN_STATUS_IDLE\t2026-11-24T01:00:00Z\t2026-11-24T01:00:00Z\t12\n\
+                       conv-new\t[\"file:///home/ubuntu/work\"]\tCASCADE_RUN_STATUS_RUNNING\t2026-11-25T08:16:00Z\t2026-11-25T08:15:30Z\t4\n";
+        let agy_rows = parse_agy_conv_rows_delimited(agy_tsv, '\t');
+        assert_eq!(agy_rows.len(), 2);
+        assert_eq!(
+            match_remote_agy_conversation(
+                "/home/ubuntu",
+                &agy_rows,
+                "/home/ubuntu/work",
+                None,
+                &HashSet::new(),
+                Some(sm_ts),
+                true,
+            ),
+            Some((
+                "conv-new".into(),
+                "/home/ubuntu/.gemini/antigravity-cli/brain/conv-new/.system_generated/logs/transcript.jsonl".into()
+            ))
+        );
+        assert!(match_remote_agy_conversation(
+            "/home/ubuntu",
+            &agy_rows,
+            "/home/ubuntu/work/sub",
+            None,
+            &HashSet::new(),
+            Some(sm_ts),
+            true,
+        )
+        .is_none());
+
+        let child_tsv = "child-1\tconv-new\tssh-mirror\tCASCADE_RUN_STATUS_RUNNING\t0\n\
+                         child-2\tconv-new\tssh-webui\tCASCADE_RUN_STATUS_IDLE\t1\n";
+        let child_rows = parse_agy_child_rows_delimited(child_tsv, '\t');
+        let children = remote_agy_children_of("/home/ubuntu", &child_rows, "conv-new");
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].agent_name.as_deref(), Some("ssh-mirror"));
+        assert_eq!(children[0].state, starfane_proto::SessionState::Working);
+        assert_eq!(children[1].state, starfane_proto::SessionState::Ended);
+
+        let proc_fd_out = "\
+/proc/1234/fd:
+lrwx------ 1 ubuntu ubuntu 64 Nov 25 08:15 11 -> /home/ubuntu/.gemini/antigravity-cli/presence/66fac8b3-93ac-4c7d-814c-b79bb0ec9c28.lock
+5678\t/home/ubuntu/.gemini/antigravity-cli/presence/f03f879a-451a-495e-ad84-90e4b6569501.lock
+p9012
+n/Users/demo/.gemini/antigravity-cli/presence/11111111-2222-3333-4444-555555555555.lock
+";
+        let proc_locks = parse_proc_fd_agy_presence(proc_fd_out);
+        assert_eq!(
+            proc_locks.get(&1234),
+            Some(&vec!["66fac8b3-93ac-4c7d-814c-b79bb0ec9c28".to_string()])
+        );
+        assert_eq!(
+            proc_locks.get(&5678),
+            Some(&vec!["f03f879a-451a-495e-ad84-90e4b6569501".to_string()])
+        );
+        assert_eq!(
+            proc_locks.get(&9012),
+            Some(&vec!["11111111-2222-3333-4444-555555555555".to_string()])
+        );
+
+        // 5. Pure config effort + status-line fallback parsers.
+        assert_eq!(
+            parse_codex_default_effort_toml("model_reasoning_effort = \"xhigh\"\n").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            parse_claude_default_effort_json(
+                r#"{"effortLevel":"medium","modelSettings":{"claude-opus-5-5":{"effortLevel":"max"}}}"#,
+                Some("claude-opus-5-5")
+            )
+            .as_deref(),
+            Some("max")
+        );
+        let st = parse_status_line_metrics(
+            AgentKind::Codex,
+            "GPT-6.2-Sol high · ~/work · 75% context left\n",
+            1234,
+        )
+        .unwrap();
+        assert_eq!(st.context_used_pct, Some(25.0));
     }
 }

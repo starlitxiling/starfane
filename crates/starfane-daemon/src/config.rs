@@ -876,6 +876,8 @@ pub enum NodeKindConfig {
     Peer,
 }
 
+pub const DEFAULT_SSH_CONNECT_TIMEOUT_SECS: u64 = 5;
+
 /// Remote federated host entry (`[[nodes]]`) supporting mixed zero-install SSH and peer `starfaned`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -889,8 +891,20 @@ pub struct NodeConfig {
     /// SSH target (`user@host` or `~/.ssh/config` alias) when `kind = "ssh"`.
     pub ssh_target: String,
     pub ssh_args: Vec<String>,
+    /// Optional `ssh` binary override (empty falls back to `STARFANE_SSH_BIN` env or `"ssh"`).
+    pub ssh_bin: String,
+    /// OpenSSH `ConnectTimeout` in seconds for `kind = "ssh"` (default `5`).
+    pub connect_timeout_secs: u64,
+    /// Enable OpenSSH zlib compression (`-o Compression=yes`, default `true`).
+    pub compression: bool,
     pub tmux_bin: String,
     pub tmux_socket: String,
+    /// Optional remote `claude` binary override for SSH spawns (empty defaults to `"claude"`).
+    pub claude_bin: String,
+    /// Optional remote `codex` binary override for SSH spawns (empty defaults to `"codex"`).
+    pub codex_bin: String,
+    /// Optional remote `agy` binary override for SSH spawns (empty defaults to `"agy"`).
+    pub agy_bin: String,
     pub include_shell_panes: bool,
     /// Candidate outbound HTTP(S) base URLs tried in priority order when `kind = "peer"`.
     pub endpoints: Vec<String>,
@@ -910,8 +924,14 @@ impl Default for NodeConfig {
             enabled: true,
             ssh_target: String::new(),
             ssh_args: Vec::new(),
+            ssh_bin: String::new(),
+            connect_timeout_secs: DEFAULT_SSH_CONNECT_TIMEOUT_SECS,
+            compression: true,
             tmux_bin: "tmux".into(),
             tmux_socket: String::new(),
+            claude_bin: String::new(),
+            codex_bin: String::new(),
+            agy_bin: String::new(),
             include_shell_panes: false,
             endpoints: Vec::new(),
             token: String::new(),
@@ -927,6 +947,24 @@ impl NodeConfig {
             NodeKindConfig::Ssh => NotifyOwnership::Hub,
             NodeKindConfig::Peer => NotifyOwnership::NodeLocal,
         })
+    }
+
+    pub fn ssh_bin_override(&self) -> Option<String> {
+        non_empty(&self.ssh_bin)
+    }
+
+    pub fn effective_connect_timeout_secs(&self) -> u64 {
+        self.connect_timeout_secs.max(1)
+    }
+
+    pub fn agent_bin(&self, agent: starfane_proto::AgentKind) -> String {
+        let configured = match agent {
+            starfane_proto::AgentKind::Claude => &self.claude_bin,
+            starfane_proto::AgentKind::Codex => &self.codex_bin,
+            starfane_proto::AgentKind::Agy => &self.agy_bin,
+            starfane_proto::AgentKind::Shell => return "sh".to_string(),
+        };
+        non_empty(configured).unwrap_or_else(|| agent.as_str().to_string())
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -948,6 +986,16 @@ impl NodeConfig {
                 if self.ssh_target.trim().is_empty() {
                     return Err(format!("ssh node {id:?} requires non-empty ssh_target"));
                 }
+                if self.connect_timeout_secs == 0 {
+                    return Err(format!("ssh node {id:?} connect_timeout_secs must be >= 1"));
+                }
+                validate_no_control_chars(&format!("ssh node {id:?} ssh_bin"), &self.ssh_bin)?;
+                validate_no_control_chars(
+                    &format!("ssh node {id:?} claude_bin"),
+                    &self.claude_bin,
+                )?;
+                validate_no_control_chars(&format!("ssh node {id:?} codex_bin"), &self.codex_bin)?;
+                validate_no_control_chars(&format!("ssh node {id:?} agy_bin"), &self.agy_bin)?;
             }
             NodeKindConfig::Peer => {
                 if self.endpoints.is_empty() || self.endpoints.iter().any(|u| u.trim().is_empty()) {
@@ -1849,5 +1897,75 @@ url = "https://hooks.example.com/ev"
             let err = TeamConfig::parse(&src).unwrap_err();
             assert!(err.contains(key), "expected {key} in error: {err}");
         }
+    }
+
+    #[test]
+    fn ssh_node_config_defaults_and_overrides() {
+        // Legacy SSH node TOML omitting all new fields remains 100% valid with sane defaults.
+        let legacy: StarfaneConfig = toml::from_str(
+            r#"
+[[nodes]]
+id = "gpu-a"
+kind = "ssh"
+ssh_target = "ubuntu@gpu-a"
+"#,
+        )
+        .unwrap();
+        legacy.validate().unwrap();
+        let node = &legacy.nodes[0];
+        assert_eq!(node.ssh_bin, "");
+        assert_eq!(node.ssh_bin_override(), None);
+        assert_eq!(node.connect_timeout_secs, DEFAULT_SSH_CONNECT_TIMEOUT_SECS);
+        assert!(node.compression);
+        assert_eq!(node.agent_bin(starfane_proto::AgentKind::Claude), "claude");
+        assert_eq!(node.agent_bin(starfane_proto::AgentKind::Codex), "codex");
+        assert_eq!(node.agent_bin(starfane_proto::AgentKind::Agy), "agy");
+
+        // Explicit overrides parse and validate cleanly.
+        let custom: StarfaneConfig = toml::from_str(
+            r#"
+[[nodes]]
+id = "gpu-b"
+kind = "ssh"
+ssh_target = "ubuntu@gpu-b"
+ssh_bin = "/opt/bin/fake-ssh"
+connect_timeout_secs = 12
+compression = false
+claude_bin = "/home/ubuntu/.local/bin/claude"
+codex_bin = "/home/ubuntu/.npm-global/bin/codex"
+agy_bin = "/home/ubuntu/.local/bin/agy"
+"#,
+        )
+        .unwrap();
+        custom.validate().unwrap();
+        let n = &custom.nodes[0];
+        assert_eq!(n.ssh_bin_override().as_deref(), Some("/opt/bin/fake-ssh"));
+        assert_eq!(n.connect_timeout_secs, 12);
+        assert!(!n.compression);
+        assert_eq!(
+            n.agent_bin(starfane_proto::AgentKind::Claude),
+            "/home/ubuntu/.local/bin/claude"
+        );
+        assert_eq!(
+            n.agent_bin(starfane_proto::AgentKind::Codex),
+            "/home/ubuntu/.npm-global/bin/codex"
+        );
+        assert_eq!(
+            n.agent_bin(starfane_proto::AgentKind::Agy),
+            "/home/ubuntu/.local/bin/agy"
+        );
+
+        // Zero connect_timeout_secs fails validation.
+        let bad: StarfaneConfig = toml::from_str(
+            r#"
+[[nodes]]
+id = "gpu-bad"
+kind = "ssh"
+ssh_target = "ubuntu@gpu-bad"
+connect_timeout_secs = 0
+"#,
+        )
+        .unwrap();
+        assert!(bad.validate().is_err());
     }
 }

@@ -1029,6 +1029,55 @@ impl TranscriptIndex {
         )
     }
 
+    pub fn total_messages(&self) -> usize {
+        self.turns.len() + usize::from(!self.pending_tools.is_empty())
+    }
+
+    /// Return deduplicated AGY `step_index` values within the page selected by `query` that
+    /// still need hydration from `transcript_full.jsonl` (after attempting hydration from any
+    /// already-cached local sibling `transcript_full.jsonl`), prioritized newest-first and
+    /// capped at `max_steps` (returned sorted ascending for deterministic fetching).
+    pub fn missing_agy_hydration_steps(
+        &mut self,
+        compact_path: &Path,
+        query: TranscriptQuery,
+        max_steps: usize,
+    ) -> Vec<usize> {
+        if self.agent != AgentKind::Agy || max_steps == 0 {
+            return Vec::new();
+        }
+        let total = self.total_messages();
+        let end_excl = query.before.map(|b| b.min(total)).unwrap_or(total);
+        let max_count = if query.all {
+            MAX_TRANSCRIPT_LIMIT
+        } else {
+            query.limit.clamp(1, MAX_TRANSCRIPT_LIMIT)
+        };
+        let min_start = end_excl.saturating_sub(max_count);
+        let real_end = end_excl.min(self.turns.len());
+        let real_min_start = min_start.min(real_end);
+
+        // First hydrate from whatever is already present in local sibling `transcript_full.jsonl`.
+        self.hydrate_range(compact_path, real_min_start, real_end);
+
+        let mut missing: Vec<usize> = Vec::new();
+        for it in self.turns[real_min_start..real_end].iter().rev() {
+            if it.hydrated || (!it.needs_content_hydration && !it.needs_tools_hydration) {
+                continue;
+            }
+            if let Some(step_idx) = it.step_index.and_then(|v| usize::try_from(v).ok()) {
+                if !missing.contains(&step_idx) {
+                    missing.push(step_idx);
+                    if missing.len() >= max_steps {
+                        break;
+                    }
+                }
+            }
+        }
+        missing.sort_unstable();
+        missing
+    }
+
     pub(crate) fn slice_page(
         &mut self,
         path: &Path,
@@ -1118,7 +1167,7 @@ struct TranscriptCacheStats {
 /// Bounded LRU in-memory cache of append-only `TranscriptIndex`es AND paginated
 /// `TranscriptResponse` snapshots (lives outside `Mutex<State>`).
 #[derive(Debug)]
-pub(crate) struct TranscriptIndexCache {
+pub struct TranscriptIndexCache {
     entries: HashMap<PathBuf, CachedIndex>,
     pages: HashMap<PageCacheKey, CachedPage>,
     page_bytes: usize,
@@ -1294,7 +1343,7 @@ impl TranscriptIndexCache {
     /// Return a cached `TranscriptResponse` page in sub-millisecond time when
     /// `(canonical_path, dev, ino, file_len, mtime_ns, full_identity, query)` is unchanged;
     /// otherwise incrementally sync `TranscriptIndex` in O(delta), slice the page, and cache it.
-    pub(crate) fn get_page_or_sync(
+    pub fn get_page_or_sync(
         &mut self,
         agent: AgentKind,
         path: &Path,
@@ -1362,7 +1411,7 @@ impl TranscriptIndexCache {
         Some(resp)
     }
 
-    pub(crate) fn sync_and_telemetry(
+    pub fn sync_and_telemetry(
         &mut self,
         agent: AgentKind,
         path: &Path,
@@ -1372,6 +1421,46 @@ impl TranscriptIndexCache {
             return (None, None, None);
         };
         idx.telemetry_snapshot(now_ms)
+    }
+
+    /// Return the total indexed turn count for `path` (syncing any newly appended bytes first).
+    pub fn total_messages_for_path(&mut self, agent: AgentKind, path: &Path) -> Option<usize> {
+        let idx = self.get_or_sync(agent, path)?;
+        Some(idx.total_messages())
+    }
+
+    /// Return AGY `step_index` values in the slice selected by `query` that are not yet hydrated
+    /// locally in sibling `transcript_full.jsonl`, capped at `max_steps`.
+    pub fn missing_agy_hydration_steps(
+        &mut self,
+        agent: AgentKind,
+        path: &Path,
+        query: TranscriptQuery,
+        max_steps: usize,
+    ) -> Vec<usize> {
+        if agent != AgentKind::Agy || max_steps == 0 {
+            return Vec::new();
+        }
+        let key_path = canonicalize_cache_path(path);
+        let Some(idx) = self.get_or_sync_canonical(agent, &key_path) else {
+            return Vec::new();
+        };
+        idx.missing_agy_hydration_steps(&key_path, query, max_steps)
+    }
+
+    /// Purge cached response pages for `path` (preserving the parsed `TranscriptIndex` so
+    /// incremental hydration does not need to re-scan `transcript.jsonl`).
+    pub fn invalidate_pages(&mut self, path: &Path) {
+        let key_path = canonicalize_cache_path(path);
+        self.purge_pages_for_path(&key_path, None);
+    }
+
+    /// Purge both cached response pages AND the `TranscriptIndex` entry for `path`
+    /// (used after atomic prefix backfill or full mirror replacement).
+    pub fn invalidate_path(&mut self, path: &Path) {
+        let key_path = canonicalize_cache_path(path);
+        self.entries.remove(&key_path);
+        self.purge_pages_for_path(&key_path, None);
     }
 }
 
@@ -1986,7 +2075,7 @@ fn sibling_transcript_full(transcript_path: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// Zero-allocation fast pre-filter extracting the integer after `"step_index":` in a JSONL line.
-fn fast_extract_step_index(line: &str) -> Option<u64> {
+pub(crate) fn fast_extract_step_index(line: &str) -> Option<u64> {
     let pos = line.find("\"step_index\"")?;
     let rest = line[pos + "\"step_index\"".len()..].trim_start();
     let rest = rest.strip_prefix(':')?.trim_start();
@@ -3288,6 +3377,62 @@ not valid json at all
             "Full hydrated assistant response body."
         );
         assert_eq!(cache.stats.page_hits, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_agy_hydration_steps_caps_prioritizes_newest_and_clears_after_hydration() {
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-agy-missing-steps-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compact = dir.join("transcript.jsonl");
+        let full = dir.join("transcript_full.jsonl");
+
+        let mut lines = String::new();
+        for step in [1u64, 3, 5, 7, 9] {
+            let entry = serde_json::json!({
+                "step_index": step,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T03:00:00Z",
+                "content": format!("step {step} <truncated 100 bytes>"),
+                "truncated_fields": ["content"]
+            });
+            lines.push_str(&entry.to_string());
+            lines.push('\n');
+        }
+        std::fs::write(&compact, &lines).unwrap();
+
+        let mut cache = TranscriptIndexCache::default();
+        let q = TranscriptQuery::tail(10);
+        // Capped at 3 steps: picks the 3 newest (5, 7, 9), returned sorted ascending.
+        assert_eq!(
+            cache.missing_agy_hydration_steps(AgentKind::Agy, &compact, q, 3),
+            vec![5, 7, 9]
+        );
+
+        // Write steps 7 and 9 into sibling transcript_full.jsonl -> only 1, 3, 5 remain missing.
+        let mut full_lines = String::new();
+        for step in [7u64, 9] {
+            let entry = serde_json::json!({
+                "step_index": step,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T03:00:00Z",
+                "content": format!("FULL STEP {step}")
+            });
+            full_lines.push_str(&entry.to_string());
+            full_lines.push('\n');
+        }
+        std::fs::write(&full, &full_lines).unwrap();
+
+        assert_eq!(
+            cache.missing_agy_hydration_steps(AgentKind::Agy, &compact, q, 10),
+            vec![1, 3, 5]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
