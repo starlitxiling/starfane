@@ -23,9 +23,11 @@ pub use spawn::{
 };
 pub use trust::{
     agy_trust_settings_json, codex_mcp_env_vars_override_from_toml, codex_trust_override_arg,
-    ensure_ancestor_trust_args, ensure_codex_mcp_env_vars_arg, evaluate_agy_trust,
-    evaluate_agy_trust_from_json, evaluate_claude_trust, evaluate_claude_trust_from_json,
-    evaluate_codex_trust, evaluate_codex_trust_from_toml, FolderTrustDecision, CODEX_MCP_ENV_VARS,
+    ensure_ancestor_trust_args, ensure_ancestor_trust_args_remote, ensure_codex_mcp_env_vars_arg,
+    evaluate_agy_trust, evaluate_agy_trust_from_json, evaluate_agy_trust_remote,
+    evaluate_claude_trust, evaluate_claude_trust_from_json, evaluate_codex_trust,
+    evaluate_codex_trust_from_toml, evaluate_codex_trust_remote, FolderTrustDecision,
+    CODEX_MCP_ENV_VARS,
 };
 
 /// Supported agent names (kept for M0 compatibility).

@@ -4,20 +4,43 @@ use crate::error::TmuxError;
 use serde::Serialize;
 use starfane_proto::{PaneId, PipelineId, SessionState, StageKind};
 
-/// Field separator used in every `-F` format (ASCII Unit Separator).
+/// Legacy ASCII Unit Separator (retained for backward compatibility with older
+/// parsers/tests and non-tmux tools such as `sqlite3 -separator`).
 pub const FIELD_SEP: char = '\x1f';
 
-pub const PANE_FORMAT: &str = "#{pane_id}\x1f#{session_name}\x1f#{window_id}\x1f#{window_index}\x1f#{pane_index}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{pane_active}\x1f#{window_active}\x1f#{session_attached}\x1f#{pane_in_mode}\x1f#{pane_dead}\x1f#{pane_synchronized}\x1f#{alternate_on}\x1f#{cursor_x}\x1f#{cursor_y}\x1f#{window_name}\x1f#{session_group}\x1f#{history_size}\x1f#{pane_height}";
+/// Cross-version field separator used in every tmux `-F` / `display-message -p` format.
+///
+/// TAB (`\t`) passes through unescaped on both `tmux 3.5a` (which octal-escapes `0x1f` into
+/// literal 4-char `\037`) and `tmux 3.7c`.
+pub const TMUX_FIELD_SEP: char = '\t';
+
+/// Split a single tmux `-F` / `display-message -p` line across all delimiter variants:
+/// - `'\t'` (current cross-version separator),
+/// - `'\x1f'` (legacy ASCII Unit Separator from `tmux >= 3.7` / existing fixtures),
+/// - `"\\037"` (octal-escaped `0x1f` emitted by `tmux 3.5a` when given `0x1f`).
+pub fn split_tmux_fields(line: &str) -> Vec<&str> {
+    if line.contains(TMUX_FIELD_SEP) {
+        line.split(TMUX_FIELD_SEP).collect()
+    } else if line.contains(FIELD_SEP) {
+        line.split(FIELD_SEP).collect()
+    } else if line.contains("\\037") {
+        line.split("\\037").collect()
+    } else {
+        vec![line]
+    }
+}
+
+pub const PANE_FORMAT: &str = "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_active}\t#{window_active}\t#{session_attached}\t#{pane_in_mode}\t#{pane_dead}\t#{pane_synchronized}\t#{alternate_on}\t#{cursor_x}\t#{cursor_y}\t#{window_name}\t#{session_group}\t#{history_size}\t#{pane_height}";
 const LEGACY_PANE_FIELDS: usize = 18;
 const PANE_FIELDS: usize = 21;
 
 pub(crate) const CLIENT_FORMAT: &str =
-    "#{client_tty}\x1f#{client_session}\x1f#{client_activity}\x1f#{client_flags}\x1f#{session_group}\x1f#{window_id}";
+    "#{client_tty}\t#{client_session}\t#{client_activity}\t#{client_flags}\t#{session_group}\t#{window_id}";
 const LEGACY_CLIENT_FIELDS: usize = 4;
 const CLIENT_FIELDS: usize = 6;
 
 pub(crate) const WINDOW_FORMAT: &str =
-    "#{session_name}\x1f#{window_index}\x1f#{window_name}\x1f#{window_layout}\x1f#{window_active}";
+    "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{window_active}";
 const WINDOW_FIELDS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -122,7 +145,7 @@ fn parse_flag(field: &str, name: &str, line: &str) -> Result<bool, TmuxError> {
 
 /// Parse a single `list-panes -a -F PANE_FORMAT` line (accepts both 21-field extended and 18-field legacy lines).
 pub fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
-    let f: Vec<&str> = line.split(FIELD_SEP).collect();
+    let f = split_tmux_fields(line);
     if f.len() != PANE_FIELDS && f.len() != LEGACY_PANE_FIELDS {
         return Err(TmuxError::Parse(format!(
             "expected {PANE_FIELDS} (or {LEGACY_PANE_FIELDS}) fields, got {} in line {line:?}",
@@ -182,7 +205,7 @@ pub fn parse_panes(out: &str) -> Result<Vec<PaneInfo>, TmuxError> {
 
 /// Parse a single `list-clients -F CLIENT_FORMAT` line (accepts both 6-field extended and 4-field legacy lines).
 pub fn parse_client_line(line: &str) -> Result<ClientInfo, TmuxError> {
-    let f: Vec<&str> = line.split(FIELD_SEP).collect();
+    let f = split_tmux_fields(line);
     if f.len() != CLIENT_FIELDS && f.len() != LEGACY_CLIENT_FIELDS {
         return Err(TmuxError::Parse(format!(
             "expected {CLIENT_FIELDS} (or {LEGACY_CLIENT_FIELDS}) fields, got {} in line {line:?}",
@@ -213,7 +236,7 @@ pub fn parse_clients(out: &str) -> Result<Vec<ClientInfo>, TmuxError> {
 
 /// Parse a single `list-windows -a -F WINDOW_FORMAT` line.
 pub fn parse_window_line(line: &str) -> Result<WindowInfo, TmuxError> {
-    let f: Vec<&str> = line.split(FIELD_SEP).collect();
+    let f = split_tmux_fields(line);
     if f.len() != WINDOW_FIELDS {
         return Err(TmuxError::Parse(format!(
             "expected {WINDOW_FIELDS} fields, got {} in line {line:?}",
@@ -242,22 +265,67 @@ mod tests {
 
     #[test]
     fn pane_format_field_count_matches() {
-        assert_eq!(PANE_FORMAT.split(FIELD_SEP).count(), PANE_FIELDS);
-        assert_eq!(CLIENT_FORMAT.split(FIELD_SEP).count(), CLIENT_FIELDS);
-        assert_eq!(WINDOW_FORMAT.split(FIELD_SEP).count(), WINDOW_FIELDS);
+        assert_eq!(PANE_FORMAT.split(TMUX_FIELD_SEP).count(), PANE_FIELDS);
+        assert_eq!(CLIENT_FORMAT.split(TMUX_FIELD_SEP).count(), CLIENT_FIELDS);
+        assert_eq!(WINDOW_FORMAT.split(TMUX_FIELD_SEP).count(), WINDOW_FIELDS);
     }
 
     #[test]
     fn parses_window_line() {
-        let line = format!(
-            "learning{0}2{0}openkernel{0}bb62,212x54,0,0[212x27,0,0,1,212x26,0,28,2]{0}1",
-            FIELD_SEP
-        );
-        let w = parse_window_line(&line).unwrap();
-        assert_eq!(w.session_name, "learning");
-        assert_eq!(w.window_index, 2);
-        assert_eq!(w.window_name, "openkernel");
-        assert!(w.window_active);
-        assert!(w.window_layout.contains('['));
+        for sep in ["\t", "\x1f", "\\037"] {
+            let line = format!(
+                "learning{0}2{0}openkernel{0}bb62,212x54,0,0[212x27,0,0,1,212x26,0,28,2]{0}1",
+                sep
+            );
+            let w = parse_window_line(&line).unwrap();
+            assert_eq!(w.session_name, "learning");
+            assert_eq!(w.window_index, 2);
+            assert_eq!(w.window_name, "openkernel");
+            assert!(w.window_active);
+            assert!(w.window_layout.contains('['));
+        }
+    }
+
+    #[test]
+    fn parses_pane_and_client_across_tab_us_and_tmux35a_octal_037() {
+        // Exact real tmux 3.5a octal-escaped output captured from `mac-xiling`.
+        let tmux35a_line = "%1\\037ai-codex\\037@1\\0370\\0370\\0379436\\037zsh\\037/Users/xiling\\0371\\0370\\0370\\0370\\0370\\0370\\0370\\0378\\03746\\037arxiv-chrome-exten\\037\\037774\\03748";
+        let tab_line = tmux35a_line.replace("\\037", "\t");
+        let legacy_us_line = tmux35a_line.replace("\\037", "\x1f");
+
+        for line in [&tab_line, &legacy_us_line, &tmux35a_line.to_string()] {
+            let p = parse_pane_line(line).unwrap();
+            assert_eq!(p.pane_id.as_str(), "%1");
+            assert_eq!(p.session_name, "ai-codex");
+            assert_eq!(p.window_id, "@1");
+            assert_eq!(p.pane_pid, 9436);
+            assert_eq!(p.current_command, "zsh");
+            assert_eq!(p.current_path, "/Users/xiling");
+            assert!(p.pane_active);
+            assert!(!p.in_mode);
+            assert_eq!(p.cursor_x, 8);
+            assert_eq!(p.cursor_y, 46);
+            assert_eq!(p.window_name, "arxiv-chrome-exten");
+            assert_eq!(p.session_group, "");
+            assert_eq!(p.history_size, 774);
+            assert_eq!(p.pane_height, 48);
+        }
+
+        for sep in ["\t", "\x1f", "\\037"] {
+            let cli = format!(
+                "/dev/ttys001{0}ai-codex{0}1760000000{0}focused{0}{0}@1",
+                sep
+            );
+            let c = parse_client_line(&cli).unwrap();
+            assert_eq!(c.tty, "/dev/ttys001");
+            assert_eq!(c.session_name, "ai-codex");
+            assert_eq!(c.activity_s, 1_760_000_000);
+            assert_eq!(c.flags, "focused");
+            assert_eq!(c.session_group, "");
+            assert_eq!(c.window_id, "@1");
+        }
+
+        assert_eq!(split_tmux_fields("single"), vec!["single"]);
+        assert_eq!(split_tmux_fields("0\t"), vec!["0", ""]);
     }
 }

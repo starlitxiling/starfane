@@ -87,14 +87,25 @@ fn record_entry(entries: &mut HashMap<PathBuf, TrustMark>, key: PathBuf, mark: T
     }
 }
 
-fn evaluate_entries(
-    raw_entries: &[(String, TrustMark)],
-    cwd: &Path,
-    home: Option<&Path>,
-) -> FolderTrustDecision {
-    let cwd_lex = lexical_normalize(&expand_home(&cwd.to_string_lossy(), home));
-    let cwd_canon = canonical_or_normalized(&cwd_lex);
+fn nearest_ancestor_mark(
+    path: &Path,
+    norm_entries: &HashMap<PathBuf, TrustMark>,
+) -> Option<(PathBuf, TrustMark)> {
+    for ancestor in path.ancestors().skip(1) {
+        if let Some(mark) = norm_entries.get(ancestor) {
+            return Some((ancestor.to_path_buf(), *mark));
+        }
+    }
+    None
+}
 
+fn evaluate_entries_resolved(
+    raw_entries: &[(String, TrustMark)],
+    cwd_lex: PathBuf,
+    cwd_canon: PathBuf,
+    home: Option<&Path>,
+    allow_local_fs_canonicalize: bool,
+) -> FolderTrustDecision {
     let mut exact_trusted_keys: HashMap<PathBuf, ()> = HashMap::new();
     let mut norm_entries: HashMap<PathBuf, TrustMark> = HashMap::new();
 
@@ -108,9 +119,11 @@ fn evaluate_entries(
             exact_trusted_keys.insert(lex.clone(), ());
         }
         record_entry(&mut norm_entries, lex.clone(), *mark);
-        if let Ok(canon) = std::fs::canonicalize(&lex) {
-            if canon != lex {
-                record_entry(&mut norm_entries, canon, *mark);
+        if allow_local_fs_canonicalize {
+            if let Ok(canon) = std::fs::canonicalize(&lex) {
+                if canon != lex {
+                    record_entry(&mut norm_entries, canon, *mark);
+                }
             }
         }
     }
@@ -147,53 +160,84 @@ fn evaluate_entries(
     }
 
     // 2. Walk strict ancestors from nearest parent upward to root.
-    // Nearest listed ancestor wins: a closer explicit Untrusted blocks any outer Trusted ancestor.
-    for ancestor in cwd_canon.ancestors().skip(1) {
-        if let Some(mark) = norm_entries.get(ancestor) {
-            return match mark {
-                TrustMark::Trusted => FolderTrustDecision::InheritFromAncestor {
-                    trusted_ancestor: ancestor.to_path_buf(),
-                    canonical_cwd: cwd_canon,
-                },
-                TrustMark::Untrusted => FolderTrustDecision::ExplicitlyUntrusted {
-                    untrusted_path: ancestor.to_path_buf(),
-                },
-            };
-        }
-    }
+    // Nearest listed ancestor wins on each chain; when canonical and lexical paths diverge
+    // (symlink), fail safe so an explicit Untrusted nearest ancestor on EITHER chain blocks
+    // inheritance from a Trusted ancestor on the other chain.
+    let canon_hit = nearest_ancestor_mark(&cwd_canon, &norm_entries);
+    let lex_hit = if cwd_lex != cwd_canon {
+        nearest_ancestor_mark(&cwd_lex, &norm_entries)
+    } else {
+        None
+    };
 
-    // Also check lexical ancestors if canonicalization diverged (e.g. symlinked parent dir).
-    if cwd_lex != cwd_canon {
-        for ancestor in cwd_lex.ancestors().skip(1) {
-            if let Some(mark) = norm_entries.get(ancestor) {
-                return match mark {
-                    TrustMark::Trusted => FolderTrustDecision::InheritFromAncestor {
-                        trusted_ancestor: ancestor.to_path_buf(),
-                        canonical_cwd: cwd_canon,
-                    },
-                    TrustMark::Untrusted => FolderTrustDecision::ExplicitlyUntrusted {
-                        untrusted_path: ancestor.to_path_buf(),
-                    },
-                };
-            }
-        }
+    if let Some((untrusted_path, TrustMark::Untrusted)) = canon_hit {
+        return FolderTrustDecision::ExplicitlyUntrusted { untrusted_path };
+    }
+    if let Some((untrusted_path, TrustMark::Untrusted)) = lex_hit {
+        return FolderTrustDecision::ExplicitlyUntrusted { untrusted_path };
+    }
+    if let Some((trusted_ancestor, TrustMark::Trusted)) = canon_hit {
+        return FolderTrustDecision::InheritFromAncestor {
+            trusted_ancestor,
+            canonical_cwd: cwd_canon,
+        };
+    }
+    if let Some((trusted_ancestor, TrustMark::Trusted)) = lex_hit {
+        return FolderTrustDecision::InheritFromAncestor {
+            trusted_ancestor,
+            canonical_cwd: cwd_canon,
+        };
     }
 
     FolderTrustDecision::Untrusted
 }
 
-/// Evaluate Codex folder trust strictly from a `~/.codex/config.toml` document (pure, read-only).
-pub fn evaluate_codex_trust_from_toml(
-    toml_str: &str,
+fn evaluate_entries(
+    raw_entries: &[(String, TrustMark)],
     cwd: &Path,
     home: Option<&Path>,
 ) -> FolderTrustDecision {
-    let Ok(table) = toml_str.parse::<toml::Table>() else {
+    let cwd_lex = lexical_normalize(&expand_home(&cwd.to_string_lossy(), home));
+    let cwd_canon = canonical_or_normalized(&cwd_lex);
+    evaluate_entries_resolved(raw_entries, cwd_lex, cwd_canon, home, true)
+}
+
+fn evaluate_entries_remote(
+    raw_entries: &[(String, TrustMark)],
+    remote_lex_cwd: &str,
+    remote_canon_cwd: &str,
+    remote_home: Option<&str>,
+) -> FolderTrustDecision {
+    let home = remote_home
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Path::new);
+    let lex_trim = remote_lex_cwd.trim();
+    let canon_trim = remote_canon_cwd.trim();
+    if lex_trim.is_empty() && canon_trim.is_empty() {
         return FolderTrustDecision::Untrusted;
+    }
+    let lex_raw = if lex_trim.is_empty() {
+        canon_trim
+    } else {
+        lex_trim
     };
-    let Some(projects) = table.get("projects").and_then(toml::Value::as_table) else {
+    let canon_raw = if canon_trim.is_empty() {
+        lex_raw
+    } else {
+        canon_trim
+    };
+    let cwd_lex = lexical_normalize(&expand_home(lex_raw, home));
+    let cwd_canon = lexical_normalize(&expand_home(canon_raw, home));
+    if !cwd_lex.is_absolute() || !cwd_canon.is_absolute() {
         return FolderTrustDecision::Untrusted;
-    };
+    }
+    evaluate_entries_resolved(raw_entries, cwd_lex, cwd_canon, home, false)
+}
+
+fn parse_codex_trust_entries(toml_str: &str) -> Option<Vec<(String, TrustMark)>> {
+    let table = toml_str.parse::<toml::Table>().ok()?;
+    let projects = table.get("projects").and_then(toml::Value::as_table)?;
     let mut entries = Vec::with_capacity(projects.len());
     for (path, val) in projects {
         let Some(level) = val
@@ -210,7 +254,33 @@ pub fn evaluate_codex_trust_from_toml(
             _ => {}
         }
     }
+    Some(entries)
+}
+
+/// Evaluate Codex folder trust strictly from a `~/.codex/config.toml` document (pure, read-only).
+pub fn evaluate_codex_trust_from_toml(
+    toml_str: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> FolderTrustDecision {
+    let Some(entries) = parse_codex_trust_entries(toml_str) else {
+        return FolderTrustDecision::Untrusted;
+    };
     evaluate_entries(&entries, cwd, home)
+}
+
+/// Pure remote Codex folder-trust evaluation using pre-resolved remote lexical & physical
+/// canonical paths (never touches the local Hub filesystem).
+pub fn evaluate_codex_trust_remote(
+    toml_str: &str,
+    remote_lex_cwd: &str,
+    remote_canon_cwd: &str,
+    remote_home: Option<&str>,
+) -> FolderTrustDecision {
+    let Some(entries) = parse_codex_trust_entries(toml_str) else {
+        return FolderTrustDecision::Untrusted;
+    };
+    evaluate_entries_remote(&entries, remote_lex_cwd, remote_canon_cwd, remote_home)
 }
 
 /// Read-only inspection of `<home>/.codex/config.toml` for Codex folder trust.
@@ -222,16 +292,8 @@ pub fn evaluate_codex_trust(home: &Path, cwd: &Path) -> FolderTrustDecision {
     evaluate_codex_trust_from_toml(&raw, cwd, Some(home))
 }
 
-/// Evaluate AGY folder trust strictly from `~/.gemini/antigravity-cli/settings.json` (pure, read-only).
-/// Also returns the existing `trustedWorkspaces` list so session-only `--settings` overrides preserve them.
-pub fn evaluate_agy_trust_from_json(
-    json_str: &str,
-    cwd: &Path,
-    home: Option<&Path>,
-) -> (FolderTrustDecision, Vec<String>) {
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
-        return (FolderTrustDecision::Untrusted, Vec::new());
-    };
+fn parse_agy_trusted_workspaces(json_str: &str) -> Option<Vec<String>> {
+    let val = serde_json::from_str::<serde_json::Value>(json_str).ok()?;
     let existing: Vec<String> = val
         .get("trustedWorkspaces")
         .and_then(serde_json::Value::as_array)
@@ -244,11 +306,45 @@ pub fn evaluate_agy_trust_from_json(
                 .collect()
         })
         .unwrap_or_default();
+    Some(existing)
+}
+
+/// Evaluate AGY folder trust strictly from `~/.gemini/antigravity-cli/settings.json` (pure, read-only).
+/// Also returns the existing `trustedWorkspaces` list so session-only `--settings` overrides preserve them.
+pub fn evaluate_agy_trust_from_json(
+    json_str: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> (FolderTrustDecision, Vec<String>) {
+    let Some(existing) = parse_agy_trusted_workspaces(json_str) else {
+        return (FolderTrustDecision::Untrusted, Vec::new());
+    };
     let entries: Vec<(String, TrustMark)> = existing
         .iter()
         .map(|p| (p.clone(), TrustMark::Trusted))
         .collect();
     (evaluate_entries(&entries, cwd, home), existing)
+}
+
+/// Pure remote AGY folder-trust evaluation using pre-resolved remote lexical & physical
+/// canonical paths (never touches the local Hub filesystem).
+pub fn evaluate_agy_trust_remote(
+    json_str: &str,
+    remote_lex_cwd: &str,
+    remote_canon_cwd: &str,
+    remote_home: Option<&str>,
+) -> (FolderTrustDecision, Vec<String>) {
+    let Some(existing) = parse_agy_trusted_workspaces(json_str) else {
+        return (FolderTrustDecision::Untrusted, Vec::new());
+    };
+    let entries: Vec<(String, TrustMark)> = existing
+        .iter()
+        .map(|p| (p.clone(), TrustMark::Trusted))
+        .collect();
+    (
+        evaluate_entries_remote(&entries, remote_lex_cwd, remote_canon_cwd, remote_home),
+        existing,
+    )
 }
 
 /// Read-only inspection of `<home>/.gemini/antigravity-cli/settings.json` for AGY folder trust.
@@ -491,6 +587,49 @@ pub fn ensure_ancestor_trust_args(
                 return;
             }
             let (decision, existing) = evaluate_agy_trust(home, cwd);
+            if let FolderTrustDecision::InheritFromAncestor { canonical_cwd, .. } = decision {
+                extra.push("--settings".into());
+                extra.push(agy_trust_settings_json(&existing, &canonical_cwd));
+            }
+        }
+        AgentKind::Claude | AgentKind::Shell => {}
+    }
+}
+
+/// Pure remote counterpart of [`ensure_ancestor_trust_args`] for zero-install SSH spawns.
+///
+/// Consumes read-only config text fetched during SSH preflight (`~/.codex/config.toml` for Codex,
+/// `~/.gemini/antigravity-cli/settings.json` for AGY; ignored for Claude/Shell so `~/.claude.json`
+/// is never touched) and never calls local filesystem APIs.
+pub fn ensure_ancestor_trust_args_remote(
+    agent: AgentKind,
+    config_str: Option<&str>,
+    remote_lex_cwd: &str,
+    remote_canon_cwd: &str,
+    remote_home: Option<&str>,
+    extra: &mut Vec<String>,
+) {
+    let Some(cfg) = config_str else {
+        return;
+    };
+    match agent {
+        AgentKind::Codex => {
+            if has_codex_projects_override(extra) {
+                return;
+            }
+            if let FolderTrustDecision::InheritFromAncestor { canonical_cwd, .. } =
+                evaluate_codex_trust_remote(cfg, remote_lex_cwd, remote_canon_cwd, remote_home)
+            {
+                extra.push("-c".into());
+                extra.push(codex_trust_override_arg(&canonical_cwd));
+            }
+        }
+        AgentKind::Agy => {
+            if has_agy_settings_override(extra) {
+                return;
+            }
+            let (decision, existing) =
+                evaluate_agy_trust_remote(cfg, remote_lex_cwd, remote_canon_cwd, remote_home);
             if let FolderTrustDecision::InheritFromAncestor { canonical_cwd, .. } = decision {
                 extra.push("--settings".into());
                 extra.push(agy_trust_settings_json(&existing, &canonical_cwd));
@@ -841,5 +980,200 @@ command = "/usr/local/bin/starfane"
 env_vars = ["TMUX_PANE", "TMUX", "ZELLIJ_PANE_ID", "ZELLIJ_SESSION_NAME", "STARFANE_BIND"]
 "#;
         assert_eq!(codex_mcp_env_vars_override_from_toml(complete), None);
+    }
+
+    #[test]
+    fn codex_remote_trust_handles_symlinks_ancestors_and_untrusted_precedence() {
+        let toml = r#"
+[projects."~"]
+trust_level = "trusted"
+
+[projects."/home/ubuntu/exact"]
+trust_level = "trusted"
+
+[projects."/home/ubuntu/link_alias"]
+trust_level = "trusted"
+
+[projects."/home/ubuntu/untrusted_zone"]
+trust_level = "untrusted"
+
+[projects."/data/real"]
+trust_level = "trusted"
+
+[projects."/home/ubuntu/symlink_to_real/secret"]
+trust_level = "untrusted"
+
+[projects."/data/real/canon_secret"]
+trust_level = "untrusted"
+"#;
+        let home = Some("/home/ubuntu");
+
+        // 1. Exact canonical match -> AlreadyTrusted.
+        assert_eq!(
+            evaluate_codex_trust_remote(toml, "/home/ubuntu/exact", "/home/ubuntu/exact", home),
+            FolderTrustDecision::AlreadyTrusted
+        );
+
+        // 2. Child of `~`-expanded trusted ancestor -> InheritFromAncestor with canonical_cwd.
+        assert_eq!(
+            evaluate_codex_trust_remote(
+                toml,
+                "/home/ubuntu/.agent_session",
+                "/home/ubuntu/.agent_session",
+                home
+            ),
+            FolderTrustDecision::InheritFromAncestor {
+                trusted_ancestor: PathBuf::from("/home/ubuntu"),
+                canonical_cwd: PathBuf::from("/home/ubuntu/.agent_session"),
+            }
+        );
+
+        // 3. Exact match only via lexical symlink alias -> InheritFromAncestor with physical canon path.
+        assert_eq!(
+            evaluate_codex_trust_remote(
+                toml,
+                "/home/ubuntu/link_alias",
+                "/mnt/nvme/link_target",
+                home
+            ),
+            FolderTrustDecision::InheritFromAncestor {
+                trusted_ancestor: PathBuf::from("/home/ubuntu/link_alias"),
+                canonical_cwd: PathBuf::from("/mnt/nvme/link_target"),
+            }
+        );
+
+        // 4. Directly untrusted dir or descendant of untrusted dir under trusted `~` -> ExplicitlyUntrusted.
+        assert_eq!(
+            evaluate_codex_trust_remote(
+                toml,
+                "/home/ubuntu/untrusted_zone",
+                "/home/ubuntu/untrusted_zone",
+                home
+            ),
+            FolderTrustDecision::ExplicitlyUntrusted {
+                untrusted_path: PathBuf::from("/home/ubuntu/untrusted_zone"),
+            }
+        );
+        assert_eq!(
+            evaluate_codex_trust_remote(
+                toml,
+                "/home/ubuntu/untrusted_zone/nested/app",
+                "/home/ubuntu/untrusted_zone/nested/app",
+                home
+            ),
+            FolderTrustDecision::ExplicitlyUntrusted {
+                untrusted_path: PathBuf::from("/home/ubuntu/untrusted_zone"),
+            }
+        );
+
+        // 5. Cross-symlink fail-safe: canonical chain is under trusted `/data/real`,
+        //    but lexical chain has explicitly untrusted `/home/ubuntu/symlink_to_real/secret` -> MUST BLOCK!
+        assert_eq!(
+            evaluate_codex_trust_remote(
+                toml,
+                "/home/ubuntu/symlink_to_real/secret/repo",
+                "/data/real/secret/repo",
+                home
+            ),
+            FolderTrustDecision::ExplicitlyUntrusted {
+                untrusted_path: PathBuf::from("/home/ubuntu/symlink_to_real/secret"),
+            }
+        );
+
+        // 6. Symmetric cross-symlink fail-safe: lexical chain is under trusted `/home/ubuntu`,
+        //    but canonical chain has explicitly untrusted `/data/real/canon_secret` -> MUST BLOCK!
+        assert_eq!(
+            evaluate_codex_trust_remote(
+                toml,
+                "/home/ubuntu/symlink_to_real/canon_secret/repo",
+                "/data/real/canon_secret/repo",
+                home
+            ),
+            FolderTrustDecision::ExplicitlyUntrusted {
+                untrusted_path: PathBuf::from("/data/real/canon_secret"),
+            }
+        );
+
+        // 7. Outside all trusted roots (and never confused by local macOS `/tmp` -> `/private/tmp`).
+        assert_eq!(
+            evaluate_codex_trust_remote(toml, "/tmp/foreign", "/tmp/foreign", home),
+            FolderTrustDecision::Untrusted
+        );
+
+        // 8. Empty or relative remote paths -> safely Untrusted (never normalize to `/`).
+        assert_eq!(
+            evaluate_codex_trust_remote(toml, "", "", home),
+            FolderTrustDecision::Untrusted
+        );
+        assert_eq!(
+            evaluate_codex_trust_remote(toml, "relative/dir", "relative/dir", home),
+            FolderTrustDecision::Untrusted
+        );
+    }
+
+    #[test]
+    fn agy_remote_trust_and_ensure_args_remote_preserve_invariants() {
+        let json = r#"{
+            "trustedWorkspaces": [
+                "~",
+                "/home/ubuntu/exact",
+                "/home/ubuntu/link_work"
+            ]
+        }"#;
+        let home = Some("/home/ubuntu");
+
+        let (d_exact, _) =
+            evaluate_agy_trust_remote(json, "/home/ubuntu/exact", "/home/ubuntu/exact", home);
+        assert_eq!(d_exact, FolderTrustDecision::AlreadyTrusted);
+
+        // Symlinked subdir under trusted lexical alias inherits physical canonical path.
+        let (d_sym, existing) = evaluate_agy_trust_remote(
+            json,
+            "/home/ubuntu/link_work/sub",
+            "/mnt/disk/work/sub",
+            home,
+        );
+        assert_eq!(
+            d_sym,
+            FolderTrustDecision::InheritFromAncestor {
+                trusted_ancestor: PathBuf::from("/home/ubuntu/link_work"),
+                canonical_cwd: PathBuf::from("/mnt/disk/work/sub"),
+            }
+        );
+        assert_eq!(existing.len(), 3);
+
+        // Outside dir -> Untrusted.
+        let (d_out, _) = evaluate_agy_trust_remote(json, "/var/tmp/x", "/var/tmp/x", home);
+        assert_eq!(d_out, FolderTrustDecision::Untrusted);
+
+        // ensure_ancestor_trust_args_remote emits only sanctioned flags for Codex/AGY, never Claude.
+        let mut agy_extra = Vec::new();
+        ensure_ancestor_trust_args_remote(
+            AgentKind::Agy,
+            Some(json),
+            "/home/ubuntu/link_work/sub",
+            "/mnt/disk/work/sub",
+            home,
+            &mut agy_extra,
+        );
+        assert_eq!(agy_extra.len(), 2);
+        assert_eq!(agy_extra[0], "--settings");
+        let parsed: serde_json::Value = serde_json::from_str(&agy_extra[1]).unwrap();
+        assert!(parsed["trustedWorkspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("/mnt/disk/work/sub")));
+
+        let mut claude_extra = Vec::new();
+        ensure_ancestor_trust_args_remote(
+            AgentKind::Claude,
+            Some(json),
+            "/home/ubuntu/.agent_session",
+            "/home/ubuntu/.agent_session",
+            home,
+            &mut claude_extra,
+        );
+        assert!(claude_extra.is_empty());
     }
 }

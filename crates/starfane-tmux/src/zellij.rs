@@ -9,6 +9,7 @@
 //! - `zellij -s <session> action paste -p terminal_<id> <text>`
 //! - `zellij -s <session> action send-keys -p terminal_<id> Enter`
 //! - `zellij -s <session> action focus-pane-id terminal_<id>`
+//! - `zellij -s <session> action close-pane --pane-id terminal_<id>`
 //! - `zellij -s <session> action new-pane --name <title> --cwd <dir> -- <argv...>`
 //! - `zellij -s <session> action dump-layout`
 
@@ -421,6 +422,46 @@ impl TerminalMux for ZellijMux {
             already_in_session: switched_client.is_some(),
             switched_client,
         })
+    }
+
+    fn kill_pane(&self, pane: &PaneId) -> Result<(), TmuxError> {
+        let (sess, numeric) = self.require_pane(pane)?;
+        // Always pass `--pane-id` explicitly so Zellij targets ONLY `terminal_<numeric>` and
+        // fails safely on older binaries rather than closing the currently focused pane.
+        let args = vec![
+            "close-pane".to_string(),
+            "--pane-id".to_string(),
+            format!("terminal_{numeric}"),
+        ];
+        match self.run_session_action(sess, &args) {
+            Ok(_) => Ok(()),
+            Err(TmuxError::Command {
+                args: cmd_args,
+                code,
+                stderr,
+            }) => {
+                let lower = stderr.to_ascii_lowercase();
+                if lower.contains("unexpected argument") || lower.contains("wasn't expected") {
+                    return Err(TmuxError::InvalidRequest(
+                        "installed zellij does not support `action close-pane --pane-id`; refusing to close the currently focused pane".into(),
+                    ));
+                }
+                if lower.contains("not found")
+                    || lower.contains("no such pane")
+                    || lower.contains("no active zellij sessions")
+                    || lower.contains("no session named")
+                    || lower.contains("does not exist")
+                {
+                    return Ok(());
+                }
+                Err(TmuxError::Command {
+                    args: cmd_args,
+                    code,
+                    stderr,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn set_status(&self, pane: &PaneId, _st: &PaneStatus) -> Result<(), TmuxError> {
@@ -873,6 +914,14 @@ mod tests {
             fn run_shell(&self, _script: &str) -> Result<ExecOutput, TmuxError> {
                 unreachable!()
             }
+            fn run_shell_bytes(
+                &self,
+                _script: &str,
+                _stdin: Option<&[u8]>,
+                _timeout: std::time::Duration,
+            ) -> Result<crate::exec::ExecBytesOutput, TmuxError> {
+                unreachable!()
+            }
             fn is_local(&self) -> bool {
                 true
             }
@@ -913,6 +962,103 @@ mod tests {
                 "- [ ] check"
             ]
         );
+    }
+
+    #[test]
+    fn kill_pane_targets_explicit_pane_id_and_handles_missing_flag_or_gone_pane() {
+        use crate::exec::ExecOutput;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct StubExec {
+            calls: Mutex<Vec<Vec<String>>>,
+            reply: ExecOutput,
+        }
+        impl ExecTransport for StubExec {
+            fn run(
+                &self,
+                _bin: &Path,
+                args: &[String],
+                _stdin: Option<&[u8]>,
+            ) -> Result<ExecOutput, TmuxError> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                Ok(self.reply.clone())
+            }
+            fn run_shell(&self, _script: &str) -> Result<ExecOutput, TmuxError> {
+                unreachable!()
+            }
+            fn run_shell_bytes(
+                &self,
+                _script: &str,
+                _stdin: Option<&[u8]>,
+                _timeout: std::time::Duration,
+            ) -> Result<crate::exec::ExecBytesOutput, TmuxError> {
+                unreachable!()
+            }
+            fn is_local(&self) -> bool {
+                true
+            }
+        }
+
+        // 1. Happy path passes `--pane-id terminal_<id>` explicitly.
+        let ok_exec = Arc::new(StubExec {
+            calls: Mutex::new(Vec::new()),
+            reply: ExecOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+                code: Some(0),
+            },
+        });
+        let zj = ZellijMux::with_transport(PathBuf::from("zellij"), ok_exec.clone());
+        zj.kill_pane(&PaneId::new("zj:work/11")).unwrap();
+        assert_eq!(
+            *ok_exec.calls.lock().unwrap(),
+            vec![vec![
+                "-s",
+                "work",
+                "action",
+                "close-pane",
+                "--pane-id",
+                "terminal_11",
+            ]]
+        );
+
+        // 2. Rejects invalid pane id without executing zellij.
+        assert!(matches!(
+            zj.kill_pane(&PaneId::new("%11")),
+            Err(TmuxError::InvalidRequest(_))
+        ));
+        assert_eq!(ok_exec.calls.lock().unwrap().len(), 1);
+
+        // 3. Rejects unsupported `--pane-id` cleanly with descriptive InvalidRequest error.
+        let old_exec = Arc::new(StubExec {
+            calls: Mutex::new(Vec::new()),
+            reply: ExecOutput {
+                stdout: String::new(),
+                stderr: "error: unexpected argument '--pane-id' found".into(),
+                success: false,
+                code: Some(2),
+            },
+        });
+        let zj_old = ZellijMux::with_transport(PathBuf::from("zellij"), old_exec);
+        let err = zj_old.kill_pane(&PaneId::new("zj:work/11")).unwrap_err();
+        assert!(matches!(err, TmuxError::InvalidRequest(_)), "{err}");
+        assert!(err.to_string().contains("--pane-id"), "{err}");
+
+        // 4. Treats already-gone pane idempotently.
+        let gone_exec = Arc::new(StubExec {
+            calls: Mutex::new(Vec::new()),
+            reply: ExecOutput {
+                stdout: String::new(),
+                stderr: "pane terminal_11 not found".into(),
+                success: false,
+                code: Some(1),
+            },
+        });
+        let zj_gone = ZellijMux::with_transport(PathBuf::from("zellij"), gone_exec);
+        zj_gone.kill_pane(&PaneId::new("zj:work/11")).unwrap();
     }
 
     #[test]

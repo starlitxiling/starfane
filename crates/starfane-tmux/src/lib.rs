@@ -28,7 +28,10 @@ pub use discover::{
     MAX_FULL_CAPTURE_BYTES, MAX_FULL_CAPTURE_LINES,
 };
 pub use error::TmuxError;
-pub use exec::{ExecOutput, ExecTransport, LocalExec, SshExec, DEFAULT_SSH_TIMEOUT};
+pub use exec::{
+    ssh_universal_quote, ExecBytesOutput, ExecOutput, ExecTransport, LocalExec, SshExec,
+    DEFAULT_SSH_CONNECT_TIMEOUT_SECS, DEFAULT_SSH_TIMEOUT, SSH_BIN_ENV,
+};
 pub use gate::{
     adaptive_paste_settle_ms, check_injection_gate, check_injection_gate_with_screen,
     check_interactive_gate, detect_blocking_startup_prompt, detect_codex_update_prompt,
@@ -37,7 +40,8 @@ pub use gate::{
 };
 pub use model::{
     parse_client_line, parse_clients, parse_pane_line, parse_panes, parse_window_line,
-    parse_windows, ClientInfo, PaneInfo, PaneStatus, WindowInfo, FIELD_SEP, PANE_FORMAT,
+    parse_windows, split_tmux_fields, ClientInfo, PaneInfo, PaneStatus, WindowInfo, FIELD_SEP,
+    PANE_FORMAT, TMUX_FIELD_SEP,
 };
 pub use mux::{
     is_tmux_pane_id, pane_mux_kind, parse_zellij_pane_id, qualify_host_pane, qualify_host_session,
@@ -121,6 +125,13 @@ fn valid_pane(p: &PaneId) -> Result<(), TmuxError> {
             "pane id must look like %12, got {id:?}"
         )))
     }
+}
+
+fn stderr_means_pane_gone(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("can't find pane")
+        || lower.contains("no such pane")
+        || lower.contains("pane not found")
 }
 
 /// Unique-per-call paste buffer name: `starfane_<pid>_<nanos>_<seq>`.
@@ -289,14 +300,14 @@ impl Tmux {
                 "-p",
                 "-t",
                 pane.as_str(),
-                "#{pane_in_mode}\x1f#{pane_mode}",
+                "#{pane_in_mode}\t#{pane_mode}",
             ],
             None,
         )?;
         let trimmed = state.trim_end_matches(['\n', '\r']);
-        let (in_mode_raw, mode_raw) = trimmed
-            .split_once(model::FIELD_SEP)
-            .unwrap_or((trimmed, ""));
+        let parts = model::split_tmux_fields(trimmed);
+        let in_mode_raw = parts.first().copied().unwrap_or(trimmed);
+        let mode_raw = parts.get(1).copied().unwrap_or("");
         if in_mode_raw.trim() == "0" {
             return Ok(true);
         }
@@ -701,6 +712,21 @@ impl Tmux {
         self.focus_pane(pane).map(|_| ())
     }
 
+    /// Kill a single tmux pane (`tmux kill-pane -t <pane_id>`).
+    ///
+    /// Automatically closes the containing window when `pane` is its sole pane while preserving
+    /// sibling split panes and the rest of the tmux session. Treats an already-gone pane or
+    /// missing server idempotently as `Ok(())`.
+    pub fn kill_pane(&self, pane: &PaneId) -> Result<(), TmuxError> {
+        valid_pane(pane)?;
+        match self.run(&["kill-pane", "-t", pane.as_str()], None) {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_no_server() => Ok(()),
+            Err(TmuxError::Command { ref stderr, .. }) if stderr_means_pane_gone(stderr) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Stop the tmux server on this socket. Intended for sandbox sockets in tests; a server
     /// that is already gone is not an error.
     pub fn kill_server(&self) -> Result<(), TmuxError> {
@@ -794,6 +820,10 @@ impl TerminalMux for Tmux {
 
     fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError> {
         Tmux::focus_pane(self, pane)
+    }
+
+    fn kill_pane(&self, pane: &PaneId) -> Result<(), TmuxError> {
+        Tmux::kill_pane(self, pane)
     }
 
     fn set_status(&self, pane: &PaneId, st: &PaneStatus) -> Result<(), TmuxError> {

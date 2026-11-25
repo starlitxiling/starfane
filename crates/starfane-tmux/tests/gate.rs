@@ -1873,3 +1873,107 @@ fn exit_copy_mode_recovers_scrolled_tmux_pane() {
         "RECOVERED_AFTER_COPY_MODE"
     );
 }
+
+#[test]
+fn kill_pane_validates_strict_pane_id_before_exec() {
+    // Use `/usr/bin/false` so any unintended subprocess call would yield `TmuxError::Command`,
+    // proving invalid targets fail strictly in `valid_pane` with `TmuxError::InvalidRequest`.
+    let tmux = Tmux::new(PathBuf::from("/usr/bin/false"), None);
+    for bad in [
+        "",
+        "%",
+        "12",
+        "teleop",
+        "teleop:3",
+        "teleop:3.0",
+        "%12a",
+        "%12; echo pwn",
+        "zj:work/1",
+        "local:%12",
+    ] {
+        let err = tmux.kill_pane(&PaneId::new(bad)).unwrap_err();
+        assert!(
+            matches!(err, TmuxError::InvalidRequest(_)),
+            "expected InvalidRequest for {bad:?}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn kill_pane_closes_single_pane_window_and_preserves_sibling_split_pane() {
+    let Some(sb) = Sandbox::new() else {
+        return;
+    };
+
+    // Window 0 (`solo`): 1 pane (`p_solo`).
+    let p_solo = sb
+        .tmux
+        .spawn_window(&SpawnWindow {
+            target_session: Some("close-test".into()),
+            create_session: true,
+            window_name: "solo".into(),
+            cwd: sb.dir.clone(),
+            env: vec![],
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        })
+        .unwrap();
+
+    // Window 1 (`split`): 2 split panes (`p_left` + `p_right`).
+    let p_left = sb
+        .tmux
+        .spawn_window(&SpawnWindow {
+            target_session: Some("close-test".into()),
+            create_session: false,
+            window_name: "split".into(),
+            cwd: sb.dir.clone(),
+            env: vec![],
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+        })
+        .unwrap();
+    let split_out = std::process::Command::new(&sb.tmux.bin)
+        .args([
+            "-L",
+            sb.tmux.socket_name.as_deref().unwrap(),
+            "split-window",
+            "-h",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            p_left.as_str(),
+            "-c",
+            &sb.dir.to_string_lossy(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ])
+        .output()
+        .unwrap();
+    assert!(split_out.status.success(), "{split_out:?}");
+    let p_right = PaneId::new(String::from_utf8_lossy(&split_out.stdout).trim());
+
+    assert_eq!(sb.tmux.list_windows().unwrap().len(), 2);
+    assert_eq!(sb.tmux.list_panes().unwrap().len(), 3);
+
+    // 1. Killing `p_solo` closes the 1-pane `solo` window while keeping `split` alive.
+    sb.tmux.kill_pane(&p_solo).unwrap();
+    let wins_after_solo = sb.tmux.list_windows().unwrap();
+    assert_eq!(wins_after_solo.len(), 1);
+    assert_eq!(wins_after_solo[0].window_name, "split");
+    let panes_after_solo = sb.tmux.list_panes().unwrap();
+    assert!(!panes_after_solo.iter().any(|p| p.pane_id == p_solo));
+    assert!(panes_after_solo.iter().any(|p| p.pane_id == p_left));
+    assert!(panes_after_solo.iter().any(|p| p.pane_id == p_right));
+
+    // 2. Killing an already-gone pane is idempotent.
+    sb.tmux.kill_pane(&p_solo).unwrap();
+
+    // 3. Killing `p_left` in the 2-pane split window preserves sibling `p_right`!
+    sb.tmux.kill_pane(&p_left).unwrap();
+    let panes_after_split = sb.tmux.list_panes().unwrap();
+    assert_eq!(panes_after_split.len(), 1);
+    assert_eq!(panes_after_split[0].pane_id, p_right);
+    assert_eq!(sb.tmux.list_windows().unwrap().len(), 1);
+}

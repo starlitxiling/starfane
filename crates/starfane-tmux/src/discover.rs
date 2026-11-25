@@ -273,12 +273,12 @@ impl Tmux {
                 "-p",
                 "-t",
                 pane_id.as_str(),
-                "#{history_size}\x1f#{pane_height}\x1f#{pane_in_mode}\x1f#{pane_dead}",
+                "#{history_size}\t#{pane_height}\t#{pane_in_mode}\t#{pane_dead}",
             ],
             None,
         )?;
         let meta_line = meta_raw.trim_end_matches(['\r', '\n']);
-        let parts: Vec<&str> = meta_line.split(crate::model::FIELD_SEP).collect();
+        let parts = crate::model::split_tmux_fields(meta_line);
         if parts.len() != 4 {
             return Err(TmuxError::Parse(format!(
                 "unexpected capture meta for {pane_id}: {meta_line:?}"

@@ -94,6 +94,7 @@ pub trait TerminalMux: Send + Sync {
 
     fn spawn_window(&self, req: &SpawnWindow) -> Result<PaneId, TmuxError>;
     fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError>;
+    fn kill_pane(&self, pane: &PaneId) -> Result<(), TmuxError>;
     fn set_status(&self, pane: &PaneId, st: &PaneStatus) -> Result<(), TmuxError>;
     fn clear_status(&self, pane: &PaneId) -> Result<(), TmuxError>;
     fn dump_layout(&self, session: &str) -> Result<String, TmuxError>;
