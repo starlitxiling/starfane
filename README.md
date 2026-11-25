@@ -73,14 +73,30 @@ Most coding-agent orchestrators wrap providers in one-shot headless `exec` / `-p
 
 ## Quickstart
 
-### Prerequisites
+### Option A: One-Prompt Agent Setup (Recommended)
+
+Send this prompt to Claude Code, Codex CLI, or Antigravity (`agy`). Your agent will inspect prerequisites, **ask for your confirmation before installing missing toolchains or writing hooks**, build `starfane`, and launch the local Web console on `http://127.0.0.1:27418/`:
+
+```text
+Please set up and start starfane (https://github.com/starlitxiling/starfane) on this machine and bring up its local Web console:
+
+1. Inspect my environment first (OS, git, rustc/cargo >= 1.82, tmux and/or zellij >= 0.44, and installed agent CLIs: claude / codex / agy).
+2. If Rust/Cargo or tmux/zellij is missing, or before modifying any agent hooks/MCP configs, show the exact commands or diff summary and ask for my explicit approval before installing or editing.
+3. Clone https://github.com/starlitxiling/starfane.git into ~/starfane (or pull if present), build `cargo build --release --bin starfane`, and symlink `~/.local/bin/starfane` (ensure `~/.local/bin` is on `PATH`).
+4. Run `starfane doctor` and `starfane install --all --dry-run`, show me the preview, then run `starfane install --all` once approved.
+5. Keep the default loopback config (`127.0.0.1:27418` with token auth enabled; only set `[web] port` in `~/.config/starfane/config.toml` if port 27418 is busy or I request another port), start `starfane daemon --detach`, verify `http://127.0.0.1:<port>/api/health` is healthy, and run `starfane web --print-url --no-open` to give me the ready-to-open local URL.
+```
+
+### Option B: Manual Setup
+
+#### Prerequisites
 
 - **Rust `1.82+`** and Cargo
 - **`tmux`** and/or **`zellij` `>= 0.44`** *(optional; auto-detected when installed)*
 - One or more interactive coding CLIs installed and authenticated: [`claude`](https://docs.anthropic.com/en/docs/claude-code), [`codex`](https://developers.openai.com/codex/cli), or `agy`
 - *(Optional)* `lark-cli` if you enable two-way Feishu notifications & quote-reply commands
 
-### 1. Build & Install
+#### 1. Build & Install
 
 ```bash
 git clone https://github.com/starlitxiling/starfane.git
@@ -130,7 +146,7 @@ Create `~/.config/starfane/config.toml` (missing files use safe `127.0.0.1` + to
 ```toml
 [web]
 bind = "127.0.0.1"              # Use "0.0.0.0" only when exposing to a private mesh / reverse proxy
-port = 7878
+port = 27418                    # Override if needed; change to any custom port you prefer
 auth_enabled = true             # Require per-boot token (or scoped_tokens); false only behind trusted CIDRs
 allowed_cidrs = []              # Network-agnostic IPv4/IPv6 CIDRs (e.g. ["10.88.0.0/16", "fd00::/8"])
 allowed_hosts = []              # Exact or *.suffix Host/Origin allowlist (e.g. ["console.example.com", "*.ts.net"])
@@ -229,7 +245,7 @@ display_name = "Local"          # Mutable at runtime via POST /api/hosts/{id}/re
 # id = "mac-work"
 # display_name = "Work Mac"
 # kind = "peer"
-# endpoints = ["http://10.144.144.2:7878", "http://100.64.0.2:7878"]
+# endpoints = ["http://10.144.144.2:27418", "http://100.64.0.2:27418"]
 # token_env = "STARFANE_MAC_WORK_TOKEN"
 # notify_ownership = "node_local" # Default for Peer nodes (Split Ownership: peer notifies locally)
 ```
@@ -300,16 +316,25 @@ cargo test -p starfane-tmux -- --include-ignored
 
 ## Roadmap
 
-Recently shipped:
-- ~~**Zellij (0.44+) Multiplexer Backend**~~ — Unified `TerminalMux` + native `ZellijMux` discovery, capture, safe injection, focus, and spawn.
-- ~~**Multi-Host Federation (`[[nodes]]`)**~~ — Mixed zero-install SSH `ControlMaster` and multi-endpoint Peer `starfaned` federation with host renaming.
-- ~~**Pluggable Notification Routing & Split Ownership**~~ — Opt-in `[[notifiers]]` (Feishu multi-profile, Telegram, Webhook, macOS), `[[notify_routes]]`, and `.starfane/team.toml` secret-free routing.
-- ~~**Network-Agnostic `AccessGate`**~~ — IPv4/IPv6 `allowed_cidrs`, wildcard `allowed_hosts`, presets, and `read_only` / admin `scoped_tokens`.
+### v0.1 — Core Control Plane & Embedded Console *(Shipped)*
+- [x] BYO-`tmux` live pane discovery, 7-point safety injection gate, and official `claude` / `codex` / `agy` hooks + stdio MCP (`starfane emit` `<10ms`)
+- [x] Zero-build ESM Web console with full cursor-paginated transcript, full terminal scrollback chunking, Prompt TOC, inline paste/image anchoring, and collapsible intermediate outputs
+- [x] Native `[tmux.backup]` periodic layout snapshots, reboot auto-restore, and `claude --resume` / `codex resume` session recovery
 
-Up next:
-- **Zellij Layout Backup & Remote SSH Zellij**: Extend snapshot backup/restore and zero-install SSH discovery to cover remote Zellij sessions alongside `tmux`.
-- **Interactive Pairing & Built-In Chat Adapters**: One-time short-code / QR pairing flow for mobile Web console onboarding, plus native Slack & Discord interactive adapters beyond generic Webhooks.
-- **Persistent Multi-Host Search & Metrics**: Cross-host transcript search and historical token/cost rollups across federated nodes.
+### v0.2 — Multiplexer Abstraction, Federation & Guardrails *(Shipped)*
+- [x] **Zellij (0.44+) Support** — Unified `TerminalMux` trait + `ZellijMux` session/pane discovery, capture, safe injection, focus, and spawning
+- [x] **Multi-Host Federation (`[[nodes]]`)** — Mixed zero-install SSH `ControlMaster` nodes and multi-endpoint Peer `starfaned` nodes with runtime host renaming
+- [x] **Pluggable Notification Routing & Split Ownership** — Opt-in `[[notifiers]]` (Feishu multi-profile, Telegram, Webhook, macOS), `[[notify_routes]]`, and secret-free `.starfane/team.toml` routing
+- [x] **Network-Agnostic `AccessGate` & Privacy Guarantee** — Precompiled IPv4/IPv6 `allowed_cidrs`, wildcard `allowed_hosts`, `read_only` / admin `scoped_tokens`, strict CSP, and zero telemetry
+
+### v0.3 — Cross-Host Persistence & Mobile Onboarding *(Planned)*
+- [ ] **Zellij Backup & Remote SSH Zellij** — Extend layout snapshot/restore and zero-install SSH discovery to cover remote Zellij sessions alongside `tmux`
+- [ ] **Interactive Pairing & Native Chat Adapters** — One-time QR / short-code onboarding for remote Web browsers, plus native Slack and Discord interactive cards
+- [ ] **Cross-Host Search & Usage Rollups** — Persistent conversation search and historical token/throughput analytics across federated nodes
+
+### Exploring
+- [ ] Pre-built release binaries (GitHub Releases / Homebrew tap) for source-free installation
+- [ ] Extensible adapter interface for community coding CLIs beyond `claude`, `codex`, and `agy`
 
 ---
 

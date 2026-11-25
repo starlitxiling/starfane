@@ -1119,9 +1119,11 @@ export function patchWorkspace(W) {
       const groupNodes = sortedGroups.map(([g, list]) => {
         const cKey = hb.id === 'local' ? g : `${hb.id}:${g}`;
         const isCollapsed = !q && UI.collapsedGroups.has(cKey);
+        const hasSel = list.some((s) => s.session_id === activeRootId);
         const attnSess = list.find((s) => ['needs_permission', 'needs_input', 'error'].includes(s.state))
           || list.find((s) => s.state === 'working');
-        return h('div', { class: 'ws-group' },
+        const groupCls = `ws-group${isCollapsed ? ' is-collapsed' : ' is-open'}${hasSel ? ' has-sel' : ''}`;
+        return h('div', { class: groupCls },
           h('button', {
             type: 'button',
             class: 'ws-group-btn',
@@ -1135,12 +1137,12 @@ export function patchWorkspace(W) {
               APP.rerender();
             },
           },
-          h('span', { class: 'row-nowrap', style: 'gap:4px;min-width:0' },
+          h('span', { class: 'row-nowrap', style: 'gap:5px;min-width:0' },
             span('ws-group-caret', isCollapsed ? '▸' : '▾'),
-            h('span', { class: 'trunc' }, g),
+            h('span', { class: 'ws-group-name trunc' }, g),
             isCollapsed && attnSess ? h('i', { class: `dot dot-${attnSess.state}`, title: stateText(attnSess.state) }) : null),
-          span('tag tabular', list.length)),
-          !isCollapsed ? list.map((s) => sidebarSessionItem(s)) : null);
+          span('ws-group-cnt tabular', list.length)),
+          !isCollapsed ? h('div', { class: 'ws-group-body' }, list.map((s) => sidebarSessionItem(s))) : null);
       });
       return h('div', { class: 'ws-host-block', 'data-host-id': hb.id },
         hostHead,

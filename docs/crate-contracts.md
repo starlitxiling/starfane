@@ -1073,7 +1073,7 @@ pub mod mcp { pub fn run_stdio(agent: AgentKind, socket: &Path) -> i32; }   // å
 ```toml
 [web]
 bind = "127.0.0.1"
-port = 7878
+port = 27418
 
 [notify]
 watch_window_secs = 90

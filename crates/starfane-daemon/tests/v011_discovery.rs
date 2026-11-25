@@ -114,7 +114,7 @@ async fn http_req(
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let payload = body.unwrap_or("");
     let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:7878\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:27418\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
         payload.len()
     );
     if let Some(tok) = token {
@@ -630,7 +630,7 @@ async fn auth_free_tailscale_mode_exposes_health_state_models_and_subagent_trans
     let mut config = StarfaneConfig::default();
     config.paths.tmux = "/usr/bin/false".into();
     config.web.bind = "0.0.0.0".into();
-    config.web.port = 7878;
+    config.web.port = 27418;
     config.web.auth_enabled = false;
     config.web.allow_tailscale = true;
     let core = Core::new(&DaemonConfig {
@@ -692,7 +692,7 @@ async fn auth_free_tailscale_mode_exposes_health_state_models_and_subagent_trans
     let mut stream = TcpStream::connect(&addr).await.unwrap();
     stream
         .write_all(
-            b"GET /api/state HTTP/1.1\r\nHost: 100.64.10.20:7878\r\nConnection: close\r\n\r\n",
+            b"GET /api/state HTTP/1.1\r\nHost: 100.64.10.20:27418\r\nConnection: close\r\n\r\n",
         )
         .await
         .unwrap();
@@ -705,7 +705,7 @@ async fn auth_free_tailscale_mode_exposes_health_state_models_and_subagent_trans
     let mut stream_bad = TcpStream::connect(&addr).await.unwrap();
     stream_bad
         .write_all(
-            b"GET /api/state HTTP/1.1\r\nHost: 192.168.1.5:7878\r\nConnection: close\r\n\r\n",
+            b"GET /api/state HTTP/1.1\r\nHost: 192.168.1.5:27418\r\nConnection: close\r\n\r\n",
         )
         .await
         .unwrap();
@@ -750,7 +750,7 @@ async fn auth_free_easytier_only_mode_allows_easytier_and_blocks_tailscale_and_l
     let mut config = StarfaneConfig {
         web: starfane_daemon::config::WebConfig {
             bind: "0.0.0.0".into(),
-            port: 7878,
+            port: 27418,
             auth_enabled: false,
             allow_easytier: true,
             easytier_cidrs: vec!["10.144.144.0/24".into()],
@@ -775,7 +775,7 @@ async fn auth_free_easytier_only_mode_allows_easytier_and_blocks_tailscale_and_l
     // 1. EasyTier IP Host header succeeds without token.
     let resp_et = raw_http_exchange(
         &addr,
-        b"GET /api/state HTTP/1.1\r\nHost: 10.144.144.3:7878\r\nConnection: close\r\n\r\n",
+        b"GET /api/state HTTP/1.1\r\nHost: 10.144.144.3:27418\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(resp_et.starts_with("HTTP/1.1 200"), "{resp_et}");
@@ -783,7 +783,7 @@ async fn auth_free_easytier_only_mode_allows_easytier_and_blocks_tailscale_and_l
     // 2. EasyTier same-origin POST succeeds.
     let post_body = br#"{"minutes":0}"#;
     let post_et = format!(
-        "POST /api/feishu/mute HTTP/1.1\r\nHost: 10.144.144.3:7878\r\nOrigin: http://10.144.144.3:7878\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /api/feishu/mute HTTP/1.1\r\nHost: 10.144.144.3:27418\r\nOrigin: http://10.144.144.3:27418\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         post_body.len(),
         std::str::from_utf8(post_body).unwrap()
     );
@@ -793,20 +793,20 @@ async fn auth_free_easytier_only_mode_allows_easytier_and_blocks_tailscale_and_l
     // 3. Tailscale IP, MagicDNS *.ts.net Host, Tailscale Origin, and LAN Host are rejected (403).
     let resp_ts_ip = raw_http_exchange(
         &addr,
-        b"GET /api/state HTTP/1.1\r\nHost: 100.64.10.20:7878\r\nConnection: close\r\n\r\n",
+        b"GET /api/state HTTP/1.1\r\nHost: 100.64.10.20:27418\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(resp_ts_ip.starts_with("HTTP/1.1 403"), "{resp_ts_ip}");
 
     let resp_ts_dns = raw_http_exchange(
         &addr,
-        b"GET /api/state HTTP/1.1\r\nHost: devbox.ts.net:7878\r\nConnection: close\r\n\r\n",
+        b"GET /api/state HTTP/1.1\r\nHost: devbox.ts.net:27418\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(resp_ts_dns.starts_with("HTTP/1.1 403"), "{resp_ts_dns}");
 
     let post_ts_origin = format!(
-        "POST /api/feishu/mute HTTP/1.1\r\nHost: 10.144.144.3:7878\r\nOrigin: http://100.64.10.20:7878\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /api/feishu/mute HTTP/1.1\r\nHost: 10.144.144.3:27418\r\nOrigin: http://100.64.10.20:27418\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         post_body.len(),
         std::str::from_utf8(post_body).unwrap()
     );
@@ -818,7 +818,7 @@ async fn auth_free_easytier_only_mode_allows_easytier_and_blocks_tailscale_and_l
 
     let resp_lan = raw_http_exchange(
         &addr,
-        b"GET /api/state HTTP/1.1\r\nHost: 10.17.0.50:7878\r\nConnection: close\r\n\r\n",
+        b"GET /api/state HTTP/1.1\r\nHost: 10.17.0.50:27418\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(resp_lan.starts_with("HTTP/1.1 403"), "{resp_lan}");
@@ -1208,7 +1208,7 @@ exit 0
     // GET preview returns HTTP 200 + `Content-Type: image/png` + exact PNG magic bytes.
     let mut stream = TcpStream::connect(&addr).await.unwrap();
     let get_req = format!(
-        "GET {preview_url} HTTP/1.1\r\nHost: 127.0.0.1:7878\r\nAuthorization: Bearer {tok}\r\nConnection: close\r\n\r\n"
+        "GET {preview_url} HTTP/1.1\r\nHost: 127.0.0.1:27418\r\nAuthorization: Bearer {tok}\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(get_req.as_bytes()).await.unwrap();
     let mut raw_resp = Vec::new();

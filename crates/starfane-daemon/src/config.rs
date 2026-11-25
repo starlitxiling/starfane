@@ -8,6 +8,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 pub const DEFAULT_EASYTIER_CIDR: &str = "10.144.144.0/24";
+/// Unassigned, non-ephemeral default Web console port (distinct from 7878/8080/3000 collisions).
+pub const DEFAULT_WEB_PORT: u16 = 27418;
 
 /// Optional extra scoped API token (e.g. read-only viewer or peer federation client).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +52,7 @@ impl Default for WebConfig {
     fn default() -> Self {
         WebConfig {
             bind: "127.0.0.1".into(),
-            port: 7878,
+            port: DEFAULT_WEB_PORT,
             auth_enabled: true,
             allow_easytier: true,
             easytier_cidrs: vec![DEFAULT_EASYTIER_CIDR.into()],
@@ -829,7 +831,7 @@ mod tests {
     fn config_defaults_and_partial() {
         let def = WebConfig::default();
         assert_eq!(def.bind, "127.0.0.1");
-        assert_eq!(def.port, 7878);
+        assert_eq!(def.port, DEFAULT_WEB_PORT);
         assert!(def.auth_enabled);
         assert!(def.allow_easytier);
         assert_eq!(def.easytier_cidrs, vec![DEFAULT_EASYTIER_CIDR]);

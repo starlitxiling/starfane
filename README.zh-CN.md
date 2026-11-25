@@ -71,14 +71,30 @@
 
 ## 快速开始
 
-### 环境准备
+### 方式一：把 Prompt 发给你的 Coding Agent 一键搭建（推荐）
+
+直接复制下面这段 Prompt 发给 Claude Code、Codex CLI 或 Antigravity（`agy`）。Agent 会先体检环境，在安装缺失工具链或写入 Hook 前**向你请求授权**，随后自动编译并在本地地址启动 Web 控制台（默认 `http://127.0.0.1:27418/`）：
+
+```text
+请在当前机器上帮我部署并启动 starfane（https://github.com/starlitxiling/starfane），运行出本地 Web 控制台：
+
+1. 先只读检查当前环境（操作系统、git、rustc/cargo >= 1.82、tmux 与/或 zellij >= 0.44，以及已安装的 Agent CLI：claude / codex / agy）。
+2. 如果缺少 Rust 工具链或 tmux / zellij，或者准备修改 Agent Hook / MCP 配置，请先列出将要执行的具体命令或配置预览，向我请求确认后再安装与写入。
+3. 将 https://github.com/starlitxiling/starfane.git 克隆到 ~/starfane（若已存在则拉取更新），执行 `cargo build --release --bin starfane`，并软链到 `~/.local/bin/starfane`（确认 `~/.local/bin` 已在 `PATH` 中）。
+4. 运行 `starfane doctor` 与 `starfane install --all --dry-run` 展示变更预览，经我确认后执行 `starfane install --all`。
+5. 保持本地回环默认安全配置（`127.0.0.1:27418` + Token 鉴权；若 27418 已被占用或我另有指定，再修改 `~/.config/starfane/config.toml` 的 `[web] port`），启动 `starfane daemon --detach`，确认 `http://127.0.0.1:<port>/api/health` 返回正常后，运行 `starfane web --print-url --no-open` 把可直接访问的本地网页地址输出给我。
+```
+
+### 方式二：手动安装
+
+#### 环境准备
 
 - **Rust `1.82+`** 与 Cargo
 - **`tmux`** 与/或 **`zellij` `>= 0.44`** *（可选，已安装时自动识别）*
 - 已安装并登录至少一个编码 Agent CLI：[`claude`](https://docs.anthropic.com/en/docs/claude-code)、[`codex`](https://developers.openai.com/codex/cli) 或 `agy`
 - *（可选）* `lark-cli`（若需要飞书双向卡片通知）
 
-### 1. 编译与安装
+#### 1. 编译与安装
 
 ```bash
 git clone https://github.com/starlitxiling/starfane.git
@@ -126,7 +142,7 @@ starfane web --print-url --no-open
 ```toml
 [web]
 bind = "127.0.0.1"              # 若通过私有组网或反向代理对外开放可设为 "0.0.0.0"
-port = 7878
+port = 27418                    # 避开常见端口冲突，可按需改为任意自定义端口
 auth_enabled = true             # 默认开启 Token 鉴权（含 scoped_tokens）；仅在可信组网 CIDR 下可设为 false
 allowed_cidrs = []              # 组网无关 IPv4/IPv6 白名单，如 ["10.88.0.0/16", "fd00::/8"]
 allowed_hosts = []              # 精确或 *.suffix 域名白名单，如 ["console.example.com", "*.ts.net"]
@@ -225,7 +241,7 @@ display_name = "Local"          # 运行期可通过 Web 弹窗或 POST /api/hos
 # id = "mac-work"
 # display_name = "公司 Mac"
 # kind = "peer"
-# endpoints = ["http://10.144.144.2:7878", "http://100.64.0.2:7878"]
+# endpoints = ["http://10.144.144.2:27418", "http://100.64.0.2:27418"]
 # token_env = "STARFANE_MAC_WORK_TOKEN"
 # notify_ownership = "node_local" # Peer 节点默认 Split Ownership：由对端本机通知，Hub 不重复推送
 ```
@@ -294,16 +310,25 @@ cargo test -p starfane-tmux -- --include-ignored
 
 ## 路线图
 
-已完成落地：
-- ~~**Zellij（0.44+）原生适配**~~ — 统一 `TerminalMux` 与 `ZellijMux` 发现、全量抓屏、安全注入、焦点探测与创建窗格。
-- ~~**多机联邦协同（`[[nodes]]`）**~~ — 支持 SSH `ControlMaster` 免安装节点与多候选地址 Peer `starfaned` 联邦混搭及主机重命名。
-- ~~**按需多渠道通知路由与 Split Ownership**~~ — 支持 `[[notifiers]]`（飞书多 Profile、Telegram、Webhook、macOS 原生）、`[[notify_routes]]` 与 `.starfane/team.toml` 无密钥路由。
-- ~~**组网无关通用访问门禁（`AccessGate`）**~~ — IPv4/IPv6 `allowed_cidrs`、通配 `allowed_hosts`、具名预设与 `read_only` / 管理 `scoped_tokens`。
+### v0.1 — 核心控制面与内嵌控制台 *(已发布)*
+- [x] BYO-`tmux` 实时窗格发现、7 重安全注入门禁，以及 `claude` / `codex` / `agy` 官方 Hook 与 stdio MCP 接入（`starfane emit` 亚 10ms 热路径）
+- [x] 零构建 ESM Web 控制台：支持游标分页全量对话记录、全量终端分块滚动、提问目录、粘贴/图片原位锚定与中间过程折叠卡片
+- [x] 原生 `[tmux.backup]` 定期布局快照、重启自动恢复，以及 `claude --resume` / `codex resume` 会话重建
 
-后续计划：
-- **Zellij 布局备份与远程 SSH Zellij 纳管**：将布局快照恢复与零安装 SSH 发现能力扩展至远程 Zellij 会话。
-- **移动端短码配对与更多内置交互渠道**：一次性扫码/短码配对接入 Web 控制台，并在通用 Webhook 之外提供 Slack / Discord 原生交互卡片适配器。
-- **跨主机全局检索与历史统计**：支持跨联邦节点的历史对话搜索与 Token/吞吐趋势汇总。
+### v0.2 — 复用器抽象、多机联邦与安全隔离 *(已发布)*
+- [x] **Zellij（0.44+）原生适配** — 统一 `TerminalMux` 抽象与 `ZellijMux` 发现、全量抓屏、安全注入、焦点探测与创建窗格
+- [x] **多机联邦协同（`[[nodes]]`）** — 支持 SSH `ControlMaster` 免安装节点与多候选地址 Peer `starfaned` 联邦混搭及运行时主机重命名
+- [x] **按需多渠道通知路由与 Split Ownership** — 支持 `[[notifiers]]`（飞书多 Profile、Telegram、Webhook、macOS 原生）、`[[notify_routes]]` 与 `.starfane/team.toml` 无密钥路由
+- [x] **通用访问门禁（`AccessGate`）与隐私承诺** — IPv4/IPv6 `allowed_cidrs`、通配 `allowed_hosts`、`scoped_tokens`、严格 CSP 与彻底零遥测
+
+### v0.3 — 跨节点持久化与便捷接入 *(计划中)*
+- [ ] **Zellij 布局备份与远程 SSH Zellij 纳管** — 将布局快照恢复与零安装 SSH 发现能力扩展至远程 Zellij 会话
+- [ ] **移动端短码配对与更多原生交互渠道** — 一次性扫码/短码配对接入 Web 控制台，并在通用 Webhook 之外提供 Slack / Discord 原生交互卡片适配器
+- [ ] **跨主机全局检索与历史用量汇总** — 支持跨联邦节点的历史对话检索与 Token / 吞吐趋势统计
+
+### 长期探索
+- [ ] 提供 GitHub Releases 预编译二进制与 Homebrew Tap（免 Rust 编译一键安装）
+- [ ] 面向社区编码 CLI 的可扩展通用适配器 / Webhook 接口
 
 ---
 

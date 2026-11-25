@@ -359,12 +359,12 @@ mod tests {
         // Reverse proxy custom hosts & wildcards (omitted port, 80, 443, and web.port)
         assert!(gate.is_allowed_host("console.example.com"));
         assert!(gate.is_allowed_host("console.example.com:443"));
-        assert!(gate.is_allowed_host("console.example.com:7878"));
+        assert!(gate.is_allowed_host("console.example.com:27418"));
         assert!(!gate.is_allowed_host("console.example.com:9999"));
         assert!(gate.is_allowed_host("dev.corp.internal"));
         assert!(gate.is_allowed_host("mac.tail123.ts.net"));
-        assert!(gate.is_allowed_host("[fd00:1234::1]:7878"));
-        assert!(!gate.is_allowed_host("evil.example.com:7878"));
+        assert!(gate.is_allowed_host("[fd00:1234::1]:27418"));
+        assert!(!gate.is_allowed_host("evil.example.com:27418"));
 
         // Explicit custom reverse-proxy port in allowed_hosts & default HTTP port 80 omitted-port loopback.
         let cfg_custom = WebConfig {
