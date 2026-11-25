@@ -87,6 +87,7 @@ export const S = {
   attention: [],
   models: null,
   tmuxSessions: [],
+  tmuxSessionsByHost: new Map(),
   terminalFont: '',
   slashCmds: new Map(),
   slashFetching: new Set(),
@@ -371,8 +372,65 @@ export const stageName = (k) => stageLabel(k);
 export const groupDisplayName = (g) => (g === NON_TMUX_GROUP ? L('非 tmux / 后台', 'Non-tmux / Background') : g);
 export const short = (s, n = 8) => (s ? String(s).slice(0, n) : '—');
 
+export const RTT_FAST_MAX_MS = 100;
+export const RTT_MEDIUM_MAX_MS = 300;
+const EPOCH_MS_THRESHOLD = 1_000_000_000_000;
+
 export function hostOf(s) {
   return (s?.host_id && String(s.host_id).trim()) || 'local';
+}
+
+export function isRemoteHost(hostId) {
+  const id = (hostId && String(hostId).trim()) || 'local';
+  return id !== 'local';
+}
+
+export function hostRecord(hostId) {
+  const id = (hostId && String(hostId).trim()) || 'local';
+  return S.hosts.get(id) || null;
+}
+
+export function sortedHosts() {
+  const list = [...S.hosts.values()].filter((h) => h && h.id);
+  if (!list.length) {
+    return [{ id: 'local', display_name: 'Local', kind: 'local', status: 'online' }];
+  }
+  return list.sort((a, b) => {
+    if (a.id === 'local') return -1;
+    if (b.id === 'local') return 1;
+    return a.id.localeCompare(b.id);
+  });
+}
+
+export function hostStatusLabel(status) {
+  return {
+    online: L('在线', 'Online'),
+    degraded: L('连接降级', 'Degraded'),
+    offline: L('已离线', 'Offline'),
+  }[status] || String(status || '');
+}
+
+export function rttTone(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return 'fast';
+  if (ms <= RTT_FAST_MAX_MS) return 'fast';
+  if (ms <= RTT_MEDIUM_MAX_MS) return 'med';
+  return 'slow';
+}
+
+export function fmtRtt(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+export function formatRetryCountdown(nextRetryMs) {
+  if (typeof nextRetryMs !== 'number' || !Number.isFinite(nextRetryMs) || nextRetryMs <= 0) return '';
+  const remMs = nextRetryMs > EPOCH_MS_THRESHOLD
+    ? Math.max(0, nextRetryMs - Date.now())
+    : nextRetryMs;
+  if (remMs <= 0) return '';
+  const secs = Math.ceil(remMs / 1000);
+  return L(`${secs}s 后重试`, `retry in ${secs}s`);
 }
 
 export function hostDisplayName(hostId, fallbackSession = null) {
@@ -688,13 +746,17 @@ export function inboxItems() {
 
 export const alertCount = () => inboxItems().length;
 
-export function knownProjects() {
+export function knownProjects(hostId = null) {
+  const scopeHost = hostId != null && String(hostId).trim() ? String(hostId).trim() : null;
   const set = new Set();
   for (const s of S.sessions.values()) {
+    if (scopeHost && hostOf(s) !== scopeHost) continue;
     if (s.git_root) set.add(s.git_root);
     else if (s.cwd) set.add(s.cwd);
   }
-  for (const p of S.pipelines.values()) if (p.project?.root) set.add(p.project.root);
+  if (!scopeHost || scopeHost === 'local') {
+    for (const p of S.pipelines.values()) if (p.project?.root) set.add(p.project.root);
+  }
   return [...set];
 }
 

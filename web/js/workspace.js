@@ -48,6 +48,7 @@ import {
   loadSessionOutput,
   loadSlashCommands,
   loadTranscript,
+  probeHostApi,
   qs,
   sessionNeedsLiveTail,
   syncStateSilent,
@@ -67,6 +68,7 @@ import {
 } from './composer.js';
 import { renderMarkdown } from './markdown.js';
 import { L, getLang } from './i18n.js';
+import { canCloseSessionWindow, openCloseSessionModal, windowGroupKeyOf } from './overlays.js';
 import {
   APP,
   S,
@@ -75,11 +77,15 @@ import {
   currentSession,
   draft,
   enc,
+  fmtRtt,
+  formatRetryCountdown,
   groupDisplayName,
   hashMessage,
   hashStr,
   hostDisplayName,
   hostOf,
+  hostStatusLabel,
+  isRemoteHost,
   modelEffortLabel,
   muxKindOf,
   paneDisplayId,
@@ -87,6 +93,7 @@ import {
   pvKeyOf,
   pvModeOf,
   rootSessions,
+  rttTone,
   saveCollapsedGroups,
   sessionLabel,
   stateText,
@@ -427,6 +434,39 @@ function sessionAlertBanner(s) {
     btn(L('清除异常状态', 'Clear error state'), { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => ackSessionError(s) }));
 }
 
+function buildRttPill(rttMs) {
+  if (typeof rttMs !== 'number' || !Number.isFinite(rttMs) || rttMs < 0) return null;
+  const label = fmtRtt(rttMs);
+  if (!label) return null;
+  return h('span', {
+    class: `tag mono rtt-pill rtt-${rttTone(rttMs)}`,
+    title: L(`往返延迟 ${label}`, `Round-trip latency ${label}`),
+  }, label);
+}
+
+function buildStaleBanner(s, staleErr, onRetry) {
+  if (!staleErr) return null;
+  const hid = hostOf(s);
+  const remote = isRemoteHost(hid);
+  const hRec = remote ? S.hosts.get(hid) : null;
+  const hStatus = hRec?.status || 'online';
+  const showReconnect = remote && (hStatus === 'degraded' || hStatus === 'offline');
+  return h('div', { class: 'stale-banner', role: 'status' },
+    h('span', { class: 'stale-banner-msg' },
+      h('i', { class: `dot dot-${hStatus === 'offline' ? 'down' : 'degraded'}` }),
+      h('span', null, L(
+        `同步暂时受阻，正显示缓存内容：${staleErr}`,
+        `Sync interrupted — showing cached output: ${staleErr}`,
+      ))),
+    h('span', { class: 'stale-banner-acts' },
+      onRetry ? btn(L('重试', 'Retry'), { cls: 'xs', onclick: onRetry }) : null,
+      showReconnect ? btn(L('重连主机', 'Reconnect'), {
+        cls: 'xs',
+        busyKey: `probe-host:${hid}`,
+        onclick: () => probeHostApi(hid),
+      }) : null));
+}
+
 function buildGlyphTogglePill() {
   const native = detectNerdFontSupport();
   const eff = effectiveGlyphMode();
@@ -450,6 +490,7 @@ function buildRawToolbar(pane, curMode, actualLines, pv) {
   return h('div', { class: 'raw-toolbar' },
     h('div', { class: 'row-nowrap', style: 'gap:8px;min-width:0' },
       span('muted tabular', statusText),
+      pv?.staleErr ? span('tag soft-amber', L('缓存', 'Cached')) : null,
       pv?.paginated ? span('tag soft-blue', L('已暂停自动滚动', 'Auto-scroll paused')) : null),
     h('div', { class: 'row-nowrap', style: 'gap:6px;flex-wrap:wrap' },
       h('div', { class: 'view-seg' }, PREVIEW_STEPS.map((step) => h('button', {
@@ -973,12 +1014,13 @@ function patchLiveTail(tv, s, pv, autoOpenTail, tailSig) {
 }
 
 function computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, errSig, lang) {
+  const staleSig = pv?.staleErr ? hashStr(pv.staleErr) : '';
   if (mode === 'raw') {
     if (!pane) return `raw:nopane:${s.session_id}:${errSig}:${lang}`;
     if (!pv || (pv.state === 'loading' && !pv.text)) return `raw:loading:${pane}:${curPvMode}:${errSig}:${lang}`;
     if (pv.state === 'err' && !pv.text) return `raw:err:${pane}:${curPvMode}:${pv.err}:${errSig}:${lang}`;
     if (!pv.text.trim()) return `raw:empty:${pane}:${curPvMode}:${errSig}:${lang}`;
-    return `raw:ok:${pane}:${curPvMode}:${pv.hash}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
+    return `raw:ok:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
   }
   if (!pane) {
     if (tr?.state === 'loading') return `read:trload:${s.session_id}:${errSig}:${lang}`;
@@ -990,7 +1032,7 @@ function computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, err
   }
   if (pv?.state === 'err' && !pv.text) return `read:err:${pane}:${curPvMode}:${pv.err}:${errSig}:${lang}`;
   if (!pv?.text?.trim()) return `read:empty:${pane}:${curPvMode}:${errSig}:${lang}`;
-  return `read:pv:${pane}:${curPvMode}:${pv.hash}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
+  return `read:pv:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
 }
 
 export function buildOutputBody(s) {
@@ -1002,8 +1044,14 @@ export function buildOutputBody(s) {
   const tr = S.transcripts.get(s.session_id);
   const glyphSig = `${UI.termGlyphMode}:${effectiveGlyphMode()}`;
   const lang = getLang();
-  const errSig = `${s.state}:${hashStr(s.last_error || '')}:${UI.busy.has(`ack:${s.session_id}`) ? 1 : 0}`;
+  const hid = hostOf(s);
+  const hStatus = isRemoteHost(hid) ? (S.hosts.get(hid)?.status || 'online') : 'online';
+  const errSig = `${s.state}:${hashStr(s.last_error || '')}:${UI.busy.has(`ack:${s.session_id}`) ? 1 : 0}:${hStatus}:${UI.busy.has(`probe-host:${hid}`) ? 1 : 0}`;
   const alertBanner = sessionAlertBanner(s);
+  const pvStaleBanner = pv?.staleErr
+    ? buildStaleBanner(s, pv.staleErr, () => loadPreview(pane, { mode: curPvMode, silent: false }))
+    : null;
+  const staleSig = pv?.staleErr ? hashStr(pv.staleErr) : '';
 
   if (mode === 'raw') {
     if (!pane) {
@@ -1041,11 +1089,12 @@ export function buildOutputBody(s) {
     const cleanRaw = formatTerminalText(pv.text);
     const actualLines = cleanRaw ? cleanRaw.split('\n').length : 0;
     return {
-      sig: `raw:ok:${pane}:${curPvMode}:${pv.hash}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`,
+      sig: `raw:ok:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`,
       sourceLabel: L('原始终端', 'Raw terminal'),
       node: h('div', { class: 'raw-shell stack-sm' },
         alertBanner,
         buildRawToolbar(pane, curPvMode, actualLines, pv),
+        pvStaleBanner,
         buildRawOlderBar(pane, pv),
         renderChunkedTerminal(cleanRaw)),
     };
@@ -1053,13 +1102,18 @@ export function buildOutputBody(s) {
 
   if (tr?.state === 'ok' && tr.source === 'transcript' && tr.messages.length > 0) {
     const tv = createTimelineView(s.session_id);
-    if (alertBanner) tv.alertSlot.replaceChildren(alertBanner);
+    const trStaleErr = tr.staleErr || pv?.staleErr || '';
+    const trStaleBanner = trStaleErr
+      ? buildStaleBanner(s, trStaleErr, () => loadSessionOutput(s, { silent: false, forcePreview: Boolean(pv?.staleErr) }))
+      : null;
+    const alertNodes = [alertBanner, trStaleBanner].filter(Boolean);
+    if (alertNodes.length) tv.alertSlot.replaceChildren(...alertNodes);
     const hb = buildHistoryBar(s, tr);
     if (hb) tv.historySlot.replaceChildren(hb);
     reconcileTimelineChunks(tv, s, tr);
     patchLiveTail(tv, s, pv, sessionNeedsLiveTail(s, tr), `${pv?.hash || ''}:${glyphSig}`);
     return {
-      sig: `read:tr:${s.session_id}:${tr.hash}:${errSig}:${lang}`,
+      sig: `read:tr:${s.session_id}:${tr.hash}:${hashStr(trStaleErr)}:${errSig}:${lang}`,
       sourceLabel: L('对话记录', 'Transcript'),
       node: tv.root,
     };
@@ -1088,7 +1142,7 @@ export function buildOutputBody(s) {
   }
   const turns = parseTerminalTurns(pv.text, s.agent);
   const fallbackToolbar = buildRawToolbar(pane, curPvMode, pv.text.split('\n').length, pv);
-  const pvSig = `read:pv:${pane}:${curPvMode}:${pv.hash}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
+  const pvSig = `read:pv:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
   if (!turns.length) {
     return {
       sig: pvSig,
@@ -1096,6 +1150,7 @@ export function buildOutputBody(s) {
       node: h('div', { class: 'timeline' },
         alertBanner,
         fallbackToolbar,
+        pvStaleBanner,
         buildRawOlderBar(pane, pv),
         h('article', { class: 'msg-card assistant' }, renderChunkedTerminal(formatTerminalText(pv.text)))),
     };
@@ -1103,7 +1158,7 @@ export function buildOutputBody(s) {
   return {
     sig: pvSig,
     sourceLabel: L('终端 Markdown', 'Terminal Markdown'),
-    node: h('div', { class: 'timeline' }, alertBanner, fallbackToolbar, buildRawOlderBar(pane, pv), renderTimelineCards(s, turns)),
+    node: h('div', { class: 'timeline' }, alertBanner, fallbackToolbar, pvStaleBanner, buildRawOlderBar(pane, pv), renderTimelineCards(s, turns)),
   };
 }
 
@@ -1123,16 +1178,25 @@ function syncOutputViewport(vp, s) {
   const tr = S.transcripts.get(s.session_id);
   const glyphSig = `${UI.termGlyphMode}:${effectiveGlyphMode()}`;
   const lang = getLang();
-  const errSig = `${s.state}:${hashStr(s.last_error || '')}:${UI.busy.has(`ack:${s.session_id}`) ? 1 : 0}:${lang}`;
+  const hid = hostOf(s);
+  const hStatus = isRemoteHost(hid) ? (S.hosts.get(hid)?.status || 'online') : 'online';
+  const baseErrSig = `${s.state}:${hashStr(s.last_error || '')}:${UI.busy.has(`ack:${s.session_id}`) ? 1 : 0}:${hStatus}:${UI.busy.has(`probe-host:${hid}`) ? 1 : 0}:${lang}`;
   const sameView = vp.dataset.sid === s.session_id && vp.dataset.mode === mode;
   const isTranscript = mode === 'reading' && tr?.state === 'ok' && tr.source === 'transcript' && tr.messages.length > 0;
 
   if (isTranscript) {
     const autoOpenTail = sessionNeedsLiveTail(s, tr);
+    const tailOpen = UI.open.has(`tail:${s.session_id}`) || autoOpenTail;
+    const staleErr = tr.staleErr || (tailOpen ? (pv?.staleErr || '') : '');
+    const errSig = `${baseErrSig}:${hashStr(staleErr)}`;
     const tailSig = `${pv?.hash || ''}:${glyphSig}:${autoOpenTail ? 1 : 0}:${paneDisplayId(s)}:${lang}`;
     const historySig = `${tr.startSeq}:${tr.totalMessages}:${tr.messages.length}:${tr.hasMore ? 1 : 0}:${tr.explicitAll ? 1 : 0}:${tr.autoPollPaused ? 1 : 0}:${tr.latestTotalMessages || 0}:${UI.busy.has(`trmore:${s.session_id}`) ? 1 : 0}:${UI.busy.has(`trall:${s.session_id}`) ? 1 : 0}:${lang}`;
     const messagesSig = `${s.session_id}:${s.agent}:${s.model || ''}:${s.effort || ''}:${s.is_subagent ? 1 : 0}:${s.state === 'ended' ? 1 : 0}:${tr.hash}:${lang}`;
     const fullSig = `read:tr:${messagesSig}`;
+    const renderAlertNodes = () => [
+      sessionAlertBanner(s),
+      staleErr ? buildStaleBanner(s, staleErr, () => loadSessionOutput(s, { silent: false, forcePreview: Boolean(pv?.staleErr) })) : null,
+    ].filter(Boolean);
 
     const tv = vp._tv;
     if (sameView && tv && tv.sid === s.session_id && tv.root.isConnected) {
@@ -1141,8 +1205,8 @@ function syncOutputViewport(vp, s) {
       }
       const onlyTailChanged = tv.errSig === errSig && tv.historySig === historySig && tv.messagesSig === messagesSig;
       if (onlyTailChanged) {
-        const tailOpen = Boolean(tv.tailDetails?.open);
-        const atBottom = tailOpen && (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 64);
+        const isTailOpen = Boolean(tv.tailDetails?.open);
+        const atBottom = isTailOpen && (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 64);
         patchLiveTail(tv, s, pv, autoOpenTail, tailSig);
         if (atBottom && tv.tailDetails?.open) {
           vp.scrollTop = vp.scrollHeight;
@@ -1155,8 +1219,8 @@ function syncOutputViewport(vp, s) {
       const expandingReading = UI.loadingEarlierSid === s.session_id;
       if (tv.errSig !== errSig) {
         tv.errSig = errSig;
-        const alertBanner = sessionAlertBanner(s);
-        if (alertBanner) tv.alertSlot.replaceChildren(alertBanner);
+        const nodes = renderAlertNodes();
+        if (nodes.length) tv.alertSlot.replaceChildren(...nodes);
         else tv.alertSlot.replaceChildren();
       }
       if (tv.historySig !== historySig) {
@@ -1188,8 +1252,8 @@ function syncOutputViewport(vp, s) {
     // Fresh mount of persistent TimelineView (session switch, raw->reading, or loading->ready).
     const nextTv = createTimelineView(s.session_id);
     nextTv.errSig = errSig;
-    const alertBanner = sessionAlertBanner(s);
-    if (alertBanner) nextTv.alertSlot.replaceChildren(alertBanner);
+    const initAlerts = renderAlertNodes();
+    if (initAlerts.length) nextTv.alertSlot.replaceChildren(...initAlerts);
     nextTv.historySig = historySig;
     const hb = buildHistoryBar(s, tr);
     if (hb) nextTv.historySlot.replaceChildren(hb);
@@ -1209,7 +1273,7 @@ function syncOutputViewport(vp, s) {
   }
 
   // Non-transcript path: compute cheap signature BEFORE building any DOM!
-  const nextSig = computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, errSig, lang);
+  const nextSig = computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, baseErrSig, lang);
   if (sameView && vp.dataset.sig === nextSig) return;
 
   const prevHeight = sameView ? vp.scrollHeight : 0;
@@ -1316,7 +1380,7 @@ function outlineRailPane(s, prompts) {
   return railEl;
 }
 
-function sidebarSessionItem(s) {
+function sidebarSessionItem(s, splitWindowKeys = null) {
   const curId = currentSession()?.session_id;
   const sel = curId === s.session_id;
   const subs = subagentsOf(s.session_id).filter((c) => UI.showEnded || c.state !== 'ended');
@@ -1332,7 +1396,9 @@ function sidebarSessionItem(s) {
   const meLabel = modelEffortLabel(s.model, s.effort);
   const paneBadge = paneDisplayId(s);
   const mux = muxKindOf(s);
-  const card = h('button', {
+  const closable = canCloseSessionWindow(s);
+  const isSplit = Boolean(closable && splitWindowKeys && splitWindowKeys.has(windowGroupKeyOf(s)));
+  const cardBtn = h('button', {
     type: 'button',
     class: `ws-item${sel ? ' sel' : ''}`,
     'data-sid': s.session_id,
@@ -1354,6 +1420,22 @@ function sidebarSessionItem(s) {
       `CTX ${Math.round(pctVal)}%`, ctxBar(pctVal, true)) : null,
     tpsVal != null ? span('muted', `${tpsVal.toFixed(1)} tok/s`) : null) : null,
   s.last_message ? h('div', { class: 'ws-item-msg' }, s.last_message) : null);
+  const closeTip = isSplit
+    ? L(`关闭窗格 ${sessionLabel(s)}`, `Close pane ${sessionLabel(s)}`)
+    : L(`关闭窗口 ${sessionLabel(s)}`, `Close window ${sessionLabel(s)}`);
+  const card = h('div', { class: `ws-item-wrap${closable ? ' has-close' : ''}` },
+    cardBtn,
+    closable ? h('button', {
+      type: 'button',
+      class: 'ws-item-close',
+      'data-close-sid': s.session_id,
+      title: closeTip,
+      'aria-label': closeTip,
+      onclick: (e) => {
+        e.stopPropagation();
+        openCloseSessionModal(s.session_id);
+      },
+    }, '×') : null);
   if (!subs.length) return card;
   const subTree = h('div', { class: 'ws-sub-wrap' },
     h('button', {
@@ -1589,9 +1671,14 @@ export function createWorkspaceShell() {
       }
       renderDeliveryAlert(S.sessions.get(sid) || s);
       if (s.pane) {
-        setTimeout(() => loadSessionOutput(s, { silent: true }), 550);
-        setTimeout(() => loadSessionOutput(s, { silent: true }), 1600);
-        setTimeout(() => loadSessionOutput(s, { silent: true }), 3200);
+        const hid = hostOf(s);
+        const hRec = isRemoteHost(hid) ? S.hosts.get(hid) : null;
+        const rttShift = isRemoteHost(hid) && typeof hRec?.rtt_ms === 'number' && Number.isFinite(hRec.rtt_ms)
+          ? Math.max(0, Math.round(hRec.rtt_ms))
+          : 0;
+        setTimeout(() => loadSessionOutput(s, { silent: true }), 550 + rttShift);
+        setTimeout(() => loadSessionOutput(s, { silent: true }), 1600 + rttShift);
+        setTimeout(() => loadSessionOutput(s, { silent: true }), 3200 + rttShift);
       }
       return r;
     }, (r) => {
@@ -1912,13 +1999,31 @@ export function patchWorkspace(W) {
     .map((hid) => hostMap.get(hid))
     .filter((hb) => hb.total > 0 || (S.hosts.size > 1 && S.hosts.has(hb.id)));
 
+  // Precompute active multi-pane tmux windows in O(N) for split-pane tooltips & signature tracking.
+  const windowPaneSets = new Map();
+  for (const sess of S.sessions.values()) {
+    if (!canCloseSessionWindow(sess)) continue;
+    const wk = windowGroupKeyOf(sess);
+    if (!wk) continue;
+    let set = windowPaneSets.get(wk);
+    if (!set) { set = new Set(); windowPaneSets.set(wk, set); }
+    set.add(String(sess.pane).trim());
+  }
+  const splitWindowKeys = new Set();
+  for (const [wk, set] of windowPaneSets.entries()) {
+    if (set.size > 1) splitWindowKeys.add(wk);
+  }
+
   // Signature-guard entire sidebar list so SSE bursts, tail ticks, and typing do ZERO sidebar rebuilds.
   const curId = active?.session_id || '';
   const sideSigParts = [lang, curId, activeRootId || '', q, UI.agentFilter, UI.showEnded ? 1 : 0, roots.length, S.hosts.size];
   for (let hi = 0; hi < visibleHostBlocks.length; hi++) {
     const hb = visibleHostBlocks[hi];
     const hRec = S.hosts.get(hb.id);
-    sideSigParts.push(`H:${hb.id}:${hRec?.display_name || ''}:${hRec?.status || ''}:${hRec?.error || ''}:${hb.total}`);
+    const retryCd = hb.id !== 'local' && (hRec?.status === 'degraded' || hRec?.status === 'offline')
+      ? formatRetryCountdown(hRec?.next_retry_ms)
+      : '';
+    sideSigParts.push(`H:${hb.id}:${hRec?.display_name || ''}:${hRec?.status || ''}:${hRec?.rtt_ms ?? ''}:${retryCd}:${UI.busy.has(`probe-host:${hb.id}`) ? 1 : 0}:${hRec?.error || ''}:${hb.total}`);
     for (const [g, list] of hb.groups.entries()) {
       const cKey = hb.id === 'local' ? g : `${hb.id}:${g}`;
       const isCollapsed = !q && UI.collapsedGroups.has(cKey);
@@ -1928,7 +2033,8 @@ export function patchWorkspace(W) {
         const subs = subagentsOf(x.session_id).filter((c) => UI.showEnded || c.state !== 'ended');
         const subOpen = UI.open.has(`subs:${x.session_id}`) || subs.some((c) => c.session_id === curId);
         const subSig = subs.length ? `${subOpen ? 1 : 0}:${subs.map((c) => `${c.session_id}:${c.state}:${c.tmux_label || ''}`).join(',')}` : '';
-        sideSigParts.push(`S:${x.session_id}:${x.state}:${x.agent}:${x.tmux_label || ''}:${x.tmux_target || ''}:${x.pane || ''}:${x.model || ''}:${x.effort || ''}:${x.mux_kind || ''}:${x.discovered_only ? 1 : 0}:${x.subagent_count || 0}:${x.metrics?.context_used_pct ?? ''}:${x.metrics?.tps ?? ''}:${hashStr(x.last_message || '')}:${subSig}`);
+        const isSplit = splitWindowKeys.has(windowGroupKeyOf(x)) ? 1 : 0;
+        sideSigParts.push(`S:${x.session_id}:${x.state}:${x.agent}:${x.tmux_label || ''}:${x.tmux_target || ''}:${x.pane || ''}:${x.model || ''}:${x.effort || ''}:${x.mux_kind || ''}:${x.discovered_only ? 1 : 0}:${x.subagent_count || 0}:${x.metrics?.context_used_pct ?? ''}:${x.metrics?.tps ?? ''}:${hashStr(x.last_message || '')}:${isSplit}:${subSig}`);
       }
     }
   }
@@ -1956,13 +2062,22 @@ export function patchWorkspace(W) {
           const pb = Math.min(...b[1].map((s) => STATE_PRIO[s.state] ?? 5));
           return pa - pb || a[0].localeCompare(b[0]);
         });
+        const isRemote = hb.id !== 'local';
+        const rttBadge = isRemote && hStatus !== 'offline' ? buildRttPill(hRec?.rtt_ms) : null;
+        const hostDotTip = [
+          hName,
+          hostStatusLabel(hStatus),
+          isRemote && hStatus !== 'offline' ? fmtRtt(hRec?.rtt_ms) : '',
+          hRec?.active_endpoint ? `(${hRec.active_endpoint})` : '',
+        ].filter(Boolean).join(' · ');
         const hostHead = h('div', { class: 'ws-host-head' },
           h('div', { class: 'ws-host-left' },
-            h('i', { class: `dot dot-${hStatus}`, title: `${hName} · ${hStatus}${hRec?.active_endpoint ? ` (${hRec.active_endpoint})` : ''}` }),
+            h('i', { class: `dot dot-${hStatus}`, title: hostDotTip }),
             h('span', { class: 'ws-host-name', title: `${hName} (${hb.id})` }, hName),
             span('ws-host-id', hb.id),
             hKind !== 'local' ? span('tag', hKind === 'ssh' ? 'SSH' : 'Peer') : null),
-          h('div', { class: 'row-nowrap', style: 'gap:4px' },
+          h('div', { class: 'row-nowrap', style: 'gap:4px;flex-shrink:0' },
+            rttBadge,
             h('button', {
               type: 'button',
               class: 'ws-host-rename',
@@ -1972,6 +2087,22 @@ export function patchWorkspace(W) {
               onclick: () => APP.openRenameHostModal(hb.id),
             }, '✎'),
             span('tag tabular', hb.total)));
+        const retryCd = isRemote && (hStatus === 'degraded' || hStatus === 'offline')
+          ? formatRetryCountdown(hRec?.next_retry_ms)
+          : '';
+        const hostStatusBanner = isRemote && (hStatus === 'degraded' || hStatus === 'offline')
+          ? h('div', { class: `ws-host-banner is-${hStatus}` },
+            h('div', { class: 'ws-host-banner-top' },
+              span(`tag ${hStatus === 'offline' ? 'soft-red' : 'soft-amber'}`, hostStatusLabel(hStatus)),
+              retryCd ? span('ws-host-retry-cd tabular', retryCd) : null,
+              btn(L('重连', 'Retry'), {
+                cls: 'xs ws-host-probe-btn',
+                busyKey: `probe-host:${hb.id}`,
+                title: L(`立即重新探测主机 ${hName}`, `Probe and reconnect host ${hName} now`),
+                onclick: () => probeHostApi(hb.id),
+              })),
+            hRec?.error ? h('div', { class: 'ws-host-err', title: hRec.error }, hRec.error) : null)
+          : null;
 
         const groupNodes = sortedGroups.map(([g, list]) => {
           const cKey = hb.id === 'local' ? g : `${hb.id}:${g}`;
@@ -1999,11 +2130,11 @@ export function patchWorkspace(W) {
               h('span', { class: 'ws-group-name trunc' }, groupDisplayName(g)),
               isCollapsed && attnSess ? h('i', { class: `dot dot-${attnSess.state}`, title: stateText(attnSess.state) }) : null),
             span('ws-group-cnt tabular', list.length)),
-            !isCollapsed ? h('div', { class: 'ws-group-body' }, list.map((s) => sidebarSessionItem(s))) : null);
+            !isCollapsed ? h('div', { class: 'ws-group-body' }, list.map((s) => sidebarSessionItem(s, splitWindowKeys))) : null);
         });
         return h('div', { class: 'ws-host-block', 'data-host-id': hb.id },
           hostHead,
-          hStatus === 'degraded' && hRec?.error ? h('div', { class: 'ws-host-err' }, L(`连接降级：${hRec.error}`, `Connection degraded: ${hRec.error}`)) : null,
+          hostStatusBanner,
           groupNodes.length ? groupNodes : h('div', { class: 'dim', style: 'font-size:12px;padding:2px 8px' }, L('暂无活跃会话', 'No active sessions')));
       }));
     }
@@ -2089,15 +2220,33 @@ export function patchWorkspace(W) {
   } else {
     C.readonlyHint.classList.add('ws-hidden');
   }
+  const compHostId = hostOf(s);
+  const compIsRemote = isRemoteHost(compHostId);
+  const compHostRec = compIsRemote ? S.hosts.get(compHostId) : null;
+  const sending = UI.busy.has(`send:${s.session_id}`);
   const effCompMode = isShell ? 'direct' : UI.composerMode;
   for (const b of C.modeBtns) {
     b.classList.toggle('ws-hidden', isShell && b.dataset.mode !== 'direct');
     b.classList.toggle('on', b.dataset.mode === effCompMode);
     b.disabled = !!readOnlyMsg;
   }
-  C.modeHint.textContent = readOnlyMsg || (isShell
-    ? L('发送终端命令或输入 · Cmd+Enter 执行', 'Send terminal command or input · Cmd+Enter to execute')
-    : (effCompMode === 'direct' ? L('输入 / 唤出命令 · Cmd+Enter 发送', '/ for commands · Cmd+Enter to send') : L('可选模板 · 留空使用默认配置', 'Optional routing · Leave blank for defaults')));
+  if (sending && effCompMode === 'direct') {
+    const rttPart = compIsRemote && typeof compHostRec?.rtt_ms === 'number' && Number.isFinite(compHostRec.rtt_ms)
+      ? ` · ${fmtRtt(compHostRec.rtt_ms)}`
+      : '';
+    const proto = compHostRec?.kind === 'peer' ? 'Peer' : 'SSH';
+    C.modeHint.textContent = compIsRemote
+      ? L(`正在通过 ${proto} 发送至 ${hostDisplayName(compHostId, s)}${rttPart}…`, `Sending over ${proto} to ${hostDisplayName(compHostId, s)}${rttPart}…`)
+      : L('正在发送至终端…', 'Sending to terminal…');
+    C.modeHint.classList.add('is-sending-hint');
+  } else {
+    C.modeHint.classList.remove('is-sending-hint');
+    C.modeHint.textContent = readOnlyMsg || (compIsRemote && compHostRec?.status === 'offline' && effCompMode === 'direct'
+      ? L(`主机 ${hostDisplayName(compHostId, s)} 已离线 · 发送将尝试重连`, `Host ${hostDisplayName(compHostId, s)} is offline · send will attempt reconnect`)
+      : (isShell
+        ? L('发送终端命令或输入 · Cmd+Enter 执行', 'Send terminal command or input · Cmd+Enter to execute')
+        : (effCompMode === 'direct' ? L('输入 / 唤出命令 · Cmd+Enter 发送', '/ for commands · Cmd+Enter to send') : L('可选模板 · 留空使用默认配置', 'Optional routing · Leave blank for defaults'))));
+  }
   if (effCompMode === 'direct' || readOnlyMsg) {
     C.directRow.classList.remove('ws-hidden');
     C.pipeSlot.classList.add('ws-hidden');
@@ -2120,10 +2269,12 @@ export function patchWorkspace(W) {
       ? L(`输入终端命令发送到 ${sessionLabel(s)}…（Cmd+Enter 执行）`, `Send terminal command to ${sessionLabel(s)}… (Cmd+Enter to execute)`)
       : L(`发消息给 ${sessionLabel(s)}…（输入 / 唤出命令，Cmd+Enter 发送）`, `Message ${sessionLabel(s)}… (/ for commands, Cmd+Enter to send)`));
     if (C.ta.placeholder !== ph) C.ta.placeholder = ph;
-    const sending = UI.busy.has(`send:${s.session_id}`);
+    const wantSendLabel = sending ? L('发送中…', 'Sending…') : L('发送', 'Send');
+    if (C.sendBtn.textContent !== wantSendLabel) C.sendBtn.textContent = wantSendLabel;
     C.ta.disabled = !!readOnlyMsg;
     C.imgBtn.disabled = !!readOnlyMsg;
-    C.sendBtn.classList.toggle('is-busy', sending);
+    C.sendBtn.classList.remove('is-busy');
+    C.sendBtn.classList.toggle('is-sending', sending);
     C.sendBtn.disabled = sending || !!readOnlyMsg;
     C.renderDeliveryAlert(s);
     renderAttachBar(s.session_id);

@@ -27,6 +27,7 @@ import {
   currentSession,
   draft,
   enc,
+  hostOf,
   knownProjects,
   nextAttachId,
   pvModeOf,
@@ -332,10 +333,14 @@ export async function uploadImageFiles(sid, files, opts = {}) {
   }
   if (!queued.length) return;
   renderAttachBar(sid);
+  const targetSess = S.sessions.get(sid) || currentSession();
+  const targetHostId = hostOf(targetSess);
   for (const { file, item, name } of queued) {
     try {
       const data_base64 = await readFileAsBase64(file);
-      const r = await api('POST', '/api/uploads/image', { filename: name, mime: item.mime, data_base64 });
+      const body = { filename: name, mime: item.mime, data_base64 };
+      if (targetHostId !== 'local') body.host_id = targetHostId;
+      const r = await api('POST', '/api/uploads/image', body);
       item.status = 'ready';
       item.path = r.path || '';
       item.previewUrl = r.preview_url || '';

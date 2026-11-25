@@ -1,4 +1,4 @@
-// starfane web console — Right Inspection Drawer & Modals (Spawn, Pipeline, Auth, Rename Host)
+// starfane web console — Right Inspection Drawer & Modals (Spawn, Pipeline, Auth, Rename Host, Close Window)
 import { AGENTS, NON_TMUX_GROUP, PLAYBOOK_STAGES, SEVERITIES, TOKEN_KEY, effortLabel } from './constants.js';
 import { L, localeTag } from './i18n.js';
 import {
@@ -38,13 +38,16 @@ import {
   act,
   api,
   artifact,
+  closeSessionApi,
   connectSSE,
+  isTmuxSessionsLoading,
   loadAll,
   loadHandoffs,
   loadModels,
   loadPreview,
   loadSessionOutput,
   loadTmuxSessions,
+  probeHostApi,
   refreshReview,
   renameHostApi,
 } from './api.js';
@@ -58,9 +61,14 @@ import {
   draft,
   effortsForModel,
   enc,
+  fmtRtt,
+  formatRetryCountdown,
   hostDisplayName,
   hostOf,
+  hostRecord,
+  hostStatusLabel,
   hydrateSpawnAgent,
+  isRemoteHost,
   isTmuxSession,
   knownProjects,
   loadSpawnPrefs,
@@ -69,9 +77,11 @@ import {
   muxKindOf,
   paneDisplayId,
   pvKeyOf,
+  rttTone,
   saveSpawnPrefs,
   sessionLabel,
   short,
+  sortedHosts,
   stageName,
   stateText,
   subagentDisplayName,
@@ -81,6 +91,16 @@ import {
 } from './store.js';
 import { formatTerminalText, renderChunkedTerminal } from './terminal.js';
 import { dropReasons, effSev, focusBtn, g2Of, g3Of, sevTagCls } from './views.js';
+
+function rttPill(rttMs) {
+  if (!isFin(rttMs) || rttMs < 0) return null;
+  const label = fmtRtt(rttMs);
+  if (!label) return null;
+  return h('span', {
+    class: `tag mono rtt-pill rtt-${rttTone(rttMs)}`,
+    title: L(`往返延迟 ${label}`, `Round-trip latency ${label}`),
+  }, label);
+}
 
 export function openDrawer(kind, params) {
   UI.drawer = { kind, ...params };
@@ -95,8 +115,11 @@ export function closeDrawer() {
 }
 
 export function openSpawnModal() {
+  const curHost = hostOf(currentSession());
+  const defaultHost = S.hosts.size > 1 && S.hosts.has(curHost) ? curHost : 'local';
+  UI.drafts.set('sp:host', defaultHost);
   loadModels();
-  loadTmuxSessions();
+  loadTmuxSessions(defaultHost);
   const prefs = loadSpawnPrefs();
   const ag = prefs.last_agent || 'claude';
   UI.drafts.set('sp:agent', ag);
@@ -106,6 +129,37 @@ export function openSpawnModal() {
   APP.schedule();
 }
 
+export function canCloseSessionWindow(s) {
+  return Boolean(s && !s.is_subagent && String(s.pane || '').trim() && s.state !== 'ended');
+}
+
+export function windowGroupKeyOf(s) {
+  if (!s || !s.tmux_target) return null;
+  const raw = String(s.tmux_target).trim();
+  if (!raw || raw.startsWith('zj:')) return null;
+  const colon = raw.lastIndexOf(':');
+  if (colon <= 0) return null;
+  const afterColon = raw.slice(colon + 1);
+  const dot = afterColon.lastIndexOf('.');
+  const winPart = dot > 0 ? afterColon.slice(0, dot) : afterColon;
+  if (!winPart) return null;
+  return `${hostOf(s)}|${raw.slice(0, colon)}:${winPart}`;
+}
+
+export function siblingSplitPanesOf(s) {
+  const key = windowGroupKeyOf(s);
+  if (!key) return [];
+  const myPane = String(s.pane || '').trim();
+  const out = [];
+  for (const other of S.sessions.values()) {
+    if (!other || other.session_id === s.session_id) continue;
+    if (!canCloseSessionWindow(other)) continue;
+    if (myPane && String(other.pane || '').trim() === myPane) continue;
+    if (windowGroupKeyOf(other) === key) out.push(other);
+  }
+  return out;
+}
+
 export function openRenameHostModal(hostId) {
   UI.renameHostId = hostId;
   UI.drafts.set('host:rename', hostDisplayName(hostId));
@@ -113,9 +167,19 @@ export function openRenameHostModal(hostId) {
   APP.schedule();
 }
 
+export function openCloseSessionModal(sessionId) {
+  if (!sessionId) return;
+  const s = S.sessions.get(sessionId);
+  if (!canCloseSessionWindow(s)) return;
+  UI.closeSessionId = sessionId;
+  UI.modal = 'close-session';
+  APP.schedule();
+}
+
 export function closeModal() {
   UI.modal = null;
   UI.renameHostId = null;
+  UI.closeSessionId = null;
   APP.schedule();
 }
 
@@ -147,6 +211,11 @@ export function renderDrawer() {
     body = !pv || pv.state === 'loading' ? skeleton(8)
       : pv.state === 'err' ? errorBanner(L(`读取终端失败：${pv.err}`, `Failed to read terminal: ${pv.err}`), L('重试', 'Retry'), () => loadPreview(d.pane, { mode: dMode }))
       : h('div', { class: 'stack-sm' },
+        pv.staleErr ? h('div', { class: 'stale-banner' },
+          h('span', { class: 'stale-banner-msg' },
+            h('i', { class: 'dot dot-degraded' }),
+            span(null, L(`刷新受阻，正显示缓存终端输出：${pv.staleErr}`, `Refresh failed — showing cached terminal output: ${pv.staleErr}`))),
+          btn(L('重试', 'Retry'), { cls: 'xs', onclick: () => loadPreview(d.pane, { mode: dMode, silent: false }) })) : null,
         h('div', { class: 'row', style: 'justify-content:space-between' },
           span('muted tabular', L(`共 ${formatted ? formatted.split('\n').length : 0} 行 · 更新于 ${clock(pv.updatedMs)}`, `${formatted ? formatted.split('\n').length : 0} lines · Updated ${clock(pv.updatedMs)}`)),
           h('div', { class: 'row-nowrap', style: 'gap:6px' },
@@ -224,6 +293,14 @@ function drawerSession(s) {
   const ho = S.handoffs.get(s.session_id);
   const evs = S.activity.filter((e) => e.session_id === s.session_id || (s.pane && e.pane === s.pane)).slice(0, 15);
   const hid = hostOf(s);
+  const remote = isRemoteHost(hid);
+  const hRec = hostRecord(hid);
+  const hStatus = hRec?.status || 'online';
+  const hKind = hRec?.kind || (remote ? 'ssh' : 'local');
+  const hUnhealthy = remote && (hStatus === 'degraded' || hStatus === 'offline');
+  const retryCd = hUnhealthy ? formatRetryCountdown(hRec?.next_retry_ms) : '';
+  const closable = canCloseSessionWindow(s);
+  const isSplit = closable && siblingSplitPanesOf(s).length > 0;
   return h('div', { class: 'stack' },
     h('div', { class: 'drawer-controls' },
       s.pane ? focusBtn(s.session_id, 'sm') : null,
@@ -231,11 +308,37 @@ function drawerSession(s) {
         ? btn(L('清除异常状态', 'Clear error state'), { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => APP.ackSessionError(s) }) : null,
       btn(L('手动刷新', 'Refresh'), { cls: 'sm', onclick: () => { loadSessionOutput(s, { silent: false, forcePreview: true }); toast(L('已刷新会话输出', 'Session output refreshed')); } }),
       s.pane ? btn(L('完整终端日志', 'Full Terminal Log'), { cls: 'ghost sm', onclick: () => openDrawer('terminal', { pane: s.pane, title: sessionLabel(s) }) }) : null,
+      closable ? btn(isSplit ? L('关闭窗格', 'Close pane') : L('关闭窗口', 'Close window'), {
+        cls: 'ghost sm danger',
+        title: isSplit
+          ? L('终止并关闭当前窗格（同窗口其他分屏不受影响）', 'Terminate and close this pane (other split panes stay open)')
+          : L('终止并关闭该终端窗口', 'Terminate and close this terminal window'),
+        onclick: () => openCloseSessionModal(s.session_id),
+      }) : null,
       h('label', { class: 'row muted', style: 'cursor:pointer;font-size:12.5px;margin-left:auto' },
-        h('input', { type: 'checkbox', checked: UI.autoRefreshPreview, onchange: (e) => { UI.autoRefreshPreview = e.target.checked; APP.rerender(); } }), L('3s 自动刷新', '3s auto-refresh'))),
+        h('input', { type: 'checkbox', checked: UI.autoRefreshPreview, onchange: (e) => { UI.autoRefreshPreview = e.target.checked; APP.rerender(); } }), remote ? L('自动刷新', 'Auto-refresh') : L('3s 自动刷新', '3s auto-refresh'))),
+    hUnhealthy ? h('div', { class: `callout ${hStatus === 'offline' ? 'err' : 'warn'} drawer-host-banner` },
+      h('div', { class: 'stack-xs grow', style: 'min-width:0' },
+        h('div', { class: 'row', style: 'gap:6px' },
+          span(`tag ${hStatus === 'offline' ? 'soft-red' : 'soft-amber'}`, hostStatusLabel(hStatus)),
+          h('strong', { style: 'font-size:12.5px' }, hostDisplayName(hid, s)),
+          retryCd ? span('muted tabular', retryCd) : null),
+        hRec?.error ? h('span', { style: 'font-size:12px;word-break:break-word' }, hRec.error) : null),
+      btn(L('重连', 'Retry'), {
+        cls: 'sm',
+        busyKey: `probe-host:${hid}`,
+        title: L(`立即重新探测主机 ${hostDisplayName(hid, s)}`, `Probe and reconnect host ${hostDisplayName(hid, s)} now`),
+        onclick: () => probeHostApi(hid),
+      })) : null,
     drawerMetricsCard(s.metrics),
     kvGrid([
-      [L('所属主机', 'Host'), h('span', { class: 'row' }, h('strong', null, hostDisplayName(hid, s)), h('code', null, hid))],
+      [L('所属主机', 'Host'), h('span', { class: 'row', style: 'gap:6px' },
+        h('strong', null, hostDisplayName(hid, s)),
+        h('code', null, hid),
+        remote ? span('tag', hKind === 'ssh' ? 'SSH' : 'Peer') : null,
+        remote ? span(`tag ${hStatus === 'online' ? 'soft-green' : hStatus === 'offline' ? 'soft-red' : 'soft-amber'}`, hostStatusLabel(hStatus)) : null,
+        remote && hStatus !== 'offline' ? rttPill(hRec?.rtt_ms) : null,
+        hUnhealthy ? btn(L('重连', 'Retry'), { cls: 'xs', busyKey: `probe-host:${hid}`, onclick: () => probeHostApi(hid) }) : null)],
       [L('复用器', 'Multiplexer'), span(muxKindOf(s) === 'zellij' ? 'tag mux-zj' : 'tag', muxKindOf(s))],
       [L('会话 ID', 'Session ID'), h('code', null, s.session_id)],
       [L('窗口标识', 'Window label'), s.tmux_label ? h('code', null, s.tmux_label) : null],
@@ -413,7 +516,82 @@ export function renderModal() {
   if (want === 'auth') d.replaceChildren(authModalBody());
   else if (want === 'spawn') d.replaceChildren(spawnModalBody());
   else if (want === 'rename-host') d.replaceChildren(renameHostModalBody());
+  else if (want === 'close-session') d.replaceChildren(closeSessionModalBody());
   else d.replaceChildren(pipelineModalBody(want));
+}
+
+function closeSessionModalBody() {
+  const sid = UI.closeSessionId;
+  const s = sid ? S.sessions.get(sid) : null;
+  if (!s || !canCloseSessionWindow(s)) {
+    return h('div', { class: 'stack' },
+      h('div', { class: 'modal-head' },
+        h('h3', null, L('关闭窗口', 'Close Window')),
+        btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
+      h('p', { class: 'muted' }, L('该会话已结束或当前无法关闭。', 'This session has already ended or can no longer be closed.')),
+      h('div', { class: 'row', style: 'justify-content:flex-end' },
+        btn(L('知道了', 'Close'), { cls: 'primary', onclick: closeModal })));
+  }
+  const siblings = siblingSplitPanesOf(s);
+  const isSplit = siblings.length > 0;
+  const label = sessionLabel(s);
+  const paneBadge = paneDisplayId(s);
+  const mux = muxKindOf(s);
+  const hid = hostOf(s);
+  const busyKey = `close-session:${s.session_id}`;
+  const title = isSplit ? L('关闭窗格', 'Close Pane') : L('关闭窗口', 'Close Window');
+  const confirmLabel = isSplit ? L('确认关闭窗格', 'Close Pane') : L('确认关闭', 'Close Window');
+  const siblingPreview = siblings
+    .slice(0, 3)
+    .map((x) => (x.tmux_target ? `${sessionLabel(x)} (${x.tmux_target})` : sessionLabel(x)))
+    .join(', ')
+    + (siblings.length > 3 ? ` +${siblings.length - 3}` : '');
+
+  return h('div', { class: 'stack' },
+    h('div', { class: 'modal-head' },
+      h('h3', null, title),
+      btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
+    h('div', { class: 'close-target-card' },
+      h('div', { class: 'close-target-head' },
+        h('div', { class: 'row', style: 'gap:7px' },
+          h('i', { class: `dot dot-${s.state}`, title: stateText(s.state) }),
+          agentTag(s.agent),
+          h('span', { class: 'close-target-name' }, label)),
+        statusInd(s.state, stateText(s.state))),
+      h('div', { class: 'close-target-meta' },
+        span('muted', `${L('主机', 'Host')}: ${hostDisplayName(hid, s)}`),
+        s.tmux_target ? [span('dim', '·'), h('code', null, s.tmux_target)] : null,
+        paneBadge ? [span('dim', '·'), h('code', null, paneBadge)] : null)),
+    isSplit
+      ? h('div', { class: 'close-split-note' },
+        h('span', null, L(
+          `此操作将终止并仅关闭当前窗格；同一 tmux 窗口内的其余 ${siblings.length} 个分屏窗格将保持运行、不受影响。`,
+          `This will terminate and close only this pane. The other ${siblings.length} sibling split ${siblings.length === 1 ? 'pane' : 'panes'} in the same tmux window will remain untouched.`,
+        )),
+        siblingPreview ? h('span', { class: 'close-split-list' }, `${siblings.length === 1 ? L('保留的分屏：', 'Untouched split pane: ') : L('保留的分屏：', 'Untouched split panes: ')}${siblingPreview}`) : null)
+      : h('p', { class: 'muted', style: 'font-size:13.5px;line-height:1.6' },
+        mux === 'zellij'
+          ? L(
+            '此操作将终止该会话中的进程并关闭对应的 Zellij 窗格，其他标签页与窗口不受影响。',
+            'This will terminate the running process and close the Zellij pane. Other tabs and windows remain untouched.',
+          )
+          : L(
+            '此操作将终止该会话中的进程并关闭对应的 tmux 窗口，所属 tmux 会话中的其他窗口不受影响。',
+            'This will terminate the running process and close the tmux window. Other windows in the tmux session remain untouched.',
+          )),
+    s.state === 'working'
+      ? h('div', { class: 'callout warn' }, L(
+        '该会话当前正在运行中，关闭会中断正在执行的任务。',
+        'This session is currently working; closing it will interrupt the active run.',
+      ))
+      : null,
+    h('div', { class: 'row', style: 'justify-content:flex-end' },
+      btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
+      btn(confirmLabel, {
+        cls: 'danger-primary',
+        busyKey,
+        onclick: () => closeSessionApi(s.session_id, { isSplitPane: isSplit }),
+      })));
 }
 
 function renameHostModalBody() {
@@ -445,7 +623,16 @@ function renameHostModalBody() {
 }
 
 function spawnModalBody() {
-  const projects = knownProjects();
+  const hasMultiHosts = S.hosts.size > 1;
+  const fallbackHost = hasMultiHosts && S.hosts.has(hostOf(currentSession())) ? hostOf(currentSession()) : 'local';
+  const rawHost = draft('sp:host', fallbackHost);
+  const targetHost = hasMultiHosts && S.hosts.has(rawHost) ? rawHost : 'local';
+  const isRemote = isRemoteHost(targetHost);
+  const targetHostRec = hostRecord(targetHost);
+  const targetHostStatus = targetHostRec?.status || 'online';
+  const targetOffline = isRemote && targetHostStatus === 'offline';
+  const targetDegraded = isRemote && targetHostStatus === 'degraded';
+  const projects = knownProjects(targetHost);
   const prefs = loadSpawnPrefs();
   const agent = draft('sp:agent', prefs.last_agent || 'claude');
   const curDir = '';
@@ -465,18 +652,27 @@ function spawnModalBody() {
   const effortOpts = fixedEffort ? [['', L('固定配置', 'Fixed')]] : effs.map((e) => [e, effortLabel(e)]);
   const dlId = 'sp-projects';
   const sessDlId = 'sp-sessions';
-  const activeSessionGroups = (S.tmuxSessions || []).length
-    ? S.tmuxSessions
+  const cachedHostSessions = S.tmuxSessionsByHost.get(targetHost)
+    || (!isRemote ? S.tmuxSessions : null);
+  const activeSessionGroups = (cachedHostSessions && cachedHostSessions.length)
+    ? cachedHostSessions
     : [...S.sessions.values()]
-      .filter((s) => s.state !== 'ended' && isTmuxSession(s))
+      .filter((s) => s.state !== 'ended' && isTmuxSession(s) && hostOf(s) === targetHost)
       .map((s) => tmuxGroupOf(s))
       .filter((g) => g && g !== NON_TMUX_GROUP && g !== 'tmux');
   const sessionCandidates = [...new Set(['agent-session', ...activeSessionGroups])];
+  const loadingSessions = isTmuxSessionsLoading(targetHost);
   const persistCurrent = (ag, mSel, eSel) => {
     const modelVal = mSel === '__custom__' ? draft('sp:modelCustom').trim() : String(mSel || '').trim();
     saveSpawnPrefs(ag, { model: modelVal || undefined, effort: eSel || '' });
   };
   const create = () => act('spawn-sess', async () => {
+    const chosenHost = S.hosts.size > 1 ? draft('sp:host', targetHost) : 'local';
+    const effHost = chosenHost && S.hosts.has(chosenHost) ? chosenHost : 'local';
+    const remoteHost = isRemoteHost(effHost);
+    if (remoteHost && hostRecord(effHost)?.status === 'offline') {
+      throw new Error(L(`目标主机「${hostDisplayName(effHost)}」当前离线，请先重连`, `Target host "${hostDisplayName(effHost)}" is offline — reconnect first`));
+    }
     const ag = draft('sp:agent', 'claude');
     const info = modelsForAgent(ag);
     const picked = UI.drafts.get(`sp:modelSel:${ag}`) || info.default;
@@ -487,6 +683,7 @@ function spawnModalBody() {
     const tmuxSess = draft('sp:session').trim();
     const payload = {
       agent: ag,
+      host_id: remoteHost ? effHost : undefined,
       project_root: proj || undefined,
       tmux_session: tmuxSess || undefined,
       model: model || undefined,
@@ -496,12 +693,19 @@ function spawnModalBody() {
     };
     const r = await api('POST', '/api/sessions/spawn', payload);
     saveSpawnPrefs(ag, { model: model || undefined, effort: pickedEff || '' });
-    ['sp:dir', 'sp:session', 'sp:name', 'sp:prompt'].forEach((k) => UI.drafts.delete(k));
+    ['sp:dir', 'sp:session', 'sp:name', 'sp:prompt', 'sp:host'].forEach((k) => UI.drafts.delete(k));
     UI.modal = null;
     await loadAll();
     if (r?.session_id) APP.openSession(r.session_id);
     return r;
-  }, (r) => L(`已在 tmux 新建会话 ${r?.tmux_target || r?.pane_id || ''}`, `Created tmux session ${r?.tmux_target || r?.pane_id || ''}`));
+  }, (r) => {
+    const tgt = r?.tmux_target || r?.pane_id || '';
+    const hid = r?.host_id || (isRemote ? targetHost : 'local');
+    if (hid && hid !== 'local') {
+      return L(`已在 ${hostDisplayName(hid)} 新建会话 ${tgt}`, `Created session ${tgt} on ${hostDisplayName(hid)}`);
+    }
+    return L(`已在 tmux 新建会话 ${tgt}`, `Created tmux session ${tgt}`);
+  });
   const modelSelect = selectField(selKey, modelOpts, curSel, { class: 'inp', style: 'width:100%' });
   modelSelect.addEventListener('change', () => {
     const nextModel = modelSelect.value;
@@ -519,10 +723,80 @@ function spawnModalBody() {
   effortSelect.addEventListener('change', () => { persistCurrent(agent, curSel, effortSelect.value); });
   const customModelInp = curSel === '__custom__' ? field('sp:modelCustom', { class: 'inp sm mono', placeholder: L('输入自定义模型 ID…', 'Enter custom model ID…'), autocomplete: 'off' }) : null;
   if (customModelInp) customModelInp.addEventListener('input', () => persistCurrent(agent, '__custom__', fixedEffort ? '' : curEff));
+  const hostSelector = hasMultiHosts ? h('div', { class: 'stack-xs' },
+    h('label', { class: 'lbl', style: 'margin:0' }, L('目标主机', 'Target Host')),
+    h('div', { class: 'chips sp-host-chips' }, sortedHosts().map((hr) => {
+      const st = hr.status || 'online';
+      const selected = targetHost === hr.id;
+      const rttLabel = hr.id !== 'local' && st !== 'offline' ? fmtRtt(hr.rtt_ms) : '';
+      const tip = [
+        `${hostDisplayName(hr.id)} (${hr.id})`,
+        hostStatusLabel(st),
+        rttLabel,
+      ].filter(Boolean).join(' · ');
+      return h('button', {
+        type: 'button',
+        class: `chip sp-host-chip${selected ? ' on' : ''}${st === 'offline' ? ' is-offline' : st === 'degraded' ? ' is-degraded' : ''}`,
+        'data-sp-host': hr.id,
+        title: tip,
+        onclick: () => {
+          if (hr.id === targetHost) return;
+          const prevHost = targetHost;
+          const curDirVal = draft('sp:dir').trim();
+          if (curDirVal && knownProjects(prevHost).includes(curDirVal)) {
+            UI.drafts.delete('sp:dir');
+          }
+          UI.drafts.set('sp:host', hr.id);
+          loadTmuxSessions(hr.id);
+          APP.rerender();
+        },
+      },
+      h('i', { class: `dot dot-${st}` }),
+      h('span', null, hostDisplayName(hr.id)),
+      rttLabel ? span('sp-host-rtt tabular', rttLabel) : null,
+      st === 'offline' ? span('sp-host-rtt', L('离线', 'Offline')) : null,
+      st === 'degraded' && !rttLabel ? span('sp-host-rtt', L('降级', 'Degraded')) : null);
+    })),
+    targetOffline ? h('div', { class: 'callout err sp-host-warn' },
+      h('span', { class: 'grow' }, L(
+        `主机「${hostDisplayName(targetHost)}」当前离线${targetHostRec?.error ? `（${targetHostRec.error}）` : ''}，请先重连后再新建会话。`,
+        `Host "${hostDisplayName(targetHost)}" is offline${targetHostRec?.error ? ` (${targetHostRec.error})` : ''} — reconnect before creating a session.`,
+      )),
+      btn(L('重连', 'Retry'), {
+        cls: 'xs',
+        busyKey: `probe-host:${targetHost}`,
+        onclick: async () => {
+          const r = await probeHostApi(targetHost);
+          if (r && r.status !== 'offline') loadTmuxSessions(targetHost);
+        },
+      })) : null,
+    targetDegraded ? h('div', { class: 'callout warn sp-host-warn' },
+      h('span', { class: 'grow' }, L(
+        `主机「${hostDisplayName(targetHost)}」连接降级${targetHostRec?.error ? `（${targetHostRec.error}）` : ''}，新建会话可能较慢。`,
+        `Host "${hostDisplayName(targetHost)}" is degraded${targetHostRec?.error ? ` (${targetHostRec.error})` : ''} — spawning may take longer.`,
+      )),
+      btn(L('重连', 'Retry'), {
+        cls: 'xs',
+        busyKey: `probe-host:${targetHost}`,
+        onclick: async () => {
+          const r = await probeHostApi(targetHost);
+          if (r && r.status !== 'offline') loadTmuxSessions(targetHost);
+        },
+      })) : null) : null;
+  const dirLabel = isRemote
+    ? L('工作目录（留空默认远端 ~/.agent_session）', 'Working directory (blank defaults to remote ~/.agent_session)')
+    : L('工作目录（默认 ~/.agent_session）', 'Working directory (default ~/.agent_session)');
+  const dirPlaceholder = isRemote
+    ? L('留空默认远端 ~/.agent_session', 'Defaults to remote ~/.agent_session')
+    : L('留空默认 ~/.agent_session', 'Defaults to ~/.agent_session');
+  const sessPlaceholder = loadingSessions
+    ? L('正在获取远端 tmux 会话…', 'Loading remote tmux sessions…')
+    : L('默认 agent-session（自动创建）', 'Default: agent-session (auto-created)');
   return h('div', { class: 'stack' },
     h('div', { class: 'modal-head' }, h('h3', null, L('新建交互会话', 'New Interactive Session')), btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
     h('datalist', { id: dlId }, projects.map((p) => h('option', { value: p }))),
     h('datalist', { id: sessDlId }, sessionCandidates.map((s) => h('option', { value: s }))),
+    hostSelector,
     h('div', null,
       h('label', { class: 'lbl' }, L('选择 Agent', 'Agent')),
       h('div', { class: 'chips' }, AGENTS.map((a) => h('button', {
@@ -541,18 +815,24 @@ function spawnModalBody() {
       h('div', { class: 'stack-xs' }, h('label', { class: 'lbl', style: 'margin:0' }, L('模型', 'Model')), modelSelect, customModelInp),
       h('div', { class: 'stack-xs' }, h('label', { class: 'lbl', style: 'margin:0' }, L('思考强度', 'Effort')), effortSelect)),
     h('div', null,
-      h('label', { class: 'lbl' }, L('工作目录（默认 ~/.agent_session）', 'Working directory (default ~/.agent_session)')),
-      field('sp:dir', { class: 'inp mono', list: dlId, placeholder: L('留空默认 ~/.agent_session', 'Defaults to ~/.agent_session'), autocomplete: 'off' }, curDir)),
+      h('label', { class: 'lbl' }, dirLabel),
+      field('sp:dir', { class: 'inp mono', list: dlId, placeholder: dirPlaceholder, autocomplete: 'off' }, curDir)),
     h('div', { class: 'opt-grid' },
       h('div', null, h('label', { class: 'lbl' }, L('tmux 会话（Session，选填）', 'tmux Session (optional)')),
-        field('sp:session', { class: 'inp mono', list: sessDlId, placeholder: L('默认 agent-session（自动创建）', 'Default: agent-session (auto-created)'), autocomplete: 'off' })),
+        field('sp:session', { class: 'inp mono', list: sessDlId, placeholder: sessPlaceholder, autocomplete: 'off' })),
       h('div', null, h('label', { class: 'lbl' }, L('tmux 窗口名（Window，选填）', 'tmux Window (optional)')),
         field('sp:name', { class: 'inp mono', placeholder: L(`留空顺延命名（如 ${agent}-1）`, `Auto-numbered if blank (e.g. ${agent}-1)`), autocomplete: 'off' }))),
     h('div', null, h('label', { class: 'lbl' }, L('首条消息（选填）', 'Initial prompt (optional)')),
       field('sp:prompt', { tag: 'textarea', rows: 2, class: 'inp', placeholder: L('留空则仅打开干净的交互式会话…', 'Leave blank to open a fresh interactive session…') })),
     h('div', { class: 'row', style: 'justify-content:flex-end' },
       btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
-      btn(L('新建交互会话', 'Create Session'), { cls: 'primary', busyKey: 'spawn-sess', onclick: create })));
+      btn(L('新建交互会话', 'Create Session'), {
+        cls: 'primary',
+        busyKey: 'spawn-sess',
+        disabled: targetOffline,
+        title: targetOffline ? L('请先重连离线主机后再新建会话', 'Reconnect the offline host before creating a session') : undefined,
+        onclick: create,
+      })));
 }
 
 function pipelineModalBody(pb) {
