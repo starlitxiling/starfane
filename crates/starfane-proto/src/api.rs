@@ -11,7 +11,7 @@ use crate::artifact::review::{
 use crate::artifact::triage::TriageReport;
 use crate::artifact::{AuthorRef, TestRun};
 use crate::id::{
-    ArtifactId, BindToken, FindingId, HandoffId, PaneId, PipelineId, ReviewId, SessionId,
+    ArtifactId, BindToken, FindingId, HandoffId, HostId, PaneId, PipelineId, ReviewId, SessionId,
 };
 use crate::pipeline::{
     ArtifactKind, PipelineOptions, PipelineSource, PipelineSpec, PlaybookKind, StageBinding,
@@ -181,9 +181,11 @@ pub enum DaemonCommand {
         #[serde(default)]
         interactive: bool,
     },
-    /// -> `{"session_id": SessionId, "pane_id": PaneId, "tmux_target": String, "tmux_label": Option<String>, "agent": AgentKind, "model": Option<String>, "effort": Option<String>, "cwd": String}`
+    /// -> `{"session_id": SessionId, "pane_id": PaneId, "host_id": HostId, "tmux_target": String, "tmux_label": Option<String>, "agent": AgentKind, "model": Option<String>, "effort": Option<String>, "cwd": String}`
     SpawnSession {
         agent: AgentKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_id: Option<HostId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

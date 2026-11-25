@@ -68,9 +68,12 @@ impl Core {
             EventKind::TurnComplete => NoticeKind::TurnComplete,
             _ => return,
         };
-        // Heuristic tail-hash transitions (`tmux_idle_heuristic` on `discovered_only` panes) come
-        // from terminal redraws, CLI auto-updates, or window resizes — never push Feishu completion cards.
+        // Local heuristic tail-hash transitions (`tmux_idle_heuristic` on local `discovered_only` panes)
+        // come from terminal redraws, CLI auto-updates, or window resizes — never push Feishu completion
+        // cards locally where exact hooks exist. Zero-install remote SSH hosts (`!is_local_host()`)
+        // rely on heuristic completion detection and are gated by `NotifyOwnership::Hub` in `Core::notify`.
         if notice_kind == NoticeKind::TurnComplete
+            && session.is_local_host()
             && (ev.confidence == Confidence::Heuristic
                 || session.discovered_only
                 || ev.native_event == "tmux_idle_heuristic")
@@ -219,7 +222,7 @@ impl Core {
             {
                 continue;
             }
-            if cur.discovered_only {
+            if cur.discovered_only && cur.is_local_host() {
                 continue;
             }
             if self.user_watching(&cur).await {
@@ -357,25 +360,49 @@ impl Core {
         session: &SessionRecord,
         ev: &NormalizedEvent,
     ) -> Option<String> {
-        let sess_clone = session.clone();
         let ev_ts = ev.ts_ms;
-        let from_tr = tokio::task::spawn_blocking(move || {
-            let tr = load_session_transcript(&sess_clone, 6);
-            tr.messages
-                .into_iter()
-                .rev()
-                .find(|m| {
-                    m.role == TranscriptRole::Assistant
-                        && !m.text.trim().is_empty()
-                        && m.ts_ms.is_none_or(|msg_ts| {
-                            ev_ts < 1_700_000_000_000 || ev_ts.saturating_sub(msg_ts) <= 1_800_000
-                        })
-                })
-                .map(|m| m.text)
-        })
-        .await
-        .ok()
-        .flatten();
+        let from_tr = if session.is_local_host() {
+            let sess_clone = session.clone();
+            tokio::task::spawn_blocking(move || {
+                let tr = load_session_transcript(&sess_clone, 6);
+                tr.messages
+                    .into_iter()
+                    .rev()
+                    .find(|m| {
+                        m.role == TranscriptRole::Assistant
+                            && !m.text.trim().is_empty()
+                            && m.ts_ms.is_none_or(|msg_ts| {
+                                ev_ts < 1_700_000_000_000
+                                    || ev_ts.saturating_sub(msg_ts) <= 1_800_000
+                            })
+                    })
+                    .map(|m| m.text)
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            self.session_transcript(
+                &session.session_id,
+                super::transcript::TranscriptQuery::tail(6),
+            )
+            .await
+            .ok()
+            .and_then(|tr| {
+                tr.messages
+                    .into_iter()
+                    .rev()
+                    .find(|m| {
+                        m.role == TranscriptRole::Assistant
+                            && !m.text.trim().is_empty()
+                            && m.ts_ms.is_none_or(|msg_ts| {
+                                ev_ts < 1_700_000_000_000
+                                    || ev_ts.saturating_sub(msg_ts) <= 1_800_000
+                            })
+                    })
+                    .map(|m| m.text)
+            })
+        };
         if let Some(txt) = from_tr {
             return Some(txt);
         }
@@ -388,6 +415,9 @@ impl Core {
             .filter(|s| !s.is_empty())
         {
             return Some(m.to_string());
+        }
+        if !session.is_local_host() {
+            return None;
         }
         let pane = session.pane.clone()?;
         let core = self.clone();

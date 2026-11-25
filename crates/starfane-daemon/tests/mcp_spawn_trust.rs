@@ -147,6 +147,7 @@ async fn spawn_session_command_returns_structured_json_and_applies_sanctioned_an
     let resp_cx: Value = core
         .handle(DaemonCommand::SpawnSession {
             agent: AgentKind::Codex,
+            host_id: None,
             model: Some("gpt-6.2-astra".into()),
             effort: Some(Effort::Xhigh),
             project_root: Some(trusted_child.to_string_lossy().into_owned()),
@@ -183,6 +184,7 @@ async fn spawn_session_command_returns_structured_json_and_applies_sanctioned_an
     // 2. Spawn Codex in explicitly untrusted subdir -> MUST NOT pass projects override
     core.handle(DaemonCommand::SpawnSession {
         agent: AgentKind::Codex,
+        host_id: None,
         model: None,
         effort: None,
         project_root: Some(untrusted_child.to_string_lossy().into_owned()),
@@ -202,6 +204,7 @@ async fn spawn_session_command_returns_structured_json_and_applies_sanctioned_an
     // 3. Spawn Codex in completely outside dir -> MUST NOT pass projects override
     core.handle(DaemonCommand::SpawnSession {
         agent: AgentKind::Codex,
+        host_id: None,
         model: None,
         effort: None,
         project_root: Some(outside_dir.to_string_lossy().into_owned()),
@@ -222,6 +225,7 @@ async fn spawn_session_command_returns_structured_json_and_applies_sanctioned_an
     let resp_agy = core
         .handle(DaemonCommand::SpawnSession {
             agent: AgentKind::Agy,
+            host_id: None,
             model: Some("gemini-4-carbon".into()),
             effort: Some(Effort::High),
             project_root: Some(trusted_child.to_string_lossy().into_owned()),
@@ -252,6 +256,7 @@ async fn spawn_session_command_returns_structured_json_and_applies_sanctioned_an
     // 5. Spawn Claude in trusted-ancestor child -> NO trust CLI flag & ~/.claude.json untouched!
     core.handle(DaemonCommand::SpawnSession {
         agent: AgentKind::Claude,
+        host_id: None,
         model: Some("opus".into()),
         effort: Some(Effort::High),
         project_root: Some(trusted_child.to_string_lossy().into_owned()),

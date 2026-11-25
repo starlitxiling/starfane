@@ -39,6 +39,10 @@ pub struct HostRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub session_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -286,5 +290,33 @@ mod tests {
             subagent_session_id(&SessionId::new("s1"), "a9").as_str(),
             "s1/a9"
         );
+    }
+
+    #[test]
+    fn host_record_latency_fields_default_and_roundtrip() {
+        let legacy_json = serde_json::json!({
+            "id": "tencent",
+            "display_name": "Tencent GPU",
+            "kind": "ssh",
+            "status": "online",
+            "session_count": 2
+        });
+        let legacy: HostRecord = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.rtt_ms, None);
+        assert_eq!(legacy.next_retry_ms, None);
+        let ser_legacy = serde_json::to_value(&legacy).unwrap();
+        assert!(ser_legacy.get("rtt_ms").is_none());
+        assert!(ser_legacy.get("next_retry_ms").is_none());
+
+        let with_net = HostRecord {
+            rtt_ms: Some(142),
+            next_retry_ms: Some(1_700_000_015_000),
+            ..legacy
+        };
+        let ser = serde_json::to_value(&with_net).unwrap();
+        assert_eq!(ser["rtt_ms"], 142);
+        assert_eq!(ser["next_retry_ms"], 1_700_000_015_000u64);
+        let back: HostRecord = serde_json::from_value(ser).unwrap();
+        assert_eq!(back, with_net);
     }
 }

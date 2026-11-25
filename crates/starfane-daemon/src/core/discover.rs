@@ -69,6 +69,19 @@ pub(crate) struct DiscoveryScanCache {
     pub(crate) home_override: Option<PathBuf>,
 }
 
+impl DiscoveryScanCache {
+    pub(crate) fn evict_pane(&mut self, pane: &PaneId) {
+        self.panes_sig.clear();
+        self.cached_discovered.retain(|d| &d.pane_id != pane);
+        self.tail_cache.remove(pane);
+        self.pane_agent_pid.remove(pane);
+        self.pane_first_seen_ms.remove(pane);
+        self.pane_birth_ms.remove(pane);
+        self.authoritative_panes.remove(pane);
+        self.spawned_panes.remove(pane);
+    }
+}
+
 /// Number of unchanged 3-second polling ticks (~9s) before a `Working` legacy pane is
 /// considered `Idle` (heuristic `TurnComplete`).
 const LEGACY_STABLE_TICKS: u32 = 3;
@@ -2223,7 +2236,21 @@ impl Core {
     }
 
     /// List live tmux session names (sorted, empty when tmux server is not running).
-    pub async fn list_tmux_sessions(&self) -> Result<Vec<String>, ApiError> {
+    /// When `host_id` is `Some(h)` and `h != "local"`, proxies to the configured remote host.
+    pub async fn list_tmux_sessions(&self, host_id: Option<&str>) -> Result<Vec<String>, ApiError> {
+        if let Some(raw) = host_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != LOCAL_HOST_ID)
+        {
+            let hid = HostId::new(raw);
+            let provider = self
+                .inner
+                .remote_nodes
+                .get(&hid)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(format!("unknown remote host {raw}")))?;
+            return provider.list_tmux_sessions().await;
+        }
         let core = self.clone();
         tokio::task::spawn_blocking(move || core.inner.tmux.list_sessions())
             .await
@@ -2231,11 +2258,13 @@ impl Core {
             .map_err(|e| ApiError::new(ErrorCode::Unavailable, format!("tmux list-sessions: {e}")))
     }
 
-    /// Spawn a standalone interactive session directly in tmux (L4, no pipeline required).
+    /// Spawn a standalone interactive session directly in tmux (L4, no pipeline required),
+    /// targeting either the local host (`None` / `"local"`) or a configured remote host.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_direct_session(
         &self,
         agent: AgentKind,
+        host_id: Option<HostId>,
         project_root: Option<String>,
         tmux_session: Option<String>,
         model: Option<String>,
@@ -2247,6 +2276,78 @@ impl Core {
             return Err(ApiError::bad_request(
                 "cannot spawn plain shell via coding-agent launcher",
             ));
+        }
+        let remote_host_id = host_id
+            .as_ref()
+            .map(|h| h.as_str().trim())
+            .filter(|s| !s.is_empty() && *s != LOCAL_HOST_ID)
+            .map(HostId::new);
+        if let Some(hid) = remote_host_id {
+            let provider = self
+                .inner
+                .remote_nodes
+                .get(&hid)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(format!("unknown remote host {hid}")))?;
+            let (display_name, known_host_projects) = {
+                let st = lock(&self.inner.state);
+                let display = st
+                    .host_display_names
+                    .get(&hid)
+                    .cloned()
+                    .unwrap_or_else(|| provider.default_display_name().to_string());
+                let mut projs: Vec<String> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for s in st.sessions.values() {
+                    if s.is_subagent || s.effective_host_id() != hid.as_str() {
+                        continue;
+                    }
+                    for p in [s.git_root.as_deref(), s.cwd.as_deref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        let t = p.trim();
+                        if !t.is_empty() && seen.insert(t.to_string()) {
+                            projs.push(t.to_string());
+                        }
+                    }
+                }
+                (display, projs)
+            };
+            let target_session = match tmux_session
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(s) => {
+                    if s.contains([':', '.']) || s.chars().any(char::is_control) {
+                        return Err(ApiError::bad_request(format!(
+                            "invalid tmux session name {s:?}"
+                        )));
+                    }
+                    s.to_string()
+                }
+                None => starfane_tmux::DEFAULT_DETACHED_SESSION.to_string(),
+            };
+            let req = crate::nodes::RemoteSpawnReq {
+                agent,
+                project_root,
+                tmux_session: target_session,
+                window_name: name,
+                model,
+                effort,
+                prompt,
+                known_host_projects,
+            };
+            let outcome = provider.spawn_session(&display_name, &req).await?;
+            lock(&self.inner.state)
+                .sessions
+                .insert(outcome.session.session_id.clone(), outcome.session.clone());
+            self.mark_dirty();
+            self.publish_session(outcome.session);
+            self.refresh_attention();
+            self.flush_snapshot_async().await;
+            return Ok(outcome.response);
         }
         let home_env = self.effective_home_dir();
         let cwd = self.resolve_spawn_cwd_in(home_env.as_deref(), project_root.as_deref())?;
@@ -2464,12 +2565,149 @@ impl Core {
         Ok(serde_json::json!({
             "session_id": sid,
             "pane_id": pane,
+            "host_id": LOCAL_HOST_ID,
             "tmux_target": tmux_target,
             "tmux_label": tmux_label,
             "agent": agent,
             "model": resp_model,
             "effort": resp_effort,
             "cwd": resp_cwd,
+        }))
+    }
+
+    /// Safely close a single session's terminal pane/window (local tmux/zellij or federated remote
+    /// host) without killing sibling split panes or whole multiplexer sessions.
+    ///
+    /// Immediately marks the session `SessionState::Ended`, clears `last_error` and pending
+    /// attention items, broadcasts SSE `event: session`, and persists the state snapshot.
+    pub async fn close_session_window(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<serde_json::Value, ApiError> {
+        let (pane, tmux_target, host_id) = {
+            let st = lock(&self.inner.state);
+            let s = st
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| ApiError::not_found(format!("session {session_id}")))?;
+            if s.is_subagent {
+                return Err(ApiError::bad_request(
+                    "cannot close subagent or session without terminal pane",
+                ));
+            }
+            let Some(pane) = s.pane.clone() else {
+                return Err(ApiError::bad_request(
+                    "cannot close subagent or session without terminal pane",
+                ));
+            };
+            (
+                pane,
+                s.tmux_target.clone(),
+                HostId::new(s.effective_host_id()),
+            )
+        };
+
+        let mut response_tmux_target = tmux_target;
+        if host_id.as_str() != LOCAL_HOST_ID {
+            let provider = self
+                .inner
+                .remote_nodes
+                .get(&host_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(format!("unknown remote host {host_id}")))?;
+            let (_, local_pane) = starfane_tmux::split_host_prefix(pane.as_str());
+            let remote_sid = session_id
+                .as_str()
+                .strip_prefix(&format!("{}:", host_id.as_str()))
+                .map(SessionId::new)
+                .unwrap_or_else(|| session_id.clone());
+            let remote_res = provider
+                .close_pane(&remote_sid, &PaneId::new(local_pane))
+                .await?;
+            if response_tmux_target.is_none() {
+                response_tmux_target = remote_res
+                    .get("tmux_target")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+        } else {
+            let core = self.clone();
+            let pane_to_kill = pane.clone();
+            tokio::task::spawn_blocking(move || core.inner.mux.kill_pane(&pane_to_kill))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .map_err(|e| match e {
+                    starfane_tmux::TmuxError::InvalidRequest(m) => ApiError::bad_request(m),
+                    other => ApiError::new(ErrorCode::Unavailable, format!("close pane: {other}")),
+                })?;
+        }
+
+        let now_ms = id::now_ms();
+        let leg_id = (host_id.as_str() == LOCAL_HOST_ID).then(|| legacy_session_id(&pane));
+        let updated_sessions = {
+            let mut st = lock(&self.inner.state);
+            let mut updated = Vec::new();
+            if let Some(rec) = st.sessions.get_mut(session_id) {
+                rec.state = SessionState::Ended;
+                rec.state_since_ms = now_ms;
+                rec.last_event_ms = now_ms;
+                rec.last_error = None;
+                rec.active_subagents = 0;
+                updated.push(rec.clone());
+            }
+            for child in st.sessions.values_mut() {
+                if child.is_subagent
+                    && child.parent_session_id.as_ref() == Some(session_id)
+                    && child.state != SessionState::Ended
+                {
+                    child.state = SessionState::Ended;
+                    child.state_since_ms = now_ms;
+                    child.last_event_ms = now_ms;
+                    child.last_error = None;
+                    updated.push(child.clone());
+                }
+            }
+            st.pane_watch.remove(&pane);
+            st.last_mirrored_tmux.remove(&pane);
+            st.pending_away_notices.remove(session_id);
+            if let Some(ref leg) = leg_id {
+                st.pending_away_notices.remove(leg);
+            }
+            st.unconfirmed.retain(|a| {
+                a.session_id.as_ref() != Some(session_id)
+                    && leg_id
+                        .as_ref()
+                        .is_none_or(|leg| a.session_id.as_ref() != Some(leg))
+            });
+            updated
+        };
+        if host_id.as_str() == LOCAL_HOST_ID {
+            lock(&self.inner.discovery_cache).evict_pane(&pane);
+        }
+        lock(&self.inner.acks).remove(session_id);
+
+        self.mark_dirty();
+        for s in updated_sessions {
+            self.publish_session(s);
+        }
+        self.refresh_attention();
+        self.flush_snapshot_async().await;
+        self.audit(
+            "web",
+            serde_json::json!({
+                "action": "close_session_window",
+                "session_id": session_id,
+                "pane": pane,
+                "tmux_target": response_tmux_target,
+                "host_id": host_id,
+            }),
+        );
+
+        Ok(serde_json::json!({
+            "closed": true,
+            "session_id": session_id,
+            "pane": pane,
+            "tmux_target": response_tmux_target,
         }))
     }
 }

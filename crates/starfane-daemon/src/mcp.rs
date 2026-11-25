@@ -13,9 +13,9 @@ use starfane_proto::mcp::{negotiate_protocol_version, MCP_TOOL_NAMES};
 use starfane_proto::{
     mcp_tool_schemas, AgentKind, ApiError, ArtifactPayload, AuthorRef, BindToken,
     CreatePipelineReq, DaemonCommand, Effort, EvidenceQuote, FalsifierSubmission, FalsifierVerdict,
-    FinalReport, FindingId, HandoffDraft, HandoffId, HandoffStatus, IdentityResolution, PaneId,
-    PipelineSource, PlanDoc, PlaybookKind, RcaReport, ReviewId, ReviewReport, SessionId,
-    SessionRecord, Severity, StageBinding, StageKind, TriageReport, Via,
+    FinalReport, FindingId, HandoffDraft, HandoffId, HandoffStatus, HostId, IdentityResolution,
+    PaneId, PipelineSource, PlanDoc, PlaybookKind, RcaReport, ReviewId, ReviewReport, SessionId,
+    SessionRecord, Severity, StageBinding, StageKind, TriageReport, Via, LOCAL_HOST_ID,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -879,18 +879,31 @@ impl<T: Transport> McpServer<T> {
             })?),
             None => None,
         };
-        let project_root = opt_str(args, "project_root")?
+        let host_id = opt_str(args, "host_id")?
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
+            .map(HostId::new);
+        let targets_remote = host_id
+            .as_ref()
+            .is_some_and(|h| h.as_str() != LOCAL_HOST_ID);
+        let explicit_project_root = opt_str(args, "project_root")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let project_root = if targets_remote {
+            // Never leak the local MCP subprocess `CallerEnv.cwd` onto a remote host;
+            // when omitted, pass `None` so the remote host expands its own `$HOME/.agent_session`.
+            explicit_project_root
+        } else {
+            explicit_project_root.or_else(|| {
                 self.env
                     .cwd
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
-            });
+            })
+        };
         let tmux_session = opt_str(args, "tmux_session")?
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -907,6 +920,7 @@ impl<T: Transport> McpServer<T> {
 
         self.call(DaemonCommand::SpawnSession {
             agent,
+            host_id,
             model,
             effort,
             project_root,
@@ -1476,6 +1490,7 @@ mod tests {
         match &s.transport.calls[..] {
             [DaemonCommand::SpawnSession {
                 agent,
+                host_id: _,
                 model,
                 effort,
                 project_root,
@@ -1523,13 +1538,57 @@ mod tests {
         );
         let r2 = call_tool(&mut s_no_cwd, "spawn_session", json!({"agent": "claude"}));
         assert_eq!(r2["isError"], false, "{r2}");
+        // 3. Remote `host_id` must NOT leak local `CallerEnv.cwd` when `project_root` is omitted,
+        //    whereas `"local"` still defaults to `CallerEnv.cwd` and explicit `project_root` passes through.
+        let mut s_remote = server(default_responder());
+        let r3 = call_tool(
+            &mut s_remote,
+            "spawn_session",
+            json!({"agent": "claude", "host_id": "remote-gpu"}),
+        );
+        assert_eq!(r3["isError"], false, "{r3}");
         assert!(matches!(
-            &s_no_cwd.transport.calls[..],
+            &s_remote.transport.calls[..],
             [DaemonCommand::SpawnSession {
                 agent: AgentKind::Claude,
+                host_id: Some(h),
                 project_root: None,
                 ..
-            }]
+            }] if h.as_str() == "remote-gpu"
+        ));
+
+        let mut s_remote_explicit = server(default_responder());
+        let r4 = call_tool(
+            &mut s_remote_explicit,
+            "spawn_session",
+            json!({"agent": "codex", "host_id": "remote-gpu", "project_root": "~/repo"}),
+        );
+        assert_eq!(r4["isError"], false, "{r4}");
+        assert!(matches!(
+            &s_remote_explicit.transport.calls[..],
+            [DaemonCommand::SpawnSession {
+                agent: AgentKind::Codex,
+                host_id: Some(h),
+                project_root: Some(p),
+                ..
+            }] if h.as_str() == "remote-gpu" && p == "~/repo"
+        ));
+
+        let mut s_explicit_local = server(default_responder());
+        let r5 = call_tool(
+            &mut s_explicit_local,
+            "spawn_session",
+            json!({"agent": "agy", "host_id": "local"}),
+        );
+        assert_eq!(r5["isError"], false, "{r5}");
+        assert!(matches!(
+            &s_explicit_local.transport.calls[..],
+            [DaemonCommand::SpawnSession {
+                agent: AgentKind::Agy,
+                host_id: Some(h),
+                project_root: Some(p),
+                ..
+            }] if h.as_str() == "local" && p == "/tmp/proj"
         ));
     }
 

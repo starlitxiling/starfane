@@ -142,6 +142,7 @@ pub fn router(core: Core) -> Router {
         .route("/api/tmux/backups", get(tmux_backups))
         .route("/api/sessions/spawn", post(spawn_session))
         .route("/api/sessions/{id}/focus", post(focus))
+        .route("/api/sessions/{id}/close", post(close_session))
         .route("/api/sessions/{id}/ack", post(ack_session))
         .route("/api/sessions/{id}/transcript", get(session_transcript))
         .route("/api/panes/{pane_id}/preview", get(pane_preview))
@@ -171,6 +172,7 @@ pub fn router(core: Core) -> Router {
         .route("/api/feishu/mute", post(feishu_mute))
         .route("/api/hosts", get(list_hosts))
         .route("/api/hosts/{id}/rename", post(rename_host))
+        .route("/api/hosts/{id}/probe", post(probe_host))
         .route("/api/notifiers", get(list_notifiers))
         .route("/api/notifiers/mute", post(notifiers_mute))
         .route("/api/notifiers/{id}/test", post(test_notifier))
@@ -653,6 +655,10 @@ async fn focus(State(core): State<Core>, Path(id): Path<String>) -> Response {
     respond(core.focus_session(&SessionId(id)).await)
 }
 
+async fn close_session(State(core): State<Core>, Path(id): Path<String>) -> Response {
+    respond(core.close_session_window(&SessionId(id)).await)
+}
+
 async fn ack_session(State(core): State<Core>, Path(id): Path<String>) -> Response {
     respond(
         core.handle(DaemonCommand::AckSession {
@@ -719,9 +725,15 @@ async fn pane_preview(
     respond(r)
 }
 
-async fn tmux_sessions(State(core): State<Core>) -> Response {
+#[derive(Deserialize, Default)]
+struct TmuxSessionsQuery {
+    #[serde(default)]
+    host: Option<String>,
+}
+
+async fn tmux_sessions(State(core): State<Core>, Query(q): Query<TmuxSessionsQuery>) -> Response {
     let r = core
-        .list_tmux_sessions()
+        .list_tmux_sessions(q.host.as_deref())
         .await
         .map(|sessions| serde_json::json!({ "sessions": sessions }));
     respond(r)
@@ -777,6 +789,8 @@ async fn tmux_backups(State(core): State<Core>) -> Response {
 struct SpawnSessionBody {
     agent: AgentKind,
     #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
     project_root: Option<String>,
     #[serde(default)]
     tmux_session: Option<String>,
@@ -800,15 +814,23 @@ async fn spawn_session(State(core): State<Core>, body: Bytes) -> Response {
             ),
             None => None,
         };
-        core.spawn_direct_session(
-            b.agent,
-            b.project_root,
-            b.tmux_session,
-            b.model,
+        let host_id = b
+            .host_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(HostId::new);
+        core.handle(DaemonCommand::SpawnSession {
+            agent: b.agent,
+            host_id,
+            model: b.model,
             effort,
-            b.prompt,
-            b.name,
-        )
+            project_root: b.project_root,
+            tmux_session: b.tmux_session,
+            name: b.name,
+            prompt: b.prompt,
+            from_session: None,
+        })
         .await
     };
     respond(r.await)
@@ -1263,12 +1285,20 @@ struct UploadImageBody {
     filename: Option<String>,
     #[serde(default)]
     mime: Option<String>,
+    #[serde(default)]
+    host_id: Option<String>,
     data_base64: String,
 }
 
 async fn upload_image(State(core): State<Core>, body: Bytes) -> Response {
     let r = async {
         let b: UploadImageBody = parse_body(&body)?;
+        let target_host = b
+            .host_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != LOCAL_HOST_ID)
+            .map(str::to_string);
         let state_dir = core.state_dir().to_path_buf();
         let saved = tokio::task::spawn_blocking(move || {
             crate::core::uploads::save_uploaded_image(
@@ -1280,6 +1310,22 @@ async fn upload_image(State(core): State<Core>, body: Bytes) -> Response {
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))??;
+        if let Some(hid) = target_host {
+            if core.has_remote_host(&hid) {
+                let local_path = std::path::PathBuf::from(&saved.path);
+                let stage_name = local_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&saved.filename)
+                    .to_string();
+                let core_bg = core.clone();
+                tokio::spawn(async move {
+                    core_bg
+                        .stage_upload_for_host(&hid, stage_name, local_path)
+                        .await;
+                });
+            }
+        }
         serde_json::to_value(saved).map_err(|e| ApiError::internal(e.to_string()))
     };
     respond(r.await)
@@ -1341,6 +1387,14 @@ async fn rename_host(State(core): State<Core>, Path(id): Path<String>, body: Byt
         let b: RenameHostBody = parse_body(&body)?;
         let host = core.rename_host(&HostId::new(id), &b.display_name)?;
         serde_json::to_value(host).map_err(|e| ApiError::internal(e.to_string()))
+    };
+    respond(r.await)
+}
+
+async fn probe_host(State(core): State<Core>, Path(id): Path<String>) -> Response {
+    let r = async {
+        let outcome = core.probe_host(&id).await?;
+        serde_json::to_value(outcome).map_err(|e| ApiError::internal(e.to_string()))
     };
     respond(r.await)
 }

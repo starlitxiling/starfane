@@ -295,6 +295,7 @@ async fn newly_spawned_empty_agy_codex_and_claude_sessions_never_hijack_old_agen
     let spawned_agy: Value = core
         .spawn_direct_session(
             AgentKind::Agy,
+            None,
             None, // defaults to `<home>/.agent_session`
             None, // defaults to `agent-session`
             Some("gemini-4-neon".into()),
@@ -312,6 +313,7 @@ async fn newly_spawned_empty_agy_codex_and_claude_sessions_never_hijack_old_agen
             AgentKind::Codex,
             None,
             None,
+            None,
             Some("gpt-6.2-sol".into()),
             Some(Effort::Xhigh),
             None,
@@ -324,6 +326,7 @@ async fn newly_spawned_empty_agy_codex_and_claude_sessions_never_hijack_old_agen
     let spawned_cl = core
         .spawn_direct_session(
             AgentKind::Claude,
+            None,
             None,
             None,
             Some("claude-opus-5-5".into()),
@@ -385,6 +388,7 @@ async fn newly_spawned_empty_agy_codex_and_claude_sessions_never_hijack_old_agen
     let spawned_agy2 = core
         .spawn_direct_session(
             AgentKind::Agy,
+            None,
             None,
             None,
             Some("gemini-4-carbon".into()),
@@ -524,6 +528,9 @@ async fn startup_self_heals_poisoned_discovered_only_snapshot_and_binds_unique_p
     // Seed an ALREADY-POISONED `state.json` identical to live `tmux-%50` before the fix!
     let state_dir = root.join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
+    let now_ms = id::now_ms();
+    let ended_since_ms = now_ms.saturating_sub(2 * 3_600_000);
+    let ended_event_ms = now_ms.saturating_sub(3 * 3_600_000);
     let poisoned_snapshot = json!({
         "sessions": {
             "4b808b49-48a6-4aaa-9eab-15d68e18f657": {
@@ -534,8 +541,8 @@ async fn startup_self_heals_poisoned_discovered_only_snapshot_and_binds_unique_p
                 "model": "gemini-4-neon-high",
                 "effort": "high",
                 "state": "ended",
-                "state_since_ms": 1795516772685u64,
-                "last_event_ms": 1795513172178u64,
+                "state_since_ms": ended_since_ms,
+                "last_event_ms": ended_event_ms,
                 "confidence": "exact",
                 "discovered_only": false,
                 "transcript_path": poisoned_tp
@@ -549,8 +556,8 @@ async fn startup_self_heals_poisoned_discovered_only_snapshot_and_binds_unique_p
                 "model": "gemini-4-neon-high",
                 "effort": "high",
                 "state": "idle",
-                "state_since_ms": id::now_ms(),
-                "last_event_ms": id::now_ms(),
+                "state_since_ms": now_ms,
+                "last_event_ms": now_ms,
                 "confidence": "heuristic",
                 "tmux_target": "agent-session:0.0",
                 "tmux_label": "agent-session-agy-1",
@@ -562,7 +569,7 @@ async fn startup_self_heals_poisoned_discovered_only_snapshot_and_binds_unique_p
                     "context_used_pct": 14.2,
                     "tps": 93.2,
                     "source": "cc_switch",
-                    "updated_ms": 1795513146000u64
+                    "updated_ms": ended_event_ms
                 }
             }
         }

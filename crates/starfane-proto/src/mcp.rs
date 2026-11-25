@@ -434,6 +434,7 @@ pub fn mcp_tool_schemas() -> Value {
                     "enum": ["claude", "codex", "agy"],
                     "description": "Coding agent CLI to launch interactively."
                 },
+                "host_id": string_desc("Optional target host id ('local' or a configured [[nodes]] id); defaults to 'local'."),
                 "model": string_desc("Optional model id (e.g. 'gpt-6.2-astra', 'gemini-4-carbon', 'opus')."),
                 "effort": {
                     "type": "string",

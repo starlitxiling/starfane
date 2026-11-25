@@ -19,7 +19,10 @@ pub(crate) mod util;
 
 use crate::access::AccessGate;
 use crate::config::{StarfaneConfig, TeamConfig};
-use crate::nodes::{build_remote_providers, LocalMuxPool, NodeProvider};
+use crate::nodes::{
+    build_remote_providers_with_transcript_cache, HostProbeOutcome, LocalMuxPool, NodeProvider,
+    NodeSnapshot,
+};
 use crate::notice::{FeishuSender, Notice, NoticeKind};
 use crate::notify::{NotifyRouteContext, NotifyRouter};
 use crate::store::{write_private, Store};
@@ -36,7 +39,13 @@ use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
 const SPOOL_INTERVAL: Duration = Duration::from_secs(5);
 const DISCOVER_INTERVAL: Duration = Duration::from_secs(3);
-const REMOTE_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+const REMOTE_SYNC_BUSY_FAST_INTERVAL: Duration = Duration::from_secs(3);
+const REMOTE_SYNC_BUSY_SLOW_INTERVAL: Duration = Duration::from_secs(5);
+const REMOTE_SYNC_RECENT_IDLE_INTERVAL: Duration = Duration::from_secs(5);
+const REMOTE_SYNC_IDLE_INTERVAL: Duration = Duration::from_secs(8);
+const REMOTE_IDLE_LONG_MS: u64 = 60_000;
+const REMOTE_BACKOFF_SLACK_MS: u64 = 25;
+const REMOTE_RETRY_MAX_SLEEP_MS: u64 = 65_000;
 const EVENT_CHANNEL: usize = 1024;
 const FEISHU_RATE_WINDOW_MS: u64 = 60_000;
 const MAX_FEISHU_NOTICES_PER_WINDOW: usize = 6;
@@ -104,6 +113,7 @@ pub(crate) struct Inner {
     pub access_gate: AccessGate,
     pub notify_router: NotifyRouter,
     pub remote_nodes: HashMap<HostId, Arc<dyn NodeProvider>>,
+    pub remote_wake: HashMap<HostId, Arc<Notify>>,
     pub store: Store,
     pub acks: Mutex<HashMap<SessionId, Vec<oneshot::Sender<()>>>>,
     pub dirty: AtomicBool,
@@ -113,7 +123,7 @@ pub(crate) struct Inner {
     pub model_catalog: Mutex<Option<models::ModelCatalog>>,
     pub slash_cache: Mutex<slash::SlashCache>,
     pub telemetry: Mutex<TelemetryCaches>,
-    pub transcript_index: Mutex<transcript::TranscriptIndexCache>,
+    pub transcript_index: Arc<Mutex<transcript::TranscriptIndexCache>>,
     pub discovery_cache: Mutex<discover::DiscoveryScanCache>,
 }
 
@@ -226,7 +236,16 @@ impl Core {
         );
         let access_gate = AccessGate::from_config(&cfg.config.web);
         let notify_router = NotifyRouter::from_config(&cfg.config);
-        let remote_nodes = build_remote_providers(&cfg.config.nodes, &cfg.state_dir);
+        let transcript_index = Arc::new(Mutex::new(transcript::TranscriptIndexCache::default()));
+        let remote_nodes = build_remote_providers_with_transcript_cache(
+            &cfg.config.nodes,
+            &cfg.state_dir,
+            transcript_index.clone(),
+        );
+        let remote_wake: HashMap<HostId, Arc<Notify>> = remote_nodes
+            .keys()
+            .map(|hid| (hid.clone(), Arc::new(Notify::new())))
+            .collect();
 
         // Seed runtime host registry (local + configured remote hosts).
         let local_id = HostId::new(LOCAL_HOST_ID);
@@ -253,6 +272,8 @@ impl Core {
                 last_seen_ms: Some(startup_now),
                 error: None,
                 session_count: 0,
+                rtt_ms: None,
+                next_retry_ms: None,
             },
         );
         for (hid, provider) in &remote_nodes {
@@ -272,6 +293,8 @@ impl Core {
                     last_seen_ms: None,
                     error: None,
                     session_count: 0,
+                    rtt_ms: None,
+                    next_retry_ms: None,
                 },
             );
         }
@@ -296,6 +319,7 @@ impl Core {
                 access_gate,
                 notify_router,
                 remote_nodes,
+                remote_wake,
                 store,
                 acks: Mutex::new(HashMap::new()),
                 dirty: AtomicBool::new(purged_any),
@@ -305,7 +329,7 @@ impl Core {
                 model_catalog: Mutex::new(None),
                 slash_cache: Mutex::new(slash::SlashCache::default()),
                 telemetry: Mutex::new(TelemetryCaches::default()),
-                transcript_index: Mutex::new(transcript::TranscriptIndexCache::default()),
+                transcript_index,
                 discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
             }),
         })
@@ -796,6 +820,8 @@ impl Core {
                     last_seen_ms: None,
                     error: None,
                     session_count: count,
+                    rtt_ms: None,
+                    next_retry_ms: None,
                 });
             }
         }
@@ -867,6 +893,8 @@ impl Core {
                     last_seen_ms: Some(id::now_ms()),
                     error: None,
                     session_count: count,
+                    rtt_ms: None,
+                    next_retry_ms: None,
                 });
             rec.session_count = count;
             (rec, updated_sessions)
@@ -879,141 +907,295 @@ impl Core {
         Ok(record)
     }
 
-    /// Sync all configured remote hosts (`SshMuxNodeProvider` & `PeerDaemonNodeProvider`) concurrently.
-    /// Offline or timed-out hosts degrade gracefully to `HostStatus::Degraded` without marking sessions `Ended`.
+    /// True when `host_id` refers to a configured remote (`ssh` or `peer`) node provider.
+    pub fn has_remote_host(&self, host_id: &str) -> bool {
+        let trimmed = host_id.trim();
+        !trimmed.is_empty()
+            && trimmed != LOCAL_HOST_ID
+            && self.inner.remote_nodes.contains_key(&HostId::new(trimmed))
+    }
+
+    /// Spawn one independent supervisor task per configured remote host so a hung or lossy WAN
+    /// host has zero impact on local discovery or sibling remote hosts.
+    pub fn spawn_remote_host_supervisors(&self) {
+        for (hid, wake) in &self.inner.remote_wake {
+            let core = self.clone();
+            let hid = hid.clone();
+            let wake = wake.clone();
+            tokio::spawn(async move {
+                core.run_remote_host_supervisor(hid, wake).await;
+            });
+        }
+    }
+
+    async fn run_remote_host_supervisor(self, host_id: HostId, wake: Arc<Notify>) {
+        loop {
+            self.sync_remote_host(&host_id).await;
+            loop {
+                let sleep_dur = self.compute_remote_host_sleep(&host_id);
+                tokio::select! {
+                    _ = self.inner.shutdown.notified() => return,
+                    _ = wake.notified() => {
+                        let should_sync_now = {
+                            let now = id::now_ms();
+                            let recently_synced = lock(&self.inner.state)
+                                .hosts
+                                .get(&host_id)
+                                .and_then(|h| h.last_seen_ms)
+                                .is_some_and(|t| now.saturating_sub(t) < 500);
+                            let in_backoff = self
+                                .inner
+                                .remote_nodes
+                                .get(&host_id)
+                                .and_then(|p| p.next_retry_ms())
+                                .is_some_and(|u| now < u);
+                            !recently_synced && !in_backoff
+                        };
+                        if should_sync_now {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(sleep_dur) => break,
+                }
+            }
+        }
+    }
+
+    /// Compute the adaptive sleep interval for a remote host's independent supervisor task:
+    /// - `Degraded` / `Offline`: sleep until `next_retry_ms` (plus small slack so backoff has elapsed)
+    /// - `Online` with active `Working`/`Starting`/`Needs*` sessions: `3s` (or `5s` when RTT >= 250ms)
+    /// - `Online` with all sessions `Idle` >60s (or none): `8s`
+    /// - `Online` with recently idle sessions: `5s`
+    pub(crate) fn compute_remote_host_sleep(&self, host_id: &HostId) -> Duration {
+        let Some(provider) = self.inner.remote_nodes.get(host_id) else {
+            return REMOTE_SYNC_IDLE_INTERVAL;
+        };
+        let status = provider.circuit_status();
+        let now = id::now_ms();
+        if status != HostStatus::Online {
+            if let Some(retry_at) = provider.next_retry_ms() {
+                let wait_ms = retry_at
+                    .saturating_sub(now)
+                    .saturating_add(REMOTE_BACKOFF_SLACK_MS)
+                    .clamp(200, REMOTE_RETRY_MAX_SLEEP_MS);
+                return Duration::from_millis(wait_ms);
+            }
+            return REMOTE_SYNC_BUSY_SLOW_INTERVAL;
+        }
+
+        let st = lock(&self.inner.state);
+        let mut any_live = false;
+        let mut any_busy = false;
+        let mut all_long_idle = true;
+        for s in st.sessions.values() {
+            if s.is_subagent
+                || s.state == SessionState::Ended
+                || s.effective_host_id() != host_id.as_str()
+            {
+                continue;
+            }
+            any_live = true;
+            if matches!(
+                s.state,
+                SessionState::Working
+                    | SessionState::Starting
+                    | SessionState::NeedsPermission
+                    | SessionState::NeedsInput
+            ) {
+                any_busy = true;
+                break;
+            }
+            let last_activity = s.last_event_ms.max(s.state_since_ms);
+            if now.saturating_sub(last_activity) <= REMOTE_IDLE_LONG_MS {
+                all_long_idle = false;
+            }
+        }
+        if any_busy {
+            if provider.rtt_ms().is_some_and(|r| r >= 250) {
+                REMOTE_SYNC_BUSY_SLOW_INTERVAL
+            } else {
+                REMOTE_SYNC_BUSY_FAST_INTERVAL
+            }
+        } else if !any_live || all_long_idle {
+            REMOTE_SYNC_IDLE_INTERVAL
+        } else {
+            REMOTE_SYNC_RECENT_IDLE_INTERVAL
+        }
+    }
+
+    /// Sync a single configured remote host (`SshMuxNodeProvider` or `PeerDaemonNodeProvider`),
+    /// passing per-host `claimed_external_ids` (all active AND `Ended` sessions on that host)
+    /// and routing any resulting heuristic events through `Core`'s event & notification pipeline.
+    pub async fn sync_remote_host(&self, host_id: &HostId) {
+        let Some(provider) = self.inner.remote_nodes.get(host_id).cloned() else {
+            return;
+        };
+        let (display, claimed) = {
+            let st = lock(&self.inner.state);
+            let display = st
+                .host_display_names
+                .get(host_id)
+                .cloned()
+                .unwrap_or_else(|| provider.default_display_name().to_string());
+            let claimed = collect_claimed_external_ids_for_host(&st, host_id);
+            (display, claimed)
+        };
+        match provider.sync_with_claimed(&display, &claimed).await {
+            Ok(snap) => {
+                self.apply_remote_snapshot(host_id, provider.kind(), snap, false)
+                    .await;
+            }
+            Err(err) => {
+                self.apply_remote_sync_error(host_id, display, provider.as_ref(), err, false);
+            }
+        }
+    }
+
+    /// Sync all configured remote hosts concurrently (one-shot barrier used by tests/CLI).
+    /// Offline or timed-out hosts degrade gracefully (`Degraded` -> `Offline`) without marking sessions `Ended`.
     pub async fn sync_remote_nodes(&self) {
         if self.inner.remote_nodes.is_empty() {
             return;
         }
-        let entries: Vec<(HostId, String, Arc<dyn NodeProvider>)> = {
-            let st = lock(&self.inner.state);
-            self.inner
-                .remote_nodes
-                .iter()
-                .map(|(hid, prov)| {
-                    let display = st
-                        .host_display_names
-                        .get(hid)
-                        .cloned()
-                        .unwrap_or_else(|| prov.default_display_name().to_string());
-                    (hid.clone(), display, prov.clone())
-                })
-                .collect()
-        };
-
-        let mut handles = Vec::with_capacity(entries.len());
-        for (hid, display, prov) in entries {
+        let host_ids: Vec<HostId> = self.inner.remote_nodes.keys().cloned().collect();
+        let mut handles = Vec::with_capacity(host_ids.len());
+        for hid in host_ids {
+            let core = self.clone();
             handles.push(tokio::spawn(async move {
-                let res = prov.sync(&display).await;
-                (hid, display, prov.kind(), res)
+                core.sync_remote_host(&hid).await;
             }));
         }
-
-        let mut updated_sessions = Vec::new();
-        let mut updated_hosts = Vec::new();
-        let mut changed = false;
         for h in handles {
-            let Ok((hid, display, kind, res)) = h.await else {
-                continue;
-            };
+            let _ = h.await;
+        }
+    }
+
+    async fn apply_remote_snapshot(
+        &self,
+        hid: &HostId,
+        kind: HostKind,
+        mut snap: NodeSnapshot,
+        force_publish_host: bool,
+    ) {
+        let now_ms = id::now_ms();
+        let mut updated_sessions = Vec::new();
+        let mut changed = false;
+        let updated_host;
+        {
             let mut st = lock(&self.inner.state);
-            match res {
-                Ok(snap) => {
-                    let live_ids: HashSet<SessionId> =
-                        snap.sessions.iter().map(|s| s.session_id.clone()).collect();
-                    for mut s in snap.sessions {
-                        // Zero-install SSH discovery stamps `now_ms` on every poll; preserve
-                        // stable timestamps when meaningful session fields did not change so
-                        // we never trigger endless fsync/SSE floods or reset idle timers.
-                        if kind == HostKind::Ssh {
-                            if let Some(prev) = st.sessions.get(&s.session_id) {
-                                if prev.state == s.state {
-                                    s.state_since_ms = prev.state_since_ms;
-                                    let same_meta = prev.agent == s.agent
-                                        && prev.pane == s.pane
-                                        && prev.cwd == s.cwd
-                                        && prev.model == s.model
-                                        && prev.effort == s.effort
-                                        && prev.tmux_target == s.tmux_target
-                                        && prev.tmux_label == s.tmux_label
-                                        && prev.host_display_name == s.host_display_name
-                                        && prev.mux_kind == s.mux_kind;
-                                    if same_meta {
-                                        s.last_event_ms = prev.last_event_ms;
-                                    }
-                                }
+            let display = st
+                .host_display_names
+                .get(hid)
+                .cloned()
+                .unwrap_or_else(|| snap.host.display_name.clone());
+            snap.host.display_name = display.clone();
+
+            let live_ids: HashSet<SessionId> =
+                snap.sessions.iter().map(|s| s.session_id.clone()).collect();
+            for mut s in snap.sessions {
+                s.host_display_name = Some(display.clone());
+                // Zero-install SSH discovery may stamp fresh poll timestamps on subagents or
+                // re-parsed metrics; preserve stable timestamps when meaningful fields did not
+                // change so we never trigger endless fsync/SSE floods or reset idle timers.
+                if kind == HostKind::Ssh {
+                    if let Some(prev) = st.sessions.get(&s.session_id) {
+                        let same_metrics =
+                            metrics::metrics_meaningfully_equal(&prev.metrics, &s.metrics);
+                        if same_metrics {
+                            s.metrics = prev.metrics.clone();
+                        }
+                        if prev.state == s.state {
+                            s.state_since_ms = prev.state_since_ms;
+                            let same_meta = prev.agent == s.agent
+                                && prev.pane == s.pane
+                                && prev.cwd == s.cwd
+                                && prev.git_root == s.git_root
+                                && prev.model == s.model
+                                && prev.effort == s.effort
+                                && prev.tmux_target == s.tmux_target
+                                && prev.tmux_label == s.tmux_label
+                                && prev.host_display_name == s.host_display_name
+                                && prev.mux_kind == s.mux_kind
+                                && prev.transcript_path == s.transcript_path
+                                && prev.last_error == s.last_error
+                                && prev.subagent_count == s.subagent_count
+                                && prev.active_subagents == s.active_subagents
+                                && same_metrics;
+                            if same_meta {
+                                s.last_event_ms = prev.last_event_ms;
                             }
                         }
-                        let prev = st.sessions.get(&s.session_id);
-                        if prev != Some(&s) {
-                            st.sessions.insert(s.session_id.clone(), s.clone());
-                            updated_sessions.push(s);
-                            changed = true;
-                        }
                     }
-                    // Prune remote sessions that disappeared from a HEALTHY remote host.
-                    let gone: Vec<SessionId> = st
-                        .sessions
-                        .iter()
-                        .filter(|(sid, s)| {
-                            s.effective_host_id() == hid.as_str() && !live_ids.contains(*sid)
-                        })
-                        .map(|(sid, _)| sid.clone())
-                        .collect();
-                    for sid in gone {
-                        if let Some(mut old) = st.sessions.remove(&sid) {
-                            old.state = SessionState::Ended;
-                            updated_sessions.push(old);
-                            changed = true;
-                        }
-                    }
-                    let prev_host = st.hosts.get(&hid);
-                    let host_diff = prev_host.is_none_or(|p| {
-                        p.status != snap.host.status
-                            || p.error != snap.host.error
-                            || p.active_endpoint != snap.host.active_endpoint
-                            || p.display_name != snap.host.display_name
-                            || p.session_count != snap.host.session_count
-                    });
-                    if host_diff {
-                        updated_hosts.push(snap.host.clone());
-                    }
-                    st.hosts.insert(hid, snap.host);
                 }
-                Err(err) => {
-                    // Graceful degradation: mark host Degraded, NEVER mark existing remote sessions Ended!
-                    log::debug!("remote host {hid} sync degraded: {err}");
-                    let prev = st.hosts.get(&hid).cloned();
-                    let count = st
-                        .sessions
-                        .values()
-                        .filter(|s| {
-                            !s.is_subagent
-                                && s.state != SessionState::Ended
-                                && s.effective_host_id() == hid.as_str()
-                        })
-                        .count();
-                    let degraded = HostRecord {
-                        id: hid.clone(),
-                        display_name: display,
-                        kind,
-                        status: HostStatus::Degraded,
-                        active_endpoint: prev.as_ref().and_then(|p| p.active_endpoint.clone()),
-                        last_seen_ms: prev.as_ref().and_then(|p| p.last_seen_ms),
-                        error: Some(err),
-                        session_count: count,
-                    };
-                    if prev.as_ref().is_none_or(|p| {
-                        p.status != degraded.status
-                            || p.error != degraded.error
-                            || p.session_count != degraded.session_count
-                    }) {
-                        updated_hosts.push(degraded.clone());
-                    }
-                    st.hosts.insert(hid, degraded);
+                if st.sessions.get(&s.session_id) != Some(&s) {
+                    st.sessions.insert(s.session_id.clone(), s.clone());
+                    updated_sessions.push(s);
+                    changed = true;
                 }
             }
+
+            // Transition previously live remote sessions that disappeared from a HEALTHY host.
+            // Already-`Ended` sessions are left untouched so closed transcripts remain in
+            // `claimed_external_ids` and SSE does not emit duplicate `Ended` tombstones.
+            let gone: Vec<SessionId> = st
+                .sessions
+                .iter()
+                .filter(|(sid, s)| {
+                    s.effective_host_id() == hid.as_str()
+                        && s.state != SessionState::Ended
+                        && !live_ids.contains(*sid)
+                })
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            for sid in gone {
+                let keep_for_claim = st.sessions.get(&sid).is_some_and(|s| {
+                    !s.is_subagent && (!s.discovered_only || s.transcript_path.is_some())
+                });
+                if keep_for_claim {
+                    if let Some(old) = st.sessions.get_mut(&sid) {
+                        old.state = SessionState::Ended;
+                        old.state_since_ms = now_ms;
+                        old.last_event_ms = now_ms;
+                        old.last_error = None;
+                        old.active_subagents = 0;
+                        updated_sessions.push(old.clone());
+                        changed = true;
+                    }
+                } else if let Some(mut old) = st.sessions.remove(&sid) {
+                    old.state = SessionState::Ended;
+                    old.state_since_ms = now_ms;
+                    old.last_event_ms = now_ms;
+                    old.last_error = None;
+                    old.active_subagents = 0;
+                    updated_sessions.push(old);
+                    changed = true;
+                }
+            }
+
+            snap.host.session_count = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    !s.is_subagent
+                        && s.state != SessionState::Ended
+                        && s.effective_host_id() == hid.as_str()
+                })
+                .count();
+            let prev_host = st.hosts.get(hid);
+            let host_diff = force_publish_host
+                || prev_host.is_none_or(|p| {
+                    p.status != snap.host.status
+                        || p.error != snap.host.error
+                        || p.active_endpoint != snap.host.active_endpoint
+                        || p.display_name != snap.host.display_name
+                        || p.session_count != snap.host.session_count
+                        || p.rtt_ms != snap.host.rtt_ms
+                        || p.next_retry_ms != snap.host.next_retry_ms
+                });
+            updated_host = host_diff.then(|| snap.host.clone());
+            st.hosts.insert(hid.clone(), snap.host);
         }
+
         if changed {
             self.mark_dirty();
             for s in updated_sessions {
@@ -1021,8 +1203,152 @@ impl Core {
             }
             self.refresh_attention();
         }
-        for host in updated_hosts {
+        if let Some(host) = updated_host {
             self.publish_host(host);
+        }
+
+        if !snap.events.is_empty() {
+            for ev in snap.events {
+                self.publish(|seq| DaemonEvent::Event {
+                    seq,
+                    event: ev.clone(),
+                });
+                let sess_opt = lock(&self.inner.state)
+                    .sessions
+                    .get(&ev.session_id)
+                    .cloned();
+                if let Some(sess) = sess_opt {
+                    self.on_session_event(&sess, &ev, None, sess.is_subagent)
+                        .await;
+                }
+            }
+            self.refresh_attention();
+        }
+    }
+
+    fn apply_remote_sync_error(
+        &self,
+        hid: &HostId,
+        display: String,
+        provider: &dyn NodeProvider,
+        err: String,
+        force_publish_host: bool,
+    ) {
+        // Graceful degradation: update circuit status (`Degraded` -> `Offline`) & backoff,
+        // NEVER mark existing remote sessions `Ended`!
+        log::debug!("remote host {hid} sync degraded: {err}");
+        let cb_status = provider.circuit_status();
+        let status = if cb_status == HostStatus::Online {
+            HostStatus::Degraded
+        } else {
+            cb_status
+        };
+        let next_retry_ms = provider.next_retry_ms();
+        let rtt_ms = provider.rtt_ms();
+        let kind = provider.kind();
+
+        let publish_rec = {
+            let mut st = lock(&self.inner.state);
+            let prev = st.hosts.get(hid).cloned();
+            let display_name = st.host_display_names.get(hid).cloned().unwrap_or(display);
+            let count = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    !s.is_subagent
+                        && s.state != SessionState::Ended
+                        && s.effective_host_id() == hid.as_str()
+                })
+                .count();
+            let degraded = HostRecord {
+                id: hid.clone(),
+                display_name,
+                kind,
+                status,
+                active_endpoint: prev.as_ref().and_then(|p| p.active_endpoint.clone()),
+                last_seen_ms: prev.as_ref().and_then(|p| p.last_seen_ms),
+                error: Some(err),
+                session_count: count,
+                rtt_ms: rtt_ms.or_else(|| prev.as_ref().and_then(|p| p.rtt_ms)),
+                next_retry_ms,
+            };
+            let diff = force_publish_host
+                || prev.as_ref().is_none_or(|p| {
+                    p.status != degraded.status
+                        || p.error != degraded.error
+                        || p.session_count != degraded.session_count
+                        || p.rtt_ms != degraded.rtt_ms
+                        || p.next_retry_ms != degraded.next_retry_ms
+                        || p.display_name != degraded.display_name
+                });
+            st.hosts.insert(hid.clone(), degraded.clone());
+            diff.then_some(degraded)
+        };
+        if let Some(host) = publish_rec {
+            self.publish_host(host);
+        }
+    }
+
+    /// Reset a remote host's circuit breaker and execute an immediate probe (`POST /api/hosts/{id}/probe`).
+    pub async fn probe_host(&self, host_id: &str) -> Result<HostProbeOutcome, ApiError> {
+        let trimmed = host_id.trim();
+        if trimmed.is_empty() || trimmed == LOCAL_HOST_ID {
+            return Err(ApiError::not_found(format!(
+                "unknown remote host {trimmed:?}"
+            )));
+        }
+        let hid = HostId::new(trimmed);
+        let provider = self
+            .inner
+            .remote_nodes
+            .get(&hid)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found(format!("unknown remote host {trimmed}")))?;
+
+        let mut outcome = provider.probe_now().await?;
+        if let Some(snap) = outcome.snapshot.take() {
+            self.apply_remote_snapshot(&hid, provider.kind(), snap, true)
+                .await;
+        } else {
+            let display = {
+                let st = lock(&self.inner.state);
+                st.host_display_names
+                    .get(&hid)
+                    .cloned()
+                    .unwrap_or_else(|| provider.default_display_name().to_string())
+            };
+            let err = outcome
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("host {hid} probe failed"));
+            self.apply_remote_sync_error(&hid, display, provider.as_ref(), err, true);
+        }
+
+        if let Some(wake) = self.inner.remote_wake.get(&hid) {
+            wake.notify_one();
+        }
+        Ok(outcome)
+    }
+
+    /// Best-effort non-blocking upload pre-staging onto a configured remote host.
+    /// Logs warnings explicitly via `log::warn!`; never panics or swallows silently.
+    pub async fn stage_upload_for_host(&self, host_id: &str, name: String, local_path: PathBuf) {
+        let trimmed = host_id.trim();
+        if trimmed.is_empty() || trimmed == LOCAL_HOST_ID {
+            return;
+        }
+        let hid = HostId::new(trimmed);
+        let Some(provider) = self.inner.remote_nodes.get(&hid).cloned() else {
+            log::warn!("stage_upload_for_host: unknown remote host {trimmed:?}");
+            return;
+        };
+        let files = vec![(name.clone(), local_path.clone())];
+        if let Err(e) = provider.stage_input_files(&files).await {
+            log::warn!(
+                "background upload pre-stage to host {hid} failed for {name} ({}): {}",
+                local_path.display(),
+                e.message
+            );
         }
     }
 
@@ -1315,7 +1641,7 @@ impl Core {
     }
 
     /// Clone persisted state in microseconds under `Mutex<State>`, then write + fsync on `spawn_blocking`.
-    async fn flush_snapshot_async(&self) {
+    pub(crate) async fn flush_snapshot_async(&self) {
         if !self.inner.dirty.load(Ordering::SeqCst) {
             return;
         }
@@ -1502,6 +1828,7 @@ impl Core {
                 .and_then(to_json),
             C::SpawnSession {
                 agent,
+                host_id,
                 model,
                 effort,
                 project_root,
@@ -1512,6 +1839,7 @@ impl Core {
             } => {
                 self.spawn_direct_session(
                     agent,
+                    host_id,
                     project_root,
                     tmux_session,
                     model,
@@ -1555,6 +1883,35 @@ impl Core {
         let id = sender.send_test(text).await?;
         Ok(serde_json::json!({"message_id": id}))
     }
+}
+
+pub(crate) fn collect_claimed_external_ids_for_host(
+    st: &State,
+    host_id: &HostId,
+) -> HashSet<String> {
+    let prefix = format!("{}:", host_id.as_str());
+    let mut claimed = HashSet::new();
+    for s in st.sessions.values() {
+        if s.is_subagent || s.effective_host_id() != host_id.as_str() {
+            continue;
+        }
+        if let Some(tp) = s.transcript_path.as_deref() {
+            if let Some(eid) =
+                metrics::extract_session_id_from_transcript_path(s.agent, Path::new(tp))
+            {
+                claimed.insert(eid);
+            }
+        }
+        let local_sid = s
+            .session_id
+            .as_str()
+            .strip_prefix(&prefix)
+            .unwrap_or(s.session_id.as_str());
+        if !s.discovered_only && !local_sid.starts_with("tmux-") && !local_sid.is_empty() {
+            claimed.insert(local_sid.to_string());
+        }
+    }
+    claimed
 }
 
 pub(crate) fn to_json<T: serde::Serialize>(v: T) -> Result<serde_json::Value, ApiError> {
@@ -1740,14 +2097,7 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         });
     }
     if !core.inner.remote_nodes.is_empty() {
-        let c = core.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(REMOTE_SYNC_INTERVAL);
-            loop {
-                tick.tick().await;
-                c.sync_remote_nodes().await;
-            }
-        });
+        core.spawn_remote_host_supervisors();
     }
     {
         let c = core.clone();

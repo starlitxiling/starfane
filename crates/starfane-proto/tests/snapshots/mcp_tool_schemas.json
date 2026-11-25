@@ -1128,6 +1128,10 @@
           "description": "Optional explicit caller session id; overrides the cached identity.",
           "type": "string"
         },
+        "host_id": {
+          "description": "Optional target host id ('local' or a configured [[nodes]] id); defaults to 'local'.",
+          "type": "string"
+        },
         "model": {
           "description": "Optional model id (e.g. 'gpt-6.2-astra', 'gemini-4-carbon', 'opus').",
           "type": "string"

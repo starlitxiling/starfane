@@ -289,6 +289,7 @@ fn spawn_session_schema_and_command_roundtrip() {
     );
     for key in [
         "agent",
+        "host_id",
         "model",
         "effort",
         "project_root",
@@ -316,6 +317,7 @@ fn spawn_session_schema_and_command_roundtrip() {
     match cmd {
         DaemonCommand::SpawnSession {
             agent,
+            host_id,
             model,
             effort,
             project_root,
@@ -325,6 +327,7 @@ fn spawn_session_schema_and_command_roundtrip() {
             from_session,
         } => {
             assert_eq!(agent, AgentKind::Codex);
+            assert_eq!(host_id, None);
             assert_eq!(model.as_deref(), Some("gpt-6.2-astra"));
             assert_eq!(effort, Some(Effort::Xhigh));
             assert_eq!(project_root.as_deref(), Some("/repo"));
@@ -332,6 +335,22 @@ fn spawn_session_schema_and_command_roundtrip() {
             assert_eq!(name.as_deref(), Some("codex-audit"));
             assert_eq!(prompt.as_deref(), Some("starfane: read_inbox"));
             assert_eq!(from_session, Some(SessionId::new("s-caller")));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let remote_cmd: DaemonCommand = serde_json::from_value(json!({
+        "cmd": "spawn_session",
+        "agent": "claude",
+        "host_id": "remote-gpu"
+    }))
+    .unwrap();
+    let ser_remote = serde_json::to_value(&remote_cmd).unwrap();
+    assert_eq!(ser_remote["host_id"], "remote-gpu");
+    match remote_cmd {
+        DaemonCommand::SpawnSession { agent, host_id, .. } => {
+            assert_eq!(agent, AgentKind::Claude);
+            assert_eq!(host_id, Some(HostId::new("remote-gpu")));
         }
         other => panic!("unexpected {other:?}"),
     }

@@ -57,6 +57,14 @@ fn normalize_newlines(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+pub(crate) struct PreparedDispatchPayload {
+    pub text: String,
+    /// All validated local image files referenced by this dispatch.
+    pub image_paths: Vec<PathBuf>,
+    /// Long-paste `paste-<id>.md` file created for this dispatch, if any.
+    pub paste_path: Option<PathBuf>,
+}
+
 /// Prepare dispatch text & optional paste / image attachments.
 ///
 /// - Image attachments (`kind == "image"`, or `path` present with empty `content`) are strictly
@@ -67,11 +75,24 @@ fn normalize_newlines(s: &str) -> String {
 /// - Within `LONG_TEXT_*` bounds, assembled multi-line content is returned directly for verbatim
 ///   bracketed paste; when longer (or containing unsafe control characters), the ordered assembled
 ///   content is written to `<state_dir>/inputs/paste-<id>.md` (0600) with a concise pointer.
+#[cfg(test)]
 pub(crate) fn prepare_dispatch_payload(
     state_dir: &Path,
     raw_text: &str,
     attachments: &[PasteAttachment],
 ) -> Result<(String, Option<PathBuf>), ApiError> {
+    let prep = prepare_dispatch_payload_detailed(state_dir, raw_text, attachments)?;
+    let primary = prep
+        .paste_path
+        .or_else(|| prep.image_paths.into_iter().next());
+    Ok((prep.text, primary))
+}
+
+pub(crate) fn prepare_dispatch_payload_detailed(
+    state_dir: &Path,
+    raw_text: &str,
+    attachments: &[PasteAttachment],
+) -> Result<PreparedDispatchPayload, ApiError> {
     let mut resolved: Vec<ResolvedAttachment<'_>> = Vec::with_capacity(attachments.len());
     for att in attachments {
         let token = att
@@ -204,7 +225,11 @@ pub(crate) fn prepare_dispatch_payload(
             } else {
                 format!("请查看以下图片：{imgs_joined}")
             };
-            return Ok((pointer, Some(all_images[0].clone())));
+            return Ok(PreparedDispatchPayload {
+                text: pointer,
+                image_paths: all_images,
+                paste_path: None,
+            });
         }
 
         let mut assembled = expanded.trim().to_string();
@@ -244,7 +269,11 @@ pub(crate) fn prepare_dispatch_payload(
             || has_disallowed_control(&assembled);
 
         if !assembled_is_long {
-            return Ok((assembled, all_images.first().cloned()));
+            return Ok(PreparedDispatchPayload {
+                text: assembled,
+                image_paths: all_images,
+                paste_path: None,
+            });
         }
 
         let file_id = id::new_id("P");
@@ -276,7 +305,11 @@ pub(crate) fn prepare_dispatch_payload(
                 path.display()
             )
         };
-        return Ok((pointer, Some(path)));
+        return Ok(PreparedDispatchPayload {
+            text: pointer,
+            image_paths: all_images,
+            paste_path: Some(path),
+        });
     }
 
     // Legacy / unanchored path (attachments omitted tokens or callers without tokens).
@@ -296,7 +329,11 @@ pub(crate) fn prepare_dispatch_payload(
 
     if text_attachments.is_empty() && !text_is_long {
         if image_paths.is_empty() {
-            return Ok((trimmed.to_string(), None));
+            return Ok(PreparedDispatchPayload {
+                text: trimmed.to_string(),
+                image_paths: Vec::new(),
+                paste_path: None,
+            });
         }
         let imgs_joined = image_paths
             .iter()
@@ -313,7 +350,11 @@ pub(crate) fn prepare_dispatch_payload(
             let prefix = util::sanitize_line(trimmed, 800);
             format!("{prefix}（附图片：{imgs_joined}，请直接读取查看图片内容）")
         };
-        return Ok((pointer, Some(image_paths[0].clone())));
+        return Ok(PreparedDispatchPayload {
+            text: pointer,
+            image_paths,
+            paste_path: None,
+        });
     }
 
     let file_id = id::new_id("P");
@@ -383,7 +424,11 @@ pub(crate) fn prepare_dispatch_payload(
         )
     };
 
-    Ok((pointer, Some(path)))
+    Ok(PreparedDispatchPayload {
+        text: pointer,
+        image_paths,
+        paste_path: Some(path),
+    })
 }
 
 /// What to spawn for a stage / falsifier.
@@ -422,11 +467,18 @@ impl Core {
         allow: Vec<DeliveryLevel>,
         interactive: bool,
     ) -> Result<DeliveryReport, ApiError> {
-        let (text, _saved_path) =
-            prepare_dispatch_payload(&self.inner.state_dir, &text, &attachments)?;
+        let prepared =
+            prepare_dispatch_payload_detailed(&self.inner.state_dir, &text, &attachments)?;
 
         if interactive {
-            let report = self.dispatch_interactive(&target, &text).await?;
+            let report = self
+                .dispatch_interactive(
+                    &target,
+                    &prepared.text,
+                    &prepared.image_paths,
+                    prepared.paste_path.as_deref(),
+                )
+                .await?;
             self.publish(|seq| DaemonEvent::Delivery {
                 seq,
                 report: report.clone(),
@@ -434,6 +486,8 @@ impl Core {
             });
             return Ok(report);
         }
+
+        let text = prepared.text;
 
         let session_id = self.resolve_dispatch_target(&target)?;
         let allow = if allow.is_empty() {
@@ -487,8 +541,16 @@ impl Core {
         &self,
         target: &DispatchTarget,
         text: &str,
+        image_paths: &[PathBuf],
+        paste_path: Option<&Path>,
     ) -> Result<DeliveryReport, ApiError> {
         let (session_id, pane, discovered_only, agent) = self.resolve_interactive_target(target)?;
+
+        // Serialize concurrent injections into the same (Core, Host, Pane) — local or remote —
+        // so paste + settle + Enter never interleave.
+        let core_key = Arc::as_ptr(&self.inner) as usize;
+        let pane_lock = acquire_pane_inject_lock(core_key, &pane);
+        let _pane_guard = pane_lock.lock().await;
 
         // Remote SSH or Peer host interactive dispatch proxy.
         let (host_opt, local_pane) = starfane_tmux::split_host_prefix(pane.as_str());
@@ -505,7 +567,75 @@ impl Core {
                 .and_then(|s| s.as_str().strip_prefix(&format!("{host}:")))
                 .map(SessionId::new);
             let settle_ms = self.gate_config().paste_settle_ms;
-            let clean_text = text.replace('\r', "");
+            let mut clean_text = text.replace('\r', "");
+
+            // Stage attached images and any long-paste `paste-<id>.md` file onto the remote host
+            // and rewrite Hub-local paths before dispatching — never inject broken Hub-local paths.
+            if !image_paths.is_empty() || paste_path.is_some() {
+                let mut staged_rewrites: Vec<(String, String)> = Vec::new();
+                if !image_paths.is_empty() {
+                    let img_files = collect_unique_stage_files(image_paths)?;
+                    let img_map = provider.stage_input_files(&img_files).await?;
+                    for (_, lp) in &img_files {
+                        let remote_path = img_map.get(lp).ok_or_else(|| {
+                            ApiError::new(
+                                ErrorCode::Unavailable,
+                                format!(
+                                    "remote host {host} did not return staged path for {}",
+                                    lp.display()
+                                ),
+                            )
+                        })?;
+                        staged_rewrites.push((lp.display().to_string(), remote_path.clone()));
+                    }
+                }
+                if let Some(pp) = paste_path {
+                    // Rewrite any Hub-local image paths embedded inside the freshly created
+                    // `paste-<id>.md` file so the remote agent sees valid remote image paths too.
+                    if !staged_rewrites.is_empty() {
+                        let pp_owned = pp.to_path_buf();
+                        let rewrites = staged_rewrites.clone();
+                        tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+                            let orig = std::fs::read_to_string(&pp_owned).map_err(|e| {
+                                ApiError::internal(format!(
+                                    "read paste input {}: {e}",
+                                    pp_owned.display()
+                                ))
+                            })?;
+                            let updated = rewrite_staged_paths(&orig, &rewrites);
+                            if updated != orig {
+                                crate::store::write_private(&pp_owned, updated.as_bytes())
+                                    .map_err(|e| {
+                                        ApiError::internal(format!(
+                                            "rewrite paste input {}: {e}",
+                                            pp_owned.display()
+                                        ))
+                                    })?;
+                            }
+                            Ok(())
+                        })
+                        .await
+                        .map_err(|e| ApiError::internal(e.to_string()))??;
+                    }
+                    let paste_files = collect_unique_stage_files(&[pp.to_path_buf()])?;
+                    let paste_map = provider.stage_input_files(&paste_files).await?;
+                    if let Some(remote_paste) = paste_map.get(pp) {
+                        staged_rewrites.push((pp.display().to_string(), remote_paste.clone()));
+                    } else if provider.kind() == HostKind::Ssh {
+                        return Err(ApiError::new(
+                            ErrorCode::Unavailable,
+                            format!(
+                                "remote host {host} did not return staged path for {}",
+                                pp.display()
+                            ),
+                        ));
+                    }
+                }
+                if !staged_rewrites.is_empty() {
+                    clean_text = rewrite_staged_paths(&clean_text, &staged_rewrites);
+                }
+            }
+
             return provider
                 .dispatch_interactive(
                     remote_sid.as_ref(),
@@ -515,11 +645,6 @@ impl Core {
                 )
                 .await;
         }
-
-        // Serialize concurrent injections into the same pane so paste + settle + Enter never interleave.
-        let core_key = Arc::as_ptr(&self.inner) as usize;
-        let pane_lock = acquire_pane_inject_lock(core_key, &pane);
-        let _pane_guard = pane_lock.lock().await;
 
         let probe_pane = |pane_target: PaneId| {
             let core = self.clone();
@@ -1420,6 +1545,41 @@ impl Core {
     pub(crate) fn inbox_key_for_bind(token: &BindToken) -> SessionId {
         State::bind_inbox_key(token)
     }
+}
+
+fn collect_unique_stage_files(paths: &[PathBuf]) -> Result<Vec<(String, PathBuf)>, ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        if !seen.insert(p.clone()) {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "staged input file missing filename: {}",
+                    p.display()
+                ))
+            })?
+            .to_string();
+        out.push((name, p.clone()));
+    }
+    Ok(out)
+}
+
+fn rewrite_staged_paths(input: &str, mappings: &[(String, String)]) -> String {
+    let mut sorted = mappings.to_vec();
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+    let mut out = input.to_string();
+    for (local, remote) in sorted {
+        if !local.is_empty() && local != remote {
+            out = out.replace(&local, &remote);
+        }
+    }
+    out
 }
 
 enum InteractiveVerify {
