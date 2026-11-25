@@ -342,7 +342,61 @@ function parseSystemCardText(rawText) {
   return { tag, preview, body };
 }
 
-function renderMessageCard(s, msg, idx, userIdx = null) {
+const INTERMEDIATE_COLLAPSE_LINES = 6;
+const INTERMEDIATE_COLLAPSE_CHARS = 280;
+const LEGACY_MID_COLLAPSE_LINES = 8;
+const LEGACY_MID_COLLAPSE_CHARS = 400;
+
+function classifyCollapsibleAssistant(msg, hasLaterAssistantInTurn) {
+  if (!msg || msg.role !== 'assistant') return null;
+  const raw = String(msg.text || '');
+  if (!raw.trim()) return null;
+  const lines = raw.replace(/\r\n?/g, '\n').split('\n').length;
+  const chars = raw.length;
+  const kind = msg.kind || '';
+  if (kind === 'plan') return { tag: '执行计划', lines };
+  if (kind === 'agent_message') {
+    return { tag: raw.trimStart().startsWith('[群组消息]') ? '群组消息' : '代理通信', lines };
+  }
+  if (kind === 'final') return null;
+  if (kind === 'intermediate') {
+    return lines >= INTERMEDIATE_COLLAPSE_LINES || chars >= INTERMEDIATE_COLLAPSE_CHARS
+      ? { tag: '过程输出', lines }
+      : null;
+  }
+  if (hasLaterAssistantInTurn && (lines >= LEGACY_MID_COLLAPSE_LINES || chars >= LEGACY_MID_COLLAPSE_CHARS)) {
+    return { tag: '过程输出', lines };
+  }
+  return null;
+}
+
+function summarizeCollapsePreview(rawText) {
+  const lines = String(rawText || '').replace(/\r\n?/g, '\n').split('\n');
+  const cleaned = [];
+  for (let i = 0; i < lines.length; i++) {
+    let s = lines[i].trim();
+    if (!s) continue;
+    if (i === 0 && /^\[(?:群组消息|发送给 [^\]]+)\]$/.test(s)) continue;
+    if (/^```/.test(s)) continue;
+    s = s
+      .replace(/^#{1,6}\s+/, '')
+      .replace(/^>\s?/, '')
+      .replace(/^[-*+]\s+/, '')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (s) {
+      cleaned.push(s);
+      if (cleaned.length >= 2) break;
+    }
+  }
+  if (!cleaned.length) return '中间过程输出';
+  if (cleaned.length >= 2 && cleaned[0].length <= 24) return `${cleaned[0]} · ${cleaned[1]}`;
+  return cleaned[0];
+}
+
+function renderMessageCard(s, msg, idx, userIdx = null, hasLaterAssistantInTurn = false) {
   if (msg.role === 'system') {
     const sysKey = `sys:${s.session_id}:${idx}:${msg.ts_ms || 0}`;
     const { tag, preview, body } = parseSystemCardText(msg.text);
@@ -375,6 +429,40 @@ function renderMessageCard(s, msg, idx, userIdx = null) {
       quoteReplyToComposer(s.session_id, rawSel || msg.text);
     },
   }, '引用') : null;
+  const collapsible = classifyCollapsibleAssistant(msg, hasLaterAssistantInTurn);
+  if (collapsible) {
+    const midKey = `mid:${s.session_id}:${msg.ts_ms || idx}:${hashStr(String(msg.text || '').slice(0, 120))}`;
+    const metaText = `${collapsible.lines} 行${tools.length ? ` · ${tools.length} 工具` : ''}`;
+    const collapseBtn = collapsible.lines >= 16 ? h('button', {
+      type: 'button',
+      class: 'msg-mid-collapse-btn',
+      onclick: () => {
+        detailsEl.open = false;
+        UI.open.delete(midKey);
+        detailsEl.scrollIntoView({ block: 'nearest' });
+      },
+    }, `收起${collapsible.tag}`) : null;
+    const detailsEl = h('details', { class: 'msg-mid-details', 'data-k': midKey, open: UI.open.has(midKey) },
+      h('summary', { class: 'msg-mid-summary' },
+        h('i', { class: `dot agent-dot-${s.agent || 'x'}` }),
+        span('msg-mid-tag', collapsible.tag),
+        span('msg-mid-preview trunc grow', summarizeCollapsePreview(msg.text)),
+        span('msg-mid-meta tabular', metaText),
+        msg.ts_ms ? span('tabular dim', clock(msg.ts_ms)) : null),
+      h('div', { class: 'msg-mid-body' },
+        h('div', { class: 'msg-mid-body-head' },
+          h('span', { class: 'row' },
+            span(`tag a-${s.agent || 'x'}`, agentName),
+            modelEffortLabel(s.model, s.effort) ? span('mono muted', modelEffortLabel(s.model, s.effort)) : null),
+          h('span', { class: 'row' }, quoteBtn)),
+        renderMarkdown(msg.text),
+        tools.length ? h('details', { class: 'msg-tools', 'data-k': tKey, open: UI.open.has(tKey) },
+          h('summary', null, `调用了 ${tools.length} 个工具`),
+          h('div', { class: 'msg-tool-list' }, tools.map((t) => span('tag mono', t)))) : null,
+        collapseBtn));
+    cardEl = h('article', { class: 'msg-card intermediate' }, detailsEl);
+    return cardEl;
+  }
   cardEl = h('article', {
     class: `msg-card ${isUser ? 'user' : 'assistant'}`,
     id: isUser && userIdx != null ? `turn-u-${userIdx}` : null,
@@ -395,8 +483,25 @@ function renderMessageCard(s, msg, idx, userIdx = null) {
 }
 
 function renderTimelineCards(s, list) {
+  const hasLaterAssistant = new Array(list.length).fill(false);
+  let seenAssistantWithText = false;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (m.role === 'user') {
+      seenAssistantWithText = false;
+    } else if (m.role === 'assistant') {
+      hasLaterAssistant[i] = seenAssistantWithText;
+      if (String(m.text || '').trim()) seenAssistantWithText = true;
+    }
+  }
   let uIdx = 0;
-  return list.map((msg, idx) => renderMessageCard(s, msg, idx, msg.role === 'user' ? ++uIdx : null));
+  return list.map((msg, idx) => renderMessageCard(
+    s,
+    msg,
+    idx,
+    msg.role === 'user' ? ++uIdx : null,
+    hasLaterAssistant[idx],
+  ));
 }
 
 export function buildOutputBody(s) {

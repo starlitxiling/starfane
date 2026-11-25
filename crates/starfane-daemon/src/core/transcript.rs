@@ -67,6 +67,22 @@ pub enum TranscriptRole {
     System,
 }
 
+/// Semantic category for assistant turns so Web UI can collapse non-formal
+/// intermediate outputs while keeping formal replies fully expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptMessageKind {
+    /// Internal plan handoff (e.g. AGY `exit_plan_mode`).
+    Plan,
+    /// Inter-agent / swarm tool message (e.g. AGY `send_message` / `post_message`).
+    AgentMessage,
+    /// Mid-turn intermediate narration/commentary before final answer
+    /// (Codex `commentary`, Claude `tool_use`, AGY `PLANNER_RESPONSE` with simultaneous `tool_calls`).
+    Intermediate,
+    /// Formal final reply to the user.
+    Final,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptMessage {
     pub role: TranscriptRole,
@@ -75,6 +91,8 @@ pub struct TranscriptMessage {
     pub ts_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<TranscriptMessageKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -471,6 +489,11 @@ impl TranscriptIndex {
                 if last.msg.ts_ms.is_none() {
                     last.msg.ts_ms = msg.ts_ms;
                 }
+                if msg.kind.is_some()
+                    && (last.msg.kind.is_none() || msg.kind == Some(TranscriptMessageKind::Final))
+                {
+                    last.msg.kind = msg.kind;
+                }
                 return;
             }
         }
@@ -508,6 +531,7 @@ impl TranscriptIndex {
                         text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                         ts_ms,
                         tools: Vec::new(),
+                        kind: None,
                     });
                 }
             }
@@ -516,7 +540,18 @@ impl TranscriptIndex {
                     return;
                 };
                 let msg_id = msg.get("id").and_then(Value::as_str).map(str::to_string);
+                let stop_reason = msg.get("stop_reason").and_then(Value::as_str);
                 let (body, tools) = extract_claude_assistant_content(msg.get("content"));
+                let is_tool_turn = !tools.is_empty() || stop_reason == Some("tool_use");
+                let is_final_turn =
+                    matches!(stop_reason, Some("end_turn" | "stop_sequence")) && tools.is_empty();
+                let chunk_kind = if is_tool_turn {
+                    Some(TranscriptMessageKind::Intermediate)
+                } else if is_final_turn {
+                    Some(TranscriptMessageKind::Final)
+                } else {
+                    None
+                };
 
                 if let (Some(id), Some(prev_id)) = (&msg_id, &self.last_claude_msg_id) {
                     if id == prev_id {
@@ -536,6 +571,13 @@ impl TranscriptIndex {
                             if last.msg.ts_ms.is_none() {
                                 last.msg.ts_ms = ts_ms;
                             }
+                            if is_tool_turn {
+                                last.msg.kind = Some(TranscriptMessageKind::Intermediate);
+                            } else if is_final_turn
+                                && last.msg.kind != Some(TranscriptMessageKind::Intermediate)
+                            {
+                                last.msg.kind = Some(TranscriptMessageKind::Final);
+                            }
                             return;
                         }
                     }
@@ -551,6 +593,7 @@ impl TranscriptIndex {
                     text: truncate_utf8(&body, MAX_MESSAGE_BYTES),
                     ts_ms,
                     tools: attached,
+                    kind: chunk_kind,
                 });
                 self.last_claude_msg_id = msg_id;
             }
@@ -585,6 +628,7 @@ impl TranscriptIndex {
                             text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                             ts_ms,
                             tools: Vec::new(),
+                            kind: None,
                         });
                     }
                 } else {
@@ -598,6 +642,7 @@ impl TranscriptIndex {
                         text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                         ts_ms,
                         tools: attached,
+                        kind: codex_phase_kind(payload),
                     });
                 }
             }
@@ -623,6 +668,7 @@ impl TranscriptIndex {
                         text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                         ts_ms,
                         tools: Vec::new(),
+                        kind: None,
                     });
                 }
             }
@@ -636,6 +682,7 @@ impl TranscriptIndex {
                             text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                             ts_ms,
                             tools: attached,
+                            kind: codex_phase_kind(payload),
                         });
                     }
                 }
@@ -650,6 +697,7 @@ impl TranscriptIndex {
                             text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                             ts_ms,
                             tools: attached,
+                            kind: Some(TranscriptMessageKind::Final),
                         });
                     }
                 }
@@ -674,6 +722,12 @@ impl TranscriptIndex {
                 merge_tools(&mut last.msg.tools, &item.msg.tools);
                 if last.msg.ts_ms.is_none() {
                     last.msg.ts_ms = item.msg.ts_ms;
+                }
+                if item.msg.kind.is_some()
+                    && (last.msg.kind.is_none()
+                        || item.msg.kind == Some(TranscriptMessageKind::Final))
+                {
+                    last.msg.kind = item.msg.kind;
                 }
                 return;
             }
@@ -713,6 +767,7 @@ impl TranscriptIndex {
                             text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                             ts_ms,
                             tools: Vec::new(),
+                            kind: None,
                         },
                         step_index,
                         needs_content_hydration,
@@ -723,6 +778,7 @@ impl TranscriptIndex {
             }
             "PLANNER_RESPONSE" => {
                 let calls = obj.get("tool_calls").and_then(Value::as_array);
+                let has_own_calls = calls.is_some_and(|c| !c.is_empty());
                 if let Some(calls) = calls {
                     for tc in calls {
                         if let Some(name) = tc.get("name").and_then(Value::as_str) {
@@ -739,12 +795,18 @@ impl TranscriptIndex {
                     let attached = std::mem::take(&mut self.pending_tools);
                     let needs_content_hydration =
                         step_index.is_some() && agy_needs_content_hydration(obj, content);
+                    let turn_kind = if has_own_calls {
+                        TranscriptMessageKind::Intermediate
+                    } else {
+                        TranscriptMessageKind::Final
+                    };
                     self.push_agy_turn(IndexedTurn {
                         msg: TranscriptMessage {
                             role: TranscriptRole::Assistant,
                             text: truncate_utf8(content, MAX_MESSAGE_BYTES),
                             ts_ms,
                             tools: attached,
+                            kind: Some(turn_kind),
                         },
                         step_index,
                         needs_content_hydration,
@@ -752,7 +814,7 @@ impl TranscriptIndex {
                         hydrated: !needs_content_hydration,
                     });
                 } else if let Some(calls) = calls {
-                    if let Some(tc_text) = extract_agy_tool_call_text(calls) {
+                    if let Some((tc_text, tc_kind)) = extract_agy_tool_call_text(calls) {
                         let attached = std::mem::take(&mut self.pending_tools);
                         let needs_tools_hydration =
                             step_index.is_some() && agy_needs_tools_hydration(obj);
@@ -762,6 +824,7 @@ impl TranscriptIndex {
                                 text: truncate_utf8(&tc_text, MAX_MESSAGE_BYTES),
                                 ts_ms,
                                 tools: attached,
+                                kind: Some(tc_kind),
                             },
                             step_index,
                             needs_content_hydration: false,
@@ -782,6 +845,7 @@ impl TranscriptIndex {
                                 text: truncate_utf8(&msg_text, MAX_MESSAGE_BYTES),
                                 ts_ms,
                                 tools: Vec::new(),
+                                kind: None,
                             },
                             step_index,
                             needs_content_hydration,
@@ -806,6 +870,7 @@ impl TranscriptIndex {
                             text: truncate_utf8(&format!("[错误] {err_text}"), MAX_MESSAGE_BYTES),
                             ts_ms,
                             tools: attached,
+                            kind: None,
                         },
                         step_index,
                         needs_content_hydration: false,
@@ -873,8 +938,9 @@ impl TranscriptIndex {
                 }
             } else if it.needs_tools_hydration {
                 if let Some(calls) = full_obj.get("tool_calls").and_then(Value::as_array) {
-                    if let Some(tc_text) = extract_agy_tool_call_text(calls) {
+                    if let Some((tc_text, tc_kind)) = extract_agy_tool_call_text(calls) {
                         it.msg.text = truncate_utf8(&tc_text, MAX_MESSAGE_BYTES);
+                        it.msg.kind = Some(tc_kind);
                     }
                 }
             }
@@ -918,6 +984,7 @@ impl TranscriptIndex {
                     text: String::new(),
                     ts_ms: self.turns.last().and_then(|t| t.msg.ts_ms),
                     tools: self.pending_tools.clone(),
+                    kind: None,
                 }
             };
             let est_bytes = msg.text.len() + 64;
@@ -1491,8 +1558,17 @@ fn agy_arg_str(v: &Value) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn extract_agy_tool_call_text(calls: &[Value]) -> Option<String> {
+fn codex_phase_kind(payload: &Value) -> Option<TranscriptMessageKind> {
+    match payload.get("phase").and_then(Value::as_str) {
+        Some("commentary") => Some(TranscriptMessageKind::Intermediate),
+        Some("final_answer") => Some(TranscriptMessageKind::Final),
+        _ => None,
+    }
+}
+
+fn extract_agy_tool_call_text(calls: &[Value]) -> Option<(String, TranscriptMessageKind)> {
     let mut parts: Vec<String> = Vec::new();
+    let mut has_plan = false;
     for tc in calls {
         let name = tc.get("name").and_then(Value::as_str).unwrap_or("");
         let Some(args) = tc.get("args") else {
@@ -1501,6 +1577,7 @@ fn extract_agy_tool_call_text(calls: &[Value]) -> Option<String> {
         match name {
             "exit_plan_mode" => {
                 if let Some(plan) = args.get("plan").and_then(agy_arg_str) {
+                    has_plan = true;
                     parts.push(plan);
                 }
             }
@@ -1529,7 +1606,12 @@ fn extract_agy_tool_call_text(calls: &[Value]) -> Option<String> {
     if parts.is_empty() {
         None
     } else {
-        Some(parts.join("\n\n"))
+        let kind = if has_plan {
+            TranscriptMessageKind::Plan
+        } else {
+            TranscriptMessageKind::AgentMessage
+        };
+        Some((parts.join("\n\n"), kind))
     }
 }
 
@@ -2207,8 +2289,10 @@ not valid json at all
         assert!(agy_msgs[0].text.contains("done verifying"));
         assert_eq!(agy_msgs[1].role, TranscriptRole::Assistant);
         assert_eq!(agy_msgs[1].text, "# Full Hydrated Plan");
+        assert_eq!(agy_msgs[1].kind, Some(TranscriptMessageKind::Plan));
         assert_eq!(agy_msgs[2].role, TranscriptRole::Assistant);
         assert!(agy_msgs[2].text.contains("HTTP 400 failed"));
+        assert_eq!(agy_msgs[2].kind, None);
 
         // Task id background completion & [swarm] notifications stay System, only USER_INPUT is User.
         let sys_jsonl = format!(
@@ -2431,5 +2515,179 @@ not valid json at all
         assert_eq!(all_resp.messages[46].text, "turn-46");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifies_plan_agent_intermediate_and_final_turns_across_agents() {
+        // 1. AGY: silent tool step -> mid commentary+tools -> exit_plan_mode -> send_message -> formal final reply
+        let agy_jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T02:00:01Z",
+                "tool_calls": [{"name": "read_file", "args": {"Path": "/tmp/a.rs"}}]
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T02:00:02Z",
+                "content": "Let me inspect the other module too.",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls"}}]
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T02:00:03Z",
+                "tool_calls": [{"name": "exit_plan_mode", "args": {"plan": "\"## Goal\\nLong plan text\""}}]
+            }),
+            serde_json::json!({
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T02:00:04Z",
+                "tool_calls": [{"name": "send_message", "args": {"Recipient": "worker-1", "Message": "\"Please check logs\""}}]
+            }),
+            serde_json::json!({
+                "step_index": 4,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T02:00:05Z",
+                "content": "All changes are complete and verified."
+            }),
+        );
+        let agy_msgs = parse_agy_jsonl_with_hydration(&agy_jsonl, None, 20);
+        assert_eq!(agy_msgs.len(), 4, "{agy_msgs:?}");
+        assert_eq!(agy_msgs[0].kind, Some(TranscriptMessageKind::Intermediate));
+        assert!(agy_msgs[0].tools.contains(&"read_file".to_string()));
+        assert_eq!(agy_msgs[1].kind, Some(TranscriptMessageKind::Plan));
+        assert_eq!(agy_msgs[2].kind, Some(TranscriptMessageKind::AgentMessage));
+        assert_eq!(agy_msgs[3].kind, Some(TranscriptMessageKind::Final));
+
+        // Ensure earlier pending_tools alone never demotes a tool-less final PLANNER_RESPONSE.
+        let agy_final_after_tools = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "step_index": 10,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T02:01:01Z",
+                "tool_calls": [{"name": "edit_file", "args": {}}]
+            }),
+            serde_json::json!({
+                "step_index": 11,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-25T02:01:02Z",
+                "content": "Formal summary after edits."
+            }),
+        );
+        let agy_ft = parse_agy_jsonl_with_hydration(&agy_final_after_tools, None, 10);
+        assert_eq!(agy_ft.len(), 1);
+        assert_eq!(agy_ft[0].kind, Some(TranscriptMessageKind::Final));
+        assert_eq!(agy_ft[0].tools, vec!["edit_file"]);
+
+        // 2. Codex: commentary -> final_answer -> task_complete upgrade
+        let codex_jsonl = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-25T02:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "Checking workspace files first..."}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-25T02:00:02Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done implementing fix."}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-11-25T02:00:03Z",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": "Done implementing fix."
+                }
+            }),
+        );
+        let codex_msgs = parse_transcript_for_agent(AgentKind::Codex, &codex_jsonl, 10);
+        assert_eq!(codex_msgs.len(), 2, "{codex_msgs:?}");
+        assert_eq!(
+            codex_msgs[0].kind,
+            Some(TranscriptMessageKind::Intermediate)
+        );
+        assert_eq!(codex_msgs[1].kind, Some(TranscriptMessageKind::Final));
+
+        // Legacy Codex rollout without `phase`: task_complete upgrades to Final.
+        let codex_legacy = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-11-25T02:00:01Z",
+                "payload": {"type": "agent_message", "message": "Step 1 narration"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-11-25T02:00:02Z",
+                "payload": {"type": "task_complete", "last_agent_message": "Step 1 narration"}
+            }),
+        );
+        let codex_legacy_msgs = parse_transcript_for_agent(AgentKind::Codex, &codex_legacy, 10);
+        assert_eq!(codex_legacy_msgs.len(), 1);
+        assert_eq!(
+            codex_legacy_msgs[0].kind,
+            Some(TranscriptMessageKind::Final)
+        );
+
+        // 3. Claude: streaming same-id chunk with later tool_use -> Intermediate; later end_turn without tool_use -> Final
+        let claude_jsonl = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-25T02:00:01Z",
+                "message": {
+                    "id": "msg_mid",
+                    "stop_reason": null,
+                    "content": [{"type": "text", "text": "Inspecting module now..."}]
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-25T02:00:02Z",
+                "message": {
+                    "id": "msg_mid",
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "name": "Read", "input": {}}]
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-25T02:00:03Z",
+                "message": {
+                    "id": "msg_final",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "Here is the final answer."}]
+                }
+            }),
+        );
+        let claude_msgs = parse_transcript_for_agent(AgentKind::Claude, &claude_jsonl, 10);
+        assert_eq!(claude_msgs.len(), 2, "{claude_msgs:?}");
+        assert_eq!(
+            claude_msgs[0].kind,
+            Some(TranscriptMessageKind::Intermediate)
+        );
+        assert_eq!(claude_msgs[1].kind, Some(TranscriptMessageKind::Final));
     }
 }
