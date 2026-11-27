@@ -16,7 +16,7 @@ import {
   toast,
   tomorrowAt9Ms,
 } from './dom.js';
-import { act, loadNotifiers, loadUsage, muteNotifiersApi, testNotifierApi } from './api.js';
+import { act, connectSSE, loadNotifiers, loadUsage, muteNotifiersApi, pollHealth, reloadForUpdate, testNotifierApi } from './api.js';
 import {
   APP,
   S,
@@ -482,13 +482,33 @@ export function renderTop() {
     0,
   );
   const counts = { workspace: liveSessions, inbox: alerts, pipelines: activePipes, reviews: pendingVerdicts };
-  const connTxt = { live: L('实时已连接', 'Live'), connecting: L('重连中…', 'Reconnecting…'), down: L('连接已断开', 'Disconnected') }[cs];
+  const connTxt = {
+    live: L('实时已连接', 'Live'),
+    connecting: L('重连中…', 'Reconnecting…'),
+    restarting: L('升级重启中…', 'Restarting…'),
+    down: L('连接已断开', 'Disconnected'),
+  }[cs] || L('重连中…', 'Reconnecting…');
   const connTip = `starfane ${S.version || '?'} · SSE ${S.conn} · seq ${S.lastSeq}${S.uptimeMs != null ? ` · ${L('运行', 'up')} ${dur(S.uptimeMs)}` : ''}`;
   const bar = $('#topbar');
   let TOP = UI.topShell;
   if (!TOP || TOP.bar !== bar) {
     const nav = h('nav', { class: 'nav-seg', role: 'tablist', 'aria-label': L('主导航', 'Primary navigation') });
-    const connPill = h('span', { class: 'status-ind pill-soft' });
+    const connPill = h('button', {
+      type: 'button',
+      class: 'status-ind pill-soft conn-pill',
+      onclick: () => {
+        if (connState() !== 'live') {
+          pollHealth();
+          connectSSE();
+        }
+      },
+    });
+    const updateBtn = h('button', {
+      type: 'button',
+      class: 'btn sm pill top-update-btn',
+      hidden: true,
+      onclick: () => reloadForUpdate(),
+    }, span('top-upd-desk', L('新版 · 刷新', 'Update · Reload')), span('top-upd-mob', L('刷新', 'Reload')));
     const usageBtn = h('button', {
       type: 'button',
       class: 'btn sm pill top-usage-btn',
@@ -535,10 +555,10 @@ export function renderTop() {
         h('img', { class: 'logo', src: '/assets/logo.svg', alt: '', width: 26, height: 26 }),
         h('span', null, 'starfane')),
       nav,
-      h('div', { class: 'top-tools' }, connPill, usageBtn, themeBtn, muteWrap),
+      h('div', { class: 'top-tools' }, connPill, updateBtn, usageBtn, themeBtn, muteWrap),
     );
     const mobileNav = $('#mobile-nav');
-    TOP = { bar, nav, mobileNav, connPill, usageBtn, themeBtn, muteBtn, mutePopSlot, popKey: '' };
+    TOP = { bar, nav, mobileNav, connPill, updateBtn, usageBtn, themeBtn, muteBtn, mutePopSlot, popKey: '' };
     UI.topShell = TOP;
   }
   TOP.nav.replaceChildren(...VIEWS.map((v, i) => h('a', {
@@ -563,9 +583,19 @@ export function renderTop() {
     span('mnav-lbl', mobileViewLabel(v)))));
   }
   TOP.connPill.className = `status-ind pill-soft conn-pill is-${cs}`;
-  TOP.connPill.title = connTip;
+  TOP.connPill.title = cs !== 'live'
+    ? `${connTip} · ${L('点击立即重连', 'Click to reconnect now')}`
+    : connTip;
   TOP.connPill.setAttribute('aria-label', connTxt);
   TOP.connPill.replaceChildren(h('i', { class: `dot dot-${cs}` }), span('conn-label', connTxt));
+  if (TOP.updateBtn) {
+    TOP.updateBtn.hidden = !S.uiUpdateAvailable;
+    TOP.updateBtn.title = L(
+      '控制台已升级到新版本，点击立即刷新以加载新版资源（当前草稿/弹窗会随页面刷新重置）',
+      'A newer console build is ready — click to reload and load the new assets',
+    );
+  }
+  TOP.bar.classList.toggle('has-update', Boolean(S.uiUpdateAvailable));
 
   const todayTok = isFin(S.todayUsage?.total_tokens) ? S.todayUsage.total_tokens : null;
   const todayLabel = todayTok != null

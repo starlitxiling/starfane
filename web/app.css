@@ -42,9 +42,17 @@
  .dot-live,.dot-online,.dot-done,.dot-pass,.dot-verified,.dot-confirmed{background:var(--green)}
  .dot-working,.dot-running,.dot-starting{background:var(--blue);will-change:opacity;animation:pulse 1.6s ease-in-out infinite}
  .dot-connecting,.dot-degraded,.dot-needs_permission,.dot-needs_input,.dot-awaiting_human,.dot-awaiting_binding_confirm,.dot-relocated,.dot-downgraded{background:var(--amber)}
+ .dot-restarting{background:var(--amber);will-change:opacity;animation:pulse 1s ease-in-out infinite}
  .dot-down,.dot-error,.dot-failed,.dot-blocked,.dot-fail,.dot-fabricated,.dot-disproved{background:var(--red)}
  .dot-needs_human,.dot-pending_falsifier,.dot-suspended{background:var(--plum)}
  .dot-idle,.dot-offline,.dot-interrupted,.dot-pending,.dot-ended,.dot-cancelled,.dot-skipped,.dot-unknown{background:var(--dim)}
+ .conn-pill{font-family:inherit}
+ .conn-pill.is-down,.conn-pill.is-connecting,.conn-pill.is-restarting{cursor:pointer}
+ .conn-pill.is-down:hover,.conn-pill.is-connecting:hover,.conn-pill.is-restarting:hover{background:var(--surface);border-color:var(--border-strong)}
+ .top-update-btn{background:var(--blue-soft);border-color:rgba(47,95,208,0.28);color:var(--blue);font-size:12px;font-weight:600;white-space:nowrap}
+ .top-update-btn[hidden]{display:none !important}
+ .top-update-btn:hover:not(:disabled){background:rgba(47,95,208,0.16);border-color:rgba(47,95,208,0.44);color:var(--blue)}
+ .top-upd-mob{display:none}
  .top-usage-btn{background:var(--bg-subtle);border-color:var(--border);color:var(--ink-2);font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums}
  .top-usage-btn:hover:not(:disabled){background:var(--surface);border-color:var(--border-strong);color:var(--ink)}
  .top-theme-btn{background:var(--bg-subtle);border-color:var(--border);color:var(--ink-2);width:32px;height:32px;min-height:0;padding:0;flex-shrink:0}
@@ -678,6 +686,8 @@
  .toasts{position:fixed;inset:64px auto auto 50%;margin:0;padding:0;border:0;background:transparent;overflow:visible;width:max-content;transform:translateX(-50%);z-index:80;display:flex;flex-direction:column;align-items:center;gap:8px;max-width:min(440px,calc(100vw - 32px));pointer-events:none}
  @supports selector(:popover-open){.toasts[popover]:not(:popover-open){display:none}}
  .toast{max-width:100%;overflow-wrap:anywhere;word-break:break-word;padding:12px 16px;border-radius:var(--r-md);background:var(--surface);border:1px solid var(--border-strong);box-shadow:var(--shadow-float);font-size:13px;color:var(--ink);display:flex;align-items:center;gap:8px;pointer-events:auto;animation:slideUp 180ms ease}
+.toast-act{flex-shrink:0;margin-left:4px;background:var(--blue-soft);border-color:rgba(47,95,208,0.28);color:var(--blue);font-weight:600}
+.toast-act:hover:not(:disabled){background:rgba(47,95,208,0.16);border-color:rgba(47,95,208,0.44)}
  details >summary{cursor:pointer;color:var(--muted);font-size:13px;list-style:none;padding:4px 0}
  details >summary::-webkit-details-marker{display:none}
  details >summary::before{content:"▸ ";color:var(--dim)}
@@ -764,6 +774,11 @@
   .conn-pill.is-live{padding:0;width:30px;justify-content:center}
   .conn-pill.is-live .conn-label{display:none}
   .top-usage-btn{min-height:36px;padding:4px 8px;font-size:11.5px;max-width:96px;overflow:hidden;text-overflow:ellipsis}
+  .top-update-btn{min-height:36px;padding:4px 10px;font-size:11.5px;flex-shrink:0}
+  .top-upd-desk{display:none}
+  .top-upd-mob{display:inline}
+  .topbar.has-update .top-usage-btn{display:none}
+  .topbar.has-update .mute-wrap > .btn.sm{max-width:148px}
   .top-theme-btn{width:34px;min-width:34px;height:36px;min-height:36px;padding:0;flex-shrink:0}
   .mute-wrap > .btn.sm{min-height:36px;padding:5px 8px;font-size:11.5px;max-width:98px;overflow:hidden;text-overflow:ellipsis}
   .mobile-nav{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:40;background:rgba(255,255,255,0.97);border-top:1px solid var(--border-strong);padding:1px 4px calc(1px + env(safe-area-inset-bottom,0px));box-shadow:0 -2px 10px rgba(24,24,27,0.04)}
@@ -905,6 +920,9 @@
  :root[data-theme="dark"] ::selection{background:rgba(107,158,255,0.28)}
  :root[data-theme="dark"] :focus-visible{outline-color:rgba(236,234,228,0.42)}
  :root[data-theme="dark"] .topbar{background:rgba(20,20,19,0.90)}
+:root[data-theme="dark"] .conn-pill.is-down:hover,:root[data-theme="dark"] .conn-pill.is-connecting:hover,:root[data-theme="dark"] .conn-pill.is-restarting:hover{background:#262521;border-color:rgba(255,252,245,0.22)}
+:root[data-theme="dark"] .top-update-btn,:root[data-theme="dark"] .toast-act{background:rgba(107,158,255,0.16);border-color:rgba(107,158,255,0.34);color:#8BB5FF}
+:root[data-theme="dark"] .top-update-btn:hover:not(:disabled),:root[data-theme="dark"] .toast-act:hover:not(:disabled){background:rgba(107,158,255,0.24);border-color:rgba(107,158,255,0.50);color:#B8D4FF}
  :root[data-theme="dark"] .btn:hover:not(:disabled){border-color:rgba(255,252,245,0.24)}
  :root[data-theme="dark"] .btn.primary:active:not(:disabled){background:#DCD7CC}
  :root[data-theme="dark"] .btn.ghost:hover:not(:disabled){background:rgba(255,252,245,0.07)}

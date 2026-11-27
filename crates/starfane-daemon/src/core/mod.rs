@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Notify};
 
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(3);
 const SPOOL_INTERVAL: Duration = Duration::from_secs(5);
@@ -127,6 +127,8 @@ pub(crate) struct Inner {
     pub dirty: AtomicBool,
     pub snapshot_in_flight: AtomicBool,
     pub shutdown: Notify,
+    pub shutdown_tx: watch::Sender<bool>,
+    pub startup_restore_done: AtomicBool,
     pub last_attention: Mutex<Vec<AttentionItem>>,
     pub model_catalog: Mutex<Option<models::ModelCatalog>>,
     pub slash_cache: Mutex<slash::SlashCache>,
@@ -134,6 +136,16 @@ pub(crate) struct Inner {
     pub transcript_index: Arc<Mutex<transcript::TranscriptIndexCache>>,
     pub discovery_cache: Mutex<discover::DiscoveryScanCache>,
     pub(crate) usage_ledger: Mutex<usage::UsageLedger>,
+}
+
+/// Level-triggered shutdown waiter whose future is unconditionally `Send`
+/// (avoids keeping `watch::Ref` alive inside `tokio::select!` branches).
+pub(crate) async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Lock helper: a poisoned mutex means a panic happened while mutating state;
@@ -357,6 +369,8 @@ impl Core {
                 dirty: AtomicBool::new(purged_any),
                 snapshot_in_flight: AtomicBool::new(false),
                 shutdown: Notify::new(),
+                shutdown_tx: watch::channel(false).0,
+                startup_restore_done: AtomicBool::new(false),
                 last_attention: Mutex::new(Vec::new()),
                 model_catalog: Mutex::new(None),
                 slash_cache: Mutex::new(slash::SlashCache::default()),
@@ -1075,6 +1089,10 @@ impl Core {
     }
 
     async fn run_remote_host_supervisor(self, host_id: HostId, wake: Arc<Notify>) {
+        let mut shut = self.subscribe_shutdown();
+        if self.is_shutting_down() {
+            return;
+        }
         // Initial full sync unless auto-retry is already paused.
         if !self
             .inner
@@ -1083,12 +1101,21 @@ impl Core {
             .is_some_and(|p| p.is_retry_paused())
         {
             self.sync_remote_host(&host_id).await;
+            if self.is_shutting_down() {
+                return;
+            }
         }
 
         let (push_tx, mut push_rx) = mpsc::unbounded_channel::<HostPushSignal>();
         let mut watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
+            if self.is_shutting_down() {
+                if let Some(h) = watcher_handle.take() {
+                    h.abort();
+                }
+                return;
+            }
             let paused = self
                 .inner
                 .remote_nodes
@@ -1100,7 +1127,7 @@ impl Core {
                 }
                 while push_rx.try_recv().is_ok() {}
                 tokio::select! {
-                    _ = self.inner.shutdown.notified() => return,
+                    _ = wait_shutdown(&mut shut) => return,
                     _ = wake.notified() => continue,
                 }
             }
@@ -1119,7 +1146,7 @@ impl Core {
 
             loop {
                 tokio::select! {
-                    _ = self.inner.shutdown.notified() => {
+                    _ = wait_shutdown(&mut shut) => {
                         if let Some(h) = watcher_handle.take() {
                             h.abort();
                         }
@@ -2182,6 +2209,14 @@ impl Core {
                 "today_usage".into(),
                 serde_json::to_value(self.today_usage()).unwrap_or(serde_json::Value::Null),
             );
+            obj.insert(
+                "ui_hash".into(),
+                serde_json::Value::String(crate::web::embedded_ui_hash().to_string()),
+            );
+            obj.insert(
+                "uptime_ms".into(),
+                serde_json::Value::from(id::now_ms().saturating_sub(self.started_ms())),
+            );
         }
         v
     }
@@ -2199,7 +2234,16 @@ impl Core {
         }
     }
 
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.inner.shutdown_tx.subscribe()
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        *self.inner.shutdown_tx.borrow()
+    }
+
     pub fn request_shutdown(&self) {
+        let _ = self.inner.shutdown_tx.send(true);
         self.inner.shutdown.notify_waiters();
         self.inner.shutdown.notify_one();
     }
@@ -2918,55 +2962,68 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         core.config().web.port
     );
 
-    // Startup auto-restore MUST run before initial scan or periodic backup so an empty tmux
-    // server after reboot never overwrites `latest.json`.
-    core.maybe_auto_restore_on_start().await;
-
-    // Immediate initial scan so already-running tmux panes are visible on the first request.
-    core.sync_discovered_panes().await;
-    core.spawn_usage_backfill();
-
-    tokio::spawn(crate::uds::serve(core.clone(), listener));
-    {
+    // Serve UDS and Web immediately using persisted `state.json` so daemon upgrades
+    // restore browser connectivity in tens of milliseconds instead of blocking on tmux discovery.
+    let mut uds_handle = tokio::spawn(crate::uds::serve(core.clone(), listener));
+    let mut web_handle = tokio::spawn({
         let c = core.clone();
-        tokio::spawn(async move {
+        async move {
             if let Err(e) = crate::web::serve(c).await {
                 log::error!("web server stopped: {e}");
             }
-        });
-    }
+        }
+    });
+    core.spawn_usage_backfill();
     tokio::spawn(crate::lark::run(core.clone()));
-    if core.config().tmux.backup.enabled {
-        let c = core.clone();
-        let secs = core.config().tmux.backup.interval_secs.max(10);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(secs));
-            loop {
-                tick.tick().await;
-                match c.backup_tmux(false).await {
-                    Ok(out) if out.saved => {
-                        log::info!(
-                            "tmux backup saved: sessions={} windows={} panes={} resumable={}",
-                            out.session_count,
-                            out.window_count,
-                            out.pane_count,
-                            out.resumable_agent_count
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => log::warn!("tmux backup failed: {}", e.message),
-                }
-            }
-        });
-    }
     {
+        // Startup auto-restore MUST run before initial scan or periodic backup so an empty tmux
+        // server after reboot never overwrites `latest.json`.
         let c = core.clone();
         tokio::spawn(async move {
+            let mut shut = c.subscribe_shutdown();
+            if c.is_shutting_down() {
+                return;
+            }
+            c.maybe_auto_restore_on_start().await;
+            c.inner.startup_restore_done.store(true, Ordering::Release);
+            if c.is_shutting_down() {
+                return;
+            }
+            if c.config().tmux.backup.enabled {
+                let bc = c.clone();
+                let secs = c.config().tmux.backup.interval_secs.max(10);
+                tokio::spawn(async move {
+                    let mut bshut = bc.subscribe_shutdown();
+                    let mut tick = tokio::time::interval(Duration::from_secs(secs));
+                    loop {
+                        tokio::select! {
+                            _ = wait_shutdown(&mut bshut) => return,
+                            _ = tick.tick() => {}
+                        }
+                        match bc.backup_tmux(false).await {
+                            Ok(out) if out.saved => {
+                                log::info!(
+                                    "tmux backup saved: sessions={} windows={} panes={} resumable={}",
+                                    out.session_count,
+                                    out.window_count,
+                                    out.pane_count,
+                                    out.resumable_agent_count
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::warn!("tmux backup failed: {}", e.message),
+                        }
+                    }
+                });
+            }
+            c.sync_discovered_panes().await;
             let mut tick = tokio::time::interval(DISCOVER_INTERVAL);
             tick.tick().await; // skip immediate tick (already scanned above)
             loop {
-                tick.tick().await;
-                c.sync_discovered_panes().await;
+                tokio::select! {
+                    _ = wait_shutdown(&mut shut) => return,
+                    _ = tick.tick() => c.sync_discovered_panes().await,
+                }
             }
         });
     }
@@ -2976,21 +3033,29 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
     {
         let c = core.clone();
         tokio::spawn(async move {
+            let mut shut = c.subscribe_shutdown();
             let mut tick = tokio::time::interval(SNAPSHOT_INTERVAL);
             loop {
-                tick.tick().await;
-                c.flush_snapshot_async().await;
-                c.flush_usage_async().await;
+                tokio::select! {
+                    _ = wait_shutdown(&mut shut) => return,
+                    _ = tick.tick() => {
+                        c.flush_snapshot_async().await;
+                        c.flush_usage_async().await;
+                    }
+                }
             }
         });
     }
     {
         let c = core.clone();
         tokio::spawn(async move {
+            let mut shut = c.subscribe_shutdown();
             let mut tick = tokio::time::interval(SPOOL_INTERVAL);
             loop {
-                tick.tick().await;
-                c.drain_spool().await;
+                tokio::select! {
+                    _ = wait_shutdown(&mut shut) => return,
+                    _ = tick.tick() => c.drain_spool().await,
+                }
             }
         });
     }
@@ -3009,12 +3074,32 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         _ = tokio::signal::ctrl_c() => log::info!("SIGINT received"),
         _ = term.recv() => log::info!("SIGTERM received"),
     }
+    // Signal graceful Web/SSE + UDS teardown immediately so SSE clients reconnect without stall
+    // and TCP port releases rapidly.
+    core.request_shutdown();
     core.mark_dirty();
     core.flush_snapshot_sync();
     core.flush_usage_sync();
-    if core.config().tmux.backup.enabled {
-        if let Err(e) = core.backup_tmux(false).await {
-            log::warn!("shutdown tmux backup failed: {}", e.message);
+    if tokio::time::timeout(Duration::from_millis(250), &mut web_handle)
+        .await
+        .is_err()
+    {
+        web_handle.abort();
+    }
+    if tokio::time::timeout(Duration::from_millis(100), &mut uds_handle)
+        .await
+        .is_err()
+    {
+        uds_handle.abort();
+    }
+    if core.config().tmux.backup.enabled && core.inner.startup_restore_done.load(Ordering::Acquire)
+    {
+        match tokio::time::timeout(Duration::from_millis(400), core.backup_tmux_for_shutdown())
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => log::warn!("shutdown tmux backup failed: {}", e.message),
+            Err(_) => log::warn!("shutdown tmux backup timed out after 400ms"),
         }
     }
     for p in [&cfg.socket, &pid_path] {
@@ -3331,6 +3416,8 @@ mod push_tests {
                 dirty: AtomicBool::new(false),
                 snapshot_in_flight: AtomicBool::new(false),
                 shutdown: Notify::new(),
+                shutdown_tx: watch::channel(false).0,
+                startup_restore_done: AtomicBool::new(false),
                 last_attention: Mutex::new(Vec::new()),
                 model_catalog: Mutex::new(None),
                 slash_cache: Mutex::new(slash::SlashCache::default()),
@@ -3801,6 +3888,8 @@ mod push_tests {
                 dirty: AtomicBool::new(false),
                 snapshot_in_flight: AtomicBool::new(false),
                 shutdown: Notify::new(),
+                shutdown_tx: watch::channel(false).0,
+                startup_restore_done: AtomicBool::new(false),
                 last_attention: Mutex::new(Vec::new()),
                 model_catalog: Mutex::new(None),
                 slash_cache: Mutex::new(slash::SlashCache::default()),
@@ -4117,6 +4206,8 @@ mod push_tests {
                 dirty: AtomicBool::new(false),
                 snapshot_in_flight: AtomicBool::new(false),
                 shutdown: Notify::new(),
+                shutdown_tx: watch::channel(false).0,
+                startup_restore_done: AtomicBool::new(false),
                 last_attention: Mutex::new(Vec::new()),
                 model_catalog: Mutex::new(None),
                 slash_cache: Mutex::new(slash::SlashCache::default()),

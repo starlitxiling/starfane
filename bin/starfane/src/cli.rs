@@ -119,6 +119,9 @@ struct DaemonArgs {
     /// Stay in the foreground (default).
     #[arg(long)]
     foreground: bool,
+    /// Stop any running daemon cleanly and start a fresh instance.
+    #[arg(long)]
+    restart: bool,
     /// Serve web assets from this directory (dev hot reload).
     #[arg(long)]
     web_dir: Option<PathBuf>,
@@ -368,7 +371,81 @@ fn confirm_prompt(question: &str) -> bool {
 // daemon / doctor / install
 // ---------------------------------------------------------------------------
 
-fn daemon(_ctx: &Ctx, a: DaemonArgs) -> R<()> {
+fn read_daemon_pid(pid_path: &Path) -> Option<i32> {
+    let raw = std::fs::read_to_string(pid_path).ok()?;
+    let pid: i32 = raw.trim().parse().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+#[cfg(unix)]
+fn unix_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    extern "C" {
+        fn kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    // SAFETY: `kill(pid, 0)` only queries process existence for `pid > 0`.
+    unsafe { kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+fn unix_send_sigterm(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    const SIGTERM: std::ffi::c_int = 15;
+    extern "C" {
+        fn kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    // SAFETY: POSIX `kill(pid, SIGTERM)` on validated positive PID.
+    unsafe {
+        let _ = kill(pid, SIGTERM);
+    }
+}
+
+fn stop_running_daemon(ctx: &Ctx) -> R<()> {
+    let pid_path = paths::state_dir().join("starfaned.pid");
+    let pid = read_daemon_pid(&pid_path);
+    let sock_live = std::os::unix::net::UnixStream::connect(&ctx.socket).is_ok();
+    #[cfg(unix)]
+    let proc_live = pid.is_some_and(unix_pid_alive);
+    #[cfg(not(unix))]
+    let proc_live = false;
+
+    if !sock_live && !proc_live {
+        return Ok(());
+    }
+
+    if sock_live {
+        if let Ok(mut c) = DaemonClient::connect(&ctx.socket, false) {
+            let _ = c.call(DaemonCommand::Shutdown);
+        }
+    }
+    #[cfg(unix)]
+    if let Some(p) = pid.filter(|&p| unix_pid_alive(p)) {
+        unix_send_sigterm(p);
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let s_up = std::os::unix::net::UnixStream::connect(&ctx.socket).is_ok();
+        #[cfg(unix)]
+        let p_up = pid.is_some_and(unix_pid_alive);
+        #[cfg(not(unix))]
+        let p_up = false;
+        if !s_up && !p_up {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(err("timed out waiting for running daemon to stop"))
+}
+
+fn daemon(ctx: &Ctx, a: DaemonArgs) -> R<()> {
+    if a.restart && !a.foreground {
+        stop_running_daemon(ctx)?;
+    }
     if a.detach && !a.foreground {
         let state = paths::state_dir();
         std::fs::create_dir_all(&state).map_err(|e| err(format!("{}: {e}", state.display())))?;
@@ -412,6 +489,16 @@ fn daemon(_ctx: &Ctx, a: DaemonArgs) -> R<()> {
             }
         }
         cmd.spawn().map_err(|e| err(format!("spawn daemon: {e}")))?;
+        if a.restart {
+            let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < ready_deadline {
+                if std::os::unix::net::UnixStream::connect(&ctx.socket).is_ok() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            return Err(err("restarted daemon did not become ready in time"));
+        }
         return Ok(());
     }
     crate::logger::init();
@@ -435,13 +522,18 @@ fn daemon(_ctx: &Ctx, a: DaemonArgs) -> R<()> {
         .enable_all()
         .build()
         .map_err(|e| err(format!("tokio runtime: {e}")))?;
-    rt.block_on(starfane_daemon::run(cfg)).map_err(|e| match e {
+    let res = rt.block_on(starfane_daemon::run(cfg)).map_err(|e| match e {
         starfane_daemon::DaemonError::AlreadyRunning(m) => CliError {
             code: EXIT_ERR,
             msg: format!("daemon already running at {m}"),
         },
         other => err(other.to_string()),
-    })
+    });
+    // Bound Tokio shutdown instead of `Runtime::drop`'s unbounded wait so an in-flight
+    // offline SSH `spawn_blocking` probe (`ConnectTimeout=5`) never stalls daemon restarts
+    // after durable state, backup, and socket cleanup have already completed.
+    rt.shutdown_timeout(std::time::Duration::from_millis(120));
+    res
 }
 
 fn home() -> R<PathBuf> {

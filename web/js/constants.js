@@ -15,7 +15,7 @@ export const AGENT_DISPLAY = { claude: 'Claude', codex: 'Codex', agy: 'AGY', she
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const DEPTHS = ['D0', 'D1', 'D2', 'D3'];
 export const SEVERITIES = ['blocker', 'major', 'minor', 'nit'];
-export const SSE_TYPES = ['event', 'session', 'host', 'output', 'pipeline', 'artifact', 'review', 'delivery', 'attention', 'notifiers', 'resync', 'ping'];
+export const SSE_TYPES = ['event', 'session', 'host', 'output', 'pipeline', 'artifact', 'review', 'delivery', 'attention', 'notifiers', 'resync', 'ping', 'restarting'];
 export const NOTIFIER_KINDS = ['feishu', 'telegram', 'discord', 'slack', 'wecom', 'qq', 'webhook', 'macos'];
 export function notifierKindLabel(kind) {
   return {
@@ -97,6 +97,7 @@ export function levelLabel(lvl) {
 export const TOKEN_KEY = 'starfane_token';
 export const THEME_KEY = 'starfane_theme';
 export const REQUEST_TIMEOUT_MS = 15000;
+export const HEALTH_TIMEOUT_MS = 3000;
 export const HEALTH_POLL_MS = 8000;
 export const PREVIEW_POLL_MS = 3000;
 export const PREVIEW_LINES = 400;
@@ -111,6 +112,7 @@ export const TICK_MS = 15000;
 export const PARSE_DEBOUNCE_MS = 380;
 export const MAX_ACTIVITY = 80;
 export const MAX_BACKOFF_MS = 15000;
+export const RECONNECT_STEPS_MS = [200, 350, 600, 1000, 1500, 2500, 4000, 6000];
 export const TOAST_MS = 4200;
 export const COLLAPSED_KEY = 'starfane_collapsed_groups';
 export const GROUPS_INIT_KEY = 'starfane_groups_init';

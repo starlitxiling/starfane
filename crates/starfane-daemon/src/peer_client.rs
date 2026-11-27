@@ -868,6 +868,11 @@ impl PeerSseFrame {
     pub fn is_ping(&self) -> bool {
         self.event == "ping"
     }
+
+    /// True when the peer announced an imminent daemon shutdown/restart before closing SSE.
+    pub fn is_restarting(&self) -> bool {
+        self.event == "restarting"
+    }
 }
 
 /// Lifecycle + data signal emitted by [`PeerSseSubscriber::run_signals`].
@@ -1300,6 +1305,9 @@ impl PeerSseSubscriber {
                 }
                 if frame.is_ping() {
                     continue;
+                }
+                if frame.is_restarting() {
+                    return Ok(());
                 }
                 if tx.send(PeerSseSignal::Frame(frame)).is_err() {
                     return Ok(());
@@ -2494,5 +2502,72 @@ esac
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sse_subscriber_treats_restarting_frame_as_clean_eof() {
+        let frame = PeerSseFrame {
+            id: None,
+            event: "restarting".into(),
+            data: "{\"reason\":\"shutdown\"}".into(),
+        };
+        assert!(frame.is_restarting());
+        assert!(!frame.is_ping());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut req_buf = [0u8; 1024];
+                let _ = sock.read(&mut req_buf).await;
+                let payload = concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/event-stream\r\n",
+                    "Transfer-Encoding: chunked\r\n",
+                    "\r\n",
+                );
+                let _ = sock.write_all(payload.as_bytes()).await;
+                let frame_bytes = b"event: ping\ndata: {\"hello\":true}\n\nevent: restarting\ndata: {\"reason\":\"shutdown\"}\n\n";
+                let chunk = format!("{:x}\r\n", frame_bytes.len());
+                let _ = sock.write_all(chunk.as_bytes()).await;
+                let _ = sock.write_all(frame_bytes).await;
+                let _ = sock.write_all(b"\r\n0\r\n\r\n").await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let sub = PeerSseSubscriber::new(format!("http://{addr}"), None);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = sub.spawn_signals(tx);
+
+        let mut saw_connect = false;
+        let mut saw_disconnect = false;
+        let deadline = std::time::Duration::from_secs(2);
+        tokio::time::timeout(deadline, async {
+            while let Some(sig) = rx.recv().await {
+                match sig {
+                    PeerSseSignal::Connected { .. } => saw_connect = true,
+                    PeerSseSignal::Frame(f) => {
+                        panic!("unexpected frame after ping/restarting: {f:?}")
+                    }
+                    PeerSseSignal::Disconnected { error, .. } => {
+                        assert!(
+                            error.contains("EOF"),
+                            "expected clean EOF disconnect reason, got: {error}"
+                        );
+                        saw_disconnect = true;
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for SSE subscriber disconnect after restarting frame");
+
+        assert!(saw_connect);
+        assert!(saw_disconnect);
+        handle.abort();
+        srv.abort();
     }
 }

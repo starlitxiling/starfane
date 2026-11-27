@@ -1,10 +1,12 @@
 // starfane web console — HTTP client, SSE stream, true cursor pagination, and background polling
 import {
   AGENTS,
+  HEALTH_TIMEOUT_MS,
   MAX_ACTIVITY,
   MAX_BACKOFF_MS,
   PREVIEW_LINES,
   PREVIEW_PAGE_STEP,
+  RECONNECT_STEPS_MS,
   REQUEST_TIMEOUT_MS,
   SSE_TYPES,
   starfaneSlash,
@@ -60,9 +62,12 @@ export function authHeaders() {
   return t ? { 'X-Starfane-Token': t } : {};
 }
 
-export async function api(method, path, body) {
+export async function api(method, path, body, opts = {}) {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(opts?.timeoutMs) && opts.timeoutMs > 0
+    ? opts.timeoutMs
+    : REQUEST_TIMEOUT_MS;
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
   let res;
   try {
     res = await fetch(path, {
@@ -155,6 +160,8 @@ export async function syncStateSilent({ refreshActive = false } = {}) {
   try {
     const prevCur = currentSession();
     const st = await api('GET', '/api/state');
+    if (checkUiHash(st?.ui_hash)) return;
+    if (typeof st?.uptime_ms === 'number') S.uptimeMs = st.uptime_ms;
     const prevSig = sessionsDiffSig(S.sessions);
     const prevHostsSig = hostsDiffSig([...S.hosts.values()]);
     const prevAttn = S.attention.length;
@@ -234,8 +241,10 @@ export async function loadAll() {
   S.lastLoad = Date.now();
   try {
     const st = await api('GET', '/api/state');
+    if (checkUiHash(st?.ui_hash)) return;
     if (setLang(st.lang)) S.slashCmds.clear();
     S.version = st.version || S.version;
+    if (typeof st?.uptime_ms === 'number') S.uptimeMs = st.uptime_ms;
     S.lastSeq = st.event_seq || 0;
     S.sessions = new Map();
     S.pipelines = new Map();
@@ -276,7 +285,105 @@ const sessionPollAt = new Map();
 const sessionStateChangedAt = new Map();
 const postIdleTimers = new Map();
 let lastSseConnectAt = 0;
-let uiReloadScheduled = false;
+let uiReloading = false;
+let uiUpdateNotifiedHash = '';
+let healthInFlight = false;
+let recoveryTimer = 0;
+let recoveryAttempt = 0;
+let restartingSince = 0;
+
+export function reloadForUpdate() {
+  if (uiReloading) return;
+  if (typeof location === 'undefined' || typeof location.reload !== 'function') return;
+  uiReloading = true;
+  if (S.uiUpdateHash) S.uiHash = S.uiUpdateHash;
+  S.uiUpdateAvailable = false;
+  location.reload();
+}
+
+function checkUiHash(nextHash) {
+  if (typeof nextHash !== 'string' || !nextHash) return false;
+  if (!S.uiHash) {
+    S.uiHash = nextHash;
+    return false;
+  }
+  if (S.uiHash === nextHash) {
+    if (S.uiUpdateAvailable) {
+      S.uiUpdateAvailable = false;
+      S.uiUpdateHash = '';
+      APP.schedule();
+    }
+    return false;
+  }
+  S.uiUpdateHash = nextHash;
+  const hasDraft = Boolean(UI.wsShell?.comp?.ta?.value?.trim())
+    || ((UI.attachments.get(UI.selSession) || []).length > 0);
+  const hasOverlay = Boolean(UI.modal || UI.drawer);
+  if (!hasDraft && !hasOverlay && S.loaded && typeof location !== 'undefined' && typeof location.reload === 'function') {
+    reloadForUpdate();
+    return true;
+  }
+  S.uiUpdateAvailable = true;
+  APP.schedule();
+  if (uiUpdateNotifiedHash !== nextHash) {
+    uiUpdateNotifiedHash = nextHash;
+    toast(L('发现新版本，随时可点击刷新', 'New version ready — tap to reload'), 'info', {
+      actionLabel: L('立即刷新', 'Reload'),
+      onAction: () => reloadForUpdate(),
+      durationMs: 12000,
+    });
+  }
+  return false;
+}
+
+function stopFastRecovery() {
+  if (recoveryTimer) {
+    clearTimeout(recoveryTimer);
+    recoveryTimer = 0;
+  }
+  recoveryAttempt = 0;
+  restartingSince = 0;
+}
+
+async function fastRecoveryTick() {
+  recoveryTimer = 0;
+  if (document.hidden && S.loaded) return;
+  if (S.conn === 'live' && !S.restarting && S.healthFails === 0) {
+    stopFastRecovery();
+    return;
+  }
+  await pollHealth({ fromRecovery: true });
+  if (uiReloading) return;
+  if (S.conn !== 'live' || S.restarting || S.healthFails > 0) {
+    if (S.restarting && restartingSince && (Date.now() - restartingSince) > 15000) {
+      S.restarting = false;
+      APP.schedule();
+    }
+    recoveryAttempt += 1;
+    const wait = RECONNECT_STEPS_MS[Math.min(recoveryAttempt, RECONNECT_STEPS_MS.length - 1)] || 6000;
+    recoveryTimer = setTimeout(fastRecoveryTick, wait);
+  } else {
+    stopFastRecovery();
+  }
+}
+
+function startFastRecovery({ restarting = false } = {}) {
+  if (restarting) {
+    S.restarting = true;
+    restartingSince = restartingSince || Date.now();
+    recoveryAttempt = 0;
+    if (recoveryTimer) {
+      clearTimeout(recoveryTimer);
+      recoveryTimer = 0;
+    }
+  } else if (recoveryTimer) {
+    return;
+  }
+  const wait = restarting
+    ? 150
+    : (RECONNECT_STEPS_MS[Math.min(recoveryAttempt, RECONNECT_STEPS_MS.length - 1)] || 6000);
+  recoveryTimer = setTimeout(fastRecoveryTick, wait);
+}
 
 const PREFETCH_FRESH_MS = 15000;
 const SWITCH_FRESH_MS = 2500;
@@ -1368,7 +1475,35 @@ function handleEvent(type, d) {
   if (d?.seq) S.lastSeq = Math.max(S.lastSeq, d.seq);
   switch (type) {
     case 'ping':
+      if (d?.hello) {
+        if (setLang(d.lang)) {
+          S.slashCmds.clear();
+          APP.rerender();
+        }
+        if (d.version) S.version = d.version;
+        const prevUptimeMs = S.uptimeMs;
+        if (typeof d.uptime_ms === 'number') S.uptimeMs = d.uptime_ms;
+        if (checkUiHash(d.ui_hash)) return;
+        const restarted = prevUptimeMs != null && typeof d.uptime_ms === 'number' && d.uptime_ms < prevUptimeMs;
+        if (restarted || !S.loaded || (Date.now() - S.lastLoad > 1500)) {
+          loadAll();
+        }
+      }
       return;
+    case 'restarting': {
+      S.restarting = true;
+      S.conn = 'connecting';
+      S.healthFails = 0;
+      S.retry = 0;
+      clearTimeout(S.reconnectTimer);
+      if (S.es) {
+        S.es.close();
+        S.es = null;
+      }
+      startFastRecovery({ restarting: true });
+      APP.schedule();
+      return;
+    }
     case 'output': {
       if (handleOutputEvent(d)) APP.schedulePassive();
       return;
@@ -1457,18 +1592,24 @@ export function connectSSE() {
   const es = new EventSource('/api/events');
   S.es = es;
   es.onopen = () => {
+    if (S.es !== es) return;
+    stopFastRecovery();
     S.conn = 'live';
+    S.restarting = false;
     S.retry = 0;
+    S.healthFails = 0;
     S.lastSseAt = Date.now();
-    if (Date.now() - S.lastLoad > 1500) loadAll();
+    if (!uiReloading && (Date.now() - S.lastLoad > 1500)) loadAll();
     APP.schedule();
   };
   es.onerror = () => {
+    if (S.es !== es || S.restarting) return;
     if (es.readyState === EventSource.CLOSED) {
       S.conn = 'down';
-      const wait = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** S.retry++);
+      const wait = RECONNECT_STEPS_MS[Math.min(S.retry++, RECONNECT_STEPS_MS.length - 1)] || MAX_BACKOFF_MS;
       S.reconnectTimer = setTimeout(connectSSE, wait);
     } else S.conn = 'connecting';
+    startFastRecovery({ restarting: false });
     APP.schedule();
   };
   for (const t of SSE_TYPES) {
@@ -1609,62 +1750,59 @@ export async function loadSlashCommands(agent) {
   }
 }
 
-export async function pollHealth() {
+export async function pollHealth({ fromRecovery = false } = {}) {
   if (document.hidden && S.loaded) return;
+  if (healthInFlight) return;
+  healthInFlight = true;
   const prevFails = S.healthFails;
   const prevVer = S.version;
   const prevAuth = S.authNeeded;
+  const prevRestarting = S.restarting;
   const prevUptimeMs = S.uptimeMs;
   const prevUpMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
   try {
-    const r = await api('GET', '/api/health');
+    const r = await api('GET', '/api/health', undefined, { timeoutMs: HEALTH_TIMEOUT_MS });
     if (setLang(r.lang)) {
       S.slashCmds.clear();
       APP.rerender();
     }
     S.healthFails = 0;
+    S.restarting = false;
     S.version = r.version || S.version;
     S.uptimeMs = r.uptime_ms ?? null;
     if (typeof r.auth_enabled === 'boolean') {
       S.authEnabled = r.auth_enabled;
       if (!r.auth_enabled) S.authNeeded = false;
     }
-    if (typeof r?.ui_hash === 'string' && r.ui_hash) {
-      if (!S.uiHash) {
-        S.uiHash = r.ui_hash;
-      } else if (S.uiHash !== r.ui_hash) {
-        S.uiHash = r.ui_hash;
-        if (!uiReloadScheduled) {
-          const hasDraft = Boolean(UI.wsShell?.comp?.ta?.value?.trim());
-          const hasOverlay = Boolean(UI.modal || UI.drawer);
-          if (!hasDraft && !hasOverlay && S.loaded && typeof location !== 'undefined' && typeof location.reload === 'function') {
-            uiReloadScheduled = true;
-            location.reload();
-            return;
-          }
-          uiReloadScheduled = true;
-          toast(L('界面已更新，请刷新页面 (Cmd+R) 以加载新版界面', 'Web UI updated — refresh page to load new assets'), 'info');
-        }
-      }
-    }
-    const restarted = prevUptimeMs != null && r.uptime_ms != null && r.uptime_ms < prevUptimeMs;
+    if (checkUiHash(r?.ui_hash)) return;
+    const restarted = prevRestarting || (prevUptimeMs != null && r.uptime_ms != null && r.uptime_ms < prevUptimeMs);
     const sseSilent = S.conn === 'live' && S.lastSseAt > 0 && (Date.now() - S.lastSseAt) > 45000;
+    const sseNotLive = S.conn !== 'live';
+    const recentlyConnecting = S.conn === 'connecting'
+      && S.es
+      && S.es.readyState === EventSource.CONNECTING
+      && (Date.now() - lastSseConnectAt) < 1200;
     if (restarted) {
       console.warn('daemon restarted, reconnecting SSE and reloading state');
+      stopFastRecovery();
       connectSSE();
       loadAll();
     } else {
-      if (S.conn === 'down') {
-        connectSSE();
-      } else if (sseSilent) {
-        console.warn('SSE heartbeat silent for >45s, reconnecting SSE');
+      if ((sseNotLive && !recentlyConnecting) || sseSilent) {
+        if (sseSilent) console.warn('SSE heartbeat silent for >45s, reconnecting SSE');
         connectSSE();
       }
+      if (S.conn === 'live') stopFastRecovery();
       if (!S.loaded) loadAll();
     }
-  } catch { S.healthFails++; }
+  } catch {
+    if (!S.restarting) S.healthFails++;
+    if (!fromRecovery && S.healthFails >= 1) startFastRecovery({ restarting: false });
+  } finally {
+    healthInFlight = false;
+  }
   const nextUpMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
-  if (S.healthFails !== prevFails || S.version !== prevVer || S.authNeeded !== prevAuth || nextUpMin !== prevUpMin) {
+  if (S.healthFails !== prevFails || S.restarting !== prevRestarting || S.version !== prevVer || S.authNeeded !== prevAuth || nextUpMin !== prevUpMin) {
     APP.schedulePassive();
   }
 }

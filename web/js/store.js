@@ -87,9 +87,12 @@ function loadGlyphMode() {
 
 export const S = {
   conn: 'connecting',
+  restarting: false,
   healthFails: 0,
   version: '',
   uiHash: '',
+  uiUpdateAvailable: false,
+  uiUpdateHash: '',
   uptimeMs: null,
   lastSeq: 0,
   lastLoad: 0,
@@ -931,7 +934,7 @@ export function notifyTopSig() {
   return `${notifiersDiffSig()}|${gBucket}|${chBuckets}|${UI.muteMenu ? 1 : 0}|${UI.muteTarget}|${busyKeys}`;
 }
 
-export const connState = () => (S.healthFails >= 2 ? 'down' : S.conn);
+export const connState = () => (S.restarting ? 'restarting' : (S.healthFails >= 2 ? 'down' : S.conn));
 
 export function rootSessions() {
   return [...S.sessions.values()]

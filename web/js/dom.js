@@ -353,16 +353,13 @@ function promoteToastPopover(box) {
   }
 }
 
-export function toast(msg, kind = 'ok') {
+export function toast(msg, kind = 'ok', opts = {}) {
   const box = $('#toasts');
   if (!box) return;
   const dotCls = kind === 'err' ? 'dot-error' : kind === 'warn' ? 'dot-needs_permission' : 'dot-done';
-  const el = h('div', { class: 'toast' }, h('i', { class: `dot ${dotCls}` }), h('span', null, msg));
-  box.appendChild(el);
-  while (box.children.length > 4) box.firstChild.remove();
-  promoteToastPopover(box);
-  setTimeout(() => {
-    el.remove();
+  let el = null;
+  const dismiss = () => {
+    el?.remove();
     if (box.children.length === 0 && box.isConnected && typeof box.hidePopover === 'function') {
       try {
         if (box.matches(':popover-open')) box.hidePopover();
@@ -370,7 +367,25 @@ export function toast(msg, kind = 'ok') {
         console.debug('toast hidePopover skipped:', err);
       }
     }
-  }, kind === 'err' ? TOAST_MS * 2 : TOAST_MS);
+  };
+  const actBtn = opts?.actionLabel && typeof opts?.onAction === 'function'
+    ? h('button', {
+      type: 'button',
+      class: 'btn xs toast-act',
+      onclick: () => {
+        dismiss();
+        opts.onAction();
+      },
+    }, opts.actionLabel)
+    : null;
+  el = h('div', { class: 'toast' }, h('i', { class: `dot ${dotCls}` }), h('span', null, msg), actBtn);
+  box.appendChild(el);
+  while (box.children.length > 4) box.firstChild.remove();
+  promoteToastPopover(box);
+  const ttlMs = Number.isFinite(opts?.durationMs) && opts.durationMs > 0
+    ? opts.durationMs
+    : (kind === 'err' ? TOAST_MS * 2 : TOAST_MS);
+  setTimeout(dismiss, ttlMs);
 }
 
 export const statusInd = (state, text, soft = false) => span(

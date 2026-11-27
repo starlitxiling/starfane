@@ -9,19 +9,28 @@ use tokio::net::{UnixListener, UnixStream};
 const MAX_LINE: usize = 2 * 1024 * 1024;
 
 pub async fn serve(core: Core, listener: UnixListener) {
+    let mut shut = core.subscribe_shutdown();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let core = core.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_conn(core, stream).await {
-                        log::debug!("uds connection ended with error: {e}");
+        tokio::select! {
+            _ = crate::core::wait_shutdown(&mut shut) => return,
+            res = listener.accept() => {
+                match res {
+                    Ok((stream, _)) => {
+                        let core = core.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_conn(core, stream).await {
+                                log::debug!("uds connection ended with error: {e}");
+                            }
+                        });
                     }
-                });
-            }
-            Err(e) => {
-                log::error!("uds accept failed: {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Err(e) => {
+                        if core.is_shutting_down() {
+                            return;
+                        }
+                        log::error!("uds accept failed: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
             }
         }
     }

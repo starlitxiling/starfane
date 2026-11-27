@@ -50,6 +50,19 @@ impl Core {
 
     /// Capture the current tmux layout + active coding-agent resume IDs into `<state>/tmux-backups/`.
     pub async fn backup_tmux(&self, force: bool) -> Result<BackupSaveOutcome, ApiError> {
+        self.backup_tmux_inner(force, false).await
+    }
+
+    /// Fast shutdown snapshot using in-memory daemon session hints without re-running `ps`/`lsof`.
+    pub(crate) async fn backup_tmux_for_shutdown(&self) -> Result<BackupSaveOutcome, ApiError> {
+        self.backup_tmux_inner(false, true).await
+    }
+
+    async fn backup_tmux_inner(
+        &self,
+        force: bool,
+        fast_state_hints_only: bool,
+    ) -> Result<BackupSaveOutcome, ApiError> {
         let hints_from_state: HashMap<PaneId, PaneAgentHint> = {
             let st = lock(&self.inner.state);
             let mut ranked: HashMap<PaneId, (bool, u64, PaneAgentHint)> = HashMap::new();
@@ -104,44 +117,46 @@ impl Core {
             let clients = core.inner.tmux.list_clients().map_err(|e| {
                 ApiError::new(ErrorCode::Unavailable, format!("tmux list-clients: {e}"))
             })?;
-            let discovered = core.inner.tmux.discover_panes_from(
-                &panes,
-                DiscoverOptions {
-                    include_shell_panes: false,
-                },
-            );
-
             let mut hints = hints_from_state;
-            for dp in discovered {
-                if dp.pane_dead || dp.agent.is_shell() {
-                    continue;
-                }
-                let fallback_resume = match dp.agent {
-                    AgentKind::Claude => {
-                        resolve_claude_transcript_by_pids(&dp.subtree_pids).map(|(sid, _)| sid)
+            if !fast_state_hints_only {
+                let discovered = core.inner.tmux.discover_panes_from(
+                    &panes,
+                    DiscoverOptions {
+                        include_shell_panes: false,
+                    },
+                );
+
+                for dp in discovered {
+                    if dp.pane_dead || dp.agent.is_shell() {
+                        continue;
                     }
-                    AgentKind::Codex => dp.codex_resume_id.clone(),
-                    AgentKind::Agy | AgentKind::Shell => None,
-                };
-                match hints.get_mut(&dp.pane_id) {
-                    Some(existing) if existing.agent == dp.agent => {
-                        if existing.resume_id.is_none() {
-                            existing.resume_id = fallback_resume;
+                    let fallback_resume = match dp.agent {
+                        AgentKind::Claude => {
+                            resolve_claude_transcript_by_pids(&dp.subtree_pids).map(|(sid, _)| sid)
                         }
-                        if existing.model.is_none() {
-                            existing.model = dp.model;
+                        AgentKind::Codex => dp.codex_resume_id.clone(),
+                        AgentKind::Agy | AgentKind::Shell => None,
+                    };
+                    match hints.get_mut(&dp.pane_id) {
+                        Some(existing) if existing.agent == dp.agent => {
+                            if existing.resume_id.is_none() {
+                                existing.resume_id = fallback_resume;
+                            }
+                            if existing.model.is_none() {
+                                existing.model = dp.model;
+                            }
                         }
-                    }
-                    Some(_) => {}
-                    None => {
-                        hints.insert(
-                            dp.pane_id,
-                            PaneAgentHint {
-                                agent: dp.agent,
-                                resume_id: fallback_resume,
-                                model: dp.model,
-                            },
-                        );
+                        Some(_) => {}
+                        None => {
+                            hints.insert(
+                                dp.pane_id,
+                                PaneAgentHint {
+                                    agent: dp.agent,
+                                    resume_id: fallback_resume,
+                                    model: dp.model,
+                                },
+                            );
+                        }
                     }
                 }
             }

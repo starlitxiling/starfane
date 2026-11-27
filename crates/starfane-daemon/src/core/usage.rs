@@ -824,7 +824,14 @@ impl Core {
         };
         let core = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            let mut shut = core.subscribe_shutdown();
+            tokio::select! {
+                _ = super::wait_shutdown(&mut shut) => return,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+            if core.is_shutting_down() {
+                return;
+            }
             let now_secs = id::now_ms() / 1000;
             let min_mtime_secs = now_secs.saturating_sub((BACKFILL_DAYS as u64) * 86_400);
             let candidates = tokio::task::spawn_blocking(move || {
@@ -835,6 +842,9 @@ impl Core {
 
             let (tz_ms, _) = local_tz_offset_info();
             for (agent, raw_path, file_len, mtime_ns, mtime_ms) in candidates {
+                if core.is_shutting_down() {
+                    return;
+                }
                 let canon_path =
                     std::fs::canonicalize(&raw_path).unwrap_or_else(|_| raw_path.clone());
                 let key = canon_path.to_string_lossy().into_owned();
@@ -863,7 +873,10 @@ impl Core {
                         });
                     }
                 }
-                tokio::time::sleep(BACKFILL_SLEEP_PER_FILE).await;
+                tokio::select! {
+                    _ = super::wait_shutdown(&mut shut) => return,
+                    _ = tokio::time::sleep(BACKFILL_SLEEP_PER_FILE) => {}
+                }
             }
             core.flush_usage_async().await;
         });

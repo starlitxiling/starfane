@@ -120,9 +120,17 @@ pub async fn serve(core: Core) -> Result<(), String> {
     } else {
         format!("{bind}:{port}")
     };
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|e| format!("bind {addr}: {e}"))?;
+    let mut attempts = 0u32;
+    let listener = loop {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => break l,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempts < 25 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            }
+            Err(e) => return Err(format!("bind {addr}: {e}")),
+        }
+    };
     log::info!(
         "web console on http://{addr}/ (lang={}, auth_enabled={}, allow_easytier={}, easytier_cidrs={:?}, allow_tailscale={})",
         core.config().web.effective_lang(),
@@ -131,10 +139,21 @@ pub async fn serve(core: Core) -> Result<(), String> {
         core.config().web.easytier_cidrs,
         core.config().web.allow_tailscale
     );
+    serve_with_listener(core, listener).await
+}
+
+pub async fn serve_with_listener(
+    core: Core,
+    listener: tokio::net::TcpListener,
+) -> Result<(), String> {
+    let mut shutdown_rx = core.subscribe_shutdown();
     axum::serve(
         listener,
         router(core).into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        crate::core::wait_shutdown(&mut shutdown_rx).await;
+    })
     .await
     .map_err(|e| format!("serve: {e}"))
 }
@@ -402,8 +421,8 @@ fn fnv1a_etag(bytes: &[u8]) -> String {
 }
 
 /// Stable 16-char FNV-1a 64-bit lowercase hex digest over all compiled-in `EMBEDDED_ASSETS`,
-/// exposed via `GET /api/health` so open browser tabs detect daemon UI updates automatically.
-fn embedded_ui_hash() -> &'static str {
+/// exposed via `GET /api/health` and `GET /api/state` so open browser tabs detect daemon UI updates automatically.
+pub(crate) fn embedded_ui_hash() -> &'static str {
     static UI_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     UI_HASH
         .get_or_init(|| {
@@ -1670,9 +1689,37 @@ async fn events(State(core): State<Core>, headers: HeaderMap) -> Response {
         .and_then(|v| v.parse::<u64>().ok());
     // Subscribe before reading the replay buffer so nothing falls in between.
     let mut sub = core.subscribe();
+    let mut shutdown_rx = core.subscribe_shutdown();
     let replay = last.map(|l| core.replay_since(l)).unwrap_or_default();
+    let hello_data = serde_json::json!({
+        "hello": true,
+        "version": VERSION,
+        "ui_hash": embedded_ui_hash(),
+        "uptime_ms": id::now_ms().saturating_sub(core.started_ms()),
+        "lang": core.config().web.effective_lang(),
+    })
+    .to_string();
     let (tx, rx) = mpsc::channel::<Event>(256);
     tokio::spawn(async move {
+        if *shutdown_rx.borrow_and_update() {
+            let _ = tx
+                .send(
+                    Event::default()
+                        .event("restarting")
+                        .data("{\"reason\":\"shutdown\"}"),
+                )
+                .await;
+            return;
+        }
+        // Emit fast retry cadence + build metadata on the very first SSE frame so browsers
+        // detect version/UI changes immediately upon reconnect without waiting for `/api/health`.
+        let hello_ev = Event::default()
+            .retry(std::time::Duration::from_millis(800))
+            .event("ping")
+            .data(hello_data);
+        if tx.send(hello_ev).await.is_err() {
+            return;
+        }
         let mut sent = last.unwrap_or(0);
         for e in replay {
             sent = sent.max(e.seq());
@@ -1682,35 +1729,55 @@ async fn events(State(core): State<Core>, headers: HeaderMap) -> Response {
             }
         }
         loop {
-            match sub.recv().await {
-                Ok(e) => {
-                    if e.seq() <= sent && last.is_some() {
-                        continue;
-                    }
-                    sent = sent.max(e.seq());
-                    let Some(ev) = to_sse(&e) else { continue };
-                    if tx.send(ev).await.is_err() {
-                        return; // client went away
+            tokio::select! {
+                biased;
+                _ = crate::core::wait_shutdown(&mut shutdown_rx) => {
+                    let _ = tx
+                        .send(
+                            Event::default()
+                                .event("restarting")
+                                .data("{\"reason\":\"shutdown\"}"),
+                        )
+                        .await;
+                    return;
+                }
+                recv = sub.recv() => {
+                    match recv {
+                        Ok(e) => {
+                            if e.seq() <= sent && last.is_some() {
+                                continue;
+                            }
+                            sent = sent.max(e.seq());
+                            let Some(ev) = to_sse(&e) else { continue };
+                            if tx.send(ev).await.is_err() {
+                                return; // client went away
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            log::warn!("sse client lagged by {n} events");
+                            let ev = Event::default().event("resync").data("{}");
+                            if tx.send(ev).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    log::warn!("sse client lagged by {n} events");
-                    let ev = Event::default().event("resync").data("{}");
-                    if tx.send(ev).await.is_err() {
-                        return;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     });
-    Sse::new(EventStream { rx })
+    let mut resp = Sse::new(EventStream { rx })
         .keep_alive(
             KeepAlive::new()
                 .interval(std::time::Duration::from_secs(15))
                 .event(Event::default().event("ping").data("{}")),
         )
-        .into_response()
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    resp
 }
 
 #[cfg(test)]
@@ -2061,6 +2128,131 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(parsed["ok"], true);
         assert_eq!(parsed["data"]["ui_hash"], h1);
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sse_emits_hello_ping_with_ui_hash_and_restarting_on_shutdown() {
+        let root = std::env::temp_dir().join(format!("starfane-web-sse-shut-{}", id::new_id("T")));
+        let mut cfg = crate::config::StarfaneConfig::default();
+        cfg.paths.tmux = "/usr/bin/false".into();
+        cfg.zellij.enabled = false;
+        cfg.web.auth_enabled = false;
+        let core = Core::new(&crate::DaemonConfig {
+            state_dir: root.join("state"),
+            socket: root.join("state/starfaned.sock"),
+            config: cfg,
+            web_dir: None,
+            foreground: true,
+        })
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_core = core.clone();
+        let mut server = tokio::spawn(async move { serve_with_listener(srv_core, listener).await });
+
+        let host_hdr = format!("127.0.0.1:{}", core.config().web.port);
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let req = format!(
+            "GET /api/events HTTP/1.1\r\nHost: {host_hdr}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+
+        let mut reader = BufReader::new(stream);
+        let mut head = String::new();
+        loop {
+            let n = reader.read_line(&mut head).await.unwrap();
+            assert!(n > 0, "unexpected EOF reading SSE headers");
+            if head.ends_with("\r\n\r\n") || head.ends_with("\n\n") {
+                break;
+            }
+        }
+        assert!(head.contains("200 OK"), "unexpected SSE head:\n{head}");
+
+        let mut hello_block = String::new();
+        let deadline = std::time::Duration::from_secs(2);
+        tokio::time::timeout(deadline, async {
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await.unwrap();
+                assert!(n > 0, "unexpected EOF before hello SSE frame");
+                hello_block.push_str(&line);
+                if line == "\n" || line == "\r\n" {
+                    if hello_block.contains("event: ping") {
+                        break;
+                    }
+                    hello_block.clear();
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for initial SSE hello ping");
+
+        assert!(
+            hello_block.contains("retry: 800"),
+            "expected retry: 800 in hello frame:\n{hello_block}"
+        );
+        assert!(
+            hello_block.contains(embedded_ui_hash()),
+            "expected embedded_ui_hash in hello frame:\n{hello_block}"
+        );
+        assert!(
+            hello_block.contains("\"hello\":true"),
+            "expected hello:true in hello frame:\n{hello_block}"
+        );
+
+        core.request_shutdown();
+
+        let mut rest = String::new();
+        tokio::time::timeout(std::time::Duration::from_millis(800), async {
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                rest.push_str(&line);
+            }
+        })
+        .await
+        .expect("timed out waiting for SSE restarting frame + EOF on shutdown");
+        assert!(
+            rest.contains("event: restarting") && rest.contains("\"reason\":\"shutdown\""),
+            "expected restarting frame on shutdown, got:\n{rest}"
+        );
+
+        drop(reader);
+        let srv_res = tokio::time::timeout(std::time::Duration::from_millis(800), &mut server)
+            .await
+            .expect("web::serve_with_listener did not gracefully shut down promptly")
+            .expect("server join failed");
+        assert!(srv_res.is_ok(), "unexpected server error: {srv_res:?}");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn state_endpoint_includes_ui_hash_and_uptime() {
+        let root = std::env::temp_dir().join(format!("starfane-web-state-{}", id::new_id("T")));
+        let mut cfg = crate::config::StarfaneConfig::default();
+        cfg.paths.tmux = "/usr/bin/false".into();
+        cfg.zellij.enabled = false;
+        cfg.web.auth_enabled = false;
+        let core = Core::new(&crate::DaemonConfig {
+            state_dir: root.join("state"),
+            socket: root.join("state/starfaned.sock"),
+            config: cfg,
+            web_dir: None,
+            foreground: true,
+        })
+        .unwrap();
+
+        let state_val = core.state_json().await;
+        assert_eq!(state_val["ui_hash"], embedded_ui_hash());
+        assert!(state_val["uptime_ms"].as_u64().is_some());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

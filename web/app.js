@@ -106,7 +106,7 @@ function computeTopSig(alerts) {
     0,
   );
   const upMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
-  return `${getLang()}|${resolvedTheme()}|${UI.themePref}|${UI.view}|${cs}|${S.conn}|${S.version}|${S.lastSeq}|${upMin}|${liveSessions}|${alerts}|${activePipes}|${pendingVerdicts}|${notifyTopSig()}`;
+  return `${getLang()}|${resolvedTheme()}|${UI.themePref}|${UI.view}|${cs}|${S.conn}|${S.restarting ? 1 : 0}|${S.uiUpdateAvailable ? 1 : 0}|${S.version}|${S.lastSeq}|${upMin}|${liveSessions}|${alerts}|${activePipes}|${pendingVerdicts}|${notifyTopSig()}`;
 }
 
 function renderView() {
@@ -378,9 +378,10 @@ async function boot() {
   }
   route();
   rerender();
-  await pollHealth();
+  const healthP = pollHealth();
   await loadAll();
   connectSSE();
+  await healthP;
   loadModels();
   setInterval(pollHealth, HEALTH_POLL_MS);
   setInterval(pollActivePreview, PREVIEW_POLL_MS);
