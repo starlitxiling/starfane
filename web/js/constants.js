@@ -52,6 +52,7 @@ export function stateLabel(s) {
     needs_input: L('等待输入', 'Needs input'),
     error: L('异常', 'Error'),
     interrupted: L('已中断', 'Interrupted'),
+    suspended: L('已休眠', 'Suspended'),
     ended: L('已结束', 'Ended'),
     unknown: L('未知', 'Unknown'),
     running: L('进行中', 'Running'),
@@ -81,8 +82,9 @@ export const STATE_PRIO = {
   starting: 3,
   idle: 4,
   interrupted: 4,
-  unknown: 5,
-  ended: 6,
+  suspended: 5,
+  unknown: 6,
+  ended: 7,
 };
 export function levelLabel(lvl) {
   return {

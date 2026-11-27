@@ -137,6 +137,7 @@ pub async fn serve(core: Core) -> Result<(), String> {
 pub fn router(core: Core) -> Router {
     let api = Router::new()
         .route("/api/state", get(state))
+        .route("/api/usage", get(usage_summary))
         .route("/api/models", get(models))
         .route("/api/slash-commands", get(slash_commands))
         .route("/api/events", get(events))
@@ -147,6 +148,8 @@ pub fn router(core: Core) -> Router {
         .route("/api/tmux/backups", get(tmux_backups))
         .route("/api/sessions/spawn", post(spawn_session))
         .route("/api/sessions/{id}/focus", post(focus))
+        .route("/api/sessions/{id}/suspend", post(suspend_session))
+        .route("/api/sessions/{id}/resume", post(resume_session))
         .route("/api/sessions/{id}/close", post(close_session))
         .route("/api/sessions/{id}/key", post(send_session_key))
         .route("/api/sessions/{id}/ack", post(ack_session))
@@ -642,6 +645,21 @@ async fn state(State(core): State<Core>) -> Response {
     respond(Ok(core.state_json().await))
 }
 
+async fn usage_summary(
+    State(core): State<Core>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let days = q
+        .get("days")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(30)
+        .clamp(1, 90);
+    respond(
+        serde_json::to_value(core.usage_summary(days).await)
+            .map_err(|e| ApiError::internal(e.to_string())),
+    )
+}
+
 async fn models(State(core): State<Core>) -> Response {
     let r = core
         .model_catalog()
@@ -686,6 +704,14 @@ async fn sessions(State(core): State<Core>, Query(q): Query<HashMap<String, Stri
 
 async fn focus(State(core): State<Core>, Path(id): Path<String>) -> Response {
     respond(core.focus_session(&SessionId(id)).await)
+}
+
+async fn suspend_session(State(core): State<Core>, Path(id): Path<String>) -> Response {
+    respond(core.suspend_session(&SessionId(id)).await)
+}
+
+async fn resume_session(State(core): State<Core>, Path(id): Path<String>) -> Response {
+    respond(core.resume_session(&SessionId(id)).await)
 }
 
 async fn close_session(State(core): State<Core>, Path(id): Path<String>) -> Response {

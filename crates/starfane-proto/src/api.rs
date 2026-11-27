@@ -559,6 +559,82 @@ pub struct StateSnapshot {
     pub event_seq: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsageTotals {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+}
+
+impl TokenUsageTotals {
+    /// Construct normalized token totals (`total_tokens = input_tokens + output_tokens`).
+    pub fn from_counts(input_tokens: u64, output_tokens: u64, cache_read_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+        }
+    }
+
+    pub fn add_assign(&mut self, rhs: &TokenUsageTotals) {
+        self.input_tokens = self.input_tokens.saturating_add(rhs.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(rhs.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(rhs.cache_read_tokens);
+        self.total_tokens = self.input_tokens.saturating_add(self.output_tokens);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DailyUsageBucket {
+    pub date: String,
+    #[serde(flatten)]
+    pub totals: TokenUsageTotals,
+    #[serde(default)]
+    pub by_agent: BTreeMap<String, TokenUsageTotals>,
+    #[serde(default)]
+    pub session_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsageRankItem {
+    pub session_id: SessionId,
+    pub agent: AgentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(flatten)]
+    pub totals: TokenUsageTotals,
+    #[serde(default)]
+    pub last_active_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageSummaryResponse {
+    pub days: usize,
+    pub tz_offset: String,
+    pub today_date: String,
+    pub today: TokenUsageTotals,
+    pub last_7_days: TokenUsageTotals,
+    pub last_30_days: TokenUsageTotals,
+    pub range_totals: TokenUsageTotals,
+    #[serde(default)]
+    pub by_agent_range: BTreeMap<String, TokenUsageTotals>,
+    #[serde(default)]
+    pub daily: Vec<DailyUsageBucket>,
+    #[serde(default)]
+    pub top_sessions: Vec<SessionUsageRankItem>,
+    pub updated_ms: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

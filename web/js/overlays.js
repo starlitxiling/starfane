@@ -27,6 +27,7 @@ import {
   pct,
   plainList,
   selectField,
+  sessionTotalTokens,
   shorthand,
   skeleton,
   span,
@@ -49,10 +50,13 @@ import {
   loadPreview,
   loadSessionOutput,
   loadTmuxSessions,
+  loadUsage,
   pauseHostRetryApi,
   probeHostApi,
   refreshReview,
   renameHostApi,
+  resumeSessionApi,
+  suspendSessionApi,
 } from './api.js';
 import { expandAttachmentToInput, queueParse, removeAttachment } from './composer.js';
 import { mdProse, renderMarkdown } from './markdown.js';
@@ -150,6 +154,14 @@ export function openSpawnModal() {
 
 export function canCloseSessionWindow(s) {
   return Boolean(s && !s.is_subagent && String(s.pane || '').trim() && s.state !== 'ended');
+}
+
+export function canSuspendSession(s) {
+  return Boolean(s && !s.is_subagent && s.agent !== 'shell' && String(s.pane || '').trim() && s.state !== 'ended' && s.state !== 'suspended');
+}
+
+export function canResumeSession(s) {
+  return Boolean(s && !s.is_subagent && s.agent !== 'shell' && String(s.pane || '').trim() && s.state === 'suspended');
 }
 
 export function windowGroupKeyOf(s) {
@@ -364,8 +376,13 @@ function drawerMetricsCard(m) {
   const lastTurn = isFin(m?.last_output_tokens) || isFin(m?.last_duration_ms)
     ? `${isFin(m?.last_output_tokens) ? `${fmtTokens(m.last_output_tokens)} tokens` : '—'} · ${isFin(m?.last_duration_ms) ? fmtMs(m.last_duration_ms) : '—'}`
     : '—';
+  const tot = sessionTotalTokens(m);
+  const cacheRead = isFin(m?.total_cache_read_tokens) && m.total_cache_read_tokens > 0 ? m.total_cache_read_tokens : null;
   const totals = isFin(m?.total_input_tokens) || isFin(m?.total_output_tokens)
-    ? L(`${fmtTokens(m?.total_input_tokens)} 输入 / ${fmtTokens(m?.total_output_tokens)} 输出`, `${fmtTokens(m?.total_input_tokens)} in / ${fmtTokens(m?.total_output_tokens)} out`)
+    ? L(
+      `输入 ${fmtTokens(m?.total_input_tokens)} / 输出 ${fmtTokens(m?.total_output_tokens)}${cacheRead != null ? `（缓存 ${fmtTokens(cacheRead)}）` : ''}`,
+      `In ${fmtTokens(m?.total_input_tokens)} / Out ${fmtTokens(m?.total_output_tokens)}${cacheRead != null ? ` (cache ${fmtTokens(cacheRead)})` : ''}`,
+    )
     : '—';
   const srcLine = m?.source && m.source !== 'none'
     ? `${metricsSrcLabel(m.source)}${m.updated_ms ? ` · ${clock(m.updated_ms)}` : ''}`
@@ -405,7 +422,8 @@ function drawerMetricsCard(m) {
       [L('最近首字延迟 (TTFT)', 'Latest TTFT'), span(`tabular${latestTtftCls}`, ttftVal != null ? fmtMs(ttftVal) : '—')],
       [L('平均首字延迟', 'Average TTFT'), span(`tabular${avgTtftCls}`, avgTtftText)],
       [L('最近回合', 'Last turn'), span('tabular', lastTurn)],
-      [L('累计用量', 'Cumulative tokens'), span('tabular', totals)],
+      [L('会话总消耗', 'Session total'), tot != null ? span('tabular', `${fmtTokens(tot)} tokens`) : span('muted', '—')],
+      [L('用量明细', 'Token breakdown'), span('tabular', totals)],
       [L('数据来源', 'Telemetry source'), span('tabular muted', srcLine)],
     ]),
     turnHistoryEl);
@@ -424,6 +442,8 @@ function drawerSession(s) {
   const retryPaused = Boolean(hRec?.retry_paused);
   const retryCd = hUnhealthy && !retryPaused ? formatRetryCountdown(hRec?.next_retry_ms) : '';
   const closable = canCloseSessionWindow(s);
+  const suspendable = canSuspendSession(s);
+  const resumable = canResumeSession(s);
   const isSplit = closable && siblingSplitPanesOf(s).length > 0;
   return h('div', { class: 'stack' },
     h('div', { class: 'drawer-controls' },
@@ -432,6 +452,18 @@ function drawerSession(s) {
         ? btn(L('清除异常状态', 'Clear error state'), { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => APP.ackSessionError(s) }) : null,
       btn(L('手动刷新', 'Refresh'), { cls: 'sm', onclick: () => { loadSessionOutput(s, { silent: false, forcePreview: true, force: true }); toast(L('已刷新会话输出', 'Session output refreshed')); } }),
       s.pane ? btn(L('完整终端日志', 'Full Terminal Log'), { cls: 'ghost sm', onclick: () => openDrawer('terminal', { pane: s.pane, title: sessionLabel(s) }) }) : null,
+      suspendable ? btn(L('休眠', 'Suspend'), {
+        cls: 'sm',
+        busyKey: `suspend:${s.session_id}`,
+        title: L('结束当前 Agent 进程释放 CPU/内存，保留终端窗口并支持原地恢复原会话', 'Exit the agent process to save CPU/RAM while keeping the pane and conversation resumable'),
+        onclick: () => suspendSessionApi(s.session_id),
+      }) : null,
+      resumable ? btn(L('唤醒原会话', 'Wake session'), {
+        cls: 'sm primary',
+        busyKey: `resume:${s.session_id}`,
+        title: L('原地唤醒并恢复原会话上下文', 'Wake and resume this conversation in-place'),
+        onclick: () => resumeSessionApi(s.session_id),
+      }) : null,
       closable ? btn(isSplit ? L('关闭窗格', 'Close pane') : L('关闭窗口', 'Close window'), {
         cls: 'ghost sm danger',
         title: isSplit
@@ -477,6 +509,8 @@ function drawerSession(s) {
         hUnhealthy ? btn(L('重连', 'Retry'), { cls: 'xs', busyKey: `probe-host:${hid}`, onclick: () => probeHostApi(hid) }) : null)],
       [L('复用器', 'Multiplexer'), span(muxKindOf(s) === 'zellij' ? 'tag mux-zj' : 'tag', muxKindOf(s))],
       [L('会话 ID', 'Session ID'), h('code', null, s.session_id)],
+      s.resume_id ? [L('恢复 ID', 'Resume ID'), h('code', null, s.resume_id)] : null,
+      s.state === 'suspended' && s.suspended_at_ms ? [L('休眠时间', 'Suspended at'), ago(s.suspended_at_ms)] : null,
       [L('窗口标识', 'Window label'), s.tmux_label ? h('code', null, s.tmux_label) : null],
       [L('Agent / 模型', 'Agent / Model'), h('div', { class: 'row' }, agentTag(s.agent), modelTag(modelBaseOf(s.model, s.effort) || s.model))],
       [L('思考强度', 'Reasoning effort'), s.effort ? span('tag mono', s.effort) : span('muted', '—')],
@@ -653,7 +687,206 @@ export function renderModal() {
   else if (want === 'spawn') d.replaceChildren(spawnModalBody());
   else if (want === 'rename-host') d.replaceChildren(renameHostModalBody());
   else if (want === 'close-session') d.replaceChildren(closeSessionModalBody());
-  else d.replaceChildren(pipelineModalBody(want));
+  else if (want === 'usage') {
+    if (S.usageState === 'idle') loadUsage(S.usageDays);
+    d.replaceChildren(usageModalBody());
+  } else d.replaceChildren(pipelineModalBody(want));
+}
+
+function usageKpiCard(title, totals) {
+  const tot = isFin(totals?.total_tokens) ? totals.total_tokens : 0;
+  const inp = isFin(totals?.input_tokens) ? totals.input_tokens : 0;
+  const out = isFin(totals?.output_tokens) ? totals.output_tokens : 0;
+  const cache = isFin(totals?.cache_read_tokens) ? totals.cache_read_tokens : 0;
+  return h('div', { class: 'usage-kpi-card' },
+    h('div', { class: 'usage-kpi-lbl' }, title),
+    h('div', { class: 'usage-kpi-val' }, `${fmtTokens(tot)}`),
+    h('div', { class: 'usage-kpi-sub' }, L(`输入 ${fmtTokens(inp)} · 输出 ${fmtTokens(out)}`, `In ${fmtTokens(inp)} · Out ${fmtTokens(out)}`)),
+    cache > 0 ? h('div', { class: 'usage-kpi-sub' }, L(`缓存命中 ${fmtTokens(cache)}`, `Cache read ${fmtTokens(cache)}`)) : null);
+}
+
+const USAGE_AGENT_ORDER = ['claude', 'codex', 'agy'];
+
+function usageModalBody() {
+  const days = S.usageDays || 14;
+  const data = S.usage;
+  const loading = S.usageState === 'loading';
+  const rangeBtns = h('div', { class: 'view-seg', role: 'tablist', 'aria-label': L('统计周期', 'Date range') },
+    [7, 14, 30].map((d) => h('button', {
+      type: 'button',
+      role: 'tab',
+      class: days === d ? 'on' : '',
+      'aria-selected': days === d ? 'true' : 'false',
+      onclick: () => loadUsage(d),
+    }, L(`${d} 天`, `${d}d`))));
+
+  let content;
+  if (!data && S.usageState === 'err') {
+    content = errorBanner(
+      L(`加载 Token 统计失败：${S.usageErr || ''}`, `Failed to load token usage: ${S.usageErr || ''}`),
+      L('重试', 'Retry'),
+      () => loadUsage(days),
+    );
+  } else if (!data) {
+    content = skeleton(6);
+  } else {
+    const daily = Array.isArray(data.daily) ? data.daily : [];
+    const maxTot = Math.max(1, ...daily.map((b) => (isFin(b?.total_tokens) ? b.total_tokens : 0)));
+    const rangeTot = Math.max(0, data.range_totals?.total_tokens || 0);
+    const agentEntries = Object.entries(data.by_agent_range || {})
+      .filter(([, tot]) => (tot?.total_tokens || 0) > 0)
+      .sort((a, b) => (b[1]?.total_tokens || 0) - (a[1]?.total_tokens || 0));
+
+    const selDay = daily.find((b) => b.date === S.usageSelDate) || daily[daily.length - 1] || null;
+    const tickStep = days <= 10 ? 1 : days <= 16 ? 2 : 5;
+
+    const chartBars = daily.map((b, idx) => {
+      const tot = isFin(b?.total_tokens) ? b.total_tokens : 0;
+      const fillPct = tot > 0 ? Math.max(4, Math.round((tot / maxTot) * 100)) : 0;
+      const byAg = b?.by_agent || {};
+      const segKeys = [
+        ...USAGE_AGENT_ORDER.filter((ag) => (byAg[ag]?.total_tokens || 0) > 0),
+        ...Object.keys(byAg).filter((ag) => !USAGE_AGENT_ORDER.includes(ag) && (byAg[ag]?.total_tokens || 0) > 0),
+      ];
+      const segs = segKeys.map((ag) => {
+        const v = byAg[ag]?.total_tokens || 0;
+        const cls = USAGE_AGENT_ORDER.includes(ag) ? `a-${ag}` : 'a-other';
+        return h('span', { class: `usage-bar-seg ${cls}`, style: `flex-grow:${Math.max(1, v)}` });
+      });
+      const isLast = idx === daily.length - 1;
+      const showTick = idx === 0 || isLast || (idx % tickStep === 0 && (daily.length - 1 - idx) >= Math.ceil(tickStep / 2));
+      const agTip = segKeys.map((ag) => `${ag} ${fmtTokens(byAg[ag]?.total_tokens || 0)}`).join(' · ');
+      const tip = `${b.date}: ${fmtTokens(tot)} tokens${agTip ? ` (${agTip})` : ''}`;
+      return h('button', {
+        type: 'button',
+        class: `usage-bar-col${selDay && selDay.date === b.date ? ' is-sel' : ''}`,
+        title: tip,
+        'aria-label': tip,
+        onclick: () => { S.usageSelDate = b.date; APP.rerender(); },
+      },
+      h('span', { class: 'usage-bar-track' },
+        tot > 0 ? h('span', { class: 'usage-bar-fill', style: `height:${fillPct}%` }, segs) : null),
+      h('span', { class: 'usage-bar-tick' }, showTick ? b.date.slice(5) : ''));
+    });
+
+    const selAgText = selDay
+      ? Object.entries(selDay.by_agent || {})
+        .filter(([, v]) => (v?.total_tokens || 0) > 0)
+        .sort((a, b) => (b[1]?.total_tokens || 0) - (a[1]?.total_tokens || 0))
+        .map(([ag, v]) => `${ag} ${fmtTokens(v.total_tokens)}`)
+        .join(' · ')
+      : '';
+
+    const topSessions = Array.isArray(data.top_sessions) ? data.top_sessions : [];
+
+    content = h('div', { class: 'stack' },
+      S.usageState === 'err' && S.usageErr
+        ? errorBanner(L(`刷新失败：${S.usageErr}`, `Refresh failed: ${S.usageErr}`), L('重试', 'Retry'), () => loadUsage(days))
+        : null,
+      h('div', { class: 'usage-kpi-grid' },
+        usageKpiCard(L('今日消耗', 'Today'), data.today),
+        usageKpiCard(L('近 7 日消耗', 'Last 7 days'), data.last_7_days),
+        usageKpiCard(L('近 30 日消耗', 'Last 30 days'), data.last_30_days)),
+      agentEntries.length
+        ? h('div', { class: 'usage-agent-bar' },
+          h('span', { class: 'sec-h', style: 'margin:0' }, L(`近 ${data.days} 日总计 · ${fmtTokens(rangeTot)}`, `${data.days}d total · ${fmtTokens(rangeTot)}`)),
+          h('div', { class: 'usage-agent-pills' },
+            agentEntries.map(([ag, tot]) => {
+              const v = tot?.total_tokens || 0;
+              const share = rangeTot > 0 ? Math.round((v / rangeTot) * 100) : 0;
+              return h('span', {
+                class: 'usage-agent-pill',
+                title: L(`输入 ${fmtTokens(tot.input_tokens)} · 输出 ${fmtTokens(tot.output_tokens)} · 缓存 ${fmtTokens(tot.cache_read_tokens)}`, `In ${fmtTokens(tot.input_tokens)} · Out ${fmtTokens(tot.output_tokens)} · Cache ${fmtTokens(tot.cache_read_tokens)}`),
+              }, agentTag(ag), h('span', null, `${fmtTokens(v)} (${share}%)`));
+            })))
+        : null,
+      h('div', { class: 'usage-chart-card' },
+        h('div', { class: 'row', style: 'justify-content:space-between' },
+          h('span', { class: 'sec-h', style: 'margin:0' }, L(`每日消耗趋势（近 ${data.days} 天）`, `Daily usage (last ${data.days} days)`)),
+          h('div', { class: 'usage-legend' },
+            USAGE_AGENT_ORDER.map((ag) => h('span', { class: 'usage-legend-item' }, h('i', { class: `usage-legend-dot a-${ag}` }), ag)))),
+        daily.length ? h('div', { class: 'usage-chart-cols' }, chartBars)
+          : h('div', { class: 'muted', style: 'font-size:13px;padding:12px 0' }, L('暂无每日数据', 'No daily data yet')),
+        selDay ? h('div', { class: 'usage-day-detail' },
+          h('span', { class: 'row', style: 'gap:8px' },
+            h('strong', null, selDay.date),
+            span('tag', L(`${selDay.session_count || 0} 个会话`, `${selDay.session_count || 0} sessions`))),
+          h('span', null,
+            L(
+              `总计 ${fmtTokens(selDay.total_tokens || 0)}（输入 ${fmtTokens(selDay.input_tokens || 0)} · 输出 ${fmtTokens(selDay.output_tokens || 0)}${(selDay.cache_read_tokens || 0) > 0 ? ` · 缓存 ${fmtTokens(selDay.cache_read_tokens)}` : ''}）${selAgText ? ` · ${selAgText}` : ''}`,
+              `Total ${fmtTokens(selDay.total_tokens || 0)} (in ${fmtTokens(selDay.input_tokens || 0)} · out ${fmtTokens(selDay.output_tokens || 0)}${(selDay.cache_read_tokens || 0) > 0 ? ` · cache ${fmtTokens(selDay.cache_read_tokens)}` : ''})${selAgText ? ` · ${selAgText}` : ''}`,
+            ))) : null),
+      h('div', { class: 'stack-xs' },
+        h('div', { class: 'row', style: 'justify-content:space-between' },
+          h('span', { class: 'sec-h', style: 'margin:0' }, L(`会话消耗排行（近 ${data.days} 天 Top ${topSessions.length}）`, `Top Sessions (last ${data.days}d)`)),
+          h('span', { class: 'muted', style: 'font-size:12px' }, L('点击在线会话可直接跳转', 'Click active sessions to jump'))),
+        topSessions.length
+          ? h('div', { class: 'usage-sessions-scroll' },
+            h('table', { class: 'tbl usage-tbl' },
+              h('thead', null,
+                h('tr', null,
+                  h('th', null, L('会话', 'Session')),
+                  h('th', null, L('模型', 'Model')),
+                  h('th', { class: 'num' }, L('输入 / 输出', 'In / Out')),
+                  h('th', { class: 'num' }, L('总消耗', 'Total')),
+                  h('th', { class: 'num' }, L('最近活跃', 'Last active')))),
+              h('tbody', null,
+                topSessions.map((item) => {
+                  const live = S.sessions.get(item.session_id);
+                  const clickable = Boolean(live);
+                  const lbl = live ? sessionLabel(live) : (item.label || short(item.session_id, 14));
+                  const isLive = Boolean(item.active || (live && live.state !== 'ended'));
+                  const openRow = () => {
+                    if (!clickable) return;
+                    closeModal();
+                    APP.openSession(item.session_id);
+                  };
+                  return h('tr', {
+                    class: `usage-sess-row${clickable ? ' is-clickable' : ''}`,
+                    tabindex: clickable ? '0' : undefined,
+                    role: clickable ? 'button' : undefined,
+                    title: clickable ? L(`跳转到会话 ${lbl}`, `Open session ${lbl}`) : item.session_id,
+                    onclick: clickable ? openRow : undefined,
+                    onkeydown: clickable ? (e) => {
+                      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openRow(); }
+                    } : undefined,
+                  },
+                  h('td', null,
+                    h('div', { class: 'row', style: 'gap:6px;flex-wrap:nowrap;min-width:0' },
+                      agentTag(item.agent),
+                      h('span', { class: 'trunc', style: 'max-width:170px;font-weight:500', title: item.session_id }, lbl),
+                      isLive ? span('tag soft-green', L('在线', 'Live')) : null)),
+                  h('td', null, item.model ? modelTag(item.model) : span('muted', '—')),
+                  h('td', {
+                    class: 'num mono',
+                    title: item.cache_read_tokens > 0
+                      ? L(`缓存命中 ${fmtTokens(item.cache_read_tokens)}`, `Cache read ${fmtTokens(item.cache_read_tokens)}`)
+                      : undefined,
+                  }, `${fmtTokens(item.input_tokens)} / ${fmtTokens(item.output_tokens)}`),
+                  h('td', { class: 'num mono' }, h('strong', null, fmtTokens(item.total_tokens))),
+                  h('td', { class: 'num muted' }, item.last_active_ms ? ago(item.last_active_ms) : '—'));
+                }))))
+          : emptyState(L('暂无会话用量记录', 'No session token usage recorded yet'), L('随后台扫描及对话产生的新回合会自动累计到此处。', 'Historical transcripts and live turns will appear here automatically.'))));
+  }
+
+  return h('div', { class: 'modal-shell usage-modal' },
+    h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
+    h('div', { class: 'modal-head' },
+      h('div', { class: 'stack-xs' },
+        h('h3', null, L('Token 消耗统计', 'Token Usage')),
+        data?.tz_offset ? h('span', { class: 'muted mono', style: 'font-size:11.5px' }, L(`统计时区 UTC${data.tz_offset} · 按本地日历切分`, `Timezone UTC${data.tz_offset} · local calendar day`)) : null),
+      h('div', { class: 'usage-head-acts' },
+        rangeBtns,
+        btn(loading ? L('刷新中…', 'Refreshing…') : L('刷新', 'Refresh'), {
+          cls: 'sm',
+          disabled: loading,
+          onclick: () => loadUsage(days),
+        }),
+        btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal }))),
+    h('div', { class: 'modal-body stack' }, content),
+    h('div', { class: 'modal-foot' },
+      data?.updated_ms ? h('span', { class: 'muted tabular', style: 'font-size:12px;margin-right:auto' }, L(`更新于 ${clock(data.updated_ms)}`, `Updated ${clock(data.updated_ms)}`)) : null,
+      btn(L('关闭', 'Close'), { cls: 'primary', onclick: closeModal })));
 }
 
 function closeSessionModalBody() {

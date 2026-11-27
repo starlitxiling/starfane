@@ -172,6 +172,7 @@ mod tests {
                 last_duration_ms: Some(900),
                 total_input_tokens: None,
                 total_output_tokens: None,
+                total_cache_read_tokens: None,
                 recent_turns: Vec::new(),
                 source: "transcript".into(),
                 updated_ms: 1_700_000_000_000,

@@ -365,6 +365,45 @@ pub(crate) fn reconcile_discovered_panes_with_restarts(
         if dp.pane_dead {
             continue;
         }
+        let suspended_id = st
+            .sessions
+            .values()
+            .filter(|s| {
+                !s.is_subagent
+                    && s.is_local_host()
+                    && s.pane.as_ref() == Some(&dp.pane_id)
+                    && s.state == SessionState::Suspended
+            })
+            .max_by_key(|s| (!s.discovered_only, s.last_event_ms))
+            .map(|s| s.session_id.clone());
+        if let Some(susp_id) = suspended_id {
+            if dp.agent.is_shell() {
+                // Suspended tmux waiter shell or Zellij `--start-suspended` pane: keep Suspended
+                // intact and never spawn a duplicate Shell card.
+                continue;
+            }
+            if let Some(rec) = st.sessions.get_mut(&susp_id) {
+                if dp.agent == rec.agent {
+                    rec.state = SessionState::Idle;
+                    rec.suspended_at_ms = None;
+                    rec.state_since_ms = now_ms;
+                    rec.last_event_ms = now_ms;
+                    rec.last_error = None;
+                    if rec.tmux_target.as_deref() != Some(dp.tmux_target.as_str()) {
+                        rec.tmux_target = Some(dp.tmux_target.clone());
+                    }
+                    if rec.tmux_label.as_deref() != Some(dp.tmux_label.as_str()) {
+                        rec.tmux_label = Some(dp.tmux_label.clone());
+                    }
+                    updated.push(rec.clone());
+                    changed = true;
+                    if rec.discovered_only {
+                        active_legacy.push((susp_id, dp.pane_id.clone()));
+                    }
+                    continue;
+                }
+            }
+        }
         // If a brand-new agent process PID replaced an earlier CLI inside the same live shell pane,
         // retire any leftover real session from the exited PID before binding the new process.
         if restarted_panes.contains(&dp.pane_id) {
@@ -374,6 +413,10 @@ pub(crate) fn reconcile_discovered_panes_with_restarts(
                     && s.is_local_host()
                     && s.pane.as_ref() == Some(&dp.pane_id)
                     && s.state != SessionState::Ended
+                    && s.state != SessionState::Suspended
+                    && !(s.state == SessionState::Starting
+                        && s.resume_id.is_some()
+                        && now_ms.saturating_sub(s.state_since_ms) < LEGACY_SPAWN_GRACE_MS)
                     && now_ms.saturating_sub(s.last_event_ms) >= 1_000
                 {
                     s.state = SessionState::Ended;
@@ -462,7 +505,12 @@ pub(crate) fn reconcile_discovered_panes_with_restarts(
         match st.sessions.get_mut(&leg_id) {
             Some(rec) => {
                 let mut rec_changed = false;
-                if rec.agent != dp.agent || restarted_panes.contains(&dp.pane_id) {
+                let waking_resumed = rec.state == SessionState::Starting
+                    && rec.resume_id.is_some()
+                    && now_ms.saturating_sub(rec.state_since_ms) < LEGACY_SPAWN_GRACE_MS;
+                if rec.agent != dp.agent
+                    || (restarted_panes.contains(&dp.pane_id) && !waking_resumed)
+                {
                     rec.agent = dp.agent;
                     rec.model = dp.model.clone();
                     rec.effort = None;
@@ -566,6 +614,8 @@ pub(crate) fn reconcile_discovered_panes_with_restarts(
                     } else {
                         "tmux".to_string()
                     }),
+                    resume_id: None,
+                    suspended_at_ms: None,
                 };
                 st.sessions.insert(leg_id.clone(), rec.clone());
                 changed = true;
@@ -594,6 +644,9 @@ pub(crate) fn reconcile_discovered_panes_with_restarts(
                 Some(p) => {
                     if !live_pane_ids.contains(p) {
                         return true;
+                    }
+                    if s.state == SessionState::Suspended {
+                        return false;
                     }
                     if discovered_panes.contains_key(p) {
                         return false;
@@ -638,6 +691,9 @@ pub(crate) fn reconcile_discovered_panes_with_restarts(
                     Some(p) => {
                         if !live_pane_ids.contains(p) {
                             return true;
+                        }
+                        if s.state == SessionState::Suspended {
+                            return false;
                         }
                         if now_ms.saturating_sub(s.last_event_ms) < LEGACY_SPAWN_GRACE_MS {
                             return false;
@@ -1095,8 +1151,6 @@ fn apply_computed_root_metrics(
     }
 }
 
-/// Sync `path` in `TranscriptIndexCache` and detect whether `TranscriptWatermark` changed since the
-/// last broadcast for `sid`. First observation seeds the baseline without flooding old history.
 fn sync_transcript_and_output_delta(
     core: &Core,
     sid: &SessionId,
@@ -1109,31 +1163,128 @@ fn sync_transcript_and_output_delta(
     Option<String>,
     Option<TranscriptOutputDelta>,
 ) {
-    let mut tc = lock(&core.inner.transcript_index);
-    let Some(idx) = tc.get_or_sync(agent, path) else {
-        return (None, None, None, None);
+    sync_transcript_and_output_delta_with_label(core, sid, agent, path, now_ms, None)
+}
+
+/// Sync `path` in `TranscriptIndexCache`, update persistent `usage_ledger` when `(len, mtime)` changed,
+/// and detect whether `TranscriptWatermark` changed since the last broadcast for `sid`.
+fn sync_transcript_and_output_delta_with_label(
+    core: &Core,
+    sid: &SessionId,
+    agent: AgentKind,
+    path: &Path,
+    now_ms: u64,
+    label_hint: Option<&str>,
+) -> (
+    Option<SessionMetrics>,
+    Option<String>,
+    Option<String>,
+    Option<TranscriptOutputDelta>,
+) {
+    let (metrics, model, effort, wm, file_len, mtime_ns, canon_path, fallback_ts) = {
+        let mut tc = lock(&core.inner.transcript_index);
+        let canon_path = tc.resolve_canonical(path);
+        let Some(idx) = tc.get_or_sync(agent, path) else {
+            return (None, None, None, None);
+        };
+        let (metrics, model, effort) = idx.telemetry_snapshot(now_ms);
+        let wm = idx.watermark(path);
+        let (file_len, mtime_ns) = idx.file_sig();
+        let fallback_ts = idx.latest_event_ts().unwrap_or(now_ms);
+        (
+            metrics,
+            model,
+            effort,
+            wm,
+            file_len,
+            mtime_ns,
+            canon_path,
+            fallback_ts,
+        )
     };
-    let (metrics, model, effort) = idx.telemetry_snapshot(now_ms);
-    let wm = idx.watermark(path);
     let prev_opt = lock(&core.inner.discovery_cache)
         .last_output_watermarks
         .insert(sid.clone(), wm);
-    let delta = match prev_opt {
-        Some(prev) if wm.total_messages > prev.total_messages => {
-            let prev_last_mutated = prev.total_messages > 0
-                && (prev.has_pending_tools
-                    || idx.turn_hash_at(path, prev.total_messages - 1)
-                        != Some(prev.last_turn_hash));
-            let start_from = if prev_last_mutated {
-                prev.total_messages - 1
-            } else {
-                prev.total_messages
+    let need_usage_check = file_len > 0 && prev_opt.is_none_or(|p| p != wm);
+    if need_usage_check {
+        let key_str = canon_path.to_string_lossy();
+        let already_recorded =
+            lock(&core.inner.usage_ledger).source_matches_sig(&key_str, file_len, mtime_ns);
+        if !already_recorded {
+            let (tz_ms, _) = super::metrics::local_tz_offset_info();
+            let daily_opt = {
+                let mut tc = lock(&core.inner.transcript_index);
+                tc.get_or_sync(agent, &canon_path)
+                    .map(|idx| idx.daily_usage(tz_ms, Some(fallback_ts)))
             };
-            let count = wm.total_messages - start_from;
-            if count <= super::MAX_INLINE_OUTPUT_MESSAGES {
+            if let Some(daily) = daily_opt {
+                core.record_transcript_usage(super::usage::TranscriptUsageRecord {
+                    source_path: &canon_path,
+                    agent,
+                    session_id: sid.as_str(),
+                    label: label_hint,
+                    model: model.as_deref(),
+                    file_len,
+                    mtime_ns,
+                    last_active_ms: fallback_ts,
+                    daily,
+                });
+            }
+        }
+    }
+    let delta = {
+        let mut tc = lock(&core.inner.transcript_index);
+        let Some(idx) = tc.get_or_sync(agent, path) else {
+            return (metrics, model, effort, None);
+        };
+        match prev_opt {
+            Some(prev) if wm.total_messages > prev.total_messages => {
+                let prev_last_mutated = prev.total_messages > 0
+                    && (prev.has_pending_tools
+                        || idx.turn_hash_at(path, prev.total_messages - 1)
+                            != Some(prev.last_turn_hash));
+                let start_from = if prev_last_mutated {
+                    prev.total_messages - 1
+                } else {
+                    prev.total_messages
+                };
+                let count = wm.total_messages - start_from;
+                if count <= super::MAX_INLINE_OUTPUT_MESSAGES {
+                    let page = idx.slice_page(
+                        path,
+                        super::transcript::TranscriptQuery::tail(count),
+                        None,
+                        now_ms,
+                    );
+                    let appended_messages: Vec<serde_json::Value> = page
+                        .messages
+                        .iter()
+                        .filter_map(|m| serde_json::to_value(m).ok())
+                        .collect();
+                    Some(TranscriptOutputDelta {
+                        start_seq: Some(page.start_seq),
+                        total_messages: Some(wm.total_messages),
+                        appended_messages,
+                        dirty: false,
+                    })
+                } else {
+                    Some(TranscriptOutputDelta {
+                        start_seq: Some(start_from),
+                        total_messages: Some(wm.total_messages),
+                        appended_messages: Vec::new(),
+                        dirty: true,
+                    })
+                }
+            }
+            Some(prev)
+                if wm.total_messages == prev.total_messages
+                    && wm.total_messages > 0
+                    && (wm.last_turn_hash != prev.last_turn_hash
+                        || wm.has_pending_tools != prev.has_pending_tools) =>
+            {
                 let page = idx.slice_page(
                     path,
-                    super::transcript::TranscriptQuery::tail(count),
+                    super::transcript::TranscriptQuery::tail(1),
                     None,
                     now_ms,
                 );
@@ -1148,46 +1299,15 @@ fn sync_transcript_and_output_delta(
                     appended_messages,
                     dirty: false,
                 })
-            } else {
-                Some(TranscriptOutputDelta {
-                    start_seq: Some(start_from),
-                    total_messages: Some(wm.total_messages),
-                    appended_messages: Vec::new(),
-                    dirty: true,
-                })
             }
-        }
-        Some(prev)
-            if wm.total_messages == prev.total_messages
-                && wm.total_messages > 0
-                && (wm.last_turn_hash != prev.last_turn_hash
-                    || wm.has_pending_tools != prev.has_pending_tools) =>
-        {
-            let page = idx.slice_page(
-                path,
-                super::transcript::TranscriptQuery::tail(1),
-                None,
-                now_ms,
-            );
-            let appended_messages: Vec<serde_json::Value> = page
-                .messages
-                .iter()
-                .filter_map(|m| serde_json::to_value(m).ok())
-                .collect();
-            Some(TranscriptOutputDelta {
-                start_seq: Some(page.start_seq),
+            Some(prev) if wm.total_messages < prev.total_messages => Some(TranscriptOutputDelta {
+                start_seq: None,
                 total_messages: Some(wm.total_messages),
-                appended_messages,
-                dirty: false,
-            })
+                appended_messages: Vec::new(),
+                dirty: true,
+            }),
+            _ => None,
         }
-        Some(prev) if wm.total_messages < prev.total_messages => Some(TranscriptOutputDelta {
-            start_seq: None,
-            total_messages: Some(wm.total_messages),
-            appended_messages: Vec::new(),
-            dirty: true,
-        }),
-        _ => None,
     };
     (metrics, model, effort, delta)
 }
@@ -1861,6 +1981,7 @@ impl Core {
             agent: AgentKind,
             pane: Option<PaneId>,
             model: Option<String>,
+            label: Option<String>,
             tp: Option<PathBuf>,
             ext_sid: Option<String>,
         }
@@ -2118,7 +2239,7 @@ impl Core {
                     !s.is_subagent
                         && s.is_local_host()
                         && s.agent == AgentKind::Agy
-                        && s.state != SessionState::Ended
+                        && !matches!(s.state, SessionState::Ended | SessionState::Suspended)
                 })
                 .filter_map(|s| {
                     let ext_id = canonical_external_session_id(s)?;
@@ -2138,13 +2259,14 @@ impl Core {
                     !s.is_subagent
                         && s.is_local_host()
                         && !s.agent.is_shell()
-                        && s.state != SessionState::Ended
+                        && !matches!(s.state, SessionState::Ended | SessionState::Suspended)
                 })
                 .map(|s| RootMetricsInput {
                     sid: s.session_id.clone(),
                     agent: s.agent,
                     pane: s.pane.clone(),
                     model: s.model.clone(),
+                    label: s.tmux_label.clone().or_else(|| s.tmux_target.clone()),
                     tp: resolve_transcript_path_with_home(home_dir.as_deref(), s),
                     ext_sid: canonical_external_session_id(s),
                 })
@@ -2157,7 +2279,7 @@ impl Core {
                     s.is_subagent
                         && s.is_local_host()
                         && !s.agent.is_shell()
-                        && s.state != SessionState::Ended
+                        && !matches!(s.state, SessionState::Ended | SessionState::Suspended)
                 })
                 .filter_map(|s| {
                     resolve_transcript_path_with_home(home_dir.as_deref(), s).map(|tp| {
@@ -2177,7 +2299,7 @@ impl Core {
                     !s.is_subagent
                         && s.is_local_host()
                         && s.agent.is_shell()
-                        && s.state != SessionState::Ended
+                        && !matches!(s.state, SessionState::Ended | SessionState::Suspended)
                 })
                 .filter_map(|s| s.pane.clone().map(|p| (s.session_id.clone(), p)))
                 .collect();
@@ -2251,8 +2373,13 @@ impl Core {
                     let has_transcript = item.tp.is_some();
                     let (mut tr_metrics, tr_model, tr_effort, output_delta) =
                         match item.tp.as_deref() {
-                            Some(p) => sync_transcript_and_output_delta(
-                                &core_tel, &item.sid, item.agent, p, poll_now,
+                            Some(p) => sync_transcript_and_output_delta_with_label(
+                                &core_tel,
+                                &item.sid,
+                                item.agent,
+                                p,
+                                poll_now,
+                                item.label.as_deref(),
                             ),
                             None => (None, None, None, None),
                         };
@@ -2314,9 +2441,10 @@ impl Core {
                 let mut subagent_outputs = Vec::with_capacity(live_subagents.len());
                 for sub in live_subagents {
                     scanned_subagent_sids.insert(sub.sid.clone());
-                    let (sub_metrics, _, _, output_delta) = sync_transcript_and_output_delta(
-                        &core_tel, &sub.sid, sub.agent, &sub.tp, poll_now,
-                    );
+                    let (sub_metrics, _, _, output_delta) =
+                        sync_transcript_and_output_delta_with_label(
+                            &core_tel, &sub.sid, sub.agent, &sub.tp, poll_now, None,
+                        );
                     subagent_outputs.push(ComputedSubagentOutput {
                         sid: sub.sid,
                         metrics: sub_metrics,
@@ -2335,12 +2463,13 @@ impl Core {
                         live_local_sids.insert(ksid.clone());
                         if kid.transcript_path.is_file() {
                             let (sub_metrics, _, _, output_delta) =
-                                sync_transcript_and_output_delta(
+                                sync_transcript_and_output_delta_with_label(
                                     &core_tel,
                                     &ksid,
                                     AgentKind::Agy,
                                     &kid.transcript_path,
                                     poll_now,
+                                    kid.agent_name.as_deref(),
                                 );
                             subagent_outputs.push(ComputedSubagentOutput {
                                 sid: ksid,
@@ -2463,6 +2592,8 @@ impl Core {
                                     host_id: None,
                                     host_display_name: None,
                                     mux_kind: None,
+                                    resume_id: None,
+                                    suspended_at_ms: None,
                                 };
                                 st.sessions.insert(ksid, rec.clone());
                                 metrics_updated.push(rec);
@@ -3084,6 +3215,8 @@ impl Core {
             } else {
                 "tmux".to_string()
             }),
+            resume_id: None,
+            suspended_at_ms: None,
         };
         let resp_model = rec.model.clone();
         let resp_effort = rec.effort.clone();
@@ -3247,6 +3380,377 @@ impl Core {
             "session_id": session_id,
             "pane": pane,
             "tmux_target": response_tmux_target,
+        }))
+    }
+
+    fn resolve_session_resume_id(&self, s: &SessionRecord) -> Option<String> {
+        s.resume_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| canonical_external_session_id(s))
+            .or_else(|| {
+                s.transcript_path
+                    .as_deref()
+                    .and_then(|p| extract_session_id_from_transcript_path(s.agent, Path::new(p)))
+            })
+    }
+
+    /// Suspend an active coding-agent session (`claude` / `codex` / `agy`) to reclaim CPU/RAM
+    /// while keeping its terminal pane/window and conversation history intact for resume on demand.
+    pub async fn suspend_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<serde_json::Value, ApiError> {
+        let (rec_snapshot, pane, host_id, mut resume_id_opt, bypass_perms, local_bin) = {
+            let st = lock(&self.inner.state);
+            let s = st
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| ApiError::not_found(format!("session {session_id}")))?;
+            if s.is_subagent || s.agent.is_shell() {
+                return Err(ApiError::bad_request(
+                    "only root claude/codex/agy sessions can be suspended",
+                ));
+            }
+            if s.state == SessionState::Ended {
+                return Err(ApiError::bad_request("cannot suspend an ended session"));
+            }
+            if s.state == SessionState::Suspended {
+                return Err(ApiError::new(
+                    ErrorCode::Conflict,
+                    "session is already suspended",
+                ));
+            }
+            let Some(pane) = s.pane.clone() else {
+                return Err(ApiError::bad_request(
+                    "session has no live terminal pane to suspend",
+                ));
+            };
+            let host_id = HostId::new(s.effective_host_id());
+            let rid = self.resolve_session_resume_id(s);
+            let bypass = self.inner.cfg.tmux.backup.restore_bypass_permissions;
+            let bin = (host_id.as_str() == LOCAL_HOST_ID)
+                .then(|| PathBuf::from(self.inner.cfg.agent_bin(s.agent)));
+            (s.clone(), pane, host_id, rid, bypass, bin)
+        };
+
+        if resume_id_opt.is_none()
+            && host_id.as_str() == LOCAL_HOST_ID
+            && rec_snapshot.agent == AgentKind::Claude
+        {
+            let core = self.clone();
+            let target_pane = pane.clone();
+            let home_dir = self.effective_home_dir();
+            resume_id_opt = tokio::task::spawn_blocking(move || {
+                let panes = core.inner.mux.list_all_panes().ok()?;
+                let p = panes.into_iter().find(|p| p.pane_id == target_pane)?;
+                if p.pane_pid == 0 {
+                    return None;
+                }
+                let home = home_dir?;
+                let birth = lock(&core.inner.discovery_cache).pid_birth_ms.clone();
+                let discovered = core.inner.mux.discover_panes_from(
+                    std::slice::from_ref(&p),
+                    starfane_tmux::DiscoverOptions::default(),
+                );
+                let pids: Vec<u32> = discovered
+                    .first()
+                    .map(|d| d.subtree_pids.clone())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| vec![p.pane_pid]);
+                resolve_claude_transcript_by_pids_in(&home, &pids, &birth, &HashSet::new())
+                    .map(|(cid, _)| cid)
+            })
+            .await
+            .ok()
+            .flatten();
+        }
+
+        let Some(resume_id) = resume_id_opt else {
+            return Err(ApiError::bad_request(
+                "cannot suspend session: no resumable conversation ID resolved yet",
+            ));
+        };
+
+        let resume_argv = starfane_adapters::build_resume_cmd(&starfane_adapters::ResumeRequest {
+            agent: rec_snapshot.agent,
+            bin: local_bin,
+            resume_id: resume_id.clone(),
+            cwd: rec_snapshot.cwd.clone(),
+            model: rec_snapshot.model.clone(),
+            effort: rec_snapshot.effort.clone(),
+            bypass_permissions: bypass_perms,
+        })
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+        let waiter_script = starfane_adapters::build_tmux_suspend_waiter_script(
+            rec_snapshot.agent,
+            &resume_id,
+            &resume_argv,
+        );
+
+        let new_pane = if host_id.as_str() != LOCAL_HOST_ID {
+            let provider = self
+                .inner
+                .remote_nodes
+                .get(&host_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(format!("unknown remote host {host_id}")))?;
+            let (_, local_pane) = starfane_tmux::split_host_prefix(pane.as_str());
+            let remote_sid = session_id
+                .as_str()
+                .strip_prefix(&format!("{}:", host_id.as_str()))
+                .map(SessionId::new)
+                .unwrap_or_else(|| session_id.clone());
+            let new_local = provider
+                .suspend_pane(
+                    &remote_sid,
+                    &PaneId::new(local_pane),
+                    rec_snapshot.cwd.as_deref(),
+                    &waiter_script,
+                )
+                .await?;
+            starfane_tmux::qualify_host_pane(&host_id, &new_local)
+        } else {
+            let core = self.clone();
+            let req = starfane_tmux::SuspendPaneReq {
+                pane: pane.clone(),
+                cwd: rec_snapshot.cwd.clone(),
+                pane_name: rec_snapshot
+                    .tmux_label
+                    .clone()
+                    .or_else(|| rec_snapshot.tmux_target.clone()),
+                waiter_script,
+                resume_argv,
+            };
+            tokio::task::spawn_blocking(move || core.inner.mux.suspend_pane(&req))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .map_err(|e| match e {
+                    starfane_tmux::TmuxError::InvalidRequest(m) => ApiError::bad_request(m),
+                    other => {
+                        ApiError::new(ErrorCode::Unavailable, format!("suspend pane: {other}"))
+                    }
+                })?
+        };
+
+        let now_ms = id::now_ms();
+        let mut updated_main: Option<SessionRecord> = None;
+        let updated_sessions = {
+            let mut st = lock(&self.inner.state);
+            let mut updated = Vec::new();
+            if let Some(rec) = st.sessions.get_mut(session_id) {
+                rec.state = SessionState::Suspended;
+                rec.resume_id = Some(resume_id.clone());
+                rec.suspended_at_ms = Some(now_ms);
+                if rec.pane.as_ref() != Some(&new_pane) {
+                    if new_pane.as_str().starts_with("zj:") {
+                        rec.tmux_target = Some(new_pane.0.clone());
+                    }
+                    rec.pane = Some(new_pane.clone());
+                }
+                rec.state_since_ms = now_ms;
+                rec.last_event_ms = now_ms;
+                rec.last_error = None;
+                rec.active_subagents = 0;
+                updated_main = Some(rec.clone());
+                updated.push(rec.clone());
+            }
+            for child in st.sessions.values_mut() {
+                if child.is_subagent
+                    && child.parent_session_id.as_ref() == Some(session_id)
+                    && child.state != SessionState::Ended
+                {
+                    child.state = SessionState::Ended;
+                    child.state_since_ms = now_ms;
+                    child.last_event_ms = now_ms;
+                    child.last_error = None;
+                    updated.push(child.clone());
+                }
+            }
+            st.pane_watch.remove(&pane);
+            st.pane_watch.remove(&new_pane);
+            st.last_mirrored_tmux.remove(&pane);
+            st.last_mirrored_tmux.remove(&new_pane);
+            st.pending_away_notices.remove(session_id);
+            st.unconfirmed
+                .retain(|a| a.session_id.as_ref() != Some(session_id));
+            updated
+        };
+        if host_id.as_str() == LOCAL_HOST_ID {
+            let mut dc = lock(&self.inner.discovery_cache);
+            dc.evict_pane(&pane);
+            dc.evict_pane(&new_pane);
+        }
+
+        self.mark_dirty();
+        for s in updated_sessions {
+            self.publish_session(s);
+        }
+        self.refresh_attention();
+        self.flush_snapshot_async().await;
+        self.audit(
+            "web",
+            serde_json::json!({
+                "action": "suspend_session",
+                "session_id": session_id,
+                "pane": new_pane,
+                "resume_id": resume_id,
+                "host_id": host_id,
+            }),
+        );
+
+        Ok(serde_json::json!({
+            "suspended": true,
+            "session_id": session_id,
+            "pane": new_pane,
+            "resume_id": resume_id,
+            "session": updated_main,
+        }))
+    }
+
+    /// Wake a previously suspended session back into its live CLI conversation.
+    pub async fn resume_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<serde_json::Value, ApiError> {
+        let (rec_snapshot, pane, host_id, resume_id, bypass_perms, local_bin) = {
+            let st = lock(&self.inner.state);
+            let s = st
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| ApiError::not_found(format!("session {session_id}")))?;
+            if s.is_subagent || s.agent.is_shell() {
+                return Err(ApiError::bad_request(
+                    "only root coding-agent sessions can be resumed",
+                ));
+            }
+            if s.state != SessionState::Suspended {
+                return Err(ApiError::new(
+                    ErrorCode::Conflict,
+                    "session is not suspended",
+                ));
+            }
+            let Some(pane) = s.pane.clone() else {
+                return Err(ApiError::bad_request(
+                    "suspended session has no terminal pane",
+                ));
+            };
+            let Some(rid) = self.resolve_session_resume_id(s) else {
+                return Err(ApiError::bad_request(
+                    "suspended session is missing resume_id",
+                ));
+            };
+            let host_id = HostId::new(s.effective_host_id());
+            let bypass = self.inner.cfg.tmux.backup.restore_bypass_permissions;
+            let bin = (host_id.as_str() == LOCAL_HOST_ID)
+                .then(|| PathBuf::from(self.inner.cfg.agent_bin(s.agent)));
+            (s.clone(), pane, host_id, rid, bypass, bin)
+        };
+
+        let resume_argv = starfane_adapters::build_resume_cmd(&starfane_adapters::ResumeRequest {
+            agent: rec_snapshot.agent,
+            bin: local_bin,
+            resume_id,
+            cwd: rec_snapshot.cwd.clone(),
+            model: rec_snapshot.model.clone(),
+            effort: rec_snapshot.effort.clone(),
+            bypass_permissions: bypass_perms,
+        })
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+        let new_pane = if host_id.as_str() != LOCAL_HOST_ID {
+            let provider = self
+                .inner
+                .remote_nodes
+                .get(&host_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(format!("unknown remote host {host_id}")))?;
+            let (_, local_pane) = starfane_tmux::split_host_prefix(pane.as_str());
+            let remote_sid = session_id
+                .as_str()
+                .strip_prefix(&format!("{}:", host_id.as_str()))
+                .map(SessionId::new)
+                .unwrap_or_else(|| session_id.clone());
+            let new_local = provider
+                .wake_suspended_pane(&remote_sid, &PaneId::new(local_pane))
+                .await?;
+            starfane_tmux::qualify_host_pane(&host_id, &new_local)
+        } else {
+            let core = self.clone();
+            let req = starfane_tmux::WakePaneReq {
+                pane: pane.clone(),
+                cwd: rec_snapshot.cwd.clone(),
+                pane_name: rec_snapshot
+                    .tmux_label
+                    .clone()
+                    .or_else(|| rec_snapshot.tmux_target.clone()),
+                resume_argv,
+            };
+            tokio::task::spawn_blocking(move || core.inner.mux.wake_suspended_pane(&req))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .map_err(|e| match e {
+                    starfane_tmux::TmuxError::InvalidRequest(m) => ApiError::bad_request(m),
+                    other => ApiError::new(ErrorCode::Unavailable, format!("resume pane: {other}")),
+                })?
+        };
+
+        let now_ms = id::now_ms();
+        let updated_rec = {
+            let mut st = lock(&self.inner.state);
+            let rec = st
+                .sessions
+                .get_mut(session_id)
+                .ok_or_else(|| ApiError::not_found(format!("session {session_id}")))?;
+            rec.state = SessionState::Starting;
+            rec.suspended_at_ms = None;
+            rec.pane = Some(new_pane.clone());
+            rec.state_since_ms = now_ms;
+            rec.last_event_ms = now_ms;
+            rec.last_error = None;
+            let snap = rec.clone();
+            st.pane_watch.remove(&pane);
+            st.pane_watch.remove(&new_pane);
+            snap
+        };
+        if host_id.as_str() == LOCAL_HOST_ID {
+            let mut dc = lock(&self.inner.discovery_cache);
+            dc.evict_pane(&pane);
+            dc.evict_pane(&new_pane);
+            dc.pane_first_seen_ms.insert(new_pane.clone(), now_ms);
+            dc.pane_birth_ms.insert(new_pane.clone(), now_ms);
+            dc.spawned_panes.insert(
+                new_pane.clone(),
+                SpawnedPaneMeta {
+                    spawned_at_ms: now_ms,
+                    model: updated_rec.model.clone(),
+                    effort: updated_rec.effort.clone(),
+                },
+            );
+        }
+
+        self.mark_dirty();
+        self.publish_session(updated_rec.clone());
+        self.refresh_attention();
+        self.flush_snapshot_async().await;
+        self.audit(
+            "web",
+            serde_json::json!({
+                "action": "resume_session",
+                "session_id": session_id,
+                "pane": new_pane,
+                "host_id": host_id,
+            }),
+        );
+
+        Ok(serde_json::json!({
+            "resumed": true,
+            "session_id": session_id,
+            "pane": new_pane,
+            "session": updated_rec,
         }))
     }
 }
@@ -3436,6 +3940,8 @@ mod tests {
                 host_id: None,
                 host_display_name: None,
                 mux_kind: None,
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
 
@@ -3496,6 +4002,8 @@ mod tests {
                 host_id: None,
                 host_display_name: None,
                 mux_kind: None,
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
 
@@ -3780,6 +4288,8 @@ mod tests {
                 host_id: None,
                 host_display_name: None,
                 mux_kind: None,
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
         st.feishu_session_threads
@@ -3816,6 +4326,8 @@ mod tests {
                 host_id: None,
                 host_display_name: None,
                 mux_kind: None,
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
 
@@ -3974,6 +4486,8 @@ mod tests {
                 host_id: None,
                 host_display_name: None,
                 mux_kind: Some("tmux".into()),
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
         // Also seed a remote peer session with `pane: None` and `tmux_label: Some(...)`.
@@ -4010,6 +4524,8 @@ mod tests {
                 host_id: Some(HostId::new("mac-xiling")),
                 host_display_name: Some("Mac Xiling".into()),
                 mux_kind: Some("tmux".into()),
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
 
@@ -4194,6 +4710,8 @@ mod tests {
                 host_id: None,
                 host_display_name: None,
                 mux_kind: Some("tmux".into()),
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
 
@@ -4466,6 +4984,8 @@ mod tests {
                 host_id: None,
                 host_display_name: None,
                 mux_kind: None,
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
 
@@ -4556,6 +5076,8 @@ mod tests {
             host_id: None,
             host_display_name: None,
             mux_kind: Some("tmux".into()),
+            resume_id: None,
+            suspended_at_ms: None,
         };
 
         let mut pane_birth = HashMap::new();
@@ -4586,6 +5108,7 @@ mod tests {
                     last_duration_ms: None,
                     total_input_tokens: None,
                     total_output_tokens: None,
+                    total_cache_read_tokens: None,
                     recent_turns: Vec::new(),
                     source: "transcript".into(),
                     updated_ms: 1_000,
@@ -4650,5 +5173,212 @@ mod tests {
         assert_eq!(p3.as_deref(), Some(rollout2.as_path()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suspended_session_survives_shell_discovery_wakes_with_transcript_and_ends_when_pane_closed()
+    {
+        let mut st = State::default();
+        let pane = PaneId::new("%88");
+        let sid = SessionId::new("real-claude-88");
+        st.sessions.insert(
+            sid.clone(),
+            SessionRecord {
+                session_id: sid.clone(),
+                agent: AgentKind::Claude,
+                pane: Some(pane.clone()),
+                pane_resolution: PaneResolution::Env,
+                cwd: Some("/tmp/proj".into()),
+                git_root: None,
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                state: SessionState::Suspended,
+                state_since_ms: 10_000,
+                last_event_id: None,
+                last_event_ms: 10_000,
+                last_message: None,
+                last_error: None,
+                parent_session_id: None,
+                is_subagent: false,
+                subagent_count: 0,
+                active_subagents: 0,
+                stage: None,
+                unread_inbox: 0,
+                confidence: Confidence::Exact,
+                tmux_target: Some("work:0.0".into()),
+                tmux_label: Some("work-proj".into()),
+                discovered_only: false,
+                transcript_path: Some("/tmp/tr-88.jsonl".into()),
+                metrics: Some(SessionMetrics {
+                    context_used_tokens: Some(40_000),
+                    context_window_tokens: Some(200_000),
+                    context_used_pct: Some(20.0),
+                    tps: Some(50.0),
+                    ttft_ms: None,
+                    avg_ttft_ms: None,
+                    last_output_tokens: None,
+                    last_duration_ms: None,
+                    total_input_tokens: Some(80_000),
+                    total_output_tokens: Some(2_000),
+                    total_cache_read_tokens: Some(50_000),
+                    recent_turns: Vec::new(),
+                    source: "transcript".into(),
+                    updated_ms: 9_000,
+                }),
+                host_id: None,
+                host_display_name: None,
+                mux_kind: Some("tmux".into()),
+                resume_id: Some("uuid-88".into()),
+                suspended_at_ms: Some(10_000),
+            },
+        );
+
+        let live: HashSet<PaneId> = [pane.clone()].into_iter().collect();
+        let restarted: HashSet<PaneId> = [pane.clone()].into_iter().collect();
+
+        // 1. Even with `include_shell_panes = true` (shell running waiter) & no coding-agent match,
+        //    Suspended session stays alive and NO duplicate `tmux-%88` Shell session is created.
+        let d_shell = reconcile_discovered_panes_with_restarts(
+            &mut st,
+            &[mk_dp("%88", "work:0.0", AgentKind::Shell, Some("sh"))],
+            &live,
+            &restarted,
+            20_000,
+        );
+        assert!(!d_shell.changed);
+        assert_eq!(st.sessions[&sid].state, SessionState::Suspended);
+        assert!(!st.sessions.contains_key(&SessionId::new("tmux-%88")));
+
+        // Also survives when discovered is empty (`include_shell_panes = false`) as long as `pane` is in `live`.
+        let d_empty =
+            reconcile_discovered_panes_with_restarts(&mut st, &[], &live, &restarted, 25_000);
+        assert!(!d_empty.changed);
+        assert_eq!(st.sessions[&sid].state, SessionState::Suspended);
+
+        // 2. Pressing Enter in terminal wakes `claude` -> same session wakes cleanly to `Idle`
+        //    preserving `transcript_path` and `metrics`!
+        let d_wake = reconcile_discovered_panes_with_restarts(
+            &mut st,
+            &[mk_dp("%88", "work:0.0", AgentKind::Claude, Some("opus"))],
+            &live,
+            &restarted,
+            30_000,
+        );
+        assert!(d_wake.changed);
+        assert_eq!(st.sessions[&sid].state, SessionState::Idle);
+        assert_eq!(st.sessions[&sid].suspended_at_ms, None);
+        assert_eq!(
+            st.sessions[&sid].transcript_path.as_deref(),
+            Some("/tmp/tr-88.jsonl")
+        );
+        assert!(st.sessions[&sid].metrics.is_some());
+
+        // Re-suspend and close the terminal pane (`!live.contains("%88")`) -> marks Ended cleanly.
+        st.sessions.get_mut(&sid).unwrap().state = SessionState::Suspended;
+        let d_closed = reconcile_discovered_panes_with_restarts(
+            &mut st,
+            &[],
+            &[PaneId::new("%999")].into_iter().collect(),
+            &HashSet::new(),
+            40_000,
+        );
+        assert!(d_closed.changed);
+        assert_eq!(st.sessions[&sid].state, SessionState::Ended);
+        assert_eq!(st.sessions[&sid].pane, None);
+    }
+
+    #[tokio::test]
+    async fn suspend_session_rejects_shell_and_missing_resume_id() {
+        let root = std::env::temp_dir().join(format!(
+            "starfane-susp-err-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let core = test_core(&root);
+        let sid = SessionId::new("tmux-%50");
+        lock(&core.inner.state).sessions.insert(
+            sid.clone(),
+            SessionRecord {
+                session_id: sid.clone(),
+                agent: AgentKind::Claude,
+                pane: Some(PaneId::new("%50")),
+                pane_resolution: PaneResolution::Env,
+                cwd: Some("/tmp".into()),
+                git_root: None,
+                model: None,
+                effort: None,
+                state: SessionState::Idle,
+                state_since_ms: 1_000,
+                last_event_id: None,
+                last_event_ms: 1_000,
+                last_message: None,
+                last_error: None,
+                parent_session_id: None,
+                is_subagent: false,
+                subagent_count: 0,
+                active_subagents: 0,
+                stage: None,
+                unread_inbox: 0,
+                confidence: Confidence::Heuristic,
+                tmux_target: Some("w:0.0".into()),
+                tmux_label: Some("w".into()),
+                discovered_only: true,
+                transcript_path: None,
+                metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: Some("tmux".into()),
+                resume_id: None,
+                suspended_at_ms: None,
+            },
+        );
+        let err = core.suspend_session(&sid).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        assert_eq!(
+            lock(&core.inner.state).sessions[&sid].state,
+            SessionState::Idle
+        );
+
+        let shell_sid = SessionId::new("tmux-%51");
+        lock(&core.inner.state).sessions.insert(
+            shell_sid.clone(),
+            SessionRecord {
+                session_id: shell_sid.clone(),
+                agent: AgentKind::Shell,
+                pane: Some(PaneId::new("%51")),
+                pane_resolution: PaneResolution::Env,
+                cwd: Some("/tmp".into()),
+                git_root: None,
+                model: Some("zsh".into()),
+                effort: None,
+                state: SessionState::Idle,
+                state_since_ms: 1_000,
+                last_event_id: None,
+                last_event_ms: 1_000,
+                last_message: None,
+                last_error: None,
+                parent_session_id: None,
+                is_subagent: false,
+                subagent_count: 0,
+                active_subagents: 0,
+                stage: None,
+                unread_inbox: 0,
+                confidence: Confidence::Heuristic,
+                tmux_target: Some("w:0.1".into()),
+                tmux_label: Some("w".into()),
+                discovered_only: true,
+                transcript_path: None,
+                metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: Some("tmux".into()),
+                resume_id: None,
+                suspended_at_ms: None,
+            },
+        );
+        let shell_err = core.suspend_session(&shell_sid).await.unwrap_err();
+        assert_eq!(shell_err.code, ErrorCode::BadRequest);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

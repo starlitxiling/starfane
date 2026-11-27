@@ -14,10 +14,12 @@ use super::transcript::{read_tail_utf8, MAX_TRANSCRIPT_READ_BYTES};
 use serde::Deserialize;
 use serde_json::Value;
 use starfane_proto::{AgentKind, SessionMetrics, SessionRecord, TurnMetricSample};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Minimum streaming generation duration (ms) for reliable sustained TPS.
@@ -712,6 +714,9 @@ pub(crate) fn agy_step_timings_to_metrics(
         last_duration_ms: chosen_tps.map(|x| x.2),
         total_input_tokens,
         total_output_tokens,
+        total_cache_read_tokens: base_transcript
+            .as_ref()
+            .and_then(|b| b.total_cache_read_tokens),
         recent_turns,
         source: "agy_db".into(),
         updated_ms,
@@ -2003,6 +2008,141 @@ pub(crate) fn encode_claude_project_dir(path: &str) -> String {
 // Single-pass incremental `TelemetryFold` (shared by TranscriptIndex & metrics)
 // ---------------------------------------------------------------------------
 
+/// Per-day normalized token breakdown (matching `SessionMetrics` semantics:
+/// `total_tokens = input_tokens + output_tokens`, with `cache_read_tokens` as an informational subset).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DailyTokenCounts {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+}
+
+impl DailyTokenCounts {
+    pub fn add_counts(&mut self, inp: u64, out: u64, cache_r: u64) {
+        self.input_tokens = self.input_tokens.saturating_add(inp);
+        self.output_tokens = self.output_tokens.saturating_add(out);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(cache_r);
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0 && self.cache_read_tokens == 0
+    }
+}
+
+/// Resolution in ms for timezone-agnostic sub-hour accumulation buckets (15 min supports +05:30 / +05:45 / +08:00 / UTC / US zones).
+const QUARTER_HOUR_MS: u64 = 900_000;
+
+fn add_quarter_hour_tokens(
+    buckets: &mut BTreeMap<u64, DailyTokenCounts>,
+    ts_ms: u64,
+    inp: u64,
+    out: u64,
+    cache_r: u64,
+) {
+    if inp == 0 && out == 0 && cache_r == 0 {
+        return;
+    }
+    buckets
+        .entry(ts_ms / QUARTER_HOUR_MS)
+        .or_default()
+        .add_counts(inp, out, cache_r);
+}
+
+/// Convert Unix epoch days -> Gregorian `YYYY-MM-DD` (Howard Hinnant `civil_from_days`).
+fn civil_from_days(z: i64) -> String {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = y - if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m_adj = (m + if m > 2 { 0 } else { 12 }) as u64 - 3;
+    let doy = (153 * m_adj + 2) / 5 + (d as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + (doe as i64) - 719_468)
+}
+
+/// Format UTC epoch ms into local `YYYY-MM-DD` given fixed `tz_offset_ms`.
+pub(crate) fn epoch_ms_to_ymd(ts_ms: u64, tz_offset_ms: i64) -> String {
+    let local_ms = (ts_ms as i128).saturating_add(tz_offset_ms as i128);
+    let days = local_ms.div_euclid(86_400_000) as i64;
+    civil_from_days(days)
+}
+
+/// Shift a `YYYY-MM-DD` string by `delta_days` (e.g. `-29` for 30-day ranges).
+pub(crate) fn ymd_shift_days(ymd: &str, delta_days: i64) -> Option<String> {
+    let mut parts = ymd.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let base = days_from_civil(y, m, d)?;
+    Some(civil_from_days(base + delta_days))
+}
+
+fn parse_tz_offset_str(raw: &str) -> Option<(i64, String)> {
+    let s = raw.trim();
+    if s.len() < 5 {
+        return None;
+    }
+    let sign = match &s[..1] {
+        "+" => 1i64,
+        "-" => -1i64,
+        _ => return None,
+    };
+    let rest = &s[1..];
+    let (hh_str, mm_str) = if let Some((h, m)) = rest.split_once(':') {
+        (h, m)
+    } else if rest.len() == 4 {
+        (&rest[..2], &rest[2..4])
+    } else {
+        return None;
+    };
+    let hh: i64 = hh_str.parse().ok()?;
+    let mm: i64 = mm_str.parse().ok()?;
+    if !(0..=14).contains(&hh) || !(0..=59).contains(&mm) {
+        return None;
+    }
+    let offset_ms = sign * (hh * 3_600 + mm * 60) * 1000;
+    let label = format!("{}{:02}:{:02}", if sign >= 0 { "+" } else { "-" }, hh, mm);
+    Some((offset_ms, label))
+}
+
+/// Cached local `(tz_offset_ms, "+HH:MM")` read once via `date +%z` (UTC `+00:00` fallback).
+pub(crate) fn local_tz_offset_info() -> (i64, String) {
+    static TZ: OnceLock<(i64, String)> = OnceLock::new();
+    TZ.get_or_init(|| {
+        if let Ok(out) = Command::new("date").arg("+%z").output() {
+            if out.status.success() {
+                if let Some(parsed) = parse_tz_offset_str(&String::from_utf8_lossy(&out.stdout)) {
+                    return parsed;
+                }
+            }
+        }
+        (0, "+00:00".to_string())
+    })
+    .clone()
+}
+
 #[derive(Debug, Clone)]
 struct ClaudeMsgStats {
     req_start_ts: Option<u64>,
@@ -2012,6 +2152,7 @@ struct ClaudeMsgStats {
     has_thinking: bool,
     first_had_stop_reason: bool,
     context_tokens: u64,
+    cache_read_tokens: u64,
     output_tokens: u64,
     model: Option<String>,
 }
@@ -2032,6 +2173,11 @@ struct CodexFold {
     ctx_window: Option<u64>,
     total_in: Option<u64>,
     total_out: Option<u64>,
+    total_cache_read: Option<u64>,
+    prev_total_in: Option<u64>,
+    prev_total_out_usage: Option<u64>,
+    prev_total_cache_read: Option<u64>,
+    buckets: BTreeMap<u64, DailyTokenCounts>,
     req_start_ts: Option<u64>,
     first_item_ts: Option<u64>,
     saw_model_item: bool,
@@ -2142,6 +2288,8 @@ struct AgyFold {
     latest_model: Option<String>,
     total_in: u64,
     total_out: u64,
+    total_cache_read: u64,
+    buckets: BTreeMap<u64, DailyTokenCounts>,
     last_tps: Option<(f32, u64, u64)>,
     recent_turns: Vec<TurnMetricSample>,
     pending_pr: Option<(u64, u64)>,
@@ -2265,6 +2413,7 @@ impl TelemetryFold {
                                     has_thinking: false,
                                     first_had_stop_reason: first_had_stop,
                                     context_tokens: 0,
+                                    cache_read_tokens: 0,
                                     output_tokens: 0,
                                     model: (!model.is_empty()).then(|| model.to_string()),
                                 }
@@ -2278,6 +2427,7 @@ impl TelemetryFold {
                                 entry.last_ts = Some(entry.last_ts.map_or(t, |cur| cur.max(t)));
                             }
                             entry.context_tokens = entry.context_tokens.max(ctx);
+                            entry.cache_read_tokens = entry.cache_read_tokens.max(cache_r);
                             entry.output_tokens = entry.output_tokens.max(out);
                         }
                     }
@@ -2415,11 +2565,46 @@ impl TelemetryFold {
                     }
                 }
                 if let Some(tot) = info.get("total_token_usage") {
-                    if let Some(v) = tot.get("input_tokens").and_then(Value::as_u64) {
+                    let cur_in = tot.get("input_tokens").and_then(Value::as_u64);
+                    let cur_out = tot.get("output_tokens").and_then(Value::as_u64);
+                    let cur_cr = tot
+                        .get("cached_input_tokens")
+                        .or_else(|| tot.get("cache_read_input_tokens"))
+                        .or_else(|| tot.get("cache_read_tokens"))
+                        .and_then(Value::as_u64);
+                    if let Some(v) = cur_in {
                         f.total_in = Some(v);
                     }
-                    if let Some(v) = tot.get("output_tokens").and_then(Value::as_u64) {
+                    if let Some(v) = cur_out {
                         f.total_out = Some(v);
+                    }
+                    if let Some(v) = cur_cr {
+                        f.total_cache_read = Some(v);
+                    }
+                    let d_in = cur_in
+                        .map(|v| v.saturating_sub(f.prev_total_in.unwrap_or(0)))
+                        .unwrap_or(0);
+                    let d_out = cur_out
+                        .map(|v| v.saturating_sub(f.prev_total_out_usage.unwrap_or(0)))
+                        .unwrap_or(0);
+                    let d_cr = cur_cr
+                        .map(|v| v.saturating_sub(f.prev_total_cache_read.unwrap_or(0)))
+                        .unwrap_or(0);
+                    if let Some(v) = cur_in {
+                        f.prev_total_in = Some(f.prev_total_in.map_or(v, |p| p.max(v)));
+                    }
+                    if let Some(v) = cur_out {
+                        f.prev_total_out_usage =
+                            Some(f.prev_total_out_usage.map_or(v, |p| p.max(v)));
+                    }
+                    if let Some(v) = cur_cr {
+                        f.prev_total_cache_read =
+                            Some(f.prev_total_cache_read.map_or(v, |p| p.max(v)));
+                    }
+                    if d_in > 0 || d_out > 0 || d_cr > 0 {
+                        if let Some(t) = ts_ms.or(f.latest_event_ts) {
+                            add_quarter_hour_tokens(&mut f.buckets, t, d_in, d_out, d_cr);
+                        }
                     }
                 }
                 if let Some(last) = info.get("last_token_usage") {
@@ -2547,10 +2732,18 @@ impl TelemetryFold {
                 f.latest_ctx = Some(ctx);
                 f.total_in = f.total_in.saturating_add(ctx);
             }
+            if cache_r > 0 {
+                f.total_cache_read = f.total_cache_read.saturating_add(cache_r);
+            }
             if out > 0 {
                 f.total_out = f.total_out.saturating_add(out);
                 if let Some(t) = ts_ms {
                     f.pending_pr = Some((t, out));
+                }
+            }
+            if ctx > 0 || out > 0 || cache_r > 0 {
+                if let Some(t) = ts_ms.or(f.latest_event_ts) {
+                    add_quarter_hour_tokens(&mut f.buckets, t, ctx, out, cache_r);
                 }
             }
         }
@@ -2590,6 +2783,7 @@ impl TelemetryFold {
         }
         let mut total_in: u64 = 0;
         let mut total_out: u64 = 0;
+        let mut total_cache_read: u64 = 0;
         let mut latest_ctx: Option<u64> = None;
         let mut latest_model: Option<String> = None;
         let mut reliable_tps: Option<(f32, u64, u64)> = None;
@@ -2600,6 +2794,7 @@ impl TelemetryFold {
             let Some(m) = f.by_msg.get(id) else { continue };
             total_in = total_in.saturating_add(m.context_tokens);
             total_out = total_out.saturating_add(m.output_tokens);
+            total_cache_read = total_cache_read.saturating_add(m.cache_read_tokens);
             if m.context_tokens > 0 {
                 latest_ctx = Some(m.context_tokens);
                 if m.model.is_some() {
@@ -2699,6 +2894,7 @@ impl TelemetryFold {
             last_duration_ms: chosen_tps.map(|x| x.2),
             total_input_tokens: (total_in > 0).then_some(total_in),
             total_output_tokens: (total_out > 0).then_some(total_out),
+            total_cache_read_tokens: (total_cache_read > 0).then_some(total_cache_read),
             recent_turns,
             source: "transcript".into(),
             updated_ms: f.latest_event_ts.unwrap_or(now_ms),
@@ -2736,6 +2932,7 @@ impl TelemetryFold {
             last_duration_ms: chosen_tps.map(|x| x.2),
             total_input_tokens: f.total_in,
             total_output_tokens: f.total_out,
+            total_cache_read_tokens: f.total_cache_read,
             recent_turns: f.recent_turns.clone(),
             source: "transcript".into(),
             updated_ms: f.latest_event_ts.unwrap_or(now_ms),
@@ -2768,11 +2965,164 @@ impl TelemetryFold {
             last_duration_ms: f.last_tps.map(|x| x.2),
             total_input_tokens: (f.total_in > 0).then_some(f.total_in),
             total_output_tokens: (f.total_out > 0).then_some(f.total_out),
+            total_cache_read_tokens: (f.total_cache_read > 0).then_some(f.total_cache_read),
             recent_turns: f.recent_turns.clone(),
             source: "transcript".into(),
             updated_ms: f.latest_event_ts.unwrap_or(now_ms),
         })
     }
+
+    pub(crate) fn latest_event_ts(&self) -> Option<u64> {
+        match self.agent {
+            AgentKind::Claude => self.claude.latest_event_ts,
+            AgentKind::Codex => self.codex.latest_event_ts,
+            AgentKind::Agy => self.agy.latest_event_ts,
+            AgentKind::Shell => None,
+        }
+    }
+
+    pub(crate) fn latest_model(&self) -> Option<String> {
+        match self.agent {
+            AgentKind::Claude => self.claude.latest_model.clone(),
+            AgentKind::Codex => self.codex.latest_model.clone(),
+            AgentKind::Agy => self.agy.latest_model.clone(),
+            AgentKind::Shell => None,
+        }
+    }
+
+    /// Aggregate deduplicated token consumption by local calendar date (`YYYY-MM-DD`).
+    pub(crate) fn daily_usage(
+        &self,
+        tz_offset_ms: i64,
+        fallback_ts_ms: Option<u64>,
+    ) -> BTreeMap<String, DailyTokenCounts> {
+        let mut by_day: BTreeMap<String, DailyTokenCounts> = BTreeMap::new();
+        match self.agent {
+            AgentKind::Claude => {
+                let f = &self.claude;
+                for id in &f.order {
+                    let Some(m) = f.by_msg.get(id) else {
+                        continue;
+                    };
+                    if m.context_tokens == 0 && m.output_tokens == 0 && m.cache_read_tokens == 0 {
+                        continue;
+                    }
+                    let Some(ts) = m
+                        .last_ts
+                        .or(m.first_ts)
+                        .or(f.latest_event_ts)
+                        .or(fallback_ts_ms)
+                    else {
+                        continue;
+                    };
+                    let ymd = epoch_ms_to_ymd(ts, tz_offset_ms);
+                    by_day.entry(ymd).or_default().add_counts(
+                        m.context_tokens,
+                        m.output_tokens,
+                        m.cache_read_tokens,
+                    );
+                }
+            }
+            AgentKind::Codex => {
+                for (&bucket, &counts) in &self.codex.buckets {
+                    let mid_ms = bucket.saturating_mul(QUARTER_HOUR_MS);
+                    let ymd = epoch_ms_to_ymd(mid_ms, tz_offset_ms);
+                    by_day.entry(ymd).or_default().add_counts(
+                        counts.input_tokens,
+                        counts.output_tokens,
+                        counts.cache_read_tokens,
+                    );
+                }
+                if by_day.is_empty() {
+                    let inp = self.codex.total_in.unwrap_or(0);
+                    let out = self.codex.total_out.unwrap_or(0);
+                    let cr = self.codex.total_cache_read.unwrap_or(0);
+                    if (inp > 0 || out > 0 || cr > 0)
+                        && self.codex.latest_event_ts.or(fallback_ts_ms).is_some()
+                    {
+                        let ts = self.codex.latest_event_ts.or(fallback_ts_ms).unwrap();
+                        by_day
+                            .entry(epoch_ms_to_ymd(ts, tz_offset_ms))
+                            .or_default()
+                            .add_counts(inp, out, cr);
+                    }
+                }
+            }
+            AgentKind::Agy => {
+                for (&bucket, &counts) in &self.agy.buckets {
+                    let mid_ms = bucket.saturating_mul(QUARTER_HOUR_MS);
+                    let ymd = epoch_ms_to_ymd(mid_ms, tz_offset_ms);
+                    by_day.entry(ymd).or_default().add_counts(
+                        counts.input_tokens,
+                        counts.output_tokens,
+                        counts.cache_read_tokens,
+                    );
+                }
+                if by_day.is_empty()
+                    && (self.agy.total_in > 0
+                        || self.agy.total_out > 0
+                        || self.agy.total_cache_read > 0)
+                {
+                    if let Some(ts) = self.agy.latest_event_ts.or(fallback_ts_ms) {
+                        by_day
+                            .entry(epoch_ms_to_ymd(ts, tz_offset_ms))
+                            .or_default()
+                            .add_counts(
+                                self.agy.total_in,
+                                self.agy.total_out,
+                                self.agy.total_cache_read,
+                            );
+                    }
+                }
+            }
+            AgentKind::Shell => {}
+        }
+        by_day
+    }
+}
+
+pub(crate) struct ParsedTranscriptUsage {
+    pub daily: BTreeMap<String, DailyTokenCounts>,
+    pub model: Option<String>,
+    pub latest_ts: Option<u64>,
+}
+
+/// Stream a transcript JSONL file in bounded memory (`BufReader` + giant-line skip) for offline usage backfill.
+pub(crate) fn parse_transcript_usage_file(
+    agent: AgentKind,
+    path: &Path,
+    tz_offset_ms: i64,
+    fallback_ts_ms: Option<u64>,
+) -> std::io::Result<ParsedTranscriptUsage> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut fold = TelemetryFold::new(agent);
+    loop {
+        match super::transcript::read_bounded_jsonl_line(
+            &mut reader,
+            &mut line_buf,
+            4 * 1024 * 1024,
+        )? {
+            super::transcript::BoundedLine::Eof => break,
+            super::transcript::BoundedLine::Skipped { .. } => continue,
+            super::transcript::BoundedLine::Line { .. } => {
+                let s = String::from_utf8_lossy(&line_buf);
+                let trimmed = s.trim();
+                if !trimmed.starts_with('{') {
+                    continue;
+                }
+                if let Ok(obj) = serde_json::from_str::<Value>(trimmed) {
+                    fold.feed_obj(&obj);
+                }
+            }
+        }
+    }
+    Ok(ParsedTranscriptUsage {
+        daily: fold.daily_usage(tz_offset_ms, fallback_ts_ms),
+        model: fold.latest_model(),
+        latest_ts: fold.latest_event_ts().or(fallback_ts_ms),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2863,6 +3213,7 @@ pub fn parse_status_line_metrics(
         last_duration_ms: None,
         total_input_tokens: None,
         total_output_tokens: None,
+        total_cache_read_tokens: None,
         recent_turns: Vec::new(),
         source: "status_line".into(),
         updated_ms: now_ms,
@@ -2930,6 +3281,7 @@ pub(crate) fn metrics_meaningfully_equal(
                 && x.last_duration_ms == y.last_duration_ms
                 && x.total_input_tokens == y.total_input_tokens
                 && x.total_output_tokens == y.total_output_tokens
+                && x.total_cache_read_tokens == y.total_cache_read_tokens
                 && x.recent_turns.len() == y.recent_turns.len()
                 && x.recent_turns.last() == y.recent_turns.last()
                 && x.source == y.source
@@ -3767,6 +4119,7 @@ mod tests {
             last_duration_ms: Some(4_000),
             total_input_tokens: Some(2_500_000),
             total_output_tokens: Some(18_000),
+            total_cache_read_tokens: Some(1_000_000),
             recent_turns: Vec::new(),
             source: "transcript".into(),
             updated_ms: 123,

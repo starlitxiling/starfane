@@ -122,7 +122,7 @@ export async function act(key, fn, ok) {
 
 export function sessionsDiffSig(map) {
   return [...map.values()]
-    .map((s) => `${s.session_id}|${s.host_id || 'local'}|${s.host_display_name || ''}|${s.mux_kind || ''}|${s.state}|${s.tmux_label || ''}|${s.tmux_target || ''}|${s.pane || ''}|${s.model || ''}|${s.effort || ''}|${s.last_message || ''}|${s.last_error || ''}|${s.transcript_path || ''}|${s.last_event_ms || 0}|${s.subagent_count || 0}|${s.metrics?.context_used_pct ?? ''}|${s.metrics?.tps ?? ''}|${s.metrics?.ttft_ms ?? ''}|${s.metrics?.avg_ttft_ms ?? ''}|${s.metrics?.recent_turns?.length || 0}|${s.metrics?.recent_turns?.at(-1)?.ts_ms || 0}`)
+    .map((s) => `${s.session_id}|${s.host_id || 'local'}|${s.host_display_name || ''}|${s.mux_kind || ''}|${s.state}|${s.tmux_label || ''}|${s.tmux_target || ''}|${s.pane || ''}|${s.model || ''}|${s.effort || ''}|${s.resume_id || ''}|${s.suspended_at_ms || 0}|${s.last_message || ''}|${s.last_error || ''}|${s.transcript_path || ''}|${s.last_event_ms || 0}|${s.subagent_count || 0}|${s.metrics?.context_used_pct ?? ''}|${s.metrics?.tps ?? ''}|${s.metrics?.ttft_ms ?? ''}|${s.metrics?.avg_ttft_ms ?? ''}|${s.metrics?.total_input_tokens ?? ''}|${s.metrics?.total_output_tokens ?? ''}|${s.metrics?.total_cache_read_tokens ?? ''}|${s.metrics?.recent_turns?.length || 0}|${s.metrics?.recent_turns?.at(-1)?.ts_ms || 0}`)
     .sort()
     .join('\n');
 }
@@ -184,7 +184,10 @@ export async function syncStateSilent({ refreshActive = false } = {}) {
     const nextPipe = [...nextPipelines.values()].map((p) => `${p.id}:${p.status}:${p.updated_ms || 0}`).sort().join(',');
     const nextAttn = st.attention || [];
     const notifyChanged = applyNotifiersSnapshot(st);
-    const changed = prevSig !== nextSig || prevHostsSig !== nextHostsSig || prevPipe !== nextPipe || prevAttn !== nextAttn.length || notifyChanged;
+    const prevTodayTok = S.todayUsage?.total_tokens ?? null;
+    S.todayUsage = st.today_usage || null;
+    const nextTodayTok = S.todayUsage?.total_tokens ?? null;
+    const changed = prevSig !== nextSig || prevHostsSig !== nextHostsSig || prevPipe !== nextPipe || prevAttn !== nextAttn.length || notifyChanged || prevTodayTok !== nextTodayTok;
     S.lastSeq = Math.max(S.lastSeq, st.event_seq || 0);
     if (st.terminal_font || st.has_user_term_font) applyTerminalFontConfig(st.terminal_font || '', !!st.has_user_term_font);
     if (changed) {
@@ -241,6 +244,7 @@ export async function loadAll() {
     (st.sessions || []).forEach(upsertSession);
     (st.pipelines || []).forEach(upsertPipeline);
     S.attention = st.attention || [];
+    S.todayUsage = st.today_usage || null;
     applyNotifiersSnapshot(st);
     S.loaded = true;
     S.loadError = null;
@@ -924,6 +928,86 @@ export async function pauseHostRetryApi(hostId) {
       toast(L('当前控制台处于只读模式，无法停止主机重试', 'Console is read-only — cannot pause host retries'), 'warn');
     } else {
       toast(L(`停止重试失败：${errText(e)}`, `Failed to pause retries: ${errText(e)}`), 'err');
+    }
+    return undefined;
+  } finally {
+    UI.busy.delete(busyKey);
+    APP.schedule();
+  }
+}
+
+export async function loadUsage(days = S.usageDays, { silent = false } = {}) {
+  const wantDays = Math.max(1, Math.min(90, Number(days) || 14));
+  S.usageDays = wantDays;
+  if (!silent || S.usageState === 'idle') {
+    S.usageState = 'loading';
+    S.usageErr = null;
+    APP.schedulePassive();
+  }
+  try {
+    const res = await api('GET', `/api/usage?days=${wantDays}`);
+    S.usage = res || null;
+    if (res?.today) S.todayUsage = res.today;
+    S.usageState = 'ok';
+    S.usageErr = null;
+    if (res?.daily?.length && !res.daily.some((d) => d.date === S.usageSelDate)) {
+      S.usageSelDate = res.today_date || res.daily[res.daily.length - 1].date;
+    }
+    return res;
+  } catch (e) {
+    S.usageState = 'err';
+    S.usageErr = errText(e);
+    return undefined;
+  } finally {
+    APP.schedulePassive();
+  }
+}
+
+export async function suspendSessionApi(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return undefined;
+  const busyKey = `suspend:${sid}`;
+  if (UI.busy.has(busyKey)) return undefined;
+  UI.busy.add(busyKey);
+  APP.schedule();
+  try {
+    const r = await api('POST', `/api/sessions/${enc(sid)}/suspend`, {});
+    if (r?.session) upsertSession(r.session);
+    toast(L('会话进程已休眠释放，终端窗口已保留', 'Session suspended to save resources; terminal window kept open'), 'ok');
+    return r;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 403) {
+      toast(L('当前控制台处于只读模式，无法休眠会话', 'Console is read-only — cannot suspend sessions'), 'warn');
+    } else {
+      toast(L(`休眠会话失败：${errText(e)}`, `Failed to suspend session: ${errText(e)}`), 'err');
+    }
+    return undefined;
+  } finally {
+    UI.busy.delete(busyKey);
+    APP.schedule();
+  }
+}
+
+export async function resumeSessionApi(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return undefined;
+  const busyKey = `resume:${sid}`;
+  if (UI.busy.has(busyKey)) return undefined;
+  UI.busy.add(busyKey);
+  APP.schedule();
+  try {
+    const r = await api('POST', `/api/sessions/${enc(sid)}/resume`, {});
+    if (r?.session) {
+      upsertSession(r.session);
+      loadSessionOutput(r.session, { silent: true, force: true });
+    }
+    toast(L('已唤醒原会话，正在恢复对话上下文…', 'Session woken — restoring original conversation…'), 'ok');
+    return r;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 403) {
+      toast(L('当前控制台处于只读模式，无法唤醒会话', 'Console is read-only — cannot wake session'), 'warn');
+    } else {
+      toast(L(`唤醒会话失败：${errText(e)}`, `Failed to wake session: ${errText(e)}`), 'err');
     }
     return undefined;
   } finally {

@@ -50,6 +50,25 @@ pub struct GateProbe {
     pub cursor_line: String,
 }
 
+/// Request to suspend an active agent pane while preserving the terminal pane/window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspendPaneReq {
+    pub pane: PaneId,
+    pub cwd: Option<String>,
+    pub pane_name: Option<String>,
+    pub waiter_script: String,
+    pub resume_argv: Vec<String>,
+}
+
+/// Request to wake a previously suspended agent pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakePaneReq {
+    pub pane: PaneId,
+    pub cwd: Option<String>,
+    pub pane_name: Option<String>,
+    pub resume_argv: Vec<String>,
+}
+
 /// Unified terminal multiplexer interface implemented by [`crate::Tmux`] and [`crate::ZellijMux`].
 pub trait TerminalMux: Send + Sync {
     fn kind(&self) -> MuxKind;
@@ -94,6 +113,8 @@ pub trait TerminalMux: Send + Sync {
     fn send_key(&self, pane: &PaneId, key: &str) -> Result<(), TmuxError>;
 
     fn spawn_window(&self, req: &SpawnWindow) -> Result<PaneId, TmuxError>;
+    fn suspend_pane(&self, req: &SuspendPaneReq) -> Result<PaneId, TmuxError>;
+    fn wake_suspended_pane(&self, req: &WakePaneReq) -> Result<PaneId, TmuxError>;
     fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError>;
     fn kill_pane(&self, pane: &PaneId) -> Result<(), TmuxError>;
     fn set_status(&self, pane: &PaneId, st: &PaneStatus) -> Result<(), TmuxError>;

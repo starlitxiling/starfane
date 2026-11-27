@@ -15,6 +15,7 @@ mod tasks;
 pub(crate) mod transcript;
 pub use transcript::TranscriptQuery;
 pub(crate) mod uploads;
+pub(crate) mod usage;
 pub(crate) mod util;
 
 use crate::access::AccessGate;
@@ -132,6 +133,7 @@ pub(crate) struct Inner {
     pub telemetry: Mutex<TelemetryCaches>,
     pub transcript_index: Arc<Mutex<transcript::TranscriptIndexCache>>,
     pub discovery_cache: Mutex<discover::DiscoveryScanCache>,
+    pub(crate) usage_ledger: Mutex<usage::UsageLedger>,
 }
 
 /// Lock helper: a poisoned mutex means a panic happened while mutating state;
@@ -244,6 +246,7 @@ impl Core {
         let access_gate = AccessGate::from_config(&cfg.config.web);
         let notify_router = NotifyRouter::from_config(&cfg.config);
         let transcript_index = Arc::new(Mutex::new(transcript::TranscriptIndexCache::default()));
+        let usage_ledger = Mutex::new(usage::UsageLedger::load(&cfg.state_dir));
         let remote_nodes = build_remote_providers_with_transcript_cache(
             &cfg.config.nodes,
             &cfg.state_dir,
@@ -342,6 +345,7 @@ impl Core {
                 telemetry: Mutex::new(TelemetryCaches::default()),
                 transcript_index,
                 discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
+                usage_ledger,
             }),
         })
     }
@@ -1637,6 +1641,7 @@ impl Core {
         let mut transitioned_local_panes = Vec::new();
         let mut changed = false;
         let updated_host;
+        let mut remote_usage_records: Vec<SessionRecord> = Vec::new();
         {
             let mut st = lock(&self.inner.state);
             let display = st
@@ -1646,11 +1651,63 @@ impl Core {
                 .unwrap_or_else(|| snap.host.display_name.clone());
             snap.host.display_name = display.clone();
 
-            let live_ids: HashSet<SessionId> =
-                snap.sessions.iter().map(|s| s.session_id.clone()).collect();
+            let suspended_by_pane: HashMap<PaneId, SessionId> = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    !s.is_subagent
+                        && s.effective_host_id() == hid.as_str()
+                        && s.state == SessionState::Suspended
+                })
+                .filter_map(|s| s.pane.clone().map(|p| (p, s.session_id.clone())))
+                .collect();
+
+            let mut live_ids: HashSet<SessionId> = HashSet::with_capacity(snap.sessions.len());
             for mut s in snap.sessions {
                 s.host_display_name = Some(display.clone());
+                if kind == HostKind::Ssh {
+                    if let Some(susp_sid) = s
+                        .pane
+                        .as_ref()
+                        .and_then(|p| suspended_by_pane.get(p))
+                        .cloned()
+                    {
+                        if s.agent.is_shell() {
+                            live_ids.insert(susp_sid);
+                            continue;
+                        }
+                        if s.state != SessionState::Suspended {
+                            let prev_susp = st.sessions.get(&susp_sid).cloned();
+                            if let Some(ps) = prev_susp {
+                                if ps.agent == s.agent {
+                                    if s.transcript_path.is_none() {
+                                        s.transcript_path = ps.transcript_path.clone();
+                                    }
+                                    if s.metrics.is_none() {
+                                        s.metrics = ps.metrics.clone();
+                                    }
+                                    if s.resume_id.is_none() {
+                                        s.resume_id = ps.resume_id.clone();
+                                    }
+                                    s.suspended_at_ms = None;
+                                    if s.session_id != susp_sid {
+                                        if let Some(mut old) = st.sessions.remove(&susp_sid) {
+                                            old.state = SessionState::Ended;
+                                            old.state_since_ms = now_ms;
+                                            old.last_event_ms = now_ms;
+                                            updated_sessions.push(old);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                live_ids.insert(s.session_id.clone());
                 if let Some(prev) = st.sessions.get(&s.session_id) {
+                    if prev.resume_id.is_some() && s.resume_id.is_none() {
+                        s.resume_id = prev.resume_id.clone();
+                    }
                     if matches!(prev.state, SessionState::Working | SessionState::Starting)
                         && matches!(
                             s.state,
@@ -1695,6 +1752,8 @@ impl Core {
                                 && prev.last_error == s.last_error
                                 && prev.subagent_count == s.subagent_count
                                 && prev.active_subagents == s.active_subagents
+                                && prev.resume_id == s.resume_id
+                                && prev.suspended_at_ms == s.suspended_at_ms
                                 && same_metrics;
                             if same_meta {
                                 s.last_event_ms = prev.last_event_ms;
@@ -1702,7 +1761,13 @@ impl Core {
                         }
                     }
                 }
-                if st.sessions.get(&s.session_id) != Some(&s) {
+                let prev_opt = st.sessions.get(&s.session_id);
+                if prev_opt != Some(&s) {
+                    if let Some(ref m) = s.metrics {
+                        if m.total_input_tokens.is_some() || m.total_output_tokens.is_some() {
+                            remote_usage_records.push(s.clone());
+                        }
+                    }
                     st.sessions.insert(s.session_id.clone(), s.clone());
                     updated_sessions.push(s);
                     changed = true;
@@ -1711,16 +1776,27 @@ impl Core {
 
             // Transition previously live remote sessions that disappeared from a HEALTHY host.
             // Skipped for partial dirty-pane push snapshots so non-dirty sibling sessions remain live.
-            // Already-`Ended` sessions are left untouched so closed transcripts remain in
-            // `claimed_external_ids` and SSE does not emit duplicate `Ended` tombstones.
+            // Preserve `SessionState::Suspended` SSH sessions while their remote pane stays alive!
             if !is_partial {
                 let gone: Vec<SessionId> = st
                     .sessions
                     .iter()
                     .filter(|(sid, s)| {
-                        s.effective_host_id() == hid.as_str()
-                            && s.state != SessionState::Ended
-                            && !live_ids.contains(*sid)
+                        if s.effective_host_id() != hid.as_str()
+                            || s.state == SessionState::Ended
+                            || live_ids.contains(*sid)
+                        {
+                            return false;
+                        }
+                        if kind == HostKind::Ssh
+                            && s.state == SessionState::Suspended
+                            && s.pane
+                                .as_ref()
+                                .is_some_and(|p| snap.live_pane_ids.contains(p))
+                        {
+                            return false;
+                        }
+                        true
                     })
                     .map(|(sid, _)| sid.clone())
                     .collect();
@@ -1796,6 +1872,9 @@ impl Core {
         }
         if let Some(host) = updated_host {
             self.publish_host(host);
+        }
+        for rs in remote_usage_records {
+            self.record_remote_session_usage(&rs);
         }
 
         for delta in snap.output_deltas {
@@ -2077,6 +2156,10 @@ impl Core {
             obj.insert(
                 "lang".into(),
                 serde_json::Value::String(self.inner.cfg.web.effective_lang().to_string()),
+            );
+            obj.insert(
+                "today_usage".into(),
+                serde_json::to_value(self.today_usage()).unwrap_or(serde_json::Value::Null),
             );
         }
         v
@@ -2820,6 +2903,7 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
 
     // Immediate initial scan so already-running tmux panes are visible on the first request.
     core.sync_discovered_panes().await;
+    core.spawn_usage_backfill();
 
     tokio::spawn(crate::uds::serve(core.clone(), listener));
     {
@@ -2875,6 +2959,7 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
             loop {
                 tick.tick().await;
                 c.flush_snapshot_async().await;
+                c.flush_usage_async().await;
             }
         });
     }
@@ -2905,6 +2990,7 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
     }
     core.mark_dirty();
     core.flush_snapshot_sync();
+    core.flush_usage_sync();
     if core.config().tmux.backup.enabled {
         if let Err(e) = core.backup_tmux(false).await {
             log::warn!("shutdown tmux backup failed: {}", e.message);
@@ -2984,6 +3070,8 @@ mod push_tests {
                 host_id: Some(self.host_id.clone()),
                 host_display_name: Some("Mock Host".into()),
                 mux_kind: Some("tmux".into()),
+                resume_id: None,
+                suspended_at_ms: None,
             }
         }
     }
@@ -3028,6 +3116,7 @@ mod push_tests {
                         self.mk_session("tmux-%1", "%1", SessionState::Idle),
                         self.mk_session("tmux-%2", "%2", SessionState::Idle),
                     ],
+                    live_pane_ids: HashSet::new(),
                     events: Vec::new(),
                     output_deltas: Vec::new(),
                 })
@@ -3059,6 +3148,7 @@ mod push_tests {
                         retry_paused: false,
                     },
                     sessions: vec![self.mk_session("tmux-%1", "%1", SessionState::Working)],
+                    live_pane_ids: HashSet::new(),
                     events: Vec::new(),
                     output_deltas: vec![DaemonEvent::Output {
                         seq: 0,
@@ -3226,6 +3316,7 @@ mod push_tests {
                 telemetry: Mutex::new(TelemetryCaches::default()),
                 transcript_index: Arc::new(Mutex::new(transcript::TranscriptIndexCache::default())),
                 discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
+                usage_ledger: Mutex::new(usage::UsageLedger::load(&base.inner.state_dir)),
             }),
         };
         (core, hid, wake)
@@ -3461,6 +3552,8 @@ mod push_tests {
                     host_id: Some(self.host_id.clone()),
                     host_display_name: Some("Mock Host".into()),
                     mux_kind: Some("tmux".into()),
+                    resume_id: None,
+                    suspended_at_ms: None,
                 }
             }
         }
@@ -3501,6 +3594,7 @@ mod push_tests {
                             retry_paused: false,
                         },
                         sessions: vec![self.mk_session("tmux-%1", "%1", SessionState::Working)],
+                        live_pane_ids: HashSet::new(),
                         events: Vec::new(),
                         output_deltas: Vec::new(),
                     })
@@ -3549,6 +3643,7 @@ mod push_tests {
                             retry_paused: false,
                         },
                         sessions: vec![self.mk_session("tmux-%1", "%1", st)],
+                        live_pane_ids: HashSet::new(),
                         events: Vec::new(),
                         output_deltas: deltas,
                     })
@@ -3691,6 +3786,7 @@ mod push_tests {
                 telemetry: Mutex::new(TelemetryCaches::default()),
                 transcript_index: Arc::new(Mutex::new(transcript::TranscriptIndexCache::default())),
                 discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
+                usage_ledger: Mutex::new(usage::UsageLedger::load(&base.inner.state_dir)),
             }),
         };
 
@@ -3797,6 +3893,7 @@ mod push_tests {
                                 retry_paused: self.is_retry_paused(),
                             },
                             sessions: Vec::new(),
+                            live_pane_ids: HashSet::new(),
                             events: Vec::new(),
                             output_deltas: Vec::new(),
                         })
@@ -4005,6 +4102,7 @@ mod push_tests {
                 telemetry: Mutex::new(TelemetryCaches::default()),
                 transcript_index: Arc::new(Mutex::new(transcript::TranscriptIndexCache::default())),
                 discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
+                usage_ledger: Mutex::new(usage::UsageLedger::load(&base.inner.state_dir)),
             }),
         };
 

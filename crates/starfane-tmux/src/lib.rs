@@ -50,7 +50,8 @@ pub use model::{
 };
 pub use mux::{
     is_tmux_pane_id, pane_mux_kind, parse_zellij_pane_id, qualify_host_pane, qualify_host_session,
-    split_host_prefix, validate_interactive_key, GateProbe, MuxCapabilities, MuxKind, TerminalMux,
+    split_host_prefix, validate_interactive_key, GateProbe, MuxCapabilities, MuxKind,
+    SuspendPaneReq, TerminalMux, WakePaneReq,
 };
 pub use resolve::{pid_ancestors, resolve_pane, PaneHint};
 pub use zellij::{
@@ -800,6 +801,49 @@ impl Tmux {
         }
     }
 
+    /// Build arguments for `tmux respawn-pane -k` suspending an active agent pane into a lightweight shell waiter.
+    pub fn build_respawn_pane_args(
+        pane: &PaneId,
+        cwd: Option<&str>,
+        waiter_script: &str,
+    ) -> Result<Vec<String>, TmuxError> {
+        valid_pane(pane)?;
+        if waiter_script.trim().is_empty() {
+            return Err(TmuxError::InvalidRequest(
+                "suspend waiter script cannot be empty".into(),
+            ));
+        }
+        let mut args = vec![
+            "respawn-pane".to_string(),
+            "-k".to_string(),
+            "-t".to_string(),
+            pane.0.clone(),
+        ];
+        if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+            args.push("-c".to_string());
+            args.push(dir.to_string());
+        }
+        args.push("--".to_string());
+        args.push("/bin/sh".to_string());
+        args.push("-lc".to_string());
+        args.push(waiter_script.to_string());
+        Ok(args)
+    }
+
+    /// Replace the running process inside `pane` with the interactive suspend waiter while preserving the pane/window.
+    pub fn suspend_pane(&self, req: &crate::mux::SuspendPaneReq) -> Result<PaneId, TmuxError> {
+        let args =
+            Self::build_respawn_pane_args(&req.pane, req.cwd.as_deref(), &req.waiter_script)?;
+        self.run_owned(&args, None)?;
+        Ok(req.pane.clone())
+    }
+
+    /// Wake a suspended pane waiting on `[Enter]` by sending Enter (`C-m`) into its PTY.
+    pub fn wake_suspended_pane(&self, req: &crate::mux::WakePaneReq) -> Result<PaneId, TmuxError> {
+        self.submit_enter(&req.pane)?;
+        Ok(req.pane.clone())
+    }
+
     /// Stop the tmux server on this socket. Intended for sandbox sockets in tests; a server
     /// that is already gone is not an error.
     pub fn kill_server(&self) -> Result<(), TmuxError> {
@@ -895,6 +939,14 @@ impl TerminalMux for Tmux {
         Tmux::spawn_window(self, req)
     }
 
+    fn suspend_pane(&self, req: &crate::mux::SuspendPaneReq) -> Result<PaneId, TmuxError> {
+        Tmux::suspend_pane(self, req)
+    }
+
+    fn wake_suspended_pane(&self, req: &crate::mux::WakePaneReq) -> Result<PaneId, TmuxError> {
+        Tmux::wake_suspended_pane(self, req)
+    }
+
     fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError> {
         Tmux::focus_pane(self, pane)
     }
@@ -933,6 +985,7 @@ fn state_name(st: SessionState) -> &'static str {
         SessionState::NeedsPermission => "needs_permission",
         SessionState::NeedsInput => "needs_input",
         SessionState::Error => "error",
+        SessionState::Suspended => "suspended",
         SessionState::Ended => "ended",
     }
 }
@@ -1059,5 +1112,94 @@ mod tests {
 
         // No attached clients -> None.
         assert!(Tmux::pick_focus_client(&[], "spot").is_none());
+    }
+
+    #[test]
+    fn builds_tmux_suspend_respawn_and_wake_commands() {
+        use crate::exec::ExecOutput;
+        use crate::mux::{SuspendPaneReq, WakePaneReq};
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct CaptureExec {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl ExecTransport for CaptureExec {
+            fn run(
+                &self,
+                _bin: &Path,
+                args: &[String],
+                _stdin: Option<&[u8]>,
+            ) -> Result<ExecOutput, TmuxError> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                Ok(ExecOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    success: true,
+                    code: Some(0),
+                })
+            }
+            fn run_shell(&self, _script: &str) -> Result<ExecOutput, TmuxError> {
+                unreachable!()
+            }
+            fn run_shell_bytes(
+                &self,
+                _script: &str,
+                _stdin: Option<&[u8]>,
+                _timeout: std::time::Duration,
+            ) -> Result<crate::exec::ExecBytesOutput, TmuxError> {
+                unreachable!()
+            }
+            fn is_local(&self) -> bool {
+                true
+            }
+        }
+
+        let exec = Arc::new(CaptureExec::default());
+        let tmux = Tmux::with_transport(PathBuf::from("tmux"), None, exec.clone());
+        let pane = PaneId::new("%14");
+
+        let out_pane = tmux
+            .suspend_pane(&SuspendPaneReq {
+                pane: pane.clone(),
+                cwd: Some("/repo/work".into()),
+                pane_name: Some("claude-1".into()),
+                waiter_script: "read -r _k; exec claude --resume abc".into(),
+                resume_argv: vec!["claude".into(), "--resume".into(), "abc".into()],
+            })
+            .unwrap();
+        assert_eq!(out_pane, pane);
+
+        let woke = tmux
+            .wake_suspended_pane(&WakePaneReq {
+                pane: pane.clone(),
+                cwd: Some("/repo/work".into()),
+                pane_name: Some("claude-1".into()),
+                resume_argv: vec!["claude".into(), "--resume".into(), "abc".into()],
+            })
+            .unwrap();
+        assert_eq!(woke, pane);
+
+        assert!(Tmux::build_respawn_pane_args(&PaneId::new("zj:work/1"), None, "echo hi").is_err());
+
+        let calls = exec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            vec![
+                "respawn-pane",
+                "-k",
+                "-t",
+                "%14",
+                "-c",
+                "/repo/work",
+                "--",
+                "/bin/sh",
+                "-lc",
+                "read -r _k; exec claude --resume abc",
+            ]
+        );
+        assert_eq!(calls[1], vec!["send-keys", "-t", "%14", "C-m"]);
     }
 }

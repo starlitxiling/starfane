@@ -359,7 +359,7 @@ pub(crate) struct TranscriptIndex {
     delta_bytes_scanned: u64,
 }
 
-enum BoundedLine {
+pub(crate) enum BoundedLine {
     Eof,
     Line {
         bytes_consumed: usize,
@@ -382,7 +382,7 @@ fn has_skippable_giant_type_header(buf: &[u8]) -> bool {
 
 /// Stream a single `\n`-delimited JSONL line without pulling giant `GENERIC`/`compacted`
 /// blobs (>1 MiB) or absurd >4 MiB lines onto the heap.
-fn read_bounded_jsonl_line<R: BufRead>(
+pub(crate) fn read_bounded_jsonl_line<R: BufRead>(
     reader: &mut R,
     out: &mut Vec<u8>,
     hard_limit: usize,
@@ -1354,6 +1354,22 @@ impl TranscriptIndex {
     ) -> (Option<SessionMetrics>, Option<String>, Option<String>) {
         self.telemetry.snapshot(now_ms)
     }
+
+    pub(crate) fn file_sig(&self) -> (u64, u128) {
+        (self.file_len, self.mtime_ns)
+    }
+
+    pub(crate) fn daily_usage(
+        &self,
+        tz_offset_ms: i64,
+        fallback_ts_ms: Option<u64>,
+    ) -> std::collections::BTreeMap<String, super::metrics::DailyTokenCounts> {
+        self.telemetry.daily_usage(tz_offset_ms, fallback_ts_ms)
+    }
+
+    pub(crate) fn latest_event_ts(&self) -> Option<u64> {
+        self.telemetry.latest_event_ts()
+    }
 }
 
 fn merge_transcript_metrics(
@@ -1380,6 +1396,11 @@ fn merge_transcript_metrics(
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
             };
+            agy.total_cache_read_tokens =
+                match (agy.total_cache_read_tokens, parsed.total_cache_read_tokens) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
             if agy.tps.is_none() {
                 agy.tps = parsed.tps;
                 agy.last_output_tokens = agy.last_output_tokens.or(parsed.last_output_tokens);
@@ -1642,6 +1663,10 @@ impl TranscriptIndexCache {
             return None;
         }
         Some(&mut entry.index)
+    }
+
+    pub(crate) fn resolve_canonical(&mut self, path: &Path) -> PathBuf {
+        self.resolve_canonical_path(path)
     }
 
     pub(crate) fn get_or_sync(
@@ -2931,6 +2956,8 @@ not valid json at all
             host_id: None,
             host_display_name: None,
             mux_kind: None,
+            resume_id: None,
+            suspended_at_ms: None,
         };
         assert_eq!(resolve_transcript_path_in(&home, &cl_rec), Some(cl_sub));
 
@@ -3238,6 +3265,8 @@ not valid json at all
             host_id: None,
             host_display_name: None,
             mux_kind: None,
+            resume_id: None,
+            suspended_at_ms: None,
         };
 
         let partial = load_session_transcript(&rec, 2);
@@ -4426,6 +4455,7 @@ not valid json at all
             last_duration_ms: Some(4_716),
             total_input_tokens: None,
             total_output_tokens: None,
+            total_cache_read_tokens: None,
             recent_turns: vec![starfane_proto::TurnMetricSample {
                 ts_ms: 5_000,
                 ttft_ms: Some(3_100),
@@ -4447,6 +4477,7 @@ not valid json at all
             last_duration_ms: Some(4_000),
             total_input_tokens: Some(900_000),
             total_output_tokens: Some(12_000),
+            total_cache_read_tokens: None,
             recent_turns: Vec::new(),
             source: "transcript".into(),
             updated_ms: 4_900,

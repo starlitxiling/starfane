@@ -240,6 +240,7 @@ fn state_snapshot_and_sse_roundtrip() {
             last_duration_ms: Some(10_000),
             total_input_tokens: Some(300_000),
             total_output_tokens: Some(4_200),
+            total_cache_read_tokens: Some(250_000),
             recent_turns: vec![TurnMetricSample {
                 ts_ms: 1234,
                 ttft_ms: Some(1_200),
@@ -253,6 +254,8 @@ fn state_snapshot_and_sse_roundtrip() {
         host_id: Some(HostId::new("local")),
         host_display_name: Some("Local".into()),
         mux_kind: Some("tmux".into()),
+        resume_id: Some("root-resume-1".into()),
+        suspended_at_ms: Some(1_700_000_000_123),
     };
     let snap = StateSnapshot {
         v: 1,
@@ -414,4 +417,73 @@ fn session_metrics_legacy_json_and_recent_turns_roundtrip() {
     assert!(ser["recent_turns"][1].get("duration_ms").is_none());
     let back: SessionMetrics = serde_json::from_value(ser).unwrap();
     assert_eq!(back, populated);
+}
+
+#[test]
+fn suspended_session_and_usage_summary_roundtrip() {
+    let legacy_session: SessionRecord = serde_json::from_value(json!({
+        "session_id": "s-legacy",
+        "agent": "claude",
+        "state": "idle",
+        "state_since_ms": 1,
+        "last_event_ms": 2,
+        "is_subagent": false,
+        "subagent_count": 0,
+        "active_subagents": 0,
+        "unread_inbox": 0,
+        "confidence": "exact"
+    }))
+    .unwrap();
+    assert_eq!(legacy_session.resume_id, None);
+    assert_eq!(legacy_session.suspended_at_ms, None);
+
+    let suspended: SessionRecord = SessionRecord {
+        state: SessionState::Suspended,
+        resume_id: Some("uuid-123".into()),
+        suspended_at_ms: Some(1_700_000_000_000),
+        ..legacy_session
+    };
+    let s_val = serde_json::to_value(&suspended).unwrap();
+    assert_eq!(s_val["state"], "suspended");
+    assert_eq!(s_val["resume_id"], "uuid-123");
+    assert_eq!(s_val["suspended_at_ms"], 1_700_000_000_000u64);
+    assert_eq!(
+        serde_json::from_value::<SessionRecord>(s_val).unwrap(),
+        suspended
+    );
+
+    let mut by_agent = BTreeMap::new();
+    by_agent.insert(
+        "claude".to_string(),
+        TokenUsageTotals::from_counts(1_000, 200, 800),
+    );
+    let summary = UsageSummaryResponse {
+        days: 14,
+        tz_offset: "+08:00".into(),
+        today_date: "2026-11-27".into(),
+        today: TokenUsageTotals::from_counts(1_000, 200, 800),
+        last_7_days: TokenUsageTotals::from_counts(5_000, 1_000, 4_000),
+        last_30_days: TokenUsageTotals::from_counts(10_000, 2_000, 8_000),
+        range_totals: TokenUsageTotals::from_counts(10_000, 2_000, 8_000),
+        by_agent_range: by_agent.clone(),
+        daily: vec![DailyUsageBucket {
+            date: "2026-11-27".into(),
+            totals: TokenUsageTotals::from_counts(1_000, 200, 800),
+            by_agent,
+            session_count: 1,
+        }],
+        top_sessions: vec![SessionUsageRankItem {
+            session_id: SessionId::new("s-1"),
+            agent: AgentKind::Claude,
+            label: Some("proj-a".into()),
+            model: Some("opus".into()),
+            active: true,
+            totals: TokenUsageTotals::from_counts(1_000, 200, 800),
+            last_active_ms: 1_700_000_000_000,
+        }],
+        updated_ms: 1_700_000_000_000,
+    };
+    let back: UsageSummaryResponse =
+        serde_json::from_str(&serde_json::to_string(&summary).unwrap()).unwrap();
+    assert_eq!(back, summary);
 }

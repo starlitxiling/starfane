@@ -23,7 +23,8 @@ use crate::exec::{ExecTransport, LocalExec};
 use crate::gate::{validate_interactive_text, validate_pointer_text, GateConfig};
 use crate::model::{ClientInfo, PaneInfo, PaneStatus};
 use crate::mux::{
-    parse_zellij_pane_id, validate_interactive_key, MuxCapabilities, MuxKind, TerminalMux,
+    parse_zellij_pane_id, validate_interactive_key, MuxCapabilities, MuxKind, SuspendPaneReq,
+    TerminalMux, WakePaneReq,
 };
 use crate::{FocusOutcome, SpawnWindow, DEFAULT_DETACHED_SESSION};
 use serde::Deserialize;
@@ -443,6 +444,58 @@ impl TerminalMux for ZellijMux {
         Ok(PaneId::new(format!("zj:{session}/{numeric}")))
     }
 
+    fn suspend_pane(&self, req: &SuspendPaneReq) -> Result<PaneId, TmuxError> {
+        let (sess, numeric) = self.require_pane(&req.pane)?;
+        let args = build_zellij_replace_pane_args(
+            numeric,
+            req.pane_name.as_deref(),
+            req.cwd.as_deref(),
+            true,
+            &req.resume_argv,
+        )?;
+        let list_args = vec![
+            "list-panes".to_string(),
+            "--all".to_string(),
+            "--json".to_string(),
+        ];
+        let before_raw = self
+            .run_session_action(sess, &list_args)
+            .unwrap_or_default();
+        let before_ids = parse_zellij_terminal_ids(&before_raw);
+        let out = self.run_session_action(sess, &args)?;
+        let raw = out.trim();
+        let direct = raw.strip_prefix("terminal_").unwrap_or(raw);
+        if !direct.is_empty() && direct.bytes().all(|b| b.is_ascii_digit()) {
+            return Ok(PaneId::new(format!("zj:{sess}/{direct}")));
+        }
+
+        // Zellij 0.46 prints empty stdout on `new-pane --in-place --close-replaced-pane`.
+        // Diff `list-panes --all --json` against `before_ids` to obtain the replacement pane id.
+        for attempt in 0..8 {
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(40));
+            }
+            if let Ok(after_raw) = self.run_session_action(sess, &list_args) {
+                if let Some(new_id) = pick_replacement_zellij_terminal_id(
+                    &after_raw,
+                    &before_ids,
+                    req.pane_name.as_deref(),
+                ) {
+                    return Ok(PaneId::new(format!("zj:{sess}/{new_id}")));
+                }
+            }
+        }
+        Err(TmuxError::Parse(format!(
+            "zellij suspend new-pane did not yield replacement pane id (old={})",
+            req.pane
+        )))
+    }
+
+    fn wake_suspended_pane(&self, req: &WakePaneReq) -> Result<PaneId, TmuxError> {
+        self.submit_enter(&req.pane)?;
+        Ok(req.pane.clone())
+    }
+
     fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError> {
         let (sess, numeric) = self.require_pane(pane)?;
         let term_id = format!("terminal_{numeric}");
@@ -678,7 +731,7 @@ pub fn parse_zellij_panes_json(
                     .filter(|s| !s.trim().is_empty())
             })
             .or_else(|| p.terminal_command.filter(|s| !s.trim().is_empty()))
-            .unwrap_or_else(|| p.title.clone());
+            .unwrap_or_default();
         let current_path = p
             .pane_cwd
             .filter(|s| !s.trim().is_empty())
@@ -839,6 +892,80 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Build arguments for `zellij action new-pane --in-place --close-replaced-pane`.
+pub fn build_zellij_replace_pane_args(
+    old_numeric_id: &str,
+    name: Option<&str>,
+    cwd: Option<&str>,
+    start_suspended: bool,
+    resume_argv: &[String],
+) -> Result<Vec<String>, TmuxError> {
+    if resume_argv.is_empty() || resume_argv[0].trim().is_empty() {
+        return Err(TmuxError::InvalidRequest("resume_argv is empty".into()));
+    }
+    let numeric = old_numeric_id
+        .trim()
+        .strip_prefix("terminal_")
+        .unwrap_or(old_numeric_id.trim());
+    if numeric.is_empty() || !numeric.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(TmuxError::InvalidRequest(format!(
+            "invalid zellij numeric pane id {old_numeric_id:?}"
+        )));
+    }
+    let mut args = vec![
+        "new-pane".to_string(),
+        "--in-place".to_string(),
+        "--close-replaced-pane".to_string(),
+        "--pane-id".to_string(),
+        format!("terminal_{numeric}"),
+    ];
+    if let Some(n) = name.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("--name".to_string());
+        args.push(n.to_string());
+    }
+    if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("--cwd".to_string());
+        args.push(dir.to_string());
+    }
+    if start_suspended {
+        args.push("--start-suspended".to_string());
+    }
+    args.push("--".to_string());
+    args.extend(resume_argv.iter().cloned());
+    Ok(args)
+}
+
+fn parse_zellij_terminal_ids(raw: &str) -> std::collections::HashSet<u32> {
+    serde_json::from_str::<Vec<RawZellijPane>>(raw)
+        .map(|items| {
+            items
+                .into_iter()
+                .filter(|p| !p.is_plugin)
+                .map(|p| p.id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn pick_replacement_zellij_terminal_id(
+    raw: &str,
+    before_ids: &std::collections::HashSet<u32>,
+    expected_title: Option<&str>,
+) -> Option<u32> {
+    let items: Vec<RawZellijPane> = serde_json::from_str(raw).ok()?;
+    items
+        .into_iter()
+        .filter(|p| !p.is_plugin && !before_ids.contains(&p.id))
+        .max_by_key(|p| {
+            (
+                p.pane_command.is_none(),
+                expected_title.is_some_and(|t| !t.is_empty() && p.title == t),
+                p.id,
+            )
+        })
+        .map(|p| p.id)
 }
 
 #[cfg(test)]
@@ -1235,6 +1362,123 @@ mod tests {
         assert_eq!(
             calls[4],
             vec!["-s", "work", "action", "send-keys", "-p", "terminal_9", "1"]
+        );
+    }
+
+    #[test]
+    fn suspend_and_wake_pane_use_start_suspended_and_targeted_enter() {
+        use crate::exec::ExecOutput;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct SeqExec {
+            calls: Mutex<Vec<Vec<String>>>,
+            list_count: Mutex<usize>,
+        }
+        impl ExecTransport for SeqExec {
+            fn run(
+                &self,
+                _bin: &Path,
+                args: &[String],
+                _stdin: Option<&[u8]>,
+            ) -> Result<ExecOutput, TmuxError> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                let action = args.get(3).map(String::as_str).unwrap_or("");
+                let stdout = if action == "list-panes" {
+                    let mut c = self.list_count.lock().unwrap();
+                    *c += 1;
+                    if *c == 1 {
+                        r#"[{"id":2,"is_plugin":true,"title":"tab-bar"},{"id":4,"is_plugin":false,"title":"claude-1","pane_command":"claude"}]"#.to_string()
+                    } else {
+                        r#"[{"id":2,"is_plugin":true,"title":"tab-bar"},{"id":11,"is_plugin":false,"title":"claude-1","pane_command":null}]"#.to_string()
+                    }
+                } else {
+                    String::new()
+                };
+                Ok(ExecOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                    code: Some(0),
+                })
+            }
+            fn run_shell(&self, _script: &str) -> Result<ExecOutput, TmuxError> {
+                unreachable!()
+            }
+            fn run_shell_bytes(
+                &self,
+                _script: &str,
+                _stdin: Option<&[u8]>,
+                _timeout: std::time::Duration,
+            ) -> Result<crate::exec::ExecBytesOutput, TmuxError> {
+                unreachable!()
+            }
+            fn is_local(&self) -> bool {
+                true
+            }
+        }
+
+        let exec = Arc::new(SeqExec {
+            calls: Mutex::new(Vec::new()),
+            list_count: Mutex::new(0),
+        });
+        let zj = ZellijMux::with_transport(PathBuf::from("zellij"), exec.clone());
+        let new_pane = zj
+            .suspend_pane(&SuspendPaneReq {
+                pane: PaneId::new("zj:work/4"),
+                cwd: Some("/repo".into()),
+                pane_name: Some("claude-1".into()),
+                waiter_script: String::new(),
+                resume_argv: vec!["claude".into(), "--resume".into(), "id-1".into()],
+            })
+            .unwrap();
+        assert_eq!(new_pane, PaneId::new("zj:work/11"));
+
+        let woke = zj
+            .wake_suspended_pane(&WakePaneReq {
+                pane: new_pane.clone(),
+                cwd: Some("/repo".into()),
+                pane_name: Some("claude-1".into()),
+                resume_argv: vec!["claude".into(), "--resume".into(), "id-1".into()],
+            })
+            .unwrap();
+        assert_eq!(woke, new_pane);
+
+        let calls = exec.calls.lock().unwrap();
+        assert_eq!(
+            calls[1],
+            vec![
+                "-s",
+                "work",
+                "action",
+                "new-pane",
+                "--in-place",
+                "--close-replaced-pane",
+                "--pane-id",
+                "terminal_4",
+                "--name",
+                "claude-1",
+                "--cwd",
+                "/repo",
+                "--start-suspended",
+                "--",
+                "claude",
+                "--resume",
+                "id-1",
+            ]
+        );
+        assert_eq!(
+            calls[3],
+            vec![
+                "-s",
+                "work",
+                "action",
+                "send-keys",
+                "-p",
+                "terminal_11",
+                "Enter",
+            ]
         );
     }
 

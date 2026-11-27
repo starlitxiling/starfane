@@ -61,6 +61,7 @@ pub enum SessionState {
     NeedsPermission,
     NeedsInput,
     Error,
+    Suspended,
     Ended,
 }
 
@@ -169,6 +170,8 @@ pub struct SessionMetrics {
     pub total_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cache_read_tokens: Option<u64>,
     /// Recent per-turn TTFT / TPS samples in chronological order (capped at 20).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_turns: Vec<TurnMetricSample>,
@@ -248,6 +251,12 @@ pub struct SessionRecord {
     /// Terminal multiplexer kind (`"tmux"`, `"zellij"`, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mux_kind: Option<String>,
+    /// Canonical agent resume/conversation identifier captured for suspend/wake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_id: Option<String>,
+    /// Epoch ms when this session was suspended (cleared on wake).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_at_ms: Option<u64>,
 }
 
 impl SessionRecord {
@@ -298,6 +307,11 @@ mod tests {
         // Async SessionStart arriving after UserPromptSubmit must not downgrade Working/Needs*.
         assert_eq!(S::Working.next(K::SessionStart), S::Working);
         assert_eq!(S::NeedsPermission.next(K::SessionStart), S::NeedsPermission);
+        assert_eq!(S::Suspended.next(K::Ignored), S::Suspended);
+        assert_eq!(S::Suspended.next(K::SessionStart), S::Starting);
+        assert_eq!(S::Suspended.next(K::Working), S::Working);
+        assert_eq!(S::Suspended.next(K::TurnComplete), S::Idle);
+        assert_eq!(S::Suspended.next(K::SessionEnd), S::Ended);
         // Subagent progress/completion unlatches parent NeedsPermission.
         assert_eq!(
             S::NeedsPermission.next_from_subagent(K::ToolEnd),

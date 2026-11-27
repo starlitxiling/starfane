@@ -18,8 +18,9 @@ pub use install::{
 };
 pub use normalize::{normalize_hook, normalize_request};
 pub use spawn::{
-    build_l4_spawn_cmd, default_bypass_permission_flag, ensure_bypass_permission_arg,
-    is_fixed_effort_agy_model, resolve_agy_model_id, SpawnRequest,
+    build_l4_spawn_cmd, build_resume_cmd, build_tmux_suspend_waiter_script,
+    default_bypass_permission_flag, ensure_bypass_permission_arg, is_fixed_effort_agy_model,
+    resolve_agy_model_id, shell_single_quote, ResumeRequest, SpawnRequest,
 };
 pub use trust::{
     agy_trust_settings_json, codex_mcp_env_vars_override_from_toml, codex_trust_override_arg,

@@ -56,7 +56,9 @@ import {
   probeHostApi,
   pauseHostRetryApi,
   qs,
+  resumeSessionApi,
   sessionNeedsLiveTail,
+  suspendSessionApi,
   syncStateSilent,
 } from './api.js';
 import {
@@ -74,7 +76,7 @@ import {
 } from './composer.js';
 import { renderMarkdown } from './markdown.js';
 import { L, getLang } from './i18n.js';
-import { canCloseSessionWindow, openCloseSessionModal, windowGroupKeyOf } from './overlays.js';
+import { canCloseSessionWindow, canResumeSession, canSuspendSession, openCloseSessionModal, windowGroupKeyOf } from './overlays.js';
 import {
   APP,
   OPTIMISTIC_EXPIRE_MS,
@@ -373,7 +375,7 @@ export function updateOutputClock(sessionId) {
 function telemetrySigOf(s) {
   const m = s?.metrics;
   if (!m) return `${s?.session_id || ''}:none:${getLang()}`;
-  return `${s.session_id}:${m.source || ''}:${m.context_used_pct ?? ''}:${m.context_used_tokens ?? ''}:${m.context_window_tokens ?? ''}:${m.tps ?? ''}:${m.ttft_ms ?? ''}:${m.avg_ttft_ms ?? ''}:${m.recent_turns?.length || 0}:${m.recent_turns?.at(-1)?.ts_ms || 0}:${m.total_input_tokens ?? ''}:${m.total_output_tokens ?? ''}:${m.last_output_tokens ?? ''}:${m.last_duration_ms ?? ''}:${getLang()}`;
+  return `${s.session_id}:${m.source || ''}:${m.context_used_pct ?? ''}:${m.context_used_tokens ?? ''}:${m.context_window_tokens ?? ''}:${m.tps ?? ''}:${m.ttft_ms ?? ''}:${m.avg_ttft_ms ?? ''}:${m.recent_turns?.length || 0}:${m.recent_turns?.at(-1)?.ts_ms || 0}:${m.total_input_tokens ?? ''}:${m.total_output_tokens ?? ''}:${m.total_cache_read_tokens ?? ''}:${m.last_output_tokens ?? ''}:${m.last_duration_ms ?? ''}:${getLang()}`;
 }
 
 export function patchTelemetryStrip(sessionId) {
@@ -1806,7 +1808,7 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
   const isSplit = Boolean(closable && splitWindowKeys && splitWindowKeys.has(windowGroupKeyOf(s)));
   const cardBtn = h('button', {
     type: 'button',
-    class: `ws-item${sel ? ' sel' : ''}`,
+    class: `ws-item${sel ? ' sel' : ''}${s.state === 'suspended' ? ' is-suspended' : ''}`,
     'data-sid': s.session_id,
     onpointerenter: (e) => scheduleHoverPrefetch(s, e),
     onpointerleave: () => cancelHoverPrefetch(s.session_id),
@@ -1819,6 +1821,7 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
     paneBadge ? h('span', { class: 'tag host-pfx', title: paneBadge }, paneBadge) : null),
   h('div', { class: 'ws-item-sub' },
     h('span', { class: 'trunc grow' }, subMeta),
+    s.state === 'suspended' ? span('tag soft-suspended', L('已休眠', 'Suspended')) : null,
     mux === 'zellij' ? span('tag mux-zj', 'zellij') : null,
     s.discovered_only && mux !== 'zellij' ? span('tag legacy', L('tmux 发现', 'tmux discovered')) : null,
     subCount ? span('tag tabular', L(`${subCount} 子会话`, `${subCount} subagents`)) : null),
@@ -2382,7 +2385,8 @@ export function createWorkspaceShell() {
   const directRow = h('div', { class: 'composer-direct-row' }, ta, h('div', { class: 'composer-actions' }, imgInput, slashBtn, imgBtn, sendBtn));
   const pipeSlot = h('div', { class: 'stack-sm ws-hidden' });
   const readonlyHint = h('div', { class: 'comp-readonly ws-hidden' });
-  const card = h('div', { class: 'composer-card' }, slashEl, readonlyHint, modeBar, deliveryAlertEl, attachBar, directRow, pipeSlot);
+  const suspendBanner = h('div', { class: 'comp-suspend-banner ws-hidden' });
+  const card = h('div', { class: 'composer-card' }, slashEl, readonlyHint, suspendBanner, modeBar, deliveryAlertEl, attachBar, directRow, pipeSlot);
   let dragDepth = 0;
   card.addEventListener('dragenter', (e) => {
     if (UI.composerMode !== 'direct' || !e.dataTransfer?.types?.includes('Files')) return;
@@ -2411,7 +2415,7 @@ export function createWorkspaceShell() {
   });
   const promptBarSlot = h('div', { class: 'prompt-dock-wrap ws-hidden' });
   const dock = h('div', { class: 'composer-dock' }, card);
-  const comp = { dock, card, slashEl, readonlyHint, modeBtns, modeHint, deliveryAlertEl, renderDeliveryAlert, attachBar, directRow, ta, slashBtn, imgBtn, sendBtn, pipeSlot, sid: null, agent: null, lastSel: null, syncTaMetrics };
+  const comp = { dock, card, slashEl, readonlyHint, suspendBanner, modeBar, modeBtns, modeHint, deliveryAlertEl, renderDeliveryAlert, attachBar, directRow, ta, slashBtn, imgBtn, sendBtn, pipeSlot, sid: null, agent: null, lastSel: null, syncTaMetrics };
   const convCol = h('div', { class: 'ws-conv-col' }, reopenBtn, chatStage, promptBarSlot, dock);
   const bodySplit = h('div', { class: 'ws-body-split' }, convCol);
   const emptyMain = emptyState(L('选择一个会话开始对话', 'Select a Session to Start'), L('从左侧点击任意正在运行的 tmux / Zellij 会话，即可查看实时终端并直接发送指令。', 'Pick any running tmux or Zellij session on the left to inspect output and send messages.'),
@@ -2893,7 +2897,11 @@ export function patchWorkspace(W) {
   const headHostId = hostOf(s);
   const headIsRemote = isRemoteHost(headHostId);
   const headHostLabel = headIsRemote ? hostDisplayName(headHostId, s) : '';
-  const headBaseSig = `${s.session_id}|${displayTitle}|${paneBadge}|${s.agent}|${muxKindOf(s)}|${meLabel}|${s.state}|${effectiveMode}|${headHostLabel}|${titleTip}|${lang}`;
+  const canSusp = canSuspendSession(s);
+  const canWake = canResumeSession(s);
+  const suspBusy = UI.busy.has(`suspend:${s.session_id}`);
+  const wakeBusy = UI.busy.has(`resume:${s.session_id}`);
+  const headBaseSig = `${s.session_id}|${displayTitle}|${paneBadge}|${s.agent}|${muxKindOf(s)}|${meLabel}|${s.state}|${effectiveMode}|${headHostLabel}|${titleTip}|${canSusp ? 1 : 0}|${canWake ? 1 : 0}|${suspBusy ? 1 : 0}|${wakeBusy ? 1 : 0}|${lang}`;
   const nextTelSig = telemetrySigOf(s);
   if (W.headSig !== headBaseSig) {
     W.headSig = headBaseSig;
@@ -2959,6 +2967,21 @@ export function patchWorkspace(W) {
           APP.rerender();
         },
       }, modeSwitchIcon(effectiveMode === 'reading'), span(null, effectiveMode === 'reading' ? L('终端', 'Term') : L('阅读', 'Read')));
+    const suspendWakeBtn = canWake
+      ? btn(L('唤醒', 'Wake'), {
+        cls: 'sm primary ws-head-wake-btn',
+        busyKey: `resume:${s.session_id}`,
+        title: L('原地唤醒并恢复原会话上下文', 'Wake and restore this conversation in-place'),
+        onclick: () => resumeSessionApi(s.session_id),
+      })
+      : (canSusp
+        ? btn(L('休眠', 'Suspend'), {
+          cls: 'ghost sm ws-head-susp-btn',
+          busyKey: `suspend:${s.session_id}`,
+          title: L('结束当前 Agent 进程释放 CPU/内存，保留终端窗口以便随时恢复原会话', 'Exit agent process to save CPU/RAM while keeping pane resumable'),
+          onclick: () => suspendSessionApi(s.session_id),
+        })
+        : null);
     const detailsBtn = h('button', {
       type: 'button',
       class: 'btn sm ws-head-info-btn',
@@ -2987,6 +3010,7 @@ export function patchWorkspace(W) {
         mobOutlineBtn,
         viewToggle,
         mobModeBtn,
+        suspendWakeBtn,
         detailsBtn),
     );
   } else if (W.telSig !== nextTelSig) {
@@ -3017,6 +3041,47 @@ export function patchWorkspace(W) {
   syncInteractivePromptBar(W, s);
 
   const C = W.comp;
+  if (s.state === 'suspended') {
+    if (C.sid && !C.directRow.classList.contains('ws-hidden')) {
+      UI.drafts.set(`ws:msg:${C.sid}`, C.ta.value);
+    }
+    C.sid = null;
+    C.agent = null;
+    closeSlashMenu();
+    C.readonlyHint.classList.add('ws-hidden');
+    C.modeBar.classList.add('ws-hidden');
+    C.deliveryAlertEl.classList.add('ws-hidden');
+    C.attachBar.classList.add('ws-hidden');
+    C.directRow.classList.add('ws-hidden');
+    C.pipeSlot.classList.add('ws-hidden');
+    C.suspendBanner.classList.remove('ws-hidden');
+    const wakeInFlight = UI.busy.has(`resume:${s.session_id}`);
+    const suspSig = `${s.session_id}|${s.resume_id || ''}|${wakeInFlight ? 1 : 0}|${lang}`;
+    if (C.suspendBanner.dataset.sig !== suspSig) {
+      C.suspendBanner.dataset.sig = suspSig;
+      C.suspendBanner.replaceChildren(
+        h('div', { class: 'comp-suspend-info' },
+          h('div', { class: 'comp-suspend-title' },
+            L('会话已休眠 · 资源已释放', 'Session suspended · resources reclaimed'),
+            s.resume_id ? h('code', { class: 'comp-suspend-rid' }, short(s.resume_id, 14)) : null),
+          h('div', { class: 'comp-suspend-sub' },
+            L(
+              'Agent 进程已安全退出以节省 CPU/内存，终端窗口与对话记录已保留；点击右侧按钮或在终端按 Enter 即可原地恢复原会话。',
+              'Agent process exited to save CPU/RAM while keeping your pane and transcript intact. Click Wake or press Enter in the terminal to resume in-place.',
+            ))),
+        btn(L('唤醒原会话', 'Wake Session'), {
+          cls: 'sm primary comp-wake-btn',
+          busyKey: `resume:${s.session_id}`,
+          onclick: () => resumeSessionApi(s.session_id),
+        }),
+      );
+    }
+    return;
+  }
+  C.suspendBanner.classList.add('ws-hidden');
+  C.suspendBanner.dataset.sig = '';
+  C.modeBar.classList.remove('ws-hidden');
+
   const readOnlyMsg = s.is_subagent
     ? L('只读子会话 · 无法直接在此发送消息，请返回主会话操作', 'Read-only subagent · Cannot dispatch directly here; return to parent session')
     : (s.state === 'ended' ? L('该会话已结束 · 请切换至活跃会话发送指令', 'Session has ended · Switch to an active session to send messages') : '');

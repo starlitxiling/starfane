@@ -317,6 +317,8 @@ fn new_record(
         host_id: None,
         host_display_name: None,
         mux_kind,
+        resume_id: None,
+        suspended_at_ms: None,
     }
 }
 
@@ -825,6 +827,8 @@ mod tests {
                 host_id: None,
                 host_display_name: None,
                 mux_kind: None,
+                resume_id: None,
+                suspended_at_ms: None,
             },
         );
 

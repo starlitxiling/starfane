@@ -1,7 +1,7 @@
 // starfane web console — DOM builders, formatters, and shared UI primitives
 import { TOAST_MS, levelLabel } from './constants.js';
 import { L, localeTag } from './i18n.js';
-import { UI, stageName, stateText } from './store.js';
+import { UI, APP, stageName, stateText } from './store.js';
 
 export const $ = (s, r = document) => r.querySelector(s);
 
@@ -160,6 +160,7 @@ export const isFin = (v) => typeof v === 'number' && Number.isFinite(v);
 
 export function fmtTokens(n) {
   if (!isFin(n) || n < 0) return '—';
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(n >= 10_000_000_000 ? 1 : 2).replace(/\.?0+$/, '')}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 1 : 2).replace(/\.0+$/, '')}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 100_000 ? 0 : 1).replace(/\.0$/, '')}K`;
   return String(Math.round(n));
@@ -217,16 +218,26 @@ export function ctxBar(pctVal, small = false) {
   return h('span', { class: `m-bar${small ? ' sm' : ''}${tone !== 'ok' ? ` m-${tone}` : ''}` }, h('i', { style: `width:${w.toFixed(1)}%` }));
 }
 
+export function sessionTotalTokens(m) {
+  if (!m) return null;
+  const hasIn = isFin(m.total_input_tokens);
+  const hasOut = isFin(m.total_output_tokens);
+  if (!hasIn && !hasOut) return null;
+  const tot = (hasIn ? m.total_input_tokens : 0) + (hasOut ? m.total_output_tokens : 0);
+  return Number.isFinite(tot) && tot > 0 ? tot : null;
+}
+
 export function buildTelemetryStrip(s) {
   const m = s?.metrics;
   const pctVal = ctxPctOf(m);
   const tpsVal = tpsOf(m);
   const ttftVal = ttftOf(m);
+  const totVal = sessionTotalTokens(m);
   const tone = ctxTone(pctVal);
   const hasUsed = isFin(m?.context_used_tokens);
   const hasWin = isFin(m?.context_window_tokens) && m.context_window_tokens > 0;
   const hasCtx = pctVal != null || hasUsed;
-  if (!hasCtx && tpsVal == null && ttftVal == null) {
+  if (!hasCtx && tpsVal == null && ttftVal == null && totVal == null) {
     return h('div', { class: 'ws-telemetry', 'data-tel-sid': s?.session_id || '' },
       span('ws-tel-empty', L('遥测待采集', 'Telemetry pending')));
   }
@@ -255,6 +266,14 @@ export function buildTelemetryStrip(s) {
     ttftTipParts.push(L(`已记录回合：${turnCnt}`, `Recorded turns: ${turnCnt}`));
     if (m?.source && m.source !== 'none') ttftTipParts.push(`${L('来源：', 'Source: ')}${metricsSrcLabel(m.source)}`);
   }
+  const usageTipParts = totVal != null ? [
+    L(`会话总消耗：${fmtTokens(totVal)} tokens`, `Session total: ${fmtTokens(totVal)} tokens`),
+    L(`输入 ${fmtTokens(m?.total_input_tokens || 0)} · 输出 ${fmtTokens(m?.total_output_tokens || 0)}`, `In ${fmtTokens(m?.total_input_tokens || 0)} · Out ${fmtTokens(m?.total_output_tokens || 0)}`),
+    ...(isFin(m?.total_cache_read_tokens) && m.total_cache_read_tokens > 0
+      ? [L(`缓存命中 ${fmtTokens(m.total_cache_read_tokens)}`, `Cache read ${fmtTokens(m.total_cache_read_tokens)}`)]
+      : []),
+    L('点击查看每日 Token 用量统计', 'Click to view daily token usage dashboard'),
+  ] : [];
   const ctxCls = tone === 'high' ? ' ws-tel-high' : tone === 'warn' ? ' ws-tel-warn' : '';
   const ttftCls = ttftVal != null ? (() => {
     const t = ttftTone(ttftVal);
@@ -263,6 +282,12 @@ export function buildTelemetryStrip(s) {
   return h('div', { class: 'ws-telemetry', 'data-tel-sid': s?.session_id || '' },
     hasCtx ? h('span', { class: `ws-tel-pill${ctxCls}`, title: ctxTipParts.join(' | ') || L('上下文容量', 'Context window') },
       ctxText, pctVal != null ? ctxBar(pctVal, false) : null) : null,
+    totVal != null ? h('button', {
+      type: 'button',
+      class: 'ws-tel-pill ws-tel-usage',
+      title: usageTipParts.join(' | '),
+      onclick: () => { UI.modal = 'usage'; APP.rerender(); },
+    }, L(`消耗 ${fmtTokens(totVal)}`, `Used ${fmtTokens(totVal)}`)) : null,
     tpsVal != null ? h('span', { class: 'ws-tel-pill', title: tpsTipParts.join(' | ') || L('输出速度', 'Output speed') },
       `${tpsVal.toFixed(1)} tok/s`) : null,
     ttftVal != null ? h('span', { class: `ws-tel-pill${ttftCls}`, title: ttftTipParts.join(' | ') || L('首字延迟', 'Time to first token') },

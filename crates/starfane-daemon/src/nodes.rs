@@ -352,6 +352,31 @@ impl LocalMuxPool {
         }
     }
 
+    pub fn suspend_pane(&self, req: &starfane_tmux::SuspendPaneReq) -> Result<PaneId, TmuxError> {
+        if Self::is_zellij_pane(&req.pane) {
+            let zj = self.zellij.as_ref().ok_or_else(|| {
+                TmuxError::InvalidRequest("zellij mux is not enabled or unavailable".into())
+            })?;
+            zj.suspend_pane(req)
+        } else {
+            self.tmux.suspend_pane(req)
+        }
+    }
+
+    pub fn wake_suspended_pane(
+        &self,
+        req: &starfane_tmux::WakePaneReq,
+    ) -> Result<PaneId, TmuxError> {
+        if Self::is_zellij_pane(&req.pane) {
+            let zj = self.zellij.as_ref().ok_or_else(|| {
+                TmuxError::InvalidRequest("zellij mux is not enabled or unavailable".into())
+            })?;
+            zj.wake_suspended_pane(req)
+        } else {
+            self.tmux.wake_suspended_pane(req)
+        }
+    }
+
     pub fn set_status(&self, pane: &PaneId, st: &PaneStatus) -> Result<(), TmuxError> {
         if Self::is_zellij_pane(pane) {
             Ok(())
@@ -389,6 +414,8 @@ pub enum HostPushSignal {
 pub struct NodeSnapshot {
     pub host: HostRecord,
     pub sessions: Vec<SessionRecord>,
+    /// Live host-qualified pane IDs currently present on this remote host (when full discovery ran).
+    pub live_pane_ids: HashSet<PaneId>,
     /// Heuristic events produced during SSH discovery (`TurnComplete`, `NeedsPermission`, `NeedsInput`).
     pub events: Vec<NormalizedEvent>,
     /// Incremental `DaemonEvent::Output` payloads emitted when remote transcripts or live tails advance.
@@ -661,6 +688,34 @@ pub trait NodeProvider: Send + Sync {
         remote_session: &'a SessionId,
         local_pane: &'a PaneId,
     ) -> BoxFuture<'a, Result<serde_json::Value, ApiError>>;
+
+    fn suspend_pane<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+        cwd: Option<&'a str>,
+        waiter_script: &'a str,
+    ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
+        let _ = (remote_session, local_pane, cwd, waiter_script);
+        Box::pin(async {
+            Err(ApiError::bad_request(
+                "remote host does not support suspending agent sessions",
+            ))
+        })
+    }
+
+    fn wake_suspended_pane<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+    ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
+        let _ = (remote_session, local_pane);
+        Box::pin(async {
+            Err(ApiError::bad_request(
+                "remote host does not support waking suspended sessions",
+            ))
+        })
+    }
 
     fn send_key<'a>(
         &'a self,
@@ -1845,6 +1900,7 @@ fn apply_ssh_pane_tail_watch(
 
 struct SshReconcileResult {
     sessions: Vec<SessionRecord>,
+    live_pane_ids: HashSet<PaneId>,
     events: Vec<NormalizedEvent>,
     need_mirror: Vec<(PaneId, AgentKind, String, Option<RemoteFileStat>)>,
 }
@@ -2568,6 +2624,8 @@ fn reconcile_ssh_discovery_v2(
                         host_id: Some(host_id.clone()),
                         host_display_name: Some(display_name.to_string()),
                         mux_kind: None,
+                        resume_id: None,
+                        suspended_at_ms: None,
                     });
                 }
             }
@@ -2629,6 +2687,8 @@ fn reconcile_ssh_discovery_v2(
             host_id: Some(host_id.clone()),
             host_display_name: Some(display_name.to_string()),
             mux_kind: Some("tmux".to_string()),
+            resume_id: None,
+            suspended_at_ms: None,
         });
     }
 
@@ -2676,11 +2736,19 @@ fn reconcile_ssh_discovery_v2(
             host_id: Some(host_id.clone()),
             host_display_name: Some(display_name.to_string()),
             mux_kind: Some("tmux".to_string()),
+            resume_id: None,
+            suspended_at_ms: None,
         });
     }
 
+    let qualified_live_panes: HashSet<PaneId> = live_pane_ids
+        .iter()
+        .map(|p| qualify_host_pane(host_id, p))
+        .collect();
+
     SshReconcileResult {
         sessions,
+        live_pane_ids: qualified_live_panes,
         events,
         need_mirror,
     }
@@ -4341,7 +4409,7 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
             .unwrap_or_else(|p| p.into_inner())
             .record_success();
 
-        let (mut sessions, events, need_mirror, remote_home, tail_map) = {
+        let (mut sessions, live_pane_ids, events, need_mirror, remote_home, tail_map) = {
             let mut ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
             let rec = reconcile_ssh_discovery_v2(
                 &mut ds,
@@ -4358,7 +4426,14 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                 .iter()
                 .map(|(p, e)| (p.clone(), e.tail.clone()))
                 .collect();
-            (rec.sessions, rec.events, rec.need_mirror, rh, tails)
+            (
+                rec.sessions,
+                rec.live_pane_ids,
+                rec.events,
+                rec.need_mirror,
+                rh,
+                tails,
+            )
         };
 
         let mut output_deltas: Vec<DaemonEvent> = Vec::new();
@@ -4690,6 +4765,7 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                 retry_paused: false,
             },
             sessions,
+            live_pane_ids,
             events,
             output_deltas,
         })
@@ -5018,6 +5094,7 @@ fi
                     retry_paused: false,
                 },
                 sessions,
+                live_pane_ids: HashSet::new(),
                 events: Vec::new(),
                 output_deltas: Vec::new(),
             });
@@ -5424,6 +5501,11 @@ fi
 
         let elapsed_ms = started.elapsed().as_millis().min((RTT_UNSET - 1) as u128) as u64;
         self.last_sync_ms.store(elapsed_ms, Ordering::Release);
+        let live_pane_ids: HashSet<PaneId> = sessions
+            .iter()
+            .filter(|s| s.state != SessionState::Ended)
+            .filter_map(|s| s.pane.clone())
+            .collect();
         let count = sessions
             .iter()
             .filter(|s| !s.is_subagent && s.state != SessionState::Ended)
@@ -5444,6 +5526,7 @@ fi
                 retry_paused: false,
             },
             sessions,
+            live_pane_ids,
             events,
             output_deltas,
         })
@@ -6149,6 +6232,8 @@ pub fn parse_ssh_compound_output(
             host_id: Some(host_id.clone()),
             host_display_name: Some(display_name.to_string()),
             mux_kind: Some("tmux".to_string()),
+            resume_id: None,
+            suspended_at_ms: None,
         });
     }
     Ok(sessions)
@@ -7078,6 +7163,8 @@ impl NodeProvider for SshMuxNodeProvider {
                 host_id: Some(self.host_id.clone()),
                 host_display_name: Some(display_name.to_string()),
                 mux_kind: Some("tmux".to_string()),
+                resume_id: None,
+                suspended_at_ms: None,
             };
             let response = serde_json::json!({
                 "session_id": qualified_sid,
@@ -7998,6 +8085,105 @@ printf '%s\n' "$META"
         })
     }
 
+    fn suspend_pane<'a>(
+        &'a self,
+        _remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+        cwd: Option<&'a str>,
+        waiter_script: &'a str,
+    ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
+        Box::pin(async move {
+            validate_tmux_pane_id(local_pane)?;
+            if waiter_script.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "suspend waiter script cannot be empty",
+                ));
+            }
+            let _permit = self
+                .interactive_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| ApiError::internal("ssh interactive semaphore closed"))?;
+            let cwd_opt = cwd
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|d| format!(" -c {}", shell_single_quote(d)))
+                .unwrap_or_default();
+            let script = format!(
+                "{bootstrap}{tmux} respawn-pane -k -t {pane}{cwd_opt} -- /bin/sh -lc {waiter}\n",
+                bootstrap = REMOTE_PATH_BOOTSTRAP,
+                tmux = self.tmux_cmd_prefix(),
+                pane = shell_single_quote(local_pane.as_str()),
+                waiter = shell_single_quote(waiter_script),
+            );
+            let out = self
+                .conduit_pool
+                .exec_bytes(
+                    ConduitLane::Interactive,
+                    &script,
+                    None,
+                    self.transport.timeout(),
+                )
+                .await
+                .map_err(|e| {
+                    self.circuit
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .record_failure(id::now_ms(), e.to_string());
+                    ApiError::new(ErrorCode::Unavailable, format!("ssh suspend: {e}"))
+                })?
+                .into_utf8_lossy();
+
+            if !out.success {
+                let stderr = out.stderr.trim();
+                let lower = stderr.to_ascii_lowercase();
+                if out.code != Some(255)
+                    && (lower.contains("can't find pane")
+                        || lower.contains("no such pane")
+                        || lower.contains("no server running"))
+                {
+                    return Err(ApiError::not_found(format!(
+                        "remote pane {local_pane} no longer exists"
+                    )));
+                }
+                return Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!(
+                        "ssh suspend pane failed: {}",
+                        if stderr.is_empty() {
+                            "unknown error"
+                        } else {
+                            stderr
+                        }
+                    ),
+                ));
+            }
+            let now_hub = id::now_ms();
+            self.discovery
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .evict_pane(local_pane, now_hub);
+            Ok(local_pane.clone())
+        })
+    }
+
+    fn wake_suspended_pane<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+    ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
+        Box::pin(async move {
+            self.send_key(remote_session, local_pane, "Enter").await?;
+            let now_hub = id::now_ms();
+            self.discovery
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .evict_pane(local_pane, now_hub);
+            Ok(local_pane.clone())
+        })
+    }
+
     fn send_key<'a>(
         &'a self,
         _remote_session: &'a SessionId,
@@ -8486,6 +8672,11 @@ impl PeerDaemonNodeProvider {
             .iter()
             .filter(|s| !s.is_subagent && s.state != SessionState::Ended)
             .count();
+        let live_pane_ids: HashSet<PaneId> = qualified
+            .iter()
+            .filter(|s| s.state != SessionState::Ended)
+            .filter_map(|s| s.pane.clone())
+            .collect();
         Ok(NodeSnapshot {
             host: HostRecord {
                 id: self.host_id.clone(),
@@ -8502,6 +8693,7 @@ impl PeerDaemonNodeProvider {
                 retry_paused: false,
             },
             sessions: qualified,
+            live_pane_ids,
             events: Vec::new(),
             output_deltas: Vec::new(),
         })
@@ -8679,6 +8871,8 @@ impl NodeProvider for PeerDaemonNodeProvider {
                 host_id: Some(self.host_id.clone()),
                 host_display_name: Some(display_name.to_string()),
                 mux_kind: Some("tmux".to_string()),
+                resume_id: None,
+                suspended_at_ms: None,
             };
             Ok(RemoteSpawnOutcome {
                 session,
@@ -9136,6 +9330,54 @@ impl NodeProvider for PeerDaemonNodeProvider {
                 .await
                 .map_err(|e| e.into_api_error("peer send_key failed"))?;
             Ok(())
+        })
+    }
+
+    fn suspend_pane<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+        _cwd: Option<&'a str>,
+        _waiter_script: &'a str,
+    ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
+        let encoded_sid = pct_encode(remote_session.as_str());
+        let path = format!("/api/sessions/{encoded_sid}/suspend");
+        let fallback_pane = local_pane.clone();
+        Box::pin(async move {
+            let (_, env) = self
+                .request_json("POST", &path, Some(&serde_json::json!({})))
+                .await
+                .map_err(|e| e.into_api_error("peer suspend failed"))?;
+            let pane_str = env
+                .pointer("/data/pane")
+                .or_else(|| env.pointer("/data/session/pane"))
+                .or_else(|| env.get("pane"))
+                .and_then(Value::as_str)
+                .map(|s| starfane_tmux::split_host_prefix(s).1.to_string());
+            Ok(pane_str.map(PaneId::new).unwrap_or(fallback_pane))
+        })
+    }
+
+    fn wake_suspended_pane<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+    ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
+        let encoded_sid = pct_encode(remote_session.as_str());
+        let path = format!("/api/sessions/{encoded_sid}/resume");
+        let fallback_pane = local_pane.clone();
+        Box::pin(async move {
+            let (_, env) = self
+                .request_json("POST", &path, Some(&serde_json::json!({})))
+                .await
+                .map_err(|e| e.into_api_error("peer resume failed"))?;
+            let pane_str = env
+                .pointer("/data/pane")
+                .or_else(|| env.pointer("/data/session/pane"))
+                .or_else(|| env.get("pane"))
+                .and_then(Value::as_str)
+                .map(|s| starfane_tmux::split_host_prefix(s).1.to_string());
+            Ok(pane_str.map(PaneId::new).unwrap_or(fallback_pane))
         })
     }
 }
@@ -10830,6 +11072,8 @@ EOF
                     host_id: Some(HostId::new("other-host")),
                     host_display_name: None,
                     mux_kind: None,
+                    resume_id: None,
+                    suspended_at_ms: None,
                 },
             };
             let frames = format!(

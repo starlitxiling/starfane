@@ -6,7 +6,9 @@ import {
   btn,
   defaultMuteTimeStr,
   dur,
+  fmtTokens,
   h,
+  isFin,
   muteRemain,
   muteUntilLabel,
   span,
@@ -14,7 +16,7 @@ import {
   toast,
   tomorrowAt9Ms,
 } from './dom.js';
-import { act, loadNotifiers, muteNotifiersApi, testNotifierApi } from './api.js';
+import { act, loadNotifiers, loadUsage, muteNotifiersApi, testNotifierApi } from './api.js';
 import {
   APP,
   S,
@@ -461,6 +463,15 @@ export function renderTop() {
   if (!TOP || TOP.bar !== bar) {
     const nav = h('nav', { class: 'nav-seg', role: 'tablist', 'aria-label': L('主导航', 'Primary navigation') });
     const connPill = h('span', { class: 'status-ind pill-soft' });
+    const usageBtn = h('button', {
+      type: 'button',
+      class: 'btn sm pill top-usage-btn',
+      onclick: () => {
+        UI.modal = 'usage';
+        loadUsage(S.usageDays);
+        APP.rerender();
+      },
+    });
     const muteBtn = h('button', {
       type: 'button',
       class: 'btn sm pill',
@@ -479,10 +490,10 @@ export function renderTop() {
         h('img', { class: 'logo', src: '/assets/logo.svg', alt: '', width: 26, height: 26 }),
         h('span', null, 'starfane')),
       nav,
-      h('div', { class: 'top-tools' }, connPill, muteWrap),
+      h('div', { class: 'top-tools' }, connPill, usageBtn, muteWrap),
     );
     const mobileNav = $('#mobile-nav');
-    TOP = { bar, nav, mobileNav, connPill, muteBtn, mutePopSlot, popKey: '' };
+    TOP = { bar, nav, mobileNav, connPill, usageBtn, muteBtn, mutePopSlot, popKey: '' };
     UI.topShell = TOP;
   }
   TOP.nav.replaceChildren(...VIEWS.map((v, i) => h('a', {
@@ -510,6 +521,15 @@ export function renderTop() {
   TOP.connPill.title = connTip;
   TOP.connPill.setAttribute('aria-label', connTxt);
   TOP.connPill.replaceChildren(h('i', { class: `dot dot-${cs}` }), span('conn-label', connTxt));
+
+  const todayTok = isFin(S.todayUsage?.total_tokens) ? S.todayUsage.total_tokens : null;
+  const todayLabel = todayTok != null
+    ? L(`今日 ${fmtTokens(todayTok)} tok`, `Today ${fmtTokens(todayTok)} tok`)
+    : L('Token 统计', 'Tokens');
+  TOP.usageBtn.textContent = todayLabel;
+  TOP.usageBtn.title = todayTok != null
+    ? L(`今日总消耗 ${fmtTokens(todayTok)} tokens（输入 ${fmtTokens(S.todayUsage?.input_tokens || 0)} · 输出 ${fmtTokens(S.todayUsage?.output_tokens || 0)}），点击查看每日与会话用量`, `Today ${fmtTokens(todayTok)} tokens (in ${fmtTokens(S.todayUsage?.input_tokens || 0)} · out ${fmtTokens(S.todayUsage?.output_tokens || 0)}) — click for usage stats`)
+    : L('查看每日与会话 Token 消耗统计', 'View daily & per-session token usage');
 
   const now = Date.now();
   const pill = buildTopbarPillState(now);

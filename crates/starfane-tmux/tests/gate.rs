@@ -138,6 +138,7 @@ fn gate_only_idle_state_passes() {
         (SessionState::NeedsPermission, false),
         (SessionState::NeedsInput, false),
         (SessionState::Error, false),
+        (SessionState::Suspended, false),
         (SessionState::Ended, false),
     ];
     for (st, expect) in states {

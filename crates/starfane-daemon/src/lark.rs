@@ -3056,6 +3056,7 @@ mod tests {
                 last_duration_ms: Some(6915),
                 total_input_tokens: None,
                 total_output_tokens: None,
+                total_cache_read_tokens: None,
                 recent_turns: Vec::new(),
                 source: "transcript".into(),
                 updated_ms: 1000,
@@ -3063,6 +3064,8 @@ mod tests {
             host_id: None,
             host_display_name: None,
             mux_kind: None,
+            resume_id: None,
+            suspended_at_ms: None,
         };
         let ev = NormalizedEvent {
             v: PROTO_VERSION,
