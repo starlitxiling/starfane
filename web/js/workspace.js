@@ -3056,6 +3056,7 @@ export function patchWorkspace(W) {
     C.pipeSlot.classList.add('ws-hidden');
     C.suspendBanner.classList.remove('ws-hidden');
     const wakeInFlight = UI.busy.has(`resume:${s.session_id}`);
+    const hasResume = Boolean(s.resume_id);
     const suspSig = `${s.session_id}|${s.resume_id || ''}|${wakeInFlight ? 1 : 0}|${lang}`;
     if (C.suspendBanner.dataset.sig !== suspSig) {
       C.suspendBanner.dataset.sig = suspSig;
@@ -3063,13 +3064,20 @@ export function patchWorkspace(W) {
         h('div', { class: 'comp-suspend-info' },
           h('div', { class: 'comp-suspend-title' },
             L('会话已休眠 · 资源已释放', 'Session suspended · resources reclaimed'),
-            s.resume_id ? h('code', { class: 'comp-suspend-rid' }, short(s.resume_id, 14)) : null),
+            hasResume
+              ? h('code', { class: 'comp-suspend-rid' }, short(s.resume_id, 14))
+              : span('tag', L('重开空白会话', 'Fresh on wake'))),
           h('div', { class: 'comp-suspend-sub' },
-            L(
-              'Agent 进程已安全退出以节省 CPU/内存，终端窗口与对话记录已保留；点击右侧按钮或在终端按 Enter 即可原地恢复原会话。',
-              'Agent process exited to save CPU/RAM while keeping your pane and transcript intact. Click Wake or press Enter in the terminal to resume in-place.',
-            ))),
-        btn(L('唤醒原会话', 'Wake Session'), {
+            hasResume
+              ? L(
+                'Agent 进程已安全退出以节省 CPU/内存，终端窗口与对话记录已保留；点击右侧按钮或在终端按 Enter 即可原地恢复原会话。',
+                'Agent process exited to save CPU/RAM while keeping your pane and transcript intact. Click Wake or press Enter in the terminal to resume in-place.',
+              )
+              : L(
+                'Agent 进程已退出以节省 CPU/内存，终端窗口已保留；点击右侧按钮或在终端按 Enter 将在该目录启动全新交互会话。',
+                'Agent process exited to save CPU/RAM while keeping your pane open. Click Wake or press Enter in the terminal to launch a fresh interactive session.',
+              ))),
+        btn(hasResume ? L('唤醒原会话', 'Wake Session') : L('唤醒会话', 'Relaunch Session'), {
           cls: 'sm primary comp-wake-btn',
           busyKey: `resume:${s.session_id}`,
           onclick: () => resumeSessionApi(s.session_id),

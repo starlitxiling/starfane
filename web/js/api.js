@@ -963,7 +963,7 @@ export async function loadUsage(days = S.usageDays, { silent = false } = {}) {
   }
 }
 
-export async function suspendSessionApi(sessionId) {
+export async function suspendSessionApi(sessionId, { allowFresh = false } = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return undefined;
   const busyKey = `suspend:${sid}`;
@@ -971,11 +971,25 @@ export async function suspendSessionApi(sessionId) {
   UI.busy.add(busyKey);
   APP.schedule();
   try {
-    const r = await api('POST', `/api/sessions/${enc(sid)}/suspend`, {});
+    const r = await api('POST', `/api/sessions/${enc(sid)}/suspend`, { allow_fresh: Boolean(allowFresh) });
     if (r?.session) upsertSession(r.session);
-    toast(L('会话进程已休眠释放，终端窗口已保留', 'Session suspended to save resources; terminal window kept open'), 'ok');
+    if (UI.modal === 'suspend-fresh' && UI.suspendFreshSessionId === sid) {
+      APP.closeModal();
+    }
+    toast(
+      r?.resume_mode === 'fresh'
+        ? L('会话进程已休眠释放，终端窗口已保留（唤醒将重开空白会话）', 'Session suspended to save resources; terminal kept open (wake will start a fresh session)')
+        : L('会话进程已休眠释放，终端窗口已保留（唤醒将恢复原会话）', 'Session suspended to save resources; terminal kept open (wake will restore original session)'),
+      'ok',
+    );
     return r;
   } catch (e) {
+    if (!allowFresh && e instanceof ApiError && e.status === 400 && /no_resumable_id|no resumable conversation id/i.test(e.message || '')) {
+      UI.suspendFreshSessionId = sid;
+      UI.modal = 'suspend-fresh';
+      APP.rerender();
+      return undefined;
+    }
     if (e instanceof ApiError && e.status === 403) {
       toast(L('当前控制台处于只读模式，无法休眠会话', 'Console is read-only — cannot suspend sessions'), 'warn');
     } else {

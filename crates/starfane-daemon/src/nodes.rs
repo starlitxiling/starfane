@@ -695,8 +695,9 @@ pub trait NodeProvider: Send + Sync {
         local_pane: &'a PaneId,
         cwd: Option<&'a str>,
         waiter_script: &'a str,
+        allow_fresh: bool,
     ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
-        let _ = (remote_session, local_pane, cwd, waiter_script);
+        let _ = (remote_session, local_pane, cwd, waiter_script, allow_fresh);
         Box::pin(async {
             Err(ApiError::bad_request(
                 "remote host does not support suspending agent sessions",
@@ -8091,6 +8092,7 @@ printf '%s\n' "$META"
         local_pane: &'a PaneId,
         cwd: Option<&'a str>,
         waiter_script: &'a str,
+        _allow_fresh: bool,
     ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
         Box::pin(async move {
             validate_tmux_pane_id(local_pane)?;
@@ -9339,13 +9341,18 @@ impl NodeProvider for PeerDaemonNodeProvider {
         local_pane: &'a PaneId,
         _cwd: Option<&'a str>,
         _waiter_script: &'a str,
+        allow_fresh: bool,
     ) -> BoxFuture<'a, Result<PaneId, ApiError>> {
         let encoded_sid = pct_encode(remote_session.as_str());
         let path = format!("/api/sessions/{encoded_sid}/suspend");
         let fallback_pane = local_pane.clone();
         Box::pin(async move {
             let (_, env) = self
-                .request_json("POST", &path, Some(&serde_json::json!({})))
+                .request_json(
+                    "POST",
+                    &path,
+                    Some(&serde_json::json!({ "allow_fresh": allow_fresh })),
+                )
                 .await
                 .map_err(|e| e.into_api_error("peer suspend failed"))?;
             let pane_str = env

@@ -6,6 +6,8 @@ import {
   agentTag,
   ago,
   btn,
+  cacheHitRate,
+  cacheHitTone,
   clock,
   codeRefList,
   copyText,
@@ -17,6 +19,7 @@ import {
   evBlocks,
   field,
   fmtBytes,
+  fmtHitRate,
   fmtMs,
   fmtTokens,
   h,
@@ -211,6 +214,7 @@ export function closeModal() {
   UI.modal = null;
   UI.renameHostId = null;
   UI.closeSessionId = null;
+  UI.suspendFreshSessionId = null;
   APP.schedule();
 }
 
@@ -378,10 +382,11 @@ function drawerMetricsCard(m) {
     : '—';
   const tot = sessionTotalTokens(m);
   const cacheRead = isFin(m?.total_cache_read_tokens) && m.total_cache_read_tokens > 0 ? m.total_cache_read_tokens : null;
+  const drawerHit = cacheRead != null ? cacheHitRate(m?.total_input_tokens, cacheRead) : null;
   const totals = isFin(m?.total_input_tokens) || isFin(m?.total_output_tokens)
     ? L(
-      `输入 ${fmtTokens(m?.total_input_tokens)} / 输出 ${fmtTokens(m?.total_output_tokens)}${cacheRead != null ? `（缓存 ${fmtTokens(cacheRead)}）` : ''}`,
-      `In ${fmtTokens(m?.total_input_tokens)} / Out ${fmtTokens(m?.total_output_tokens)}${cacheRead != null ? ` (cache ${fmtTokens(cacheRead)})` : ''}`,
+      `输入 ${fmtTokens(m?.total_input_tokens)} / 输出 ${fmtTokens(m?.total_output_tokens)}${cacheRead != null ? `（缓存 ${fmtTokens(cacheRead)}${drawerHit != null ? ` · 命中率 ${fmtHitRate(drawerHit)}` : ''}）` : ''}`,
+      `In ${fmtTokens(m?.total_input_tokens)} / Out ${fmtTokens(m?.total_output_tokens)}${cacheRead != null ? ` (cache ${fmtTokens(cacheRead)}${drawerHit != null ? ` · ${fmtHitRate(drawerHit)} hit` : ''})` : ''}`,
     )
     : '—';
   const srcLine = m?.source && m.source !== 'none'
@@ -458,10 +463,12 @@ function drawerSession(s) {
         title: L('结束当前 Agent 进程释放 CPU/内存，保留终端窗口并支持原地恢复原会话', 'Exit the agent process to save CPU/RAM while keeping the pane and conversation resumable'),
         onclick: () => suspendSessionApi(s.session_id),
       }) : null,
-      resumable ? btn(L('唤醒原会话', 'Wake session'), {
+      resumable ? btn(s.resume_id ? L('唤醒原会话', 'Wake session') : L('唤醒会话', 'Relaunch session'), {
         cls: 'sm primary',
         busyKey: `resume:${s.session_id}`,
-        title: L('原地唤醒并恢复原会话上下文', 'Wake and resume this conversation in-place'),
+        title: s.resume_id
+          ? L('原地唤醒并恢复原会话上下文', 'Wake and resume this conversation in-place')
+          : L('在保留的终端窗格中重新启动该 Agent 会话', 'Relaunch a fresh session inside the kept pane'),
         onclick: () => resumeSessionApi(s.session_id),
       }) : null,
       closable ? btn(isSplit ? L('关闭窗格', 'Close pane') : L('关闭窗口', 'Close window'), {
@@ -687,6 +694,7 @@ export function renderModal() {
   else if (want === 'spawn') d.replaceChildren(spawnModalBody());
   else if (want === 'rename-host') d.replaceChildren(renameHostModalBody());
   else if (want === 'close-session') d.replaceChildren(closeSessionModalBody());
+  else if (want === 'suspend-fresh') d.replaceChildren(suspendFreshModalBody());
   else if (want === 'usage') {
     if (S.usageState === 'idle') loadUsage(S.usageDays);
     d.replaceChildren(usageModalBody());
@@ -698,8 +706,17 @@ function usageKpiCard(title, totals) {
   const inp = isFin(totals?.input_tokens) ? totals.input_tokens : 0;
   const out = isFin(totals?.output_tokens) ? totals.output_tokens : 0;
   const cache = isFin(totals?.cache_read_tokens) ? totals.cache_read_tokens : 0;
+  const hit = cache > 0 ? cacheHitRate(inp, cache) : null;
+  const hitTone = hit != null ? cacheHitTone(hit) : '';
   return h('div', { class: 'usage-kpi-card' },
-    h('div', { class: 'usage-kpi-lbl' }, title),
+    h('div', { class: 'usage-kpi-head' },
+      h('span', { class: 'usage-kpi-lbl' }, title),
+      hit != null
+        ? h('span', {
+          class: `usage-hit-pill is-${hitTone}`,
+          title: L(`缓存命中率：${fmtTokens(cache)} / ${fmtTokens(inp)}`, `Cache hit rate: ${fmtTokens(cache)} / ${fmtTokens(inp)}`),
+        }, L(`命中率 ${fmtHitRate(hit)}`, `${fmtHitRate(hit)} hit`))
+        : null),
     h('div', { class: 'usage-kpi-val' }, `${fmtTokens(tot)}`),
     h('div', { class: 'usage-kpi-sub' }, L(`输入 ${fmtTokens(inp)} · 输出 ${fmtTokens(out)}`, `In ${fmtTokens(inp)} · Out ${fmtTokens(out)}`)),
     cache > 0 ? h('div', { class: 'usage-kpi-sub' }, L(`缓存命中 ${fmtTokens(cache)}`, `Cache read ${fmtTokens(cache)}`)) : null);
@@ -733,6 +750,9 @@ function usageModalBody() {
     const daily = Array.isArray(data.daily) ? data.daily : [];
     const maxTot = Math.max(1, ...daily.map((b) => (isFin(b?.total_tokens) ? b.total_tokens : 0)));
     const rangeTot = Math.max(0, data.range_totals?.total_tokens || 0);
+    const rangeHit = (data.range_totals?.cache_read_tokens || 0) > 0
+      ? cacheHitRate(data.range_totals?.input_tokens, data.range_totals?.cache_read_tokens)
+      : null;
     const agentEntries = Object.entries(data.by_agent_range || {})
       .filter(([, tot]) => (tot?.total_tokens || 0) > 0)
       .sort((a, b) => (b[1]?.total_tokens || 0) - (a[1]?.total_tokens || 0));
@@ -756,7 +776,9 @@ function usageModalBody() {
       const isLast = idx === daily.length - 1;
       const showTick = idx === 0 || isLast || (idx % tickStep === 0 && (daily.length - 1 - idx) >= Math.ceil(tickStep / 2));
       const agTip = segKeys.map((ag) => `${ag} ${fmtTokens(byAg[ag]?.total_tokens || 0)}`).join(' · ');
-      const tip = `${b.date}: ${fmtTokens(tot)} tokens${agTip ? ` (${agTip})` : ''}`;
+      const barHit = (b?.cache_read_tokens || 0) > 0 ? cacheHitRate(b?.input_tokens, b?.cache_read_tokens) : null;
+      const hitTip = barHit != null ? L(` · 命中率 ${fmtHitRate(barHit)}`, ` · ${fmtHitRate(barHit)} hit`) : '';
+      const tip = `${b.date}: ${fmtTokens(tot)} tokens${hitTip}${agTip ? ` (${agTip})` : ''}`;
       return h('button', {
         type: 'button',
         class: `usage-bar-col${selDay && selDay.date === b.date ? ' is-sel' : ''}`,
@@ -769,6 +791,9 @@ function usageModalBody() {
       h('span', { class: 'usage-bar-tick' }, showTick ? b.date.slice(5) : ''));
     });
 
+    const selHit = selDay && (selDay.cache_read_tokens || 0) > 0
+      ? cacheHitRate(selDay.input_tokens, selDay.cache_read_tokens)
+      : null;
     const selAgText = selDay
       ? Object.entries(selDay.by_agent || {})
         .filter(([, v]) => (v?.total_tokens || 0) > 0)
@@ -789,14 +814,21 @@ function usageModalBody() {
         usageKpiCard(L('近 30 日消耗', 'Last 30 days'), data.last_30_days)),
       agentEntries.length
         ? h('div', { class: 'usage-agent-bar' },
-          h('span', { class: 'sec-h', style: 'margin:0' }, L(`近 ${data.days} 日总计 · ${fmtTokens(rangeTot)}`, `${data.days}d total · ${fmtTokens(rangeTot)}`)),
+          h('span', { class: 'sec-h', style: 'margin:0' }, L(
+            `近 ${data.days} 日总计 · ${fmtTokens(rangeTot)}${rangeHit != null ? ` · 缓存命中率 ${fmtHitRate(rangeHit)}` : ''}`,
+            `${data.days}d total · ${fmtTokens(rangeTot)}${rangeHit != null ? ` · ${fmtHitRate(rangeHit)} cache hit` : ''}`,
+          )),
           h('div', { class: 'usage-agent-pills' },
             agentEntries.map(([ag, tot]) => {
               const v = tot?.total_tokens || 0;
               const share = rangeTot > 0 ? Math.round((v / rangeTot) * 100) : 0;
+              const agHit = (tot?.cache_read_tokens || 0) > 0 ? cacheHitRate(tot?.input_tokens, tot?.cache_read_tokens) : null;
               return h('span', {
                 class: 'usage-agent-pill',
-                title: L(`输入 ${fmtTokens(tot.input_tokens)} · 输出 ${fmtTokens(tot.output_tokens)} · 缓存 ${fmtTokens(tot.cache_read_tokens)}`, `In ${fmtTokens(tot.input_tokens)} · Out ${fmtTokens(tot.output_tokens)} · Cache ${fmtTokens(tot.cache_read_tokens)}`),
+                title: L(
+                  `输入 ${fmtTokens(tot.input_tokens)} · 输出 ${fmtTokens(tot.output_tokens)} · 缓存 ${fmtTokens(tot.cache_read_tokens)}${agHit != null ? ` · 命中率 ${fmtHitRate(agHit)}` : ''}`,
+                  `In ${fmtTokens(tot.input_tokens)} · Out ${fmtTokens(tot.output_tokens)} · Cache ${fmtTokens(tot.cache_read_tokens)}${agHit != null ? ` · ${fmtHitRate(agHit)} hit` : ''}`,
+                ),
               }, agentTag(ag), h('span', null, `${fmtTokens(v)} (${share}%)`));
             })))
         : null,
@@ -813,8 +845,8 @@ function usageModalBody() {
             span('tag', L(`${selDay.session_count || 0} 个会话`, `${selDay.session_count || 0} sessions`))),
           h('span', null,
             L(
-              `总计 ${fmtTokens(selDay.total_tokens || 0)}（输入 ${fmtTokens(selDay.input_tokens || 0)} · 输出 ${fmtTokens(selDay.output_tokens || 0)}${(selDay.cache_read_tokens || 0) > 0 ? ` · 缓存 ${fmtTokens(selDay.cache_read_tokens)}` : ''}）${selAgText ? ` · ${selAgText}` : ''}`,
-              `Total ${fmtTokens(selDay.total_tokens || 0)} (in ${fmtTokens(selDay.input_tokens || 0)} · out ${fmtTokens(selDay.output_tokens || 0)}${(selDay.cache_read_tokens || 0) > 0 ? ` · cache ${fmtTokens(selDay.cache_read_tokens)}` : ''})${selAgText ? ` · ${selAgText}` : ''}`,
+              `总计 ${fmtTokens(selDay.total_tokens || 0)}（输入 ${fmtTokens(selDay.input_tokens || 0)} · 输出 ${fmtTokens(selDay.output_tokens || 0)}${(selDay.cache_read_tokens || 0) > 0 ? ` · 缓存 ${fmtTokens(selDay.cache_read_tokens)}${selHit != null ? ` (${fmtHitRate(selHit)})` : ''}` : ''}）${selAgText ? ` · ${selAgText}` : ''}`,
+              `Total ${fmtTokens(selDay.total_tokens || 0)} (in ${fmtTokens(selDay.input_tokens || 0)} · out ${fmtTokens(selDay.output_tokens || 0)}${(selDay.cache_read_tokens || 0) > 0 ? ` · cache ${fmtTokens(selDay.cache_read_tokens)}${selHit != null ? ` (${fmtHitRate(selHit)})` : ''}` : ''})${selAgText ? ` · ${selAgText}` : ''}`,
             ))) : null),
       h('div', { class: 'stack-xs' },
         h('div', { class: 'row', style: 'justify-content:space-between' },
@@ -828,6 +860,7 @@ function usageModalBody() {
                   h('th', null, L('会话', 'Session')),
                   h('th', null, L('模型', 'Model')),
                   h('th', { class: 'num' }, L('输入 / 输出', 'In / Out')),
+                  h('th', { class: 'num' }, L('缓存命中率', 'Cache Hit')),
                   h('th', { class: 'num' }, L('总消耗', 'Total')),
                   h('th', { class: 'num' }, L('最近活跃', 'Last active')))),
               h('tbody', null,
@@ -836,6 +869,8 @@ function usageModalBody() {
                   const clickable = Boolean(live);
                   const lbl = live ? sessionLabel(live) : (item.label || short(item.session_id, 14));
                   const isLive = Boolean(item.active || (live && live.state !== 'ended'));
+                  const itemHit = cacheHitRate(item.input_tokens, item.cache_read_tokens);
+                  const itemHitTone = itemHit != null ? cacheHitTone(itemHit) : 'muted';
                   const openRow = () => {
                     if (!clickable) return;
                     closeModal();
@@ -854,7 +889,7 @@ function usageModalBody() {
                   h('td', null,
                     h('div', { class: 'row', style: 'gap:6px;flex-wrap:nowrap;min-width:0' },
                       agentTag(item.agent),
-                      h('span', { class: 'trunc', style: 'max-width:170px;font-weight:500', title: item.session_id }, lbl),
+                      h('span', { class: 'trunc', style: 'max-width:150px;font-weight:500', title: item.session_id }, lbl),
                       isLive ? span('tag soft-green', L('在线', 'Live')) : null)),
                   h('td', null, item.model ? modelTag(item.model) : span('muted', '—')),
                   h('td', {
@@ -863,6 +898,12 @@ function usageModalBody() {
                       ? L(`缓存命中 ${fmtTokens(item.cache_read_tokens)}`, `Cache read ${fmtTokens(item.cache_read_tokens)}`)
                       : undefined,
                   }, `${fmtTokens(item.input_tokens)} / ${fmtTokens(item.output_tokens)}`),
+                  h('td', {
+                    class: `num mono usage-hit-cell is-${itemHitTone}`,
+                    title: itemHit != null
+                      ? L(`缓存命中 ${fmtTokens(item.cache_read_tokens || 0)} / 输入 ${fmtTokens(item.input_tokens || 0)}`, `Cache read ${fmtTokens(item.cache_read_tokens || 0)} / In ${fmtTokens(item.input_tokens || 0)}`)
+                      : undefined,
+                  }, itemHit != null ? fmtHitRate(itemHit) : '—'),
                   h('td', { class: 'num mono' }, h('strong', null, fmtTokens(item.total_tokens))),
                   h('td', { class: 'num muted' }, item.last_active_ms ? ago(item.last_active_ms) : '—'));
                 }))))
@@ -887,6 +928,59 @@ function usageModalBody() {
     h('div', { class: 'modal-foot' },
       data?.updated_ms ? h('span', { class: 'muted tabular', style: 'font-size:12px;margin-right:auto' }, L(`更新于 ${clock(data.updated_ms)}`, `Updated ${clock(data.updated_ms)}`)) : null,
       btn(L('关闭', 'Close'), { cls: 'primary', onclick: closeModal })));
+}
+
+function suspendFreshModalBody() {
+  const sid = UI.suspendFreshSessionId;
+  const s = sid ? S.sessions.get(sid) : null;
+  if (!s || !canSuspendSession(s)) {
+    return h('div', { class: 'modal-shell' },
+      h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
+      h('div', { class: 'modal-head' },
+        h('h3', null, L('休眠确认', 'Confirm Suspend')),
+        btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
+      h('div', { class: 'modal-body stack' },
+        h('p', { class: 'muted' }, L('该会话当前状态已变更，无法执行休眠。', 'This session can no longer be suspended.'))),
+      h('div', { class: 'modal-foot' },
+        btn(L('知道了', 'Close'), { cls: 'primary', onclick: closeModal })));
+  }
+  const label = sessionLabel(s);
+  const paneBadge = paneDisplayId(s);
+  const hid = hostOf(s);
+  return h('div', { class: 'modal-shell' },
+    h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
+    h('div', { class: 'modal-head' },
+      h('h3', null, L('以新会话模式休眠？', 'Suspend Without Resume ID?')),
+      btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
+    h('div', { class: 'modal-body stack' },
+      h('div', { class: 'close-target-card' },
+        h('div', { class: 'close-target-head' },
+          h('div', { class: 'row', style: 'gap:7px' },
+            h('i', { class: `dot dot-${s.state}`, title: stateText(s.state) }),
+            agentTag(s.agent),
+            h('span', { class: 'close-target-name' }, label)),
+          statusInd(s.state, stateText(s.state))),
+        h('div', { class: 'close-target-meta' },
+          span('muted', `${L('主机', 'Host')}: ${hostDisplayName(hid, s)}`),
+          s.tmux_target ? [span('dim', '·'), h('code', null, s.tmux_target)] : null,
+          paneBadge ? [span('dim', '·'), h('code', null, paneBadge)] : null)),
+      h('div', { class: 'callout warn' },
+        L(
+          '当前未识别到该窗口的可恢复对话 ID（常见于尚未发出任何消息的空白启动窗口，或暂未产生对话日志的远端终端）。',
+          'No resumable conversation ID is currently associated with this pane (typically a fresh blank prompt with no user turns yet, or an unindexed remote session).',
+        )),
+      h('p', { class: 'muted', style: 'font-size:13.5px;line-height:1.6' },
+        L(
+          '如果现在休眠：后台仍会结束当前 Agent 进程以释放 CPU/内存并保留终端窗格；但下次点击「唤醒」或在终端按 Enter 时，将在同一目录重开一个全新的空白会话（不会带回之前仅留在屏幕上的输出）。',
+          'If you continue: the agent process will exit to reclaim CPU/RAM and keep this pane open, and waking it later will launch a fresh interactive session in the same directory.',
+        ))),
+    h('div', { class: 'modal-foot' },
+      btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
+      btn(L('仍要休眠（释放进程）', 'Suspend Anyway'), {
+        cls: 'primary',
+        busyKey: `suspend:${s.session_id}`,
+        onclick: () => suspendSessionApi(s.session_id, { allowFresh: true }),
+      })));
 }
 
 function closeSessionModalBody() {

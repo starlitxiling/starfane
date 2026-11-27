@@ -140,6 +140,7 @@ export const UI = {
   modal: null,
   drawer: null,
   renameHostId: null,
+  suspendFreshSessionId: null,
   selSession: null,
   composerMode: 'direct',
   outputMode: 'reading',

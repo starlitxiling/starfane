@@ -1244,6 +1244,8 @@ pub struct CodexThreadRow {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+    #[serde(default)]
+    pub has_user_event: i64,
 }
 
 #[derive(Debug, Default)]
@@ -1271,8 +1273,11 @@ impl CodexThreadCache {
         if self.db_path.as_deref() == Some(db_path.as_path()) && self.sig.as_ref() == Some(&sig) {
             return;
         }
-        let sql = "SELECT id, rollout_path, cwd, name, COALESCE(archived, 0) AS archived, COALESCE(created_at, 0) AS created_at, COALESCE(updated_at, 0) AS updated_at FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != '' ORDER BY archived ASC, updated_at DESC LIMIT 2000;";
-        let Some(json_out) = run_sqlite_json(&db_path, sql) else {
+        let sql_with_user_event = "SELECT id, rollout_path, cwd, name, COALESCE(archived, 0) AS archived, COALESCE(created_at, 0) AS created_at, COALESCE(updated_at, 0) AS updated_at, COALESCE(has_user_event, 0) AS has_user_event FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != '' ORDER BY archived ASC, updated_at DESC LIMIT 2000;";
+        let sql_legacy = "SELECT id, rollout_path, cwd, name, COALESCE(archived, 0) AS archived, COALESCE(created_at, 0) AS created_at, COALESCE(updated_at, 0) AS updated_at, 0 AS has_user_event FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != '' ORDER BY archived ASC, updated_at DESC LIMIT 2000;";
+        let Some(json_out) = run_sqlite_json(&db_path, sql_with_user_event)
+            .or_else(|| run_sqlite_json(&db_path, sql_legacy))
+        else {
             return;
         };
         let Ok(rows) = serde_json::from_str::<Vec<CodexThreadRow>>(&json_out) else {
@@ -1293,6 +1298,22 @@ impl CodexThreadCache {
         claimed_ids: &HashSet<String>,
     ) -> Option<(String, PathBuf)> {
         match_codex_thread_with_birth(&self.rows, cwd, tail, claimed_ids, None)
+    }
+
+    pub(crate) fn match_pane_by_birth(
+        &self,
+        cwd: &str,
+        proc_birth_ms: u64,
+        claimed_ids: &HashSet<String>,
+        require_user_event: bool,
+    ) -> Option<(String, PathBuf)> {
+        match_codex_thread_by_birth(
+            &self.rows,
+            cwd,
+            proc_birth_ms,
+            claimed_ids,
+            require_user_event,
+        )
     }
 
     #[allow(dead_code)]
@@ -1516,6 +1537,53 @@ pub(crate) fn match_codex_thread_with_birth(
         }
     }
     None
+}
+
+/// Strictly match an untitled Codex pane by process birth timestamp + `cwd` when `created_at`
+/// aligns with `proc_birth_ms` (`[proc_birth - 5s, proc_birth + 30s]`) and is completely unambiguous.
+pub(crate) fn match_codex_thread_by_birth(
+    rows: &[CodexThreadRow],
+    cwd: &str,
+    proc_birth_ms: u64,
+    claimed_ids: &HashSet<String>,
+    require_user_event: bool,
+) -> Option<(String, PathBuf)> {
+    if proc_birth_ms == 0 {
+        return None;
+    }
+    let lo = proc_birth_ms.saturating_sub(PROCESS_BIRTH_SLACK_MS);
+    let hi = proc_birth_ms.saturating_add(30_000);
+    let mut hits = Vec::new();
+    for r in rows {
+        if claimed_ids.contains(r.id.trim()) {
+            continue;
+        }
+        if require_user_event && r.has_user_event <= 0 {
+            continue;
+        }
+        if !same_canonical_or_norm_dir(&r.cwd, cwd) {
+            continue;
+        }
+        let Some(rp) = r.rollout_path.as_deref() else {
+            continue;
+        };
+        let p = PathBuf::from(rp);
+        if !p.is_file() {
+            continue;
+        }
+        let Some(created_ms) = epoch_i64_to_ms(r.created_at).or_else(|| transcript_birth_ms(&p))
+        else {
+            continue;
+        };
+        if created_ms < lo || created_ms > hi {
+            continue;
+        }
+        hits.push((r.id.clone(), p));
+        if hits.len() > 1 {
+            return None;
+        }
+    }
+    (hits.len() == 1).then(|| hits.remove(0))
 }
 
 /// Cached read-only snapshot of `~/.gemini/antigravity-cli/conversation_summaries.db` root conversations.
@@ -3585,6 +3653,7 @@ pub fn parse_codex_thread_rows_delimited(text: &str, sep: char) -> Vec<CodexThre
             name,
             created_at,
             updated_at,
+            has_user_event: 0,
         });
     }
     out
@@ -4341,6 +4410,7 @@ mod tests {
                 name: Some("检查仓库进度并同步远端".into()),
                 created_at: 0,
                 updated_at: 0,
+                has_user_event: 0,
             },
             CodexThreadRow {
                 id: "01a18191-2222-2222-2222-222222222222".into(),
@@ -4349,6 +4419,7 @@ mod tests {
                 name: Some("查".into()),
                 created_at: 0,
                 updated_at: 0,
+                has_user_event: 0,
             },
         ];
 
@@ -4376,6 +4447,79 @@ mod tests {
         assert!(
             match_codex_thread(&rows, "/Users/demo/work/app-a", blank, &empty_claimed).is_none()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_thread_matching_by_birth_enforces_uniqueness_and_user_event() {
+        let dir =
+            std::env::temp_dir().join(format!("starfane-cxb-{}", starfane_proto::id::new_id("T")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("rollout-1-01a19000-1111-1111-1111-111111111111.jsonl");
+        let f2 = dir.join("rollout-2-01a19000-2222-2222-2222-222222222222.jsonl");
+        let f3 = dir.join("rollout-3-01a19000-3333-3333-3333-333333333333.jsonl");
+        std::fs::write(&f1, "{}\n").unwrap();
+        std::fs::write(&f2, "{}\n").unwrap();
+        std::fs::write(&f3, "{}\n").unwrap();
+
+        let birth_ms = 1_795_000_000_000u64;
+        let rows = vec![
+            CodexThreadRow {
+                id: "01a19000-1111-1111-1111-111111111111".into(),
+                rollout_path: Some(f1.to_string_lossy().into_owned()),
+                cwd: "/Users/demo/work/app-a".into(),
+                name: None,
+                created_at: 1_795_000_002,
+                updated_at: 1_795_000_100,
+                has_user_event: 1,
+            },
+            CodexThreadRow {
+                id: "01a19000-2222-2222-2222-222222222222".into(),
+                rollout_path: Some(f2.to_string_lossy().into_owned()),
+                cwd: "/Users/demo/work/app-a".into(),
+                name: None,
+                created_at: 1_795_000_003,
+                updated_at: 1_795_000_003,
+                has_user_event: 0,
+            },
+            CodexThreadRow {
+                id: "01a19000-3333-3333-3333-333333333333".into(),
+                rollout_path: Some(f3.to_string_lossy().into_owned()),
+                cwd: "/Users/demo/work/app-b".into(),
+                name: None,
+                created_at: 1_794_999_000,
+                updated_at: 1_795_000_010,
+                has_user_event: 1,
+            },
+        ];
+
+        let empty = HashSet::new();
+        // With require_user_event = true, skips f2 (0 user events) and matches f1 uniquely.
+        let hit =
+            match_codex_thread_by_birth(&rows, "/Users/demo/work/app-a", birth_ms, &empty, true)
+                .unwrap();
+        assert_eq!(hit.0, "01a19000-1111-1111-1111-111111111111");
+
+        // With require_user_event = false, both f1 and f2 sit inside window -> ambiguous -> None.
+        assert!(match_codex_thread_by_birth(
+            &rows,
+            "/Users/demo/work/app-a",
+            birth_ms,
+            &empty,
+            false
+        )
+        .is_none());
+
+        // Pre-birth created_at (1000s before process birth) in app-b must be rejected.
+        assert!(match_codex_thread_by_birth(
+            &rows,
+            "/Users/demo/work/app-b",
+            birth_ms,
+            &empty,
+            true
+        )
+        .is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

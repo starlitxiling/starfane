@@ -515,6 +515,7 @@ pub(crate) fn reconcile_discovered_panes_with_restarts(
                     rec.model = dp.model.clone();
                     rec.effort = None;
                     rec.transcript_path = None;
+                    rec.resume_id = None;
                     rec.metrics = None;
                     rec.last_message = None;
                     rec.last_error = None;
@@ -1841,10 +1842,19 @@ impl Core {
                         }
                     }
                     let mut newly_claimed_codex_ids: HashSet<String> = HashSet::new();
-                    for (pane, cwd, _birth_ms) in &codex_needing_match {
+                    for (pane, cwd, birth_ms) in &codex_needing_match {
+                        let mut exclude = excluded_ids_for_pane(&live_claimed_codex_entries, pane);
+                        exclude.extend(newly_claimed_codex_ids.iter().cloned());
                         let Some(tail) = tails.get(pane) else {
                             if let Some(old_title) = prev_codex_title_bindings.get(pane) {
                                 codex_new_title_bindings.insert(pane.clone(), old_title.clone());
+                                authoritative_panes.insert(pane.clone());
+                            } else if let Some((cid, p)) = tc
+                                .codex_threads_cache
+                                .match_pane_by_birth(cwd, *birth_ms, &exclude, true)
+                            {
+                                newly_claimed_codex_ids.insert(cid);
+                                exact_paths.insert(pane.clone(), p);
                                 authoritative_panes.insert(pane.clone());
                             }
                             continue;
@@ -1857,6 +1867,16 @@ impl Core {
                             codex_cleared_panes.insert(pane.clone());
                         }
                         let Some(title) = cur_title else {
+                            if !codex_cleared_panes.contains(pane) {
+                                if let Some((cid, p)) = tc
+                                    .codex_threads_cache
+                                    .match_pane_by_birth(cwd, *birth_ms, &exclude, true)
+                                {
+                                    newly_claimed_codex_ids.insert(cid);
+                                    exact_paths.insert(pane.clone(), p);
+                                    authoritative_panes.insert(pane.clone());
+                                }
+                            }
                             continue;
                         };
                         let unique_title = codex_title_counts
@@ -1867,8 +1887,6 @@ impl Core {
                         if !unique_title {
                             continue;
                         }
-                        let mut exclude = excluded_ids_for_pane(&live_claimed_codex_entries, pane);
-                        exclude.extend(newly_claimed_codex_ids.iter().cloned());
                         if let Some((cid, p)) = tc
                             .codex_threads_cache
                             .match_pane_by_title(cwd, tail, &exclude)
@@ -2074,6 +2092,9 @@ impl Core {
                         }
                         if rec.transcript_path.as_deref() != Some(path_str.as_str()) {
                             rec.transcript_path = Some(path_str.clone());
+                            if rec.resume_id.is_none() {
+                                rec.resume_id = canonical_external_session_id(rec);
+                            }
                             c = true;
                         }
                         if let Some(dp) = discovered_by_pane.get(pane) {
@@ -2115,6 +2136,9 @@ impl Core {
                             rec.metrics = None;
                         }
                         rec.transcript_path = Some(path_str.clone());
+                        if rec.resume_id.is_none() {
+                            rec.resume_id = canonical_external_session_id(rec);
+                        }
                         metrics_updated.push(rec.clone());
                     }
                 }
@@ -2165,6 +2189,7 @@ impl Core {
                 let mut scrubbed = false;
                 if invalid_tp {
                     rec.transcript_path = None;
+                    rec.resume_id = None;
                     rec.metrics = None;
                     scrubbed = true;
                 } else if rec.transcript_path.is_none() {
@@ -2221,6 +2246,19 @@ impl Core {
                     rec.model = fallback_model;
                     rec.effort = fallback_effort;
                     metrics_updated.push(rec.clone());
+                }
+            }
+
+            for rec in st.sessions.values_mut() {
+                if !rec.is_subagent
+                    && !rec.agent.is_shell()
+                    && rec.state != SessionState::Ended
+                    && rec.resume_id.is_none()
+                {
+                    if let Some(eid) = canonical_external_session_id(rec) {
+                        rec.resume_id = Some(eid);
+                        metrics_updated.push(rec.clone());
+                    }
                 }
             }
 
@@ -3397,13 +3435,113 @@ impl Core {
             })
     }
 
+    fn parse_effort_token(raw: Option<&str>) -> Option<Effort> {
+        match raw?.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Effort::Low),
+            "medium" | "med" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            "xhigh" | "extra_high" | "extra-high" => Some(Effort::Xhigh),
+            "max" => Some(Effort::Max),
+            _ => None,
+        }
+    }
+
+    fn build_fresh_relaunch_argv(
+        agent: AgentKind,
+        bin: Option<PathBuf>,
+        cwd: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        bypass_permissions: bool,
+    ) -> Result<Vec<String>, ApiError> {
+        if agent.is_shell() {
+            return Err(ApiError::bad_request(
+                "cannot relaunch shell via coding-agent launcher",
+            ));
+        }
+        let bin_str = bin
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| agent.as_str().to_string());
+        let parsed_effort = Self::parse_effort_token(effort);
+        let mut argv = vec![bin_str];
+        match agent {
+            AgentKind::Claude => {
+                if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+                    argv.push("--model".into());
+                    argv.push(m.to_string());
+                }
+                if let Some(e) = parsed_effort {
+                    argv.push("--effort".into());
+                    argv.push(e.as_str().to_string());
+                }
+                if bypass_permissions {
+                    argv.push(starfane_adapters::default_bypass_permission_flag(agent).to_string());
+                }
+            }
+            AgentKind::Codex => {
+                if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+                    argv.push("-m".into());
+                    argv.push(m.to_string());
+                }
+                if let Some(e) = parsed_effort {
+                    let mapped = match e {
+                        Effort::Low => "low",
+                        Effort::Medium => "medium",
+                        Effort::High => "high",
+                        Effort::Xhigh | Effort::Max => "xhigh",
+                    };
+                    argv.push("-c".into());
+                    argv.push(format!("model_reasoning_effort=\"{mapped}\""));
+                }
+                if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+                    argv.push("-C".into());
+                    argv.push(dir.to_string());
+                }
+                if bypass_permissions {
+                    argv.push(starfane_adapters::default_bypass_permission_flag(agent).to_string());
+                }
+            }
+            AgentKind::Agy => {
+                let raw_model = model.map(str::trim).filter(|s| !s.is_empty());
+                let fixed = raw_model.is_some_and(starfane_adapters::is_fixed_effort_agy_model);
+                if let Some(m) = raw_model {
+                    argv.push("--model".into());
+                    argv.push(starfane_adapters::resolve_agy_model_id(m, parsed_effort));
+                }
+                if let Some(e) = parsed_effort {
+                    if !fixed {
+                        argv.push("--effort".into());
+                        argv.push(e.as_str().to_string());
+                    }
+                }
+                if bypass_permissions {
+                    argv.push(starfane_adapters::default_bypass_permission_flag(agent).to_string());
+                }
+            }
+            AgentKind::Shell => unreachable!("checked above"),
+        }
+        Ok(argv)
+    }
+
     /// Suspend an active coding-agent session (`claude` / `codex` / `agy`) to reclaim CPU/RAM
     /// while keeping its terminal pane/window and conversation history intact for resume on demand.
     pub async fn suspend_session(
         &self,
         session_id: &SessionId,
+        allow_fresh: bool,
     ) -> Result<serde_json::Value, ApiError> {
-        let (rec_snapshot, pane, host_id, mut resume_id_opt, bypass_perms, local_bin) = {
+        let (
+            rec_snapshot,
+            pane,
+            host_id,
+            mut resume_id_opt,
+            other_claimed,
+            bypass_perms,
+            local_bin,
+        ) = {
             let st = lock(&self.inner.state);
             let s = st
                 .sessions
@@ -3430,18 +3568,23 @@ impl Core {
             };
             let host_id = HostId::new(s.effective_host_id());
             let rid = self.resolve_session_resume_id(s);
+            let claimed_entries = if s.agent == AgentKind::Codex {
+                collect_live_claimed_agent_entries(&st, s.agent)
+            } else {
+                collect_claimed_agent_entries(&st, s.agent)
+            };
+            let exclude = excluded_ids_for_pane(&claimed_entries, &pane);
             let bypass = self.inner.cfg.tmux.backup.restore_bypass_permissions;
             let bin = (host_id.as_str() == LOCAL_HOST_ID)
                 .then(|| PathBuf::from(self.inner.cfg.agent_bin(s.agent)));
-            (s.clone(), pane, host_id, rid, bypass, bin)
+            (s.clone(), pane, host_id, rid, exclude, bypass, bin)
         };
 
-        if resume_id_opt.is_none()
-            && host_id.as_str() == LOCAL_HOST_ID
-            && rec_snapshot.agent == AgentKind::Claude
-        {
+        if resume_id_opt.is_none() && host_id.as_str() == LOCAL_HOST_ID {
             let core = self.clone();
             let target_pane = pane.clone();
+            let target_agent = rec_snapshot.agent;
+            let fallback_cwd = rec_snapshot.cwd.clone().unwrap_or_default();
             let home_dir = self.effective_home_dir();
             resume_id_opt = tokio::task::spawn_blocking(move || {
                 let panes = core.inner.mux.list_all_panes().ok()?;
@@ -3450,44 +3593,138 @@ impl Core {
                     return None;
                 }
                 let home = home_dir?;
-                let birth = lock(&core.inner.discovery_cache).pid_birth_ms.clone();
                 let discovered = core.inner.mux.discover_panes_from(
                     std::slice::from_ref(&p),
                     starfane_tmux::DiscoverOptions::default(),
                 );
-                let pids: Vec<u32> = discovered
-                    .first()
+                let dp = discovered.first();
+                let pids: Vec<u32> = dp
                     .map(|d| d.subtree_pids.clone())
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| vec![p.pane_pid]);
-                resolve_claude_transcript_by_pids_in(&home, &pids, &birth, &HashSet::new())
-                    .map(|(cid, _)| cid)
+                let now_ms = id::now_ms();
+                let mut births = query_pids_birth_ms(&pids, now_ms);
+                let (cached_births, fallback_birth) = {
+                    let dc = lock(&core.inner.discovery_cache);
+                    (
+                        dc.pid_birth_ms.clone(),
+                        dc.pane_birth_ms.get(&target_pane).copied().unwrap_or(0),
+                    )
+                };
+                for (pid, bms) in cached_births {
+                    births.entry(pid).or_insert(bms);
+                }
+                let eff_birth = dp
+                    .and_then(|d| d.agent_pid)
+                    .and_then(|pid| births.get(&pid).copied())
+                    .or_else(|| pids.iter().filter_map(|pid| births.get(pid).copied()).max())
+                    .unwrap_or(fallback_birth);
+                let cwd = dp
+                    .map(|d| d.cwd.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        (!p.current_path.trim().is_empty()).then_some(p.current_path.as_str())
+                    })
+                    .unwrap_or(fallback_cwd.as_str());
+
+                match target_agent {
+                    AgentKind::Claude => {
+                        resolve_claude_transcript_by_pids_in(&home, &pids, &births, &other_claimed)
+                            .map(|(cid, _)| cid)
+                    }
+                    AgentKind::Codex => {
+                        if let Some(cid) = dp.and_then(|d| d.codex_resume_id.clone()) {
+                            return Some(cid);
+                        }
+                        let tails = core
+                            .inner
+                            .mux
+                            .capture_panes_tail_batch(&[(&target_pane, 30)]);
+                        let tail = tails.get(&target_pane).map(String::as_str).unwrap_or("");
+                        let mut tc = lock(&core.inner.telemetry);
+                        tc.codex_threads_cache.refresh_if_needed_in(Some(&home));
+                        tc.codex_threads_cache
+                            .match_pane_by_title(cwd, tail, &other_claimed)
+                            .or_else(|| {
+                                tc.codex_threads_cache.match_pane_by_birth(
+                                    cwd,
+                                    eff_birth,
+                                    &other_claimed,
+                                    true,
+                                )
+                            })
+                            .map(|(cid, _)| cid)
+                    }
+                    AgentKind::Agy => {
+                        let lsof_map = query_lsof_agy_presence_all(&pids);
+                        let mut tc = lock(&core.inner.telemetry);
+                        tc.agy_convs_cache.refresh_if_needed_in(Some(&home));
+                        for pid in &pids {
+                            if let Some(cids) = lsof_map.get(pid) {
+                                if let Some(root_cid) = cids
+                                    .iter()
+                                    .find(|cid| tc.agy_convs_cache.is_known_root(cid))
+                                {
+                                    return Some(root_cid.clone());
+                                }
+                                if let Some(first) = cids.first() {
+                                    return Some(first.clone());
+                                }
+                            }
+                        }
+                        tc.agy_convs_cache
+                            .match_unique_cwd_excluding_in(
+                                Some(&home),
+                                cwd,
+                                true,
+                                &other_claimed,
+                                (eff_birth > 0).then_some(eff_birth),
+                            )
+                            .map(|(cid, _)| cid)
+                    }
+                    AgentKind::Shell => None,
+                }
             })
             .await
             .ok()
             .flatten();
         }
 
-        let Some(resume_id) = resume_id_opt else {
-            return Err(ApiError::bad_request(
-                "cannot suspend session: no resumable conversation ID resolved yet",
-            ));
+        let (resume_argv, waiter_tag, persisted_resume_id, resume_mode) = match resume_id_opt {
+            Some(rid) => {
+                let argv = starfane_adapters::build_resume_cmd(&starfane_adapters::ResumeRequest {
+                    agent: rec_snapshot.agent,
+                    bin: local_bin,
+                    resume_id: rid.clone(),
+                    cwd: rec_snapshot.cwd.clone(),
+                    model: rec_snapshot.model.clone(),
+                    effort: rec_snapshot.effort.clone(),
+                    bypass_permissions: bypass_perms,
+                })
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                (argv, rid.clone(), Some(rid), "resume")
+            }
+            None if allow_fresh => {
+                let argv = Self::build_fresh_relaunch_argv(
+                    rec_snapshot.agent,
+                    local_bin,
+                    rec_snapshot.cwd.as_deref(),
+                    rec_snapshot.model.as_deref(),
+                    rec_snapshot.effort.as_deref(),
+                    bypass_perms,
+                )?;
+                (argv, "fresh-session".to_string(), None, "fresh")
+            }
+            None => {
+                return Err(ApiError::bad_request(
+                    "no_resumable_id: 未识别到可恢复的对话 ID（该窗口可能是尚未对话的空白会话）",
+                ));
+            }
         };
-
-        let resume_argv = starfane_adapters::build_resume_cmd(&starfane_adapters::ResumeRequest {
-            agent: rec_snapshot.agent,
-            bin: local_bin,
-            resume_id: resume_id.clone(),
-            cwd: rec_snapshot.cwd.clone(),
-            model: rec_snapshot.model.clone(),
-            effort: rec_snapshot.effort.clone(),
-            bypass_permissions: bypass_perms,
-        })
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
         let waiter_script = starfane_adapters::build_tmux_suspend_waiter_script(
             rec_snapshot.agent,
-            &resume_id,
+            &waiter_tag,
             &resume_argv,
         );
 
@@ -3510,6 +3747,7 @@ impl Core {
                     &PaneId::new(local_pane),
                     rec_snapshot.cwd.as_deref(),
                     &waiter_script,
+                    allow_fresh,
                 )
                 .await?;
             starfane_tmux::qualify_host_pane(&host_id, &new_local)
@@ -3543,7 +3781,7 @@ impl Core {
             let mut updated = Vec::new();
             if let Some(rec) = st.sessions.get_mut(session_id) {
                 rec.state = SessionState::Suspended;
-                rec.resume_id = Some(resume_id.clone());
+                rec.resume_id = persisted_resume_id.clone();
                 rec.suspended_at_ms = Some(now_ms);
                 if rec.pane.as_ref() != Some(&new_pane) {
                     if new_pane.as_str().starts_with("zj:") {
@@ -3597,7 +3835,8 @@ impl Core {
                 "action": "suspend_session",
                 "session_id": session_id,
                 "pane": new_pane,
-                "resume_id": resume_id,
+                "resume_mode": resume_mode,
+                "resume_id": persisted_resume_id,
                 "host_id": host_id,
             }),
         );
@@ -3606,7 +3845,8 @@ impl Core {
             "suspended": true,
             "session_id": session_id,
             "pane": new_pane,
-            "resume_id": resume_id,
+            "resume_mode": resume_mode,
+            "resume_id": persisted_resume_id,
             "session": updated_main,
         }))
     }
@@ -3616,7 +3856,7 @@ impl Core {
         &self,
         session_id: &SessionId,
     ) -> Result<serde_json::Value, ApiError> {
-        let (rec_snapshot, pane, host_id, resume_id, bypass_perms, local_bin) = {
+        let (rec_snapshot, pane, host_id, resume_id_opt, bypass_perms, local_bin) = {
             let st = lock(&self.inner.state);
             let s = st
                 .sessions
@@ -3638,28 +3878,34 @@ impl Core {
                     "suspended session has no terminal pane",
                 ));
             };
-            let Some(rid) = self.resolve_session_resume_id(s) else {
-                return Err(ApiError::bad_request(
-                    "suspended session is missing resume_id",
-                ));
-            };
+            let rid_opt = self.resolve_session_resume_id(s);
             let host_id = HostId::new(s.effective_host_id());
             let bypass = self.inner.cfg.tmux.backup.restore_bypass_permissions;
             let bin = (host_id.as_str() == LOCAL_HOST_ID)
                 .then(|| PathBuf::from(self.inner.cfg.agent_bin(s.agent)));
-            (s.clone(), pane, host_id, rid, bypass, bin)
+            (s.clone(), pane, host_id, rid_opt, bypass, bin)
         };
 
-        let resume_argv = starfane_adapters::build_resume_cmd(&starfane_adapters::ResumeRequest {
-            agent: rec_snapshot.agent,
-            bin: local_bin,
-            resume_id,
-            cwd: rec_snapshot.cwd.clone(),
-            model: rec_snapshot.model.clone(),
-            effort: rec_snapshot.effort.clone(),
-            bypass_permissions: bypass_perms,
-        })
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let resume_argv = match resume_id_opt {
+            Some(rid) => starfane_adapters::build_resume_cmd(&starfane_adapters::ResumeRequest {
+                agent: rec_snapshot.agent,
+                bin: local_bin,
+                resume_id: rid,
+                cwd: rec_snapshot.cwd.clone(),
+                model: rec_snapshot.model.clone(),
+                effort: rec_snapshot.effort.clone(),
+                bypass_permissions: bypass_perms,
+            })
+            .map_err(|e| ApiError::bad_request(e.to_string()))?,
+            None => Self::build_fresh_relaunch_argv(
+                rec_snapshot.agent,
+                local_bin,
+                rec_snapshot.cwd.as_deref(),
+                rec_snapshot.model.as_deref(),
+                rec_snapshot.effort.as_deref(),
+                bypass_perms,
+            )?,
+        };
 
         let new_pane = if host_id.as_str() != LOCAL_HOST_ID {
             let provider = self
@@ -5332,8 +5578,9 @@ mod tests {
                 suspended_at_ms: None,
             },
         );
-        let err = core.suspend_session(&sid).await.unwrap_err();
+        let err = core.suspend_session(&sid, false).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::BadRequest);
+        assert!(err.message.contains("no_resumable_id"));
         assert_eq!(
             lock(&core.inner.state).sessions[&sid].state,
             SessionState::Idle
@@ -5376,8 +5623,44 @@ mod tests {
                 suspended_at_ms: None,
             },
         );
-        let shell_err = core.suspend_session(&shell_sid).await.unwrap_err();
+        let shell_err = core.suspend_session(&shell_sid, false).await.unwrap_err();
         assert_eq!(shell_err.code, ErrorCode::BadRequest);
+
+        let argv = Core::build_fresh_relaunch_argv(
+            AgentKind::Codex,
+            None,
+            Some("/repo"),
+            Some("gpt-6.2-sol"),
+            Some("high"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "codex",
+                "-m",
+                "gpt-6.2-sol",
+                "-c",
+                "model_reasoning_effort=\"high\"",
+                "-C",
+                "/repo",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ]
+        );
+        let agy_orch = Core::build_fresh_relaunch_argv(
+            AgentKind::Agy,
+            None,
+            Some("/repo"),
+            Some("gemini-pro-orchestrator-neon"),
+            Some("fixed"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            agy_orch,
+            vec!["agy", "--model", "gemini-pro-orchestrator-neon"]
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

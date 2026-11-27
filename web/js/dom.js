@@ -166,6 +166,24 @@ export function fmtTokens(n) {
   return String(Math.round(n));
 }
 
+export function cacheHitRate(inputTokens, cacheReadTokens) {
+  if (!isFin(inputTokens) || inputTokens <= 0 || !isFin(cacheReadTokens) || cacheReadTokens < 0) return null;
+  return Math.max(0, Math.min(100, (cacheReadTokens / inputTokens) * 100));
+}
+
+export function fmtHitRate(rate) {
+  if (!isFin(rate) || rate < 0) return '—';
+  if (rate === 0 || rate >= 99.95) return `${Math.round(rate)}%`;
+  return `${rate.toFixed(1).replace(/\.0$/, '')}%`;
+}
+
+export function cacheHitTone(rate) {
+  if (!isFin(rate) || rate < 0) return 'muted';
+  if (rate >= 80) return 'good';
+  if (rate >= 50) return 'mid';
+  return 'low';
+}
+
 export function ctxPctOf(m) {
   if (!m) return null;
   if (isFin(m.context_used_pct)) return Math.max(0, Math.min(100, m.context_used_pct));
@@ -266,11 +284,17 @@ export function buildTelemetryStrip(s) {
     ttftTipParts.push(L(`已记录回合：${turnCnt}`, `Recorded turns: ${turnCnt}`));
     if (m?.source && m.source !== 'none') ttftTipParts.push(`${L('来源：', 'Source: ')}${metricsSrcLabel(m.source)}`);
   }
+  const totHit = totVal != null && isFin(m?.total_cache_read_tokens) && m.total_cache_read_tokens > 0
+    ? cacheHitRate(m?.total_input_tokens, m.total_cache_read_tokens)
+    : null;
   const usageTipParts = totVal != null ? [
     L(`会话总消耗：${fmtTokens(totVal)} tokens`, `Session total: ${fmtTokens(totVal)} tokens`),
     L(`输入 ${fmtTokens(m?.total_input_tokens || 0)} · 输出 ${fmtTokens(m?.total_output_tokens || 0)}`, `In ${fmtTokens(m?.total_input_tokens || 0)} · Out ${fmtTokens(m?.total_output_tokens || 0)}`),
     ...(isFin(m?.total_cache_read_tokens) && m.total_cache_read_tokens > 0
-      ? [L(`缓存命中 ${fmtTokens(m.total_cache_read_tokens)}`, `Cache read ${fmtTokens(m.total_cache_read_tokens)}`)]
+      ? [L(
+        `缓存命中 ${fmtTokens(m.total_cache_read_tokens)}${totHit != null ? `（命中率 ${fmtHitRate(totHit)}）` : ''}`,
+        `Cache read ${fmtTokens(m.total_cache_read_tokens)}${totHit != null ? ` (${fmtHitRate(totHit)} hit)` : ''}`,
+      )]
       : []),
     L('点击查看每日 Token 用量统计', 'Click to view daily token usage dashboard'),
   ] : [];

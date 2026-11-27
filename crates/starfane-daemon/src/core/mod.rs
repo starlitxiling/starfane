@@ -1704,6 +1704,9 @@ impl Core {
                     }
                 }
                 live_ids.insert(s.session_id.clone());
+                if s.resume_id.is_none() && !s.is_subagent && !s.agent.is_shell() {
+                    s.resume_id = metrics::canonical_external_session_id(&s);
+                }
                 if let Some(prev) = st.sessions.get(&s.session_id) {
                     if prev.resume_id.is_some() && s.resume_id.is_none() {
                         s.resume_id = prev.resume_id.clone();

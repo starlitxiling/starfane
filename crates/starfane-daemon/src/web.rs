@@ -706,8 +706,22 @@ async fn focus(State(core): State<Core>, Path(id): Path<String>) -> Response {
     respond(core.focus_session(&SessionId(id)).await)
 }
 
-async fn suspend_session(State(core): State<Core>, Path(id): Path<String>) -> Response {
-    respond(core.suspend_session(&SessionId(id)).await)
+#[derive(Default, Deserialize)]
+struct SuspendBody {
+    #[serde(default)]
+    allow_fresh: bool,
+}
+
+async fn suspend_session(
+    State(core): State<Core>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        let b: SuspendBody = parse_body(&body)?;
+        core.suspend_session(&SessionId(id), b.allow_fresh).await
+    };
+    respond(r.await)
 }
 
 async fn resume_session(State(core): State<Core>, Path(id): Path<String>) -> Response {
