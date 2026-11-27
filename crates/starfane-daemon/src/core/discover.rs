@@ -971,6 +971,7 @@ fn expand_tilde_in(raw: &str, home: Option<&Path>) -> PathBuf {
 fn resolve_spawn_cwd_with<F>(
     home: Option<&Path>,
     project_root: Option<&str>,
+    create_dir: bool,
     find_project: F,
 ) -> Result<String, ApiError>
 where
@@ -985,6 +986,11 @@ where
             Ok(dir.to_string_lossy().into_owned())
         }
         Some(trimmed) => {
+            if trimmed.chars().any(char::is_control) {
+                return Err(ApiError::bad_request(
+                    "working directory contains control chars",
+                ));
+            }
             let expanded = expand_tilde_in(trimmed, home);
             if default_dir.as_ref().is_some_and(|d| d == &expanded) {
                 std::fs::create_dir_all(&expanded).map_err(|e| {
@@ -994,6 +1000,29 @@ where
             }
             if expanded.is_absolute() || trimmed.starts_with('~') {
                 if expanded.is_dir() {
+                    return Ok(expanded.to_string_lossy().into_owned());
+                }
+                if expanded.exists() {
+                    return Err(ApiError::bad_request(format!(
+                        "working directory path is not a directory: {}",
+                        expanded.display()
+                    )));
+                }
+                if create_dir {
+                    if expanded
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        return Err(ApiError::bad_request(
+                            "cannot auto-create working directory containing '..' segments",
+                        ));
+                    }
+                    std::fs::create_dir_all(&expanded).map_err(|e| {
+                        ApiError::bad_request(format!(
+                            "failed to create working directory {}: {e}",
+                            expanded.display()
+                        ))
+                    })?;
                     return Ok(expanded.to_string_lossy().into_owned());
                 }
                 return Err(ApiError::bad_request(format!(
@@ -2907,8 +2936,11 @@ impl Core {
         &self,
         home: Option<&Path>,
         project_root: Option<&str>,
+        create_dir: bool,
     ) -> Result<String, ApiError> {
-        resolve_spawn_cwd_with(home, project_root, |needle| self.find_project(needle))
+        resolve_spawn_cwd_with(home, project_root, create_dir, |needle| {
+            self.find_project(needle)
+        })
     }
 
     /// Default project root fallback when the caller leaves `project_root` empty.
@@ -2971,6 +3003,35 @@ impl Core {
         effort: Option<Effort>,
         prompt: Option<String>,
         name: Option<String>,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.spawn_direct_session_with_create_dir(
+            agent,
+            host_id,
+            project_root,
+            tmux_session,
+            model,
+            effort,
+            prompt,
+            name,
+            false,
+        )
+        .await
+    }
+
+    /// Spawn a standalone interactive session directly in tmux (L4, no pipeline required),
+    /// optionally auto-creating a missing explicit directory when `create_dir` is true.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_direct_session_with_create_dir(
+        &self,
+        agent: AgentKind,
+        host_id: Option<HostId>,
+        project_root: Option<String>,
+        tmux_session: Option<String>,
+        model: Option<String>,
+        effort: Option<Effort>,
+        prompt: Option<String>,
+        name: Option<String>,
+        create_dir: bool,
     ) -> Result<serde_json::Value, ApiError> {
         if agent.is_shell() {
             return Err(ApiError::bad_request(
@@ -3038,6 +3099,7 @@ impl Core {
                 effort,
                 prompt,
                 known_host_projects,
+                create_dir,
             };
             let outcome = provider.spawn_session(&display_name, &req).await?;
             lock(&self.inner.state)
@@ -3050,7 +3112,8 @@ impl Core {
             return Ok(outcome.response);
         }
         let home_env = self.effective_home_dir();
-        let cwd = self.resolve_spawn_cwd_in(home_env.as_deref(), project_root.as_deref())?;
+        let cwd =
+            self.resolve_spawn_cwd_in(home_env.as_deref(), project_root.as_deref(), create_dir)?;
 
         let target_session = match tmux_session
             .as_deref()
@@ -4460,17 +4523,18 @@ mod tests {
         };
 
         // 1. Blank or None creates & returns `<home>/.agent_session`.
-        let r_none = resolve_spawn_cwd_with(Some(&home), None, fail_lookup).unwrap();
+        let r_none = resolve_spawn_cwd_with(Some(&home), None, false, fail_lookup).unwrap();
         assert_eq!(PathBuf::from(&r_none), expected_default);
         assert!(expected_default.is_dir());
 
-        let r_blank = resolve_spawn_cwd_with(Some(&home), Some("   "), fail_lookup).unwrap();
+        let r_blank = resolve_spawn_cwd_with(Some(&home), Some("   "), false, fail_lookup).unwrap();
         assert_eq!(PathBuf::from(&r_blank), expected_default);
 
         // 2. Explicit `~/.agent_session` resolves cleanly even if removed before call.
         std::fs::remove_dir_all(&expected_default).unwrap();
         let r_tilde_default =
-            resolve_spawn_cwd_with(Some(&home), Some("~/.agent_session"), fail_lookup).unwrap();
+            resolve_spawn_cwd_with(Some(&home), Some("~/.agent_session"), false, fail_lookup)
+                .unwrap();
         assert_eq!(PathBuf::from(&r_tilde_default), expected_default);
         assert!(expected_default.is_dir());
 
@@ -4478,16 +4542,39 @@ mod tests {
         let custom = home.join("custom_proj");
         std::fs::create_dir_all(&custom).unwrap();
         let r_tilde_custom =
-            resolve_spawn_cwd_with(Some(&home), Some("~/custom_proj"), fail_lookup).unwrap();
+            resolve_spawn_cwd_with(Some(&home), Some("~/custom_proj"), false, fail_lookup).unwrap();
         assert_eq!(PathBuf::from(&r_tilde_custom), custom);
 
         let custom_str = custom.to_string_lossy().into_owned();
-        let r_abs = resolve_spawn_cwd_with(Some(&home), Some(&custom_str), fail_lookup).unwrap();
+        let r_abs =
+            resolve_spawn_cwd_with(Some(&home), Some(&custom_str), false, fail_lookup).unwrap();
         assert_eq!(r_abs, custom_str);
 
-        // 4. Non-existent explicit path returns BadRequest rather than falling back.
-        let missing = resolve_spawn_cwd_with(Some(&home), Some("~/missing_dir"), fail_lookup);
+        // 4. Non-existent explicit path returns BadRequest unless `create_dir` is true.
+        let missing =
+            resolve_spawn_cwd_with(Some(&home), Some("~/missing_dir"), false, fail_lookup);
         assert_eq!(missing.unwrap_err().code, ErrorCode::BadRequest);
+
+        // 5. `create_dir = true` creates nested directories cleanly while blocking files & `..`.
+        let created =
+            resolve_spawn_cwd_with(Some(&home), Some("~/new_proj/nested"), true, fail_lookup)
+                .unwrap();
+        assert_eq!(PathBuf::from(&created), home.join("new_proj/nested"));
+        assert!(home.join("new_proj/nested").is_dir());
+
+        let file_path = home.join("regular_file");
+        std::fs::write(&file_path, b"not a dir").unwrap();
+        let not_dir = resolve_spawn_cwd_with(
+            Some(&home),
+            Some(file_path.to_str().unwrap()),
+            true,
+            fail_lookup,
+        );
+        assert_eq!(not_dir.unwrap_err().code, ErrorCode::BadRequest);
+
+        let traversal =
+            resolve_spawn_cwd_with(Some(&home), Some("~/sub/../escape"), true, fail_lookup);
+        assert_eq!(traversal.unwrap_err().code, ErrorCode::BadRequest);
 
         let _ = std::fs::remove_dir_all(&home);
     }

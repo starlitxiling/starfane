@@ -32,8 +32,10 @@ import {
   isFinished,
   mutedChannelCount,
   notifiersDiffSig,
+  resolvedTheme,
   rootSessions,
   setMute,
+  toggleTheme,
 } from './store.js';
 
 const KIND_CLASS_SET = new Set(['feishu', 'telegram', 'discord', 'slack', 'wecom', 'qq', 'webhook', 'macos']);
@@ -46,6 +48,30 @@ function svgNode(tag, attrs = {}, kids = []) {
   }
   for (const c of kids) if (c) el.appendChild(c);
   return el;
+}
+
+function themeIcon(isDark) {
+  const base = {
+    class: 'top-theme-ico',
+    viewBox: '0 0 24 24',
+    width: '15',
+    height: '15',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.9',
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+    'aria-hidden': 'true',
+  };
+  if (isDark) {
+    return svgNode('svg', base, [
+      svgNode('circle', { cx: 12, cy: 12, r: 4 }),
+      svgNode('path', { d: 'M12 2.5v2M12 19.5v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2.5 12h2M19.5 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41' }),
+    ]);
+  }
+  return svgNode('svg', base, [
+    svgNode('path', { d: 'M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z' }),
+  ]);
 }
 
 function mobileTabIcon(v) {
@@ -472,6 +498,25 @@ export function renderTop() {
         APP.rerender();
       },
     });
+    const themeBtn = h('button', {
+      type: 'button',
+      class: 'btn sm pill top-theme-btn',
+      onclick: (e) => {
+        if (e.shiftKey) {
+          toggleTheme({ resetAuto: true });
+          toast(L('已恢复跟随系统外观', 'Switched to system theme'), 'ok');
+        } else {
+          const next = toggleTheme();
+          toast(
+            next === 'dark'
+              ? L('已切换为夜间模式', 'Switched to dark mode')
+              : L('已切换为日间模式', 'Switched to light mode'),
+            'ok',
+          );
+        }
+        APP.rerender();
+      },
+    });
     const muteBtn = h('button', {
       type: 'button',
       class: 'btn sm pill',
@@ -490,10 +535,10 @@ export function renderTop() {
         h('img', { class: 'logo', src: '/assets/logo.svg', alt: '', width: 26, height: 26 }),
         h('span', null, 'starfane')),
       nav,
-      h('div', { class: 'top-tools' }, connPill, usageBtn, muteWrap),
+      h('div', { class: 'top-tools' }, connPill, usageBtn, themeBtn, muteWrap),
     );
     const mobileNav = $('#mobile-nav');
-    TOP = { bar, nav, mobileNav, connPill, usageBtn, muteBtn, mutePopSlot, popKey: '' };
+    TOP = { bar, nav, mobileNav, connPill, usageBtn, themeBtn, muteBtn, mutePopSlot, popKey: '' };
     UI.topShell = TOP;
   }
   TOP.nav.replaceChildren(...VIEWS.map((v, i) => h('a', {
@@ -530,6 +575,17 @@ export function renderTop() {
   TOP.usageBtn.title = todayTok != null
     ? L(`今日总消耗 ${fmtTokens(todayTok)} tokens（输入 ${fmtTokens(S.todayUsage?.input_tokens || 0)} · 输出 ${fmtTokens(S.todayUsage?.output_tokens || 0)}），点击查看每日与会话用量`, `Today ${fmtTokens(todayTok)} tokens (in ${fmtTokens(S.todayUsage?.input_tokens || 0)} · out ${fmtTokens(S.todayUsage?.output_tokens || 0)}) — click for usage stats`)
     : L('查看每日与会话 Token 消耗统计', 'View daily & per-session token usage');
+
+  const isDark = resolvedTheme() === 'dark';
+  const prefTag = UI.themePref === 'auto' ? L('（跟随系统）', ' (Auto)') : '';
+  const themeAction = isDark ? L('切换为日间模式', 'Switch to light mode') : L('切换为夜间模式', 'Switch to dark mode');
+  TOP.themeBtn.className = `btn sm pill top-theme-btn${isDark ? ' is-dark' : ''}`;
+  TOP.themeBtn.setAttribute('aria-pressed', isDark ? 'true' : 'false');
+  TOP.themeBtn.setAttribute('aria-label', themeAction);
+  TOP.themeBtn.title = isDark
+    ? L(`当前：夜间模式${prefTag} · 点击切换日间模式（Shift+点击恢复跟随系统）`, `Theme: Dark${prefTag} · Click for light mode (Shift+click for auto)`)
+    : L(`当前：日间模式${prefTag} · 点击切换夜间模式（Shift+点击恢复跟随系统）`, `Theme: Light${prefTag} · Click for dark mode (Shift+click for auto)`);
+  TOP.themeBtn.replaceChildren(themeIcon(isDark));
 
   const now = Date.now();
   const pill = buildTopbarPillState(now);

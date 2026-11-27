@@ -11,6 +11,7 @@ import {
   PREVIEW_LINES,
   SPAWN_PREFS_KEY,
   STATE_PRIO,
+  THEME_KEY,
   TRANSCRIPT_LIMIT,
   fallbackSlash,
   stageLabel,
@@ -134,13 +135,38 @@ export const S = {
   notifiersLoaded: false,
 };
 
+const THEME_MEDIA = typeof window.matchMedia === 'function'
+  ? window.matchMedia('(prefers-color-scheme: dark)')
+  : null;
+
+export function loadThemePref() {
+  try {
+    const raw = localStorage.getItem(THEME_KEY);
+    if (raw === 'dark' || raw === 'light') return raw;
+  } catch (err) {
+    console.debug('theme storage read skipped:', err);
+  }
+  return 'auto';
+}
+
+export function resolveTheme(pref) {
+  if (pref === 'dark' || pref === 'light') return pref;
+  return THEME_MEDIA?.matches ? 'dark' : 'light';
+}
+
+const INIT_THEME_PREF = loadThemePref();
+
 export const UI = {
+  themePref: INIT_THEME_PREF,
+  theme: resolveTheme(INIT_THEME_PREF),
   view: 'workspace',
   arg: null,
   modal: null,
   drawer: null,
   renameHostId: null,
   suspendFreshSessionId: null,
+  spawnMissingDir: null,
+  spawnErr: '',
   selSession: null,
   composerMode: 'direct',
   outputMode: 'reading',
@@ -180,6 +206,49 @@ export const UI = {
   wsShell: null,
   topShell: null,
 };
+
+export const resolvedTheme = () => resolveTheme(UI.themePref);
+
+export function applyTheme(pref = UI.themePref, { persist = true } = {}) {
+  const cleanPref = pref === 'dark' || pref === 'light' ? pref : 'auto';
+  const nextTheme = resolveTheme(cleanPref);
+  UI.themePref = cleanPref;
+  UI.theme = nextTheme;
+  const root = document.documentElement;
+  if (root) {
+    root.dataset.theme = nextTheme;
+    root.dataset.themePref = cleanPref;
+  }
+  const meta = document.querySelector?.('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', nextTheme === 'dark' ? '#141413' : '#FAF9F6');
+  if (persist) {
+    try {
+      if (cleanPref === 'auto') localStorage.removeItem(THEME_KEY);
+      else localStorage.setItem(THEME_KEY, cleanPref);
+    } catch (err) {
+      console.debug('theme storage write skipped:', err);
+    }
+  }
+  return nextTheme;
+}
+
+export function toggleTheme({ resetAuto = false } = {}) {
+  if (resetAuto) return applyTheme('auto', { persist: true });
+  return applyTheme(resolvedTheme() === 'dark' ? 'light' : 'dark', { persist: true });
+}
+
+if (THEME_MEDIA) {
+  const onSystemThemeChange = () => {
+    if (UI.themePref !== 'auto') return;
+    applyTheme('auto', { persist: false });
+    APP.rerender();
+  };
+  if (typeof THEME_MEDIA.addEventListener === 'function') {
+    THEME_MEDIA.addEventListener('change', onSystemThemeChange);
+  } else if (typeof THEME_MEDIA.addListener === 'function') {
+    THEME_MEDIA.addListener(onSystemThemeChange);
+  }
+}
 
 // Cross-module callback registry wired at boot in web/app.js (prevents circular ES module imports).
 export const APP = {
@@ -573,7 +642,7 @@ export function hostRecord(hostId) {
 export function sortedHosts() {
   const list = [...S.hosts.values()].filter((h) => h && h.id);
   if (!list.length) {
-    return [{ id: 'local', display_name: 'Local', kind: 'local', status: 'online' }];
+    return [{ id: 'local', display_name: L('当前主机', 'This Host'), kind: 'local', status: 'online' }];
   }
   return list.sort((a, b) => {
     if (a.id === 'local') return -1;
@@ -616,17 +685,26 @@ export function formatRetryCountdown(nextRetryMs) {
 export function hostDisplayName(hostId, fallbackSession = null) {
   const id = (hostId && String(hostId).trim()) || 'local';
   const rec = S.hosts.get(id);
-  if (rec?.display_name) return rec.display_name;
-  if (fallbackSession?.host_display_name) return fallbackSession.host_display_name;
-  return id === 'local' ? 'Local' : id;
+  if (rec?.display_name && !/^local$/i.test(rec.display_name.trim())) return rec.display_name;
+  if (fallbackSession?.host_display_name && !/^local$/i.test(fallbackSession.host_display_name.trim())) {
+    return fallbackSession.host_display_name;
+  }
+  return id === 'local' ? L('当前主机', 'This Host') : id;
 }
 
-export function paneDisplayId(s) {
+export function shortPaneId(s) {
   if (!s?.pane) return '';
   const raw = String(s.pane);
   const hid = hostOf(s);
-  if (hid !== 'local' && raw.startsWith(`${hid}:`)) return raw;
-  return `${hid}:${raw}`;
+  if (hid !== 'local' && raw.startsWith(`${hid}:`)) return raw.slice(hid.length + 1);
+  return raw;
+}
+
+export function paneDisplayId(s) {
+  const raw = shortPaneId(s);
+  if (!raw) return '';
+  const name = hostDisplayName(hostOf(s), s);
+  return name ? `${name}:${raw}` : raw;
 }
 
 export function muxKindOf(s) {

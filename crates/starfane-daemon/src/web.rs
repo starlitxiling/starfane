@@ -34,6 +34,11 @@ const LOGO_SVG: &[u8] = include_bytes!("../embedded/logo.svg");
 
 const EMBEDDED_ASSETS: &[(&str, &[u8], &str)] = &[
     ("index.html", INDEX_HTML, "text/html; charset=utf-8"),
+    (
+        "theme-init.js",
+        include_bytes!("../embedded/web/theme-init.js"),
+        "text/javascript; charset=utf-8",
+    ),
     ("app.js", APP_JS, "text/javascript; charset=utf-8"),
     ("app.css", APP_CSS, "text/css; charset=utf-8"),
     ("logo.svg", LOGO_SVG, "image/svg+xml"),
@@ -892,6 +897,8 @@ struct SpawnSessionBody {
     prompt: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    create_dir: bool,
 }
 
 async fn spawn_session(State(core): State<Core>, body: Bytes) -> Response {
@@ -910,17 +917,17 @@ async fn spawn_session(State(core): State<Core>, body: Bytes) -> Response {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(HostId::new);
-        core.handle(DaemonCommand::SpawnSession {
-            agent: b.agent,
+        core.spawn_direct_session_with_create_dir(
+            b.agent,
             host_id,
-            model: b.model,
+            b.project_root,
+            b.tmux_session,
+            b.model,
             effort,
-            project_root: b.project_root,
-            tmux_session: b.tmux_session,
-            name: b.name,
-            prompt: b.prompt,
-            from_session: None,
-        })
+            b.prompt,
+            b.name,
+            b.create_dir,
+        )
         .await
     };
     respond(r.await)

@@ -95,6 +95,7 @@ export function levelLabel(lvl) {
   }[lvl] || String(lvl ?? '');
 }
 export const TOKEN_KEY = 'starfane_token';
+export const THEME_KEY = 'starfane_theme';
 export const REQUEST_TIMEOUT_MS = 15000;
 export const HEALTH_POLL_MS = 8000;
 export const PREVIEW_POLL_MS = 3000;

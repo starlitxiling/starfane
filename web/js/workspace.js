@@ -110,6 +110,7 @@ import {
   saveCollapsedGroups,
   saveCollapsedHosts,
   sessionLabel,
+  shortPaneId,
   stateText,
   subagentDisplayName,
   subagentsOf,
@@ -1803,6 +1804,7 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
   const subMeta = s.tmux_label && s.tmux_target ? s.tmux_target : base(s.git_root || s.cwd);
   const meLabel = modelEffortLabel(s.model, s.effort);
   const paneBadge = paneDisplayId(s);
+  const cardPaneBadge = shortPaneId(s);
   const mux = muxKindOf(s);
   const closable = canCloseSessionWindow(s);
   const isSplit = Boolean(closable && splitWindowKeys && splitWindowKeys.has(windowGroupKeyOf(s)));
@@ -1818,7 +1820,7 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
     h('i', { class: `dot dot-${s.state}`, title: stateText(s.state) }),
     agentTag(s.agent),
     h('span', { class: 'ws-item-target grow', title: primaryTitle }, primaryTitle),
-    paneBadge ? h('span', { class: 'tag host-pfx', title: paneBadge }, paneBadge) : null),
+    cardPaneBadge ? h('span', { class: 'tag host-pfx', title: paneBadge || cardPaneBadge }, cardPaneBadge) : null),
   h('div', { class: 'ws-item-sub' },
     h('span', { class: 'trunc grow' }, subMeta),
     s.state === 'suspended' ? span('tag soft-suspended', L('已休眠', 'Suspended')) : null,
@@ -2792,8 +2794,8 @@ export function patchWorkspace(W) {
           },
           span('ws-host-caret', hostCollapsed ? '▸' : '▾'),
           h('i', { class: `dot dot-${hStatus}`, title: hostDotTip }),
-          h('span', { class: 'ws-host-name', title: `${hName} (${hb.id})` }, hName),
-          span('ws-host-id', hb.id),
+          h('span', { class: 'ws-host-name', title: isRemote && hb.id !== hName ? `${hName} (${hb.id})` : hName }, hName),
+          isRemote && hb.id !== hName ? span('ws-host-id', hb.id) : null,
           hKind !== 'local' ? span('tag', hKind === 'ssh' ? 'SSH' : 'Peer') : null,
           rttBadge),
           h('div', { class: 'row-nowrap ws-host-acts', style: 'gap:4px;flex-shrink:0' },
@@ -2801,8 +2803,8 @@ export function patchWorkspace(W) {
               type: 'button',
               class: 'ws-host-rename',
               'data-host': hb.id,
-              title: L(`重命名主机 ${hName}（${hb.id}）`, `Rename host ${hName} (${hb.id})`),
-              'aria-label': L(`重命名主机 ${hb.id}`, `Rename host ${hb.id}`),
+              title: L(`重命名主机 ${hName}`, `Rename host ${hName}`),
+              'aria-label': L(`重命名主机 ${hName}`, `Rename host ${hName}`),
               onclick: () => APP.openRenameHostModal(hb.id),
             }, '✎'),
             span('tag tabular', hb.total)));
@@ -2895,8 +2897,8 @@ export function patchWorkspace(W) {
   const isShell = s.agent === 'shell';
   const effectiveMode = isShell ? 'raw' : UI.outputMode;
   const headHostId = hostOf(s);
-  const headIsRemote = isRemoteHost(headHostId);
-  const headHostLabel = headIsRemote ? hostDisplayName(headHostId, s) : '';
+  const showMobHost = S.hosts.size > 1 || isRemoteHost(headHostId);
+  const headHostLabel = showMobHost ? hostDisplayName(headHostId, s) : '';
   const canSusp = canSuspendSession(s);
   const canWake = canResumeSession(s);
   const suspBusy = UI.busy.has(`suspend:${s.session_id}`);
@@ -2934,8 +2936,8 @@ export function patchWorkspace(W) {
     h('span', { class: 'ws-mob-sub-row' },
       span(`ws-mob-agent a-${s.agent || 'x'}`, s.agent || '?'),
       buildMobCtxEl(s),
-      headIsRemote ? h('span', { class: 'ws-mob-host trunc' }, headHostLabel) : null,
-      mobPctVal == null && !headIsRemote ? h('span', { class: 'trunc' }, stateText(s.state)) : null));
+      showMobHost ? h('span', { class: 'ws-mob-host trunc' }, headHostLabel) : null,
+      mobPctVal == null && !showMobHost ? h('span', { class: 'trunc' }, stateText(s.state)) : null));
     const mobOutlineBtn = h('button', {
       type: 'button',
       class: 'btn sm ws-outline-mob-btn ws-hidden',

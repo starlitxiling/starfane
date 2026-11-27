@@ -343,6 +343,16 @@ export function warnText(w) {
   }
 }
 
+function promoteToastPopover(box) {
+  if (!box || !box.isConnected || typeof box.showPopover !== 'function') return;
+  try {
+    if (box.matches(':popover-open')) box.hidePopover();
+    box.showPopover();
+  } catch (err) {
+    console.debug('toast showPopover skipped:', err);
+  }
+}
+
 export function toast(msg, kind = 'ok') {
   const box = $('#toasts');
   if (!box) return;
@@ -350,7 +360,17 @@ export function toast(msg, kind = 'ok') {
   const el = h('div', { class: 'toast' }, h('i', { class: `dot ${dotCls}` }), h('span', null, msg));
   box.appendChild(el);
   while (box.children.length > 4) box.firstChild.remove();
-  setTimeout(() => el.remove(), kind === 'err' ? TOAST_MS * 2 : TOAST_MS);
+  promoteToastPopover(box);
+  setTimeout(() => {
+    el.remove();
+    if (box.children.length === 0 && box.isConnected && typeof box.hidePopover === 'function') {
+      try {
+        if (box.matches(':popover-open')) box.hidePopover();
+      } catch (err) {
+        console.debug('toast hidePopover skipped:', err);
+      }
+    }
+  }, kind === 'err' ? TOAST_MS * 2 : TOAST_MS);
 }
 
 export const statusInd = (state, text, soft = false) => span(

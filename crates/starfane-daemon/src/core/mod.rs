@@ -257,20 +257,38 @@ impl Core {
             .map(|hid| (hid.clone(), Arc::new(Notify::new())))
             .collect();
 
-        // Seed runtime host registry (local + configured remote hosts).
+        // Seed runtime host registry (local node ID stays `"local"`, displayed via real hostname / user alias).
         let local_id = HostId::new(LOCAL_HOST_ID);
+        if state
+            .host_display_names
+            .get(&local_id)
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("local") || v.trim().is_empty())
+        {
+            state.host_display_names.remove(&local_id);
+        }
         let local_display = state
             .host_display_names
             .get(&local_id)
-            .cloned()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("local"))
+            .map(str::to_string)
             .unwrap_or_else(|| {
                 let d = cfg.config.node.display_name.trim();
-                if d.is_empty() {
-                    "Local".to_string()
-                } else {
+                if !d.is_empty() && !d.eq_ignore_ascii_case("local") {
                     d.to_string()
+                } else {
+                    crate::config::detect_local_host_display_name()
                 }
             });
+        for s in state.sessions.values_mut() {
+            if s.effective_host_id() == LOCAL_HOST_ID
+                && s.host_display_name
+                    .as_deref()
+                    .is_none_or(|v| v.trim().is_empty() || v.trim().eq_ignore_ascii_case("local"))
+            {
+                s.host_display_name = Some(local_display.clone());
+            }
+        }
         state.hosts.insert(
             local_id.clone(),
             HostRecord {

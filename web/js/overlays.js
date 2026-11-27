@@ -15,6 +15,7 @@ import {
   ctxPctOf,
   dur,
   emptyState,
+  errText,
   errorBanner,
   evBlocks,
   field,
@@ -41,6 +42,7 @@ import {
   ttftTone,
 } from './dom.js';
 import {
+  ApiError,
   act,
   api,
   artifact,
@@ -150,6 +152,9 @@ export function openSpawnModal() {
   const ag = prefs.last_agent || 'claude';
   UI.drafts.set('sp:agent', ag);
   UI.drafts.delete('sp:dir');
+  UI.drafts.delete('sp:createDir');
+  UI.spawnMissingDir = null;
+  UI.spawnErr = '';
   hydrateSpawnAgent(ag, prefs);
   UI.modal = 'spawn';
   APP.schedule();
@@ -215,6 +220,8 @@ export function closeModal() {
   UI.renameHostId = null;
   UI.closeSessionId = null;
   UI.suspendFreshSessionId = null;
+  UI.spawnMissingDir = null;
+  UI.spawnErr = '';
   APP.schedule();
 }
 
@@ -508,7 +515,7 @@ function drawerSession(s) {
     kvGrid([
       [L('所属主机', 'Host'), h('span', { class: 'row', style: 'gap:6px' },
         h('strong', null, hostDisplayName(hid, s)),
-        h('code', null, hid),
+        remote && hid !== hostDisplayName(hid, s) ? h('code', null, hid) : null,
         remote ? span('tag', hKind === 'ssh' ? 'SSH' : 'Peer') : null,
         remote ? span(`tag ${hStatus === 'online' ? 'soft-green' : hStatus === 'offline' ? 'soft-red' : 'soft-amber'}`, hostStatusLabel(hStatus)) : null,
         remote && hStatus !== 'offline' ? rttPill(hRec?.rtt_ms, hRec?.sync_ms) : null,
@@ -1079,12 +1086,18 @@ function renameHostModalBody() {
     h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
     h('div', { class: 'modal-head' }, h('h3', null, L('重命名主机', 'Rename Host')), btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
     h('div', { class: 'modal-body stack' },
-      h('p', { class: 'muted' },
-        L('仅修改显示名称，不可变主机 ID ', 'Only the display name changes; immutable host ID '),
-        h('code', null, hostId),
-        L(' 与面板前缀 ', ' and pane prefix '),
-        h('code', null, `${hostId}:%...`),
-        L(' 保持稳定。', ' stay unchanged.')),
+      hostId === 'local'
+        ? h('p', { class: 'muted' },
+          L(
+            '修改此电脑在控制台与通知中的显示名称（如 wujie-mac / 办公 Mac），不影响现有会话连接。',
+            'Change how this computer is labeled across the console and notifications (e.g. wujie-mac / Office Mac); active sessions stay connected.',
+          ))
+        : h('p', { class: 'muted' },
+          L('仅修改显示名称，不可变主机 ID ', 'Only the display name changes; immutable host ID '),
+          h('code', null, hostId),
+          L(' 与面板前缀 ', ' and pane prefix '),
+          h('code', null, `${hostId}:%...`),
+          L(' 保持稳定。', ' stay unchanged.')),
       h('div', null, h('label', { class: 'lbl' }, L('主机显示名称', 'Host display name')), inp)),
     h('div', { class: 'modal-foot' },
       btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
@@ -1135,46 +1148,80 @@ function spawnModalBody() {
     const modelVal = mSel === '__custom__' ? draft('sp:modelCustom').trim() : String(mSel || '').trim();
     saveSpawnPrefs(ag, { model: modelVal || undefined, effort: eSel || '' });
   };
-  const create = () => act('spawn-sess', async () => {
+  const create = async (forceCreateDir = false) => {
+    const busyKey = 'spawn-sess';
+    if (UI.busy.has(busyKey)) return undefined;
     const chosenHost = S.hosts.size > 1 ? draft('sp:host', targetHost) : 'local';
     const effHost = chosenHost && S.hosts.has(chosenHost) ? chosenHost : 'local';
     const remoteHost = isRemoteHost(effHost);
     if (remoteHost && hostRecord(effHost)?.status === 'offline') {
-      throw new Error(L(`目标主机「${hostDisplayName(effHost)}」当前离线，请先重连`, `Target host "${hostDisplayName(effHost)}" is offline — reconnect first`));
+      const msg = L(`目标主机「${hostDisplayName(effHost)}」当前离线，请先重连`, `Target host "${hostDisplayName(effHost)}" is offline — reconnect first`);
+      UI.spawnErr = msg;
+      UI.spawnMissingDir = null;
+      toast(msg, 'err');
+      APP.rerender();
+      return undefined;
     }
-    const ag = draft('sp:agent', 'claude');
-    const info = modelsForAgent(ag);
-    const picked = UI.drafts.get(`sp:modelSel:${ag}`) || info.default;
-    const model = picked === '__custom__' ? draft('sp:modelCustom').trim() : String(picked || '').trim();
-    const availEffs = effortsForModel(info, picked);
-    const pickedEff = availEffs.length ? (UI.drafts.get(`sp:effort:${ag}`) || info.default_effort || availEffs[0]) : '';
-    const proj = draft('sp:dir', curDir).trim();
-    const tmuxSess = draft('sp:session').trim();
-    const payload = {
-      agent: ag,
-      host_id: remoteHost ? effHost : undefined,
-      project_root: proj || undefined,
-      tmux_session: tmuxSess || undefined,
-      model: model || undefined,
-      effort: pickedEff || undefined,
-      name: draft('sp:name').trim() || undefined,
-      prompt: draft('sp:prompt').trim() || undefined,
-    };
-    const r = await api('POST', '/api/sessions/spawn', payload);
-    saveSpawnPrefs(ag, { model: model || undefined, effort: pickedEff || '' });
-    ['sp:dir', 'sp:session', 'sp:name', 'sp:prompt', 'sp:host'].forEach((k) => UI.drafts.delete(k));
-    UI.modal = null;
-    await loadAll();
-    if (r?.session_id) APP.openSession(r.session_id);
-    return r;
-  }, (r) => {
-    const tgt = r?.tmux_target || r?.pane_id || '';
-    const hid = r?.host_id || (isRemote ? targetHost : 'local');
-    if (hid && hid !== 'local') {
-      return L(`已在 ${hostDisplayName(hid)} 新建会话 ${tgt}`, `Created session ${tgt} on ${hostDisplayName(hid)}`);
+    const wantCreateDir = Boolean(forceCreateDir || UI.drafts.get('sp:createDir') === '1');
+    UI.spawnErr = '';
+    UI.spawnMissingDir = null;
+    UI.busy.add(busyKey);
+    APP.schedule();
+    try {
+      const ag = draft('sp:agent', 'claude');
+      const info = modelsForAgent(ag);
+      const picked = UI.drafts.get(`sp:modelSel:${ag}`) || info.default;
+      const model = picked === '__custom__' ? draft('sp:modelCustom').trim() : String(picked || '').trim();
+      const availEffs = effortsForModel(info, picked);
+      const pickedEff = availEffs.length ? (UI.drafts.get(`sp:effort:${ag}`) || info.default_effort || availEffs[0]) : '';
+      const proj = draft('sp:dir', curDir).trim();
+      const tmuxSess = draft('sp:session').trim();
+      const payload = {
+        agent: ag,
+        host_id: remoteHost ? effHost : undefined,
+        project_root: proj || undefined,
+        tmux_session: tmuxSess || undefined,
+        model: model || undefined,
+        effort: pickedEff || undefined,
+        name: draft('sp:name').trim() || undefined,
+        prompt: draft('sp:prompt').trim() || undefined,
+        create_dir: wantCreateDir || undefined,
+      };
+      const r = await api('POST', '/api/sessions/spawn', payload);
+      saveSpawnPrefs(ag, { model: model || undefined, effort: pickedEff || '' });
+      ['sp:dir', 'sp:createDir', 'sp:session', 'sp:name', 'sp:prompt', 'sp:host'].forEach((k) => UI.drafts.delete(k));
+      UI.spawnMissingDir = null;
+      UI.spawnErr = '';
+      UI.modal = null;
+      await loadAll();
+      if (r?.session_id) APP.openSession(r.session_id);
+      const tgt = r?.tmux_target || r?.pane_id || '';
+      const hid = r?.host_id || (remoteHost ? effHost : 'local');
+      toast(hid && hid !== 'local'
+        ? L(`已在 ${hostDisplayName(hid)} 新建会话 ${tgt}`, `Created session ${tgt} on ${hostDisplayName(hid)}`)
+        : L(`已在 tmux 新建会话 ${tgt}`, `Created tmux session ${tgt}`), 'ok');
+      return r;
+    } catch (e) {
+      const m = !wantCreateDir && e instanceof ApiError && e.status === 400
+        ? (e.message || '').match(/working directory does not exist(?: on [^:]+)?:\s*(.+)$/i)
+        : null;
+      if (m) {
+        UI.spawnMissingDir = { path: m[1].trim(), hostId: effHost };
+        UI.spawnErr = '';
+        APP.rerender();
+        return undefined;
+      }
+      const msg = errText(e);
+      UI.spawnErr = msg;
+      UI.spawnMissingDir = null;
+      toast(msg, 'err');
+      APP.rerender();
+      return undefined;
+    } finally {
+      UI.busy.delete(busyKey);
+      APP.schedule();
     }
-    return L(`已在 tmux 新建会话 ${tgt}`, `Created tmux session ${tgt}`);
-  });
+  };
   const modelSelect = selectField(selKey, modelOpts, curSel, { class: 'inp', style: 'width:100%' });
   modelSelect.addEventListener('change', () => {
     const nextModel = modelSelect.value;
@@ -1220,6 +1267,8 @@ function spawnModalBody() {
             UI.drafts.delete('sp:dir');
           }
           UI.drafts.set('sp:host', hr.id);
+          UI.spawnMissingDir = null;
+          UI.spawnErr = '';
           loadTmuxSessions(hr.id);
           APP.rerender();
         },
@@ -1256,15 +1305,54 @@ function spawnModalBody() {
           if (r && r.status !== 'offline') loadTmuxSessions(targetHost);
         },
       })) : null) : null;
-  const dirLabel = isRemote
-    ? L('工作目录（留空默认远端 ~/.agent_session）', 'Working directory (blank defaults to remote ~/.agent_session)')
-    : L('工作目录（默认 ~/.agent_session）', 'Working directory (default ~/.agent_session)');
-  const dirPlaceholder = isRemote
-    ? L('留空默认远端 ~/.agent_session', 'Defaults to remote ~/.agent_session')
-    : L('留空默认 ~/.agent_session', 'Defaults to ~/.agent_session');
+  const dirLabel = hasMultiHosts
+    ? L(`工作目录（${hostDisplayName(targetHost)}，留空默认 ~/.agent_session）`, `Working directory (${hostDisplayName(targetHost)}; defaults to ~/.agent_session)`)
+    : L('工作目录（留空默认 ~/.agent_session）', 'Working directory (defaults to ~/.agent_session)');
+  const dirPlaceholder = L('留空默认 ~/.agent_session', 'Defaults to ~/.agent_session');
   const sessPlaceholder = loadingSessions
     ? L('正在获取远端 tmux 会话…', 'Loading remote tmux sessions…')
     : L('默认 agent-session（自动创建）', 'Default: agent-session (auto-created)');
+  const dirInp = field('sp:dir', { class: 'inp mono', list: dlId, placeholder: dirPlaceholder, autocomplete: 'off' }, curDir);
+  dirInp.addEventListener('input', () => {
+    if (UI.spawnMissingDir || UI.spawnErr) {
+      UI.spawnMissingDir = null;
+      UI.spawnErr = '';
+      APP.rerender();
+    }
+  });
+  const autoCreateDir = UI.drafts.get('sp:createDir') === '1';
+  const createDirChk = h('label', { class: 'sp-create-dir-opt' },
+    h('input', {
+      type: 'checkbox',
+      checked: autoCreateDir,
+      onchange: (e) => {
+        if (e.target.checked) UI.drafts.set('sp:createDir', '1');
+        else UI.drafts.delete('sp:createDir');
+        UI.spawnMissingDir = null;
+        UI.spawnErr = '';
+        APP.rerender();
+      },
+    }),
+    L('目录不存在时自动创建', 'Auto-create directory if missing'));
+  const missingDirBanner = UI.spawnMissingDir
+    ? h('div', { class: 'callout warn sp-missing-dir' },
+      h('div', { class: 'sp-missing-dir-body' },
+        h('div', null, L(
+          `工作目录尚不存在${UI.spawnMissingDir.hostId !== 'local' ? `（${hostDisplayName(UI.spawnMissingDir.hostId)}）` : ''}：`,
+          `Working directory does not exist${UI.spawnMissingDir.hostId !== 'local' ? ` (on ${hostDisplayName(UI.spawnMissingDir.hostId)})` : ''}:`,
+        )),
+        h('code', null, UI.spawnMissingDir.path)),
+      btn(L('创建目录并启动', 'Create & Launch'), {
+        cls: 'sm primary',
+        busyKey: 'spawn-sess',
+        disabled: targetOffline,
+        onclick: () => create(true),
+      }))
+    : null;
+  const spawnErrBanner = UI.spawnErr
+    ? h('div', { class: 'callout err', style: 'margin-top:8px;padding:9px 12px;font-size:12.5px' },
+      h('span', { style: 'word-break:break-word' }, UI.spawnErr))
+    : null;
   return h('div', { class: 'modal-shell' },
     h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
     h('div', { class: 'modal-head' }, h('h3', null, L('新建交互会话', 'New Interactive Session')), btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
@@ -1291,7 +1379,10 @@ function spawnModalBody() {
         h('div', { class: 'stack-xs' }, h('label', { class: 'lbl', style: 'margin:0' }, L('思考强度', 'Effort')), effortSelect)),
       h('div', null,
         h('label', { class: 'lbl' }, dirLabel),
-        field('sp:dir', { class: 'inp mono', list: dlId, placeholder: dirPlaceholder, autocomplete: 'off' }, curDir)),
+        dirInp,
+        createDirChk,
+        missingDirBanner,
+        spawnErrBanner),
       h('div', { class: 'opt-grid' },
         h('div', null, h('label', { class: 'lbl' }, L('tmux 会话（Session，选填）', 'tmux Session (optional)')),
           field('sp:session', { class: 'inp mono', list: sessDlId, placeholder: sessPlaceholder, autocomplete: 'off' })),
@@ -1306,7 +1397,7 @@ function spawnModalBody() {
         busyKey: 'spawn-sess',
         disabled: targetOffline,
         title: targetOffline ? L('请先重连离线主机后再新建会话', 'Reconnect the offline host before creating a session') : undefined,
-        onclick: create,
+        onclick: () => create(false),
       })));
 }
 

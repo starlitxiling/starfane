@@ -15,7 +15,7 @@ use crate::config::{
 };
 use crate::notice::{BoxFuture, Notice, NoticeKind};
 use serde::Serialize;
-use starfane_proto::{AgentKind, ApiError, LOCAL_HOST_ID};
+use starfane_proto::{AgentKind, ApiError};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -998,8 +998,8 @@ fn extract_notice_meta(notice: &Notice) -> NoticeMeta {
     let host = pane_id_str
         .and_then(extract_host_prefix)
         .or_else(|| session_id.as_deref().and_then(extract_host_prefix))
-        .unwrap_or(LOCAL_HOST_ID)
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(crate::config::detect_local_host_display_name);
     let agent = notice
         .reply_session
         .as_ref()

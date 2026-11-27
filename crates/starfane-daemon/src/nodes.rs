@@ -433,6 +433,7 @@ pub struct RemoteSpawnReq {
     pub effort: Option<Effort>,
     pub prompt: Option<String>,
     pub known_host_projects: Vec<String>,
+    pub create_dir: bool,
 }
 
 /// Result of spawning an interactive coding-agent session on a remote host.
@@ -3871,11 +3872,26 @@ printf '\n{sec_hot_deltas}\n'
         agent: AgentKind,
         raw_cwd: &str,
         tmux_session: &str,
+        create_dir: bool,
     ) -> String {
         let tmux_cmd = self.tmux_cmd_prefix();
         let agent_bin = shell_single_quote(self.agent_bin(agent));
         let raw_cwd_q = shell_single_quote(raw_cwd);
         let sess_q = shell_single_quote(tmux_session);
+        let missing_dir_block = if create_dir {
+            r#"if [ -e "$TARGET" ] && [ ! -d "$TARGET" ]; then
+  printf 'ERR:NOT_A_DIR:%s\n' "$TARGET"
+  exit 0
+fi
+if [ ! -d "$TARGET" ]; then
+  mkdir -p "$TARGET" 2>/dev/null || { printf 'ERR:MKDIR_FAIL:%s\n' "$TARGET"; exit 0; }
+fi"#
+        } else {
+            r#"if [ ! -d "$TARGET" ]; then
+  printf 'ERR:BAD_CWD:%s\n' "$TARGET"
+  exit 0
+fi"#
+        };
         // Never read or touch `~/.claude.json` for Claude.
         let agent_cfg_cmd = match agent {
             AgentKind::Codex => {
@@ -3901,10 +3917,7 @@ else
     *) TARGET="$RAW_CWD" ;;
   esac
 fi
-if [ ! -d "$TARGET" ]; then
-  printf 'ERR:BAD_CWD:%s\n' "$TARGET"
-  exit 0
-fi
+{missing_dir_block}
 LEX_CWD="$TARGET"
 CANON_CWD=$(cd "$TARGET" 2>/dev/null && pwd -P) || {{ printf 'ERR:BAD_CWD:%s\n' "$TARGET"; exit 0; }}
 GIT_ROOT=""
@@ -6263,6 +6276,16 @@ fn parse_spawn_preflight_output(
                 "working directory does not exist on {host_id}: {p}"
             )));
         }
+        if let Some(p) = line.strip_prefix("ERR:NOT_A_DIR:") {
+            return Err(ApiError::bad_request(format!(
+                "working directory path is not a directory on {host_id}: {p}"
+            )));
+        }
+        if let Some(p) = line.strip_prefix("ERR:MKDIR_FAIL:") {
+            return Err(ApiError::bad_request(format!(
+                "failed to create working directory on {host_id}: {p}"
+            )));
+        }
         if let Some(b) = line.strip_prefix("ERR:MISSING_BIN:") {
             return Err(ApiError::new(
                 ErrorCode::Unavailable,
@@ -6894,6 +6917,20 @@ impl NodeProvider for SshMuxNodeProvider {
             };
             let raw_cwd =
                 resolve_remote_project_arg(req.project_root.as_deref(), &req.known_host_projects)?;
+            if raw_cwd.chars().any(char::is_control) {
+                return Err(ApiError::bad_request(
+                    "working directory contains control chars",
+                ));
+            }
+            if req.create_dir
+                && Path::new(&raw_cwd)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(ApiError::bad_request(
+                    "cannot auto-create working directory containing '..' segments",
+                ));
+            }
 
             let _permit = self
                 .interactive_sem
@@ -6903,7 +6940,12 @@ impl NodeProvider for SshMuxNodeProvider {
                 .map_err(|_| ApiError::internal("ssh interactive semaphore closed"))?;
 
             // RTT 1: Read-only remote preflight probe over persistent `ConduitLane::Interactive`.
-            let pf_script = self.build_spawn_preflight_script(req.agent, &raw_cwd, &target_session);
+            let pf_script = self.build_spawn_preflight_script(
+                req.agent,
+                &raw_cwd,
+                &target_session,
+                req.create_dir,
+            );
             let pf_out = self
                 .exec_conduit_idempotent(
                     ConduitLane::Interactive,
@@ -8798,6 +8840,9 @@ impl NodeProvider for PeerDaemonNodeProvider {
             {
                 body.insert("name".into(), Value::String(n.to_string()));
             }
+            if req.create_dir {
+                body.insert("create_dir".into(), Value::Bool(true));
+            }
 
             let (_, env) = self
                 .request_json("POST", "/api/sessions/spawn", Some(&Value::Object(body)))
@@ -10306,6 +10351,7 @@ CODEX_DB_SIG 1:1:1|0:0:0\n\
                     effort: Some(Effort::High),
                     prompt: None,
                     known_host_projects: Vec::new(),
+                    create_dir: false,
                 },
             )
             .await
@@ -11470,6 +11516,53 @@ EOF
         assert!(script.contains(
             "if [ \"$_hino\" -ne 0 ] && [ \"$_cino\" -ne \"$_hino\" ]; then return 0; fi"
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_spawn_preflight_create_dir_script_and_errors() {
+        let dir = std::env::temp_dir().join(format!("starfane-ssh-mkdir-{}", id::new_id("T")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tr_cache = Arc::new(Mutex::new(TranscriptIndexCache::default()));
+        let provider = SshMuxNodeProvider::with_shared_caches(
+            &NodeConfig {
+                id: "ssh-mk".into(),
+                kind: NodeKindConfig::Ssh,
+                enabled: true,
+                ssh_target: "dev@example".into(),
+                ..NodeConfig::default()
+            },
+            &dir,
+            Arc::new(RemoteTranscriptMirror::new(dir.clone())),
+            tr_cache,
+        );
+
+        let strict_script =
+            provider.build_spawn_preflight_script(AgentKind::Codex, "/work/missing", "w", false);
+        assert!(strict_script.contains("ERR:BAD_CWD:%s"));
+        assert!(!strict_script.contains("ERR:NOT_A_DIR:%s"));
+
+        let create_script =
+            provider.build_spawn_preflight_script(AgentKind::Codex, "/work/missing", "w", true);
+        assert!(create_script.contains("ERR:NOT_A_DIR:%s"));
+        assert!(create_script.contains("ERR:MKDIR_FAIL:%s"));
+        assert!(create_script.contains("mkdir -p \"$TARGET\""));
+
+        let hid = HostId::new("ssh-mk");
+        let e_not_dir =
+            parse_spawn_preflight_output(&hid, "ERR:NOT_A_DIR:/tmp/file\n").unwrap_err();
+        assert_eq!(e_not_dir.code, ErrorCode::BadRequest);
+        assert!(e_not_dir
+            .message
+            .contains("working directory path is not a directory on ssh-mk: /tmp/file"));
+
+        let e_mkdir =
+            parse_spawn_preflight_output(&hid, "ERR:MKDIR_FAIL:/root/nope\n").unwrap_err();
+        assert_eq!(e_mkdir.code, ErrorCode::BadRequest);
+        assert!(e_mkdir
+            .message
+            .contains("failed to create working directory on ssh-mk: /root/nope"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

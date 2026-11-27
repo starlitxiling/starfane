@@ -50,6 +50,7 @@ import {
   onLeaveSession,
   pvKeyOf,
   pvModeOf,
+  resolvedTheme,
   rootSessions,
 } from './js/store.js';
 import { renderTop } from './js/topbar.js';
@@ -105,7 +106,7 @@ function computeTopSig(alerts) {
     0,
   );
   const upMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
-  return `${getLang()}|${UI.view}|${cs}|${S.conn}|${S.version}|${S.lastSeq}|${upMin}|${liveSessions}|${alerts}|${activePipes}|${pendingVerdicts}|${notifyTopSig()}`;
+  return `${getLang()}|${resolvedTheme()}|${UI.themePref}|${UI.view}|${cs}|${S.conn}|${S.version}|${S.lastSeq}|${upMin}|${liveSessions}|${alerts}|${activePipes}|${pendingVerdicts}|${notifyTopSig()}`;
 }
 
 function renderView() {

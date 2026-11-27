@@ -864,9 +864,47 @@ impl Default for LocalNodeConfig {
     fn default() -> Self {
         Self {
             id: starfane_proto::LOCAL_HOST_ID.to_string(),
-            display_name: "Local".to_string(),
+            display_name: String::new(),
         }
     }
+}
+
+/// Detect the human-readable computer name for this host (cached for process lifetime),
+/// avoiding master-slave labels like `"Local"` / `"localhost"`.
+pub fn detect_local_host_display_name() -> String {
+    static DETECTED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DETECTED
+        .get_or_init(|| {
+            let normalize = |raw: &str| -> Option<String> {
+                let first = raw.trim().lines().next().unwrap_or("").trim();
+                let stripped = first.strip_suffix(".local").unwrap_or(first).trim();
+                let short = stripped.split('.').next().unwrap_or("").trim();
+                if short.is_empty()
+                    || short.eq_ignore_ascii_case("localhost")
+                    || short.eq_ignore_ascii_case("local")
+                {
+                    None
+                } else {
+                    Some(short.to_string())
+                }
+            };
+            if let Ok(out) = std::process::Command::new("hostname").arg("-s").output() {
+                if out.status.success() {
+                    if let Some(name) = normalize(&String::from_utf8_lossy(&out.stdout)) {
+                        return name;
+                    }
+                }
+            }
+            for key in ["HOSTNAME", "COMPUTERNAME"] {
+                if let Ok(val) = std::env::var(key) {
+                    if let Some(name) = normalize(&val) {
+                        return name;
+                    }
+                }
+            }
+            "this-host".to_string()
+        })
+        .clone()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2018,5 +2056,14 @@ connect_timeout_secs = 0
         )
         .unwrap();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn detect_local_host_display_name_is_non_empty_and_peer_friendly() {
+        let detected = detect_local_host_display_name();
+        assert!(!detected.trim().is_empty());
+        assert!(!detected.eq_ignore_ascii_case("local"));
+        assert!(!detected.eq_ignore_ascii_case("localhost"));
+        assert_eq!(LocalNodeConfig::default().display_name, "");
     }
 }
