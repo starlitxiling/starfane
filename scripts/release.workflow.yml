@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0; defaults to git ref name)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    fail-fast: false
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin starfane
+
+      - name: Package archive and checksum
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          STAGE="starfane-${TAG}-${TARGET}"
+          ARCHIVE="${STAGE}.tar.gz"
+          mkdir -p "${STAGE}" dist
+          cp "target/${TARGET}/release/starfane" "${STAGE}/starfane"
+          chmod +x "${STAGE}/starfane"
+          cp README.md LICENSE "${STAGE}/"
+          tar -C . -czf "dist/${ARCHIVE}" "${STAGE}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          else
+            (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          fi
+          ls -lh dist/
+          cat "dist/${ARCHIVE}.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: starfane-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS.txt and verify archives
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            test -s "dist/starfane-${TAG}-${target}.tar.gz"
+            test -s "dist/starfane-${TAG}-${target}.tar.gz.sha256"
+          done
+          LC_ALL=C sort -k2 dist/*.tar.gz.sha256 > dist/SHA256SUMS.txt
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          cat <<'EOF' | sed "s/__TAG__/${TAG}/g" > release_notes.md
+          # starfane __TAG__
+
+          Lightweight, single-binary Rust control plane and embedded Web console for coordinating **Claude Code**, **Codex CLI**, **Antigravity (`agy`)**, and optional shell panes across `tmux`, `zellij` (0.44+), and federated remote hosts.
+
+          ## Highlights
+          - **Zero Headless, BYO `tmux` & `zellij` (0.44+)**: Keeps long-lived interactive `claude`, `codex`, `agy`, and optional shell panes running in your terminal multiplexer via unified `TerminalMux`, attaching unobtrusively with official hooks and stdio MCP (`starfane emit` sub-10ms hot path + spool fallback).
+          - **Embedded Web Console (No Node.js Runtime Needed)**: Cursor-paginated full transcript history, 50,000+ line scrollback capture, Prompt TOC, image paste dispatch, Nerd Font / PUA glyph-safe rendering, bilingual UI (`--lang zh|en`), and resizable sidebar.
+          - **Per-Turn TTFT & Accurate TPS Telemetry (100% Native)**: Records every turn's Time-to-First-Token (TTFT) and generation throughput directly from native Claude/Codex/AGY transcripts and local protobuf metadata—zero external database dependency.
+          - **Multi-Host Federation (`[[nodes]]`)**: Mix zero-install SSH ControlMaster hosts and federated Peer `starfaned` nodes in one host-grouped sidebar with health monitoring and failover.
+          - **Opt-In Notifications & Evidence Gate**: Pluggable `feishu`, `telegram`, `discord`, `slack`, `wecom`, `qq`, `webhook`, and `macos` adapters with Split Ownership, plus Feature Pipeline & Two-Speed Debug playbooks.
+          - **100% Local-First & Zero Telemetry**: Zero analytics SDKs, zero update phone-homes, strict CSP.
+
+          ## Install
+
+          ### Homebrew (macOS & Linux)
+          ```bash
+          brew install starlitxiling/tap/starfane
+          ```
+
+          ### Prebuilt Binary
+          Download the archive for your platform below, verify checksums against `SHA256SUMS.txt`, and place `starfane` on your `PATH`:
+          ```bash
+          tar -xzf starfane-__TAG__-<target>.tar.gz
+          mkdir -p ~/.local/bin
+          install -m 755 starfane-__TAG__-<target>/starfane ~/.local/bin/starfane
+          ```
+
+          **Documentation**: [English README](https://github.com/starlitxiling/starfane/blob/__TAG__/README.md) · [简体中文文档](https://github.com/starlitxiling/starfane/blob/__TAG__/README.zh-CN.md)
+          EOF
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/*.tar.gz dist/SHA256SUMS.txt --repo "${GITHUB_REPOSITORY}" --clobber
+            gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --title "starfane ${TAG}" --notes-file release_notes.md
+          else
+            gh release create "${TAG}" dist/*.tar.gz dist/SHA256SUMS.txt \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "starfane ${TAG}" \
+              --notes-file release_notes.md
+          fi

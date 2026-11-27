@@ -49,6 +49,7 @@ import {
   loadPreview,
   loadSessionOutput,
   loadTmuxSessions,
+  pauseHostRetryApi,
   probeHostApi,
   refreshReview,
   renameHostApi,
@@ -420,7 +421,8 @@ function drawerSession(s) {
   const hStatus = hRec?.status || 'online';
   const hKind = hRec?.kind || (remote ? 'ssh' : 'local');
   const hUnhealthy = remote && (hStatus === 'degraded' || hStatus === 'offline');
-  const retryCd = hUnhealthy ? formatRetryCountdown(hRec?.next_retry_ms) : '';
+  const retryPaused = Boolean(hRec?.retry_paused);
+  const retryCd = hUnhealthy && !retryPaused ? formatRetryCountdown(hRec?.next_retry_ms) : '';
   const closable = canCloseSessionWindow(s);
   const isSplit = closable && siblingSplitPanesOf(s).length > 0;
   return h('div', { class: 'stack' },
@@ -439,19 +441,30 @@ function drawerSession(s) {
       }) : null,
       h('label', { class: 'row muted', style: 'cursor:pointer;font-size:12.5px;margin-left:auto' },
         h('input', { type: 'checkbox', checked: UI.autoRefreshPreview, onchange: (e) => { UI.autoRefreshPreview = e.target.checked; APP.rerender(); } }), L('自动刷新', 'Auto-refresh'))),
-    hUnhealthy ? h('div', { class: `callout ${hStatus === 'offline' ? 'err' : 'warn'} drawer-host-banner` },
+    hUnhealthy ? h('div', { class: `callout ${retryPaused ? '' : hStatus === 'offline' ? 'err' : 'warn'} drawer-host-banner` },
       h('div', { class: 'stack-xs grow', style: 'min-width:0' },
         h('div', { class: 'row', style: 'gap:6px' },
           span(`tag ${hStatus === 'offline' ? 'soft-red' : 'soft-amber'}`, hostStatusLabel(hStatus)),
           h('strong', { style: 'font-size:12.5px' }, hostDisplayName(hid, s)),
-          retryCd ? span('muted tabular', retryCd) : null),
+          retryPaused
+            ? span('muted', L('已停止重试', 'Auto-retry paused'))
+            : (retryCd ? span('muted tabular', retryCd) : null)),
         hRec?.error ? h('span', { style: 'font-size:12px;word-break:break-word' }, hRec.error) : null),
-      btn(L('重连', 'Retry'), {
-        cls: 'sm',
-        busyKey: `probe-host:${hid}`,
-        title: L(`立即重新探测主机 ${hostDisplayName(hid, s)}`, `Probe and reconnect host ${hostDisplayName(hid, s)} now`),
-        onclick: () => probeHostApi(hid),
-      })) : null,
+      h('div', { class: 'row', style: 'gap:6px;flex-shrink:0' },
+        !retryPaused ? btn(L('停止重试', 'Stop retry'), {
+          cls: 'sm ghost',
+          busyKey: `pause-host:${hid}`,
+          title: L(`停止自动重试主机 ${hostDisplayName(hid, s)}`, `Pause automatic retries for host ${hostDisplayName(hid, s)}`),
+          onclick: () => pauseHostRetryApi(hid),
+        }) : null,
+        btn(L('重连', 'Retry'), {
+          cls: 'sm',
+          busyKey: `probe-host:${hid}`,
+          title: retryPaused
+            ? L(`恢复并重新连接主机 ${hostDisplayName(hid, s)}`, `Resume and reconnect host ${hostDisplayName(hid, s)}`)
+            : L(`立即重新探测主机 ${hostDisplayName(hid, s)}`, `Probe and reconnect host ${hostDisplayName(hid, s)} now`),
+          onclick: () => probeHostApi(hid),
+        }))) : null,
     drawerMetricsCard(s.metrics),
     kvGrid([
       [L('所属主机', 'Host'), h('span', { class: 'row', style: 'gap:6px' },

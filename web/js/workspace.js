@@ -54,6 +54,7 @@ import {
   loadTranscript,
   prefetchSessionOutput,
   probeHostApi,
+  pauseHostRetryApi,
   qs,
   sessionNeedsLiveTail,
   syncStateSilent,
@@ -2712,11 +2713,12 @@ export function patchWorkspace(W) {
   for (let hi = 0; hi < visibleHostBlocks.length; hi++) {
     const hb = visibleHostBlocks[hi];
     const hRec = S.hosts.get(hb.id);
-    const retryCd = hb.id !== 'local' && (hRec?.status === 'degraded' || hRec?.status === 'offline')
+    const retryPaused = Boolean(hRec?.retry_paused);
+    const retryCd = hb.id !== 'local' && !retryPaused && (hRec?.status === 'degraded' || hRec?.status === 'offline')
       ? formatRetryCountdown(hRec?.next_retry_ms)
       : '';
     const hostCollapsed = !q && UI.collapsedHosts.has(hb.id);
-    sideSigParts.push(`H:${hb.id}:${hostCollapsed ? 1 : 0}:${hRec?.display_name || ''}:${hRec?.status || ''}:${hRec?.rtt_ms ?? ''}:${hRec?.sync_ms ?? ''}:${retryCd}:${UI.busy.has(`probe-host:${hb.id}`) ? 1 : 0}:${hRec?.error || ''}:${hb.total}`);
+    sideSigParts.push(`H:${hb.id}:${hostCollapsed ? 1 : 0}:${hRec?.display_name || ''}:${hRec?.status || ''}:${hRec?.rtt_ms ?? ''}:${hRec?.sync_ms ?? ''}:${retryPaused ? 1 : 0}:${retryCd}:${UI.busy.has(`probe-host:${hb.id}`) ? 1 : 0}:${UI.busy.has(`pause-host:${hb.id}`) ? 1 : 0}:${hRec?.error || ''}:${hb.total}`);
     for (const [g, list] of hb.groups.entries()) {
       const cKey = hb.id === 'local' ? g : `${hb.id}:${g}`;
       const isCollapsed = !q && UI.collapsedGroups.has(cKey);
@@ -2800,20 +2802,32 @@ export function patchWorkspace(W) {
               onclick: () => APP.openRenameHostModal(hb.id),
             }, '✎'),
             span('tag tabular', hb.total)));
-        const retryCd = isRemote && (hStatus === 'degraded' || hStatus === 'offline')
+        const retryPaused = Boolean(hRec?.retry_paused);
+        const retryCd = isRemote && !retryPaused && (hStatus === 'degraded' || hStatus === 'offline')
           ? formatRetryCountdown(hRec?.next_retry_ms)
           : '';
         const hostStatusBanner = isRemote && (hStatus === 'degraded' || hStatus === 'offline')
-          ? h('div', { class: `ws-host-banner is-${hStatus}` },
+          ? h('div', { class: `ws-host-banner is-${hStatus}${retryPaused ? ' is-paused' : ''}` },
             h('div', { class: 'ws-host-banner-top' },
               span(`tag ${hStatus === 'offline' ? 'soft-red' : 'soft-amber'}`, hostStatusLabel(hStatus)),
-              retryCd ? span('ws-host-retry-cd tabular', retryCd) : null,
-              btn(L('重连', 'Retry'), {
-                cls: 'xs ws-host-probe-btn',
-                busyKey: `probe-host:${hb.id}`,
-                title: L(`立即重新探测主机 ${hName}`, `Probe and reconnect host ${hName} now`),
-                onclick: () => probeHostApi(hb.id),
-              })),
+              retryPaused
+                ? span('ws-host-retry-cd ws-host-paused-txt', L('已停止重试', 'Auto-retry paused'))
+                : (retryCd ? span('ws-host-retry-cd tabular', retryCd) : null),
+              h('div', { class: 'ws-host-banner-acts' },
+                !retryPaused ? btn(L('停止重试', 'Stop retry'), {
+                  cls: 'xs ghost ws-host-pause-btn',
+                  busyKey: `pause-host:${hb.id}`,
+                  title: L(`停止自动重试主机 ${hName}`, `Pause automatic retries for host ${hName}`),
+                  onclick: () => pauseHostRetryApi(hb.id),
+                }) : null,
+                btn(L('重连', 'Retry'), {
+                  cls: 'xs ws-host-probe-btn',
+                  busyKey: `probe-host:${hb.id}`,
+                  title: retryPaused
+                    ? L(`恢复并重新连接主机 ${hName}`, `Resume and reconnect host ${hName}`)
+                    : L(`立即重新探测主机 ${hName}`, `Probe and reconnect host ${hName} now`),
+                  onclick: () => probeHostApi(hb.id),
+                }))),
             hRec?.error ? h('div', { class: 'ws-host-err', title: hRec.error }, hRec.error) : null)
           : null;
 

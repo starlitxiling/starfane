@@ -1,9 +1,15 @@
 [package]
 name = "starfane-evidence"
+description = "Deterministic G1/G2/G3 verification evidence gate for starfane workflows"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 starfane-proto.workspace = true

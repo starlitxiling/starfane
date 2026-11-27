@@ -129,7 +129,7 @@ export function sessionsDiffSig(map) {
 
 function hostsDiffSig(list) {
   return (list || [])
-    .map((h) => `${h.id}|${h.display_name}|${h.status}|${h.session_count || 0}|${h.rtt_ms ?? ''}|${h.sync_ms ?? ''}|${h.next_retry_ms ?? ''}|${h.error || ''}`)
+    .map((h) => `${h.id}|${h.display_name}|${h.status}|${h.session_count || 0}|${h.rtt_ms ?? ''}|${h.sync_ms ?? ''}|${h.next_retry_ms ?? ''}|${h.retry_paused ? 1 : 0}|${h.error || ''}`)
     .sort()
     .join('\n');
 }
@@ -162,7 +162,7 @@ export async function syncStateSilent({ refreshActive = false } = {}) {
     const nextSessions = new Map();
     for (const s of st.sessions || []) {
       if (!s || !s.session_id) continue;
-      if (s.state === 'ended' && !UI.showEnded) continue;
+      if (s.state === 'ended' && (s.discovered_only || !UI.showEnded)) continue;
       nextSessions.set(s.session_id, s);
     }
     for (const [id, old] of S.sessions.entries()) {
@@ -199,16 +199,6 @@ export async function syncStateSilent({ refreshActive = false } = {}) {
       if (Array.isArray(st.hosts)) upsertHosts(st.hosts);
       pickDefaultSession();
       APP.schedulePassive();
-      const subQs = UI.showEnded ? { subagents: 1, ended: 1 } : { subagents: 1 };
-      if (UI.showEnded || [...nextSessions.values()].some((s) => (s.subagent_count || 0) > 0)) {
-        api('GET', `/api/sessions${qs(subQs)}`)
-          .then((list) => {
-            const before = sessionsDiffSig(S.sessions);
-            (list || []).forEach(upsertSession);
-            if (sessionsDiffSig(S.sessions) !== before) APP.schedulePassive();
-          })
-          .catch(() => {});
-      }
     }
     const nextCur = currentSession();
     if (
@@ -265,14 +255,6 @@ export async function loadAll() {
     if (!Array.isArray(st.notifiers) && !Array.isArray(st.details)) {
       loadNotifiers({ silent: true });
     }
-    const subQs = UI.showEnded ? { subagents: 1, ended: 1 } : { subagents: 1 };
-    api('GET', `/api/sessions${qs(subQs)}`)
-      .then((list) => {
-        (list || []).forEach(upsertSession);
-        pickDefaultSession();
-        APP.schedule();
-      })
-      .catch((e) => console.warn('sessions?subagents=1 failed', e));
   } catch (e) {
     S.loadError = errText(e);
   }
@@ -886,6 +868,7 @@ export async function probeHostApi(hostId) {
         rtt_ms: nextRtt,
         sync_ms: nextSync,
         next_retry_ms: nextStatus === 'online' ? null : (r?.next_retry_ms ?? prev.next_retry_ms),
+        retry_paused: Boolean(r?.retry_paused),
         error: nextStatus === 'online' ? null : (r?.error ?? prev.error),
       });
     }
@@ -910,6 +893,37 @@ export async function probeHostApi(hostId) {
       toast(L('当前控制台处于只读模式，无法触发主机重连', 'Console is read-only — cannot trigger host reconnect'), 'warn');
     } else {
       toast(L(`主机重连失败：${errText(e)}`, `Host reconnect failed: ${errText(e)}`), 'err');
+    }
+    return undefined;
+  } finally {
+    UI.busy.delete(busyKey);
+    APP.schedule();
+  }
+}
+
+export async function pauseHostRetryApi(hostId) {
+  const hid = String(hostId || '').trim();
+  if (!hid || hid === 'local') return undefined;
+  const busyKey = `pause-host:${hid}`;
+  if (UI.busy.has(busyKey)) return undefined;
+  UI.busy.add(busyKey);
+  APP.schedule();
+  try {
+    const rec = await api('POST', `/api/hosts/${enc(hid)}/pause`, {});
+    const prev = S.hosts.get(hid);
+    if (rec?.id) {
+      S.hosts.set(hid, rec);
+    } else if (prev) {
+      S.hosts.set(hid, { ...prev, retry_paused: true, next_retry_ms: null });
+    }
+    const hName = hostDisplayName(hid);
+    toast(L(`已停止主机 ${hName} 自动重试`, `Stopped auto-retry for host ${hName}`), 'ok');
+    return rec;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 403) {
+      toast(L('当前控制台处于只读模式，无法停止主机重试', 'Console is read-only — cannot pause host retries'), 'warn');
+    } else {
+      toast(L(`停止重试失败：${errText(e)}`, `Failed to pause retries: ${errText(e)}`), 'err');
     }
     return undefined;
   } finally {
@@ -1603,8 +1617,8 @@ export function pollActivePreview() {
   const now = Date.now();
   const sseLive = S.conn === 'live';
   const isBusy = ['working', 'starting', 'needs_permission', 'needs_input', 'error'].includes(s.state)
-    || (hid === 'local' && Boolean(s.discovered_only))
-    || (isReadingView && sessionNeedsLiveTail(s, tr));
+    || (!sseLive && hid === 'local' && Boolean(s.discovered_only))
+    || (!sseLive && isReadingView && sessionNeedsLiveTail(s, tr));
   const isRecentlySettled = (now - (sessionStateChangedAt.get(s.session_id) || 0)) < RECENTLY_SETTLED_MS;
   const hasTranscript = isReadingView && tr?.state === 'ok' && tr?.source === 'transcript';
   const lastActivity = Math.max(

@@ -47,6 +47,8 @@ pub struct HostRecord {
     pub sync_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_retry_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry_paused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -328,21 +330,25 @@ mod tests {
         assert_eq!(legacy.rtt_ms, None);
         assert_eq!(legacy.sync_ms, None);
         assert_eq!(legacy.next_retry_ms, None);
+        assert!(!legacy.retry_paused);
         let ser_legacy = serde_json::to_value(&legacy).unwrap();
         assert!(ser_legacy.get("rtt_ms").is_none());
         assert!(ser_legacy.get("sync_ms").is_none());
         assert!(ser_legacy.get("next_retry_ms").is_none());
+        assert!(ser_legacy.get("retry_paused").is_none());
 
         let with_net = HostRecord {
             rtt_ms: Some(142),
             sync_ms: Some(48),
             next_retry_ms: Some(1_700_000_015_000),
+            retry_paused: true,
             ..legacy
         };
         let ser = serde_json::to_value(&with_net).unwrap();
         assert_eq!(ser["rtt_ms"], 142);
         assert_eq!(ser["sync_ms"], 48);
         assert_eq!(ser["next_retry_ms"], 1_700_000_015_000u64);
+        assert_eq!(ser["retry_paused"], true);
         let back: HostRecord = serde_json::from_value(ser).unwrap();
         assert_eq!(back, with_net);
     }

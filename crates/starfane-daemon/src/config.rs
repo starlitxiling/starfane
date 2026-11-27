@@ -1608,9 +1608,19 @@ claude_args = ["--dangerously-skip-permissions"]
                 .join("\n")
         }
 
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        if !(repo_root.join("Cargo.toml").exists()
+            && repo_root.join("crates/starfane-daemon/Cargo.toml").exists())
+        {
+            return;
+        }
+        let readme_en =
+            std::fs::read_to_string(repo_root.join("README.md")).expect("read README.md");
+        let readme_zh = std::fs::read_to_string(repo_root.join("README.zh-CN.md"))
+            .expect("read README.zh-CN.md");
         for (name, md) in [
-            ("README.md", include_str!("../../../README.md")),
-            ("README.zh-CN.md", include_str!("../../../README.zh-CN.md")),
+            ("README.md", readme_en.as_str()),
+            ("README.zh-CN.md", readme_zh.as_str()),
         ] {
             let active = extract_first_toml_block(md);
             let cfg_active: StarfaneConfig =

@@ -17,16 +17,21 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
+repository = "https://github.com/starlitxiling/starfane"
+documentation = "https://github.com/starlitxiling/starfane#readme"
+authors = ["starlitxiling"]
+keywords = ["ai-agents", "claude-code", "codex", "tmux", "zellij"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 # Internal workspace crates
-starfane-proto = { path = "crates/starfane-proto" }
-starfane-emit = { path = "crates/starfane-emit" }
-starfane-adapters = { path = "crates/starfane-adapters" }
-starfane-tmux = { path = "crates/starfane-tmux" }
-starfane-evidence = { path = "crates/starfane-evidence" }
-starfane-binding = { path = "crates/starfane-binding" }
-starfane-daemon = { path = "crates/starfane-daemon" }
+starfane-proto = { version = "0.1.0", path = "crates/starfane-proto" }
+starfane-emit = { version = "0.1.0", path = "crates/starfane-emit" }
+starfane-adapters = { version = "0.1.0", path = "crates/starfane-adapters" }
+starfane-tmux = { version = "0.1.0", path = "crates/starfane-tmux" }
+starfane-evidence = { version = "0.1.0", path = "crates/starfane-evidence" }
+starfane-binding = { version = "0.1.0", path = "crates/starfane-binding" }
+starfane-daemon = { version = "0.1.0", path = "crates/starfane-daemon" }
 
 # Minimal external dependencies (default-features = false everywhere)
 serde = { version = "1", default-features = false, features = ["std", "derive"] }

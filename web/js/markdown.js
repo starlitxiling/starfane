@@ -8,11 +8,41 @@ export function isSafeUrl(url) {
   return /^(https?:\/\/|file:\/\/)/i.test(u);
 }
 
-const INLINE_RE_SRC = '`([^`\\n]+)`|\\[((?:[^\\]\\n`]|`[^`\\n]+`)+)\\]\\(([^)\\s]+)\\)|\\*\\*((?:[^*\\n`]|\\*(?!\\*)|`[^`\\n]+`)+?)\\*\\*|__([^_\\n`]+?)__|~~((?:[^~\\n`]|~(?!~)|`[^`\\n]+`)+?)~~|\\*((?:[^*\\n`]|`[^`\\n]+`)+?)\\*';
-const INLINE_RE_POOL = Array.from({ length: 5 }, () => new RegExp(INLINE_RE_SRC, 'g'));
-const INLINE_HINT_RE = /[`*_[~]/;
+function splitBareUrlTrailing(raw) {
+  let url = String(raw || '');
+  let trailing = '';
+  while (url.length) {
+    const ch = url[url.length - 1];
+    if (ch === '.' || ch === ',' || ch === ';' || ch === ':' || ch === '!' || ch === '?' || ch === '\'' || ch === '"') {
+      trailing = ch + trailing;
+      url = url.slice(0, -1);
+      continue;
+    }
+    if (ch === ')' || ch === ']' || ch === '}') {
+      const openCh = ch === ')' ? '(' : ch === ']' ? '[' : '{';
+      let opens = 0;
+      let closes = 0;
+      for (let k = 0; k < url.length; k++) {
+        if (url[k] === openCh) opens++;
+        else if (url[k] === ch) closes++;
+      }
+      if (closes > opens) {
+        trailing = ch + trailing;
+        url = url.slice(0, -1);
+        continue;
+      }
+    }
+    break;
+  }
+  return [url, trailing];
+}
 
-export function renderInlineMd(text, depth = 0) {
+const INLINE_RE_SRC = '`([^`\\n]+)`|\\[((?:[^\\]\\n`]|`[^`\\n]+`)+)\\]\\(([^)\\s]+)\\)|\\*\\*((?:[^*\\n`]|\\*(?!\\*)|`[^`\\n]+`)+?)\\*\\*|__([^_\\n`]+?)__|~~((?:[^~\\n`]|~(?!~)|`[^`\\n]+`)+?)~~|\\*((?:[^*\\n`]|`[^`\\n]+`)+?)\\*|<((?:https?:\\/\\/)[^\\s<>]+)>|\\b(https?:\\/\\/[^\\s<>\'"`\\u3000-\\u303F\\uFF01-\\uFF0F\\uFF1A-\\uFF20\\uFF3B-\\uFF40\\uFF5B-\\uFF65]+)|(<[bB][rR]\\s*\\/?>)|<(b|strong|i|em|u|s|del|code|sub|sup)>((?:(?!<\\/\\11>)[^\\n])+?)<\\/\\11>';
+const INLINE_RE_POOL = Array.from({ length: 5 }, () => new RegExp(INLINE_RE_SRC, 'g'));
+const INLINE_HINT_RE = /[`*_[~<]|https?:\/\//;
+const INLINE_HTML_TAG_MAP = { b: 'strong', strong: 'strong', i: 'em', em: 'em', u: 'u', s: 'del', del: 'del', sub: 'sub', sup: 'sup' };
+
+export function renderInlineMd(text, depth = 0, inLink = false) {
   const out = [];
   const s = String(text || '');
   if (!s || depth > 4 || !INLINE_HINT_RE.test(s)) return s ? [s] : out;
@@ -25,19 +55,37 @@ export function renderInlineMd(text, depth = 0) {
     if (m[1] !== undefined) {
       out.push(h('code', { class: 'md-inline-code' }, m[1]));
     } else if (m[2] !== undefined) {
-      const inner = renderInlineMd(m[2], depth + 1);
-      if (isSafeUrl(m[3])) {
+      const inner = renderInlineMd(m[2], depth + 1, true);
+      if (!inLink && isSafeUrl(m[3])) {
         const isHttp = /^https?:\/\//i.test(m[3]);
-        out.push(h('a', { href: m[3], ...(isHttp ? { target: '_blank', rel: 'noopener noreferrer' } : {}) }, inner));
+        out.push(h('a', { href: m[3], ...(isHttp ? { target: '_blank', rel: 'noopener noreferrer', class: 'md-link' } : {}) }, inner));
       } else {
         out.push(...inner);
       }
     } else if (m[4] !== undefined || m[5] !== undefined) {
-      out.push(h('strong', null, renderInlineMd(m[4] ?? m[5], depth + 1)));
+      out.push(h('strong', null, renderInlineMd(m[4] ?? m[5], depth + 1, inLink)));
     } else if (m[6] !== undefined) {
-      out.push(h('del', null, renderInlineMd(m[6], depth + 1)));
+      out.push(h('del', null, renderInlineMd(m[6], depth + 1, inLink)));
     } else if (m[7] !== undefined) {
-      out.push(h('em', null, renderInlineMd(m[7], depth + 1)));
+      out.push(h('em', null, renderInlineMd(m[7], depth + 1, inLink)));
+    } else if (m[8] !== undefined || m[9] !== undefined) {
+      const raw = m[8] ?? m[9];
+      const [cleanUrl, trailing] = m[9] !== undefined ? splitBareUrlTrailing(raw) : [raw, ''];
+      if (!inLink && isSafeUrl(cleanUrl) && /^https?:\/\/[^\s/?#]+/i.test(cleanUrl)) {
+        out.push(h('a', { href: cleanUrl, target: '_blank', rel: 'noopener noreferrer', class: 'md-link' }, cleanUrl));
+        if (trailing) out.push(trailing);
+      } else {
+        out.push(m[0]);
+      }
+    } else if (m[10] !== undefined) {
+      out.push(h('br'));
+    } else if (m[11] !== undefined) {
+      if (m[11] === 'code') {
+        out.push(h('code', { class: 'md-inline-code' }, m[12]));
+      } else {
+        const tag = INLINE_HTML_TAG_MAP[m[11]] || m[11];
+        out.push(h(tag, null, renderInlineMd(m[12], depth + 1, inLink)));
+      }
     }
     last = re.lastIndex;
   }
@@ -125,7 +173,7 @@ export function renderMarkdown(src) {
       i++;
       continue;
     }
-    if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)) {
+    if (/^\s*(?:---+|\*\*\*+|___+|<hr\s*\/?>)\s*$/i.test(line)) {
       flushPara();
       root.appendChild(h('hr', { class: 'md-hr' }));
       i++;

@@ -1,9 +1,15 @@
 [package]
 name = "starfane-tmux"
+description = "Unified tmux and Zellij terminal multiplexer driver and input gate for starfane"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 starfane-proto.workspace = true

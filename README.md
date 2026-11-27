@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/starlitxiling/starfane/releases"><img src="https://img.shields.io/github/v/release/starlitxiling/starfane?logo=github&label=release" alt="GitHub Release" /></a>
   <img src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust" alt="Rust 1.82+" />
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="Platform macOS | Linux" />
@@ -96,7 +97,25 @@ Please set up and start starfane (https://github.com/starlitxiling/starfane) on 
 - One or more interactive coding CLIs installed and authenticated: [`claude`](https://docs.anthropic.com/en/docs/claude-code), [`codex`](https://developers.openai.com/codex/cli), or `agy`
 - *(Optional)* `lark-cli` if you enable two-way Feishu notifications & quote-reply commands
 
-#### 1. Build & Install
+#### 1. Install
+
+**Homebrew (macOS & Linux)** *(recommended)*:
+
+```bash
+brew install starlitxiling/tap/starfane
+```
+
+**Prebuilt Binaries (GitHub Releases)**:
+
+Download `starfane-<tag>-<target>.tar.gz` from [GitHub Releases](https://github.com/starlitxiling/starfane/releases/latest) (macOS ARM64/Intel & Linux x86_64/ARM64):
+
+```bash
+tar -xzf starfane-*.tar.gz
+mkdir -p ~/.local/bin
+install -m 755 starfane-*/starfane ~/.local/bin/starfane
+```
+
+**Build from Source (Rust `1.82+`)**:
 
 ```bash
 git clone https://github.com/starlitxiling/starfane.git

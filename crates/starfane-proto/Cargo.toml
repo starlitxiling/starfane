@@ -1,9 +1,15 @@
 [package]
 name = "starfane-proto"
+description = "Protocol types, event schema, and state models for the starfane coding-agent control plane"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde.workspace = true

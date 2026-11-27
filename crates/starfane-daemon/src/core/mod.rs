@@ -282,6 +282,7 @@ impl Core {
                 rtt_ms: None,
                 sync_ms: None,
                 next_retry_ms: None,
+                retry_paused: false,
             },
         );
         for (hid, provider) in &remote_nodes {
@@ -304,6 +305,7 @@ impl Core {
                     rtt_ms: None,
                     sync_ms: None,
                     next_retry_ms: None,
+                    retry_paused: false,
                 },
             );
         }
@@ -941,6 +943,7 @@ impl Core {
                     rtt_ms: None,
                     sync_ms: None,
                     next_retry_ms: None,
+                    retry_paused: false,
                 });
             }
         }
@@ -1015,6 +1018,7 @@ impl Core {
                     rtt_ms: None,
                     sync_ms: None,
                     next_retry_ms: None,
+                    retry_paused: false,
                 });
             rec.session_count = count;
             (rec, updated_sessions)
@@ -1049,18 +1053,44 @@ impl Core {
     }
 
     async fn run_remote_host_supervisor(self, host_id: HostId, wake: Arc<Notify>) {
-        // Initial full sync so sessions & host status appear immediately on startup.
-        self.sync_remote_host(&host_id).await;
-
-        let (push_tx, mut push_rx) = mpsc::unbounded_channel::<HostPushSignal>();
-        let mut watcher_handle = self
+        // Initial full sync unless auto-retry is already paused.
+        if !self
             .inner
             .remote_nodes
             .get(&host_id)
-            .and_then(|p| p.spawn_push_watcher(push_tx.clone()));
-        let has_push_watcher = watcher_handle.is_some();
+            .is_some_and(|p| p.is_retry_paused())
+        {
+            self.sync_remote_host(&host_id).await;
+        }
+
+        let (push_tx, mut push_rx) = mpsc::unbounded_channel::<HostPushSignal>();
+        let mut watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
+            let paused = self
+                .inner
+                .remote_nodes
+                .get(&host_id)
+                .is_some_and(|p| p.is_retry_paused());
+            if paused {
+                if let Some(h) = watcher_handle.take() {
+                    h.abort();
+                }
+                while push_rx.try_recv().is_ok() {}
+                tokio::select! {
+                    _ = self.inner.shutdown.notified() => return,
+                    _ = wake.notified() => continue,
+                }
+            }
+            if watcher_handle.is_none() {
+                watcher_handle = self
+                    .inner
+                    .remote_nodes
+                    .get(&host_id)
+                    .and_then(|p| p.spawn_push_watcher(push_tx.clone()));
+            }
+            let has_push_watcher = watcher_handle.is_some();
+
             let sleep_dur = self.compute_remote_host_sleep_with_push(&host_id, has_push_watcher);
             let sleep_fut = tokio::time::sleep(sleep_dur);
             tokio::pin!(sleep_fut);
@@ -1074,11 +1104,27 @@ impl Core {
                         return;
                     }
                     Some(sig) = push_rx.recv() => {
+                        if self
+                            .inner
+                            .remote_nodes
+                            .get(&host_id)
+                            .is_some_and(|p| p.is_retry_paused())
+                        {
+                            break;
+                        }
                         if self.handle_remote_push_signal(&host_id, sig, &mut push_rx, &push_tx).await {
                             break;
                         }
                     }
                     _ = wake.notified() => {
+                        if self
+                            .inner
+                            .remote_nodes
+                            .get(&host_id)
+                            .is_some_and(|p| p.is_retry_paused())
+                        {
+                            break;
+                        }
                         let should_sync_now = {
                             let now = id::now_ms();
                             let recently_synced = lock(&self.inner.state)
@@ -1100,6 +1146,14 @@ impl Core {
                         }
                     }
                     _ = &mut sleep_fut => {
+                        if self
+                            .inner
+                            .remote_nodes
+                            .get(&host_id)
+                            .is_some_and(|p| p.is_retry_paused())
+                        {
+                            break;
+                        }
                         self.sync_remote_host(&host_id).await;
                         break;
                     }
@@ -1277,6 +1331,9 @@ impl Core {
         let Some(provider) = self.inner.remote_nodes.get(host_id).cloned() else {
             return;
         };
+        if provider.is_retry_paused() {
+            return;
+        }
         let (display, claimed) = {
             let st = lock(&self.inner.state);
             let display = st
@@ -1420,6 +1477,7 @@ impl Core {
                         host.status = HostStatus::Online;
                         host.error = None;
                         host.next_retry_ms = None;
+                        host.retry_paused = false;
                         host.last_seen_ms = Some(now_ms);
                         host.session_count = count;
                         if let Some(rtt) = provider_opt.and_then(|p| p.rtt_ms()) {
@@ -1433,7 +1491,8 @@ impl Core {
                             || prev.session_count != host.session_count
                             || prev.rtt_ms != host.rtt_ms
                             || prev.sync_ms != host.sync_ms
-                            || prev.next_retry_ms != host.next_retry_ms;
+                            || prev.next_retry_ms != host.next_retry_ms
+                            || prev.retry_paused != host.retry_paused;
                         diff.then(|| host.clone())
                     } else {
                         None
@@ -1711,6 +1770,7 @@ impl Core {
                     .sync_ms()
                     .or_else(|| prev_host.and_then(|p| p.sync_ms));
             }
+            snap.host.retry_paused = provider.is_retry_paused();
             let host_diff = force_publish_host
                 || prev_host.is_none_or(|p| {
                     p.status != snap.host.status
@@ -1721,6 +1781,7 @@ impl Core {
                         || p.rtt_ms != snap.host.rtt_ms
                         || p.sync_ms != snap.host.sync_ms
                         || p.next_retry_ms != snap.host.next_retry_ms
+                        || p.retry_paused != snap.host.retry_paused
                 });
             updated_host = host_diff.then(|| snap.host.clone());
             st.hosts.insert(hid.clone(), snap.host);
@@ -1779,6 +1840,7 @@ impl Core {
             cb_status
         };
         let next_retry_ms = provider.next_retry_ms();
+        let retry_paused = provider.is_retry_paused();
         let rtt_ms = provider.rtt_ms();
         let sync_ms = provider.sync_ms();
         let kind = provider.kind();
@@ -1808,6 +1870,7 @@ impl Core {
                 rtt_ms: rtt_ms.or_else(|| prev.as_ref().and_then(|p| p.rtt_ms)),
                 sync_ms: sync_ms.or_else(|| prev.as_ref().and_then(|p| p.sync_ms)),
                 next_retry_ms,
+                retry_paused,
             };
             let diff = force_publish_host
                 || prev.as_ref().is_none_or(|p| {
@@ -1817,6 +1880,7 @@ impl Core {
                         || p.rtt_ms != degraded.rtt_ms
                         || p.sync_ms != degraded.sync_ms
                         || p.next_retry_ms != degraded.next_retry_ms
+                        || p.retry_paused != degraded.retry_paused
                         || p.display_name != degraded.display_name
                 });
             st.hosts.insert(hid.clone(), degraded.clone());
@@ -1866,6 +1930,74 @@ impl Core {
             wake.notify_one();
         }
         Ok(outcome)
+    }
+
+    /// Pause automatic background reconnect retries for a remote host (`POST /api/hosts/{id}/pause`).
+    pub async fn pause_host_retry(&self, host_id: &str) -> Result<HostRecord, ApiError> {
+        let trimmed = host_id.trim();
+        if trimmed.is_empty() || trimmed == LOCAL_HOST_ID {
+            return Err(ApiError::not_found(format!(
+                "unknown remote host {trimmed:?}"
+            )));
+        }
+        let hid = HostId::new(trimmed);
+        let provider = self
+            .inner
+            .remote_nodes
+            .get(&hid)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found(format!("unknown remote host {trimmed}")))?;
+
+        provider.set_retry_paused(true);
+
+        let rec = {
+            let mut st = lock(&self.inner.state);
+            let display = st
+                .host_display_names
+                .get(&hid)
+                .cloned()
+                .unwrap_or_else(|| provider.default_display_name().to_string());
+            let count = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    !s.is_subagent
+                        && s.state != SessionState::Ended
+                        && s.effective_host_id() == hid.as_str()
+                })
+                .count();
+            let prev = st.hosts.get(&hid).cloned();
+            let cb_status = provider.circuit_status();
+            let status =
+                prev.as_ref()
+                    .map(|p| p.status)
+                    .unwrap_or(if cb_status == HostStatus::Online {
+                        HostStatus::Offline
+                    } else {
+                        cb_status
+                    });
+            let rec = HostRecord {
+                id: hid.clone(),
+                display_name: display,
+                kind: provider.kind(),
+                status,
+                active_endpoint: prev.as_ref().and_then(|p| p.active_endpoint.clone()),
+                last_seen_ms: prev.as_ref().and_then(|p| p.last_seen_ms),
+                error: prev.and_then(|p| p.error),
+                session_count: count,
+                rtt_ms: provider.rtt_ms(),
+                sync_ms: provider.sync_ms(),
+                next_retry_ms: None,
+                retry_paused: true,
+            };
+            st.hosts.insert(hid.clone(), rec.clone());
+            rec
+        };
+        self.publish_host(rec.clone());
+        if let Some(wake) = self.inner.remote_wake.get(&hid) {
+            wake.notify_one();
+        }
+        Ok(rec)
     }
 
     /// Best-effort non-blocking upload pre-staging onto a configured remote host.
@@ -2890,6 +3022,7 @@ mod push_tests {
                         rtt_ms: Some(11),
                         sync_ms: Some(42 + n as u64),
                         next_retry_ms: None,
+                        retry_paused: false,
                     },
                     sessions: vec![
                         self.mk_session("tmux-%1", "%1", SessionState::Idle),
@@ -2923,6 +3056,7 @@ mod push_tests {
                         rtt_ms: Some(10),
                         sync_ms: Some(18),
                         next_retry_ms: None,
+                        retry_paused: false,
                     },
                     sessions: vec![self.mk_session("tmux-%1", "%1", SessionState::Working)],
                     events: Vec::new(),
@@ -3056,6 +3190,7 @@ mod push_tests {
                 rtt_ms: None,
                 sync_ms: None,
                 next_retry_ms: None,
+                retry_paused: false,
             },
         );
         let (events, _) = broadcast::channel(EVENT_CHANNEL);
@@ -3363,6 +3498,7 @@ mod push_tests {
                             rtt_ms: Some(5),
                             sync_ms: Some(5),
                             next_retry_ms: None,
+                            retry_paused: false,
                         },
                         sessions: vec![self.mk_session("tmux-%1", "%1", SessionState::Working)],
                         events: Vec::new(),
@@ -3410,6 +3546,7 @@ mod push_tests {
                             rtt_ms: Some(5),
                             sync_ms: Some(5),
                             next_retry_ms: None,
+                            retry_paused: false,
                         },
                         sessions: vec![self.mk_session("tmux-%1", "%1", st)],
                         events: Vec::new(),
@@ -3598,6 +3735,337 @@ mod push_tests {
         // Wait 1.1s to verify the follow-up does NOT re-trigger/loop!
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(provider.dirty_syncs.lock().unwrap().len(), 2);
+
+        core.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), sup).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn pause_host_retry_parks_supervisor_and_probe_resumes() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct PausableMockProvider {
+            host_id: HostId,
+            paused: AtomicBool,
+            healthy: AtomicBool,
+            sync_calls: AtomicUsize,
+            watcher_spawns: AtomicUsize,
+            last_error: Mutex<Option<String>>,
+            failures: AtomicUsize,
+            next_retry: Mutex<Option<u64>>,
+        }
+
+        impl NodeProvider for PausableMockProvider {
+            fn host_id(&self) -> &HostId {
+                &self.host_id
+            }
+            fn kind(&self) -> HostKind {
+                HostKind::Ssh
+            }
+            fn default_display_name(&self) -> &str {
+                "Pause Test Host"
+            }
+            fn notify_ownership(&self) -> crate::config::NotifyOwnership {
+                crate::config::NotifyOwnership::Hub
+            }
+            fn sync_with_claimed<'a>(
+                &'a self,
+                display_name: &'a str,
+                _claimed: &'a HashSet<String>,
+            ) -> BoxFuture<'a, Result<NodeSnapshot, String>> {
+                self.sync_calls.fetch_add(1, Ordering::SeqCst);
+                let disp = display_name.to_string();
+                Box::pin(async move {
+                    if self.healthy.load(Ordering::Acquire) {
+                        self.failures.store(0, Ordering::SeqCst);
+                        *self.next_retry.lock().unwrap() = None;
+                        *self.last_error.lock().unwrap() = None;
+                        Ok(NodeSnapshot {
+                            host: HostRecord {
+                                id: self.host_id.clone(),
+                                display_name: disp,
+                                kind: HostKind::Ssh,
+                                status: HostStatus::Online,
+                                active_endpoint: Some("ssh://mock".into()),
+                                last_seen_ms: Some(id::now_ms()),
+                                error: None,
+                                session_count: 0,
+                                rtt_ms: Some(12),
+                                sync_ms: Some(15),
+                                next_retry_ms: None,
+                                retry_paused: self.is_retry_paused(),
+                            },
+                            sessions: Vec::new(),
+                            events: Vec::new(),
+                            output_deltas: Vec::new(),
+                        })
+                    } else {
+                        self.failures.fetch_add(1, Ordering::SeqCst);
+                        let err = "ssh: connect timed out".to_string();
+                        *self.last_error.lock().unwrap() = Some(err.clone());
+                        if !self.is_retry_paused() {
+                            *self.next_retry.lock().unwrap() = Some(id::now_ms() + 15_000);
+                        }
+                        Err(err)
+                    }
+                })
+            }
+            fn spawn_push_watcher(
+                &self,
+                _tx: mpsc::UnboundedSender<HostPushSignal>,
+            ) -> Option<tokio::task::JoinHandle<()>> {
+                self.watcher_spawns.fetch_add(1, Ordering::SeqCst);
+                Some(tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }))
+            }
+            fn list_tmux_sessions(&self) -> BoxFuture<'_, Result<Vec<String>, ApiError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn spawn_session<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a RemoteSpawnReq,
+            ) -> BoxFuture<'a, Result<RemoteSpawnOutcome, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn stage_input_files<'a>(
+                &'a self,
+                _: &'a [(String, PathBuf)],
+            ) -> BoxFuture<'a, Result<HashMap<PathBuf, String>, ApiError>> {
+                Box::pin(async { Ok(HashMap::new()) })
+            }
+            fn probe_now(&self) -> BoxFuture<'_, Result<HostProbeOutcome, ApiError>> {
+                self.set_retry_paused(false);
+                Box::pin(async move {
+                    let empty = HashSet::new();
+                    match self
+                        .sync_with_claimed(self.default_display_name(), &empty)
+                        .await
+                    {
+                        Ok(snap) => Ok(HostProbeOutcome {
+                            host_id: self.host_id.clone(),
+                            status: snap.host.status,
+                            rtt_ms: snap.host.rtt_ms,
+                            next_retry_ms: snap.host.next_retry_ms,
+                            retry_paused: self.is_retry_paused(),
+                            error: None,
+                            snapshot: Some(snap),
+                        }),
+                        Err(err) => Ok(HostProbeOutcome {
+                            host_id: self.host_id.clone(),
+                            status: self.circuit_status(),
+                            rtt_ms: None,
+                            next_retry_ms: self.next_retry_ms(),
+                            retry_paused: self.is_retry_paused(),
+                            error: Some(err),
+                            snapshot: None,
+                        }),
+                    }
+                })
+            }
+            fn rtt_ms(&self) -> Option<u64> {
+                None
+            }
+            fn next_retry_ms(&self) -> Option<u64> {
+                *self.next_retry.lock().unwrap()
+            }
+            fn circuit_status(&self) -> HostStatus {
+                match self.failures.load(Ordering::Acquire) {
+                    0 => HostStatus::Online,
+                    1..=2 => HostStatus::Degraded,
+                    _ => HostStatus::Offline,
+                }
+            }
+            fn is_retry_paused(&self) -> bool {
+                self.paused.load(Ordering::Acquire)
+            }
+            fn set_retry_paused(&self, paused: bool) {
+                self.paused.store(paused, Ordering::Release);
+                if paused {
+                    *self.next_retry.lock().unwrap() = None;
+                }
+            }
+            fn capture_pane<'a>(
+                &'a self,
+                _: &'a PaneId,
+                _: &'a CaptureRequest,
+            ) -> BoxFuture<'a, Result<PanePreview, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn fetch_transcript<'a>(
+                &'a self,
+                _: &'a SessionId,
+                _: &'a TranscriptQuery,
+            ) -> BoxFuture<'a, Result<TranscriptResponse, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn dispatch_interactive<'a>(
+                &'a self,
+                _: Option<&'a SessionId>,
+                _: &'a PaneId,
+                _: &'a str,
+                _: u64,
+            ) -> BoxFuture<'a, Result<DeliveryReport, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn focus_pane<'a>(
+                &'a self,
+                _: &'a SessionId,
+                _: &'a PaneId,
+            ) -> BoxFuture<'a, Result<serde_json::Value, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn close_pane<'a>(
+                &'a self,
+                _: &'a SessionId,
+                _: &'a PaneId,
+            ) -> BoxFuture<'a, Result<serde_json::Value, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("starfane-pause-retry-{}", id::new_id("T")));
+        let provider = Arc::new(PausableMockProvider {
+            host_id: HostId::new("ssh-pause"),
+            paused: AtomicBool::new(false),
+            healthy: AtomicBool::new(false),
+            sync_calls: AtomicUsize::new(0),
+            watcher_spawns: AtomicUsize::new(0),
+            last_error: Mutex::new(None),
+            failures: AtomicUsize::new(0),
+            next_retry: Mutex::new(None),
+        });
+        let mut cfg = StarfaneConfig::default();
+        cfg.paths.tmux = "/usr/bin/false".into();
+        cfg.zellij.enabled = false;
+        let base = Core::new(&DaemonConfig {
+            state_dir: root.join("state"),
+            socket: root.join("state/starfaned.sock"),
+            config: cfg.clone(),
+            web_dir: None,
+            foreground: true,
+        })
+        .unwrap();
+        let hid = provider.host_id().clone();
+        let wake = Arc::new(Notify::new());
+        let mut remote_nodes: HashMap<HostId, Arc<dyn NodeProvider>> = HashMap::new();
+        remote_nodes.insert(hid.clone(), provider.clone());
+        let mut remote_wake = HashMap::new();
+        remote_wake.insert(hid.clone(), wake.clone());
+        let mut state = State::default();
+        state.hosts.insert(
+            hid.clone(),
+            HostRecord {
+                id: hid.clone(),
+                display_name: "Pause Test Host".into(),
+                kind: HostKind::Ssh,
+                status: HostStatus::Offline,
+                active_endpoint: None,
+                last_seen_ms: None,
+                error: None,
+                session_count: 0,
+                rtt_ms: None,
+                sync_ms: None,
+                next_retry_ms: None,
+                retry_paused: false,
+            },
+        );
+        let (events, _) = broadcast::channel(EVENT_CHANNEL);
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let core = Core {
+            inner: Arc::new(Inner {
+                cfg: base.inner.cfg.clone(),
+                state_dir: base.inner.state_dir.clone(),
+                web_dir: None,
+                started_ms: base.inner.started_ms,
+                web_token: base.inner.web_token.clone(),
+                state: Mutex::new(state),
+                events,
+                replay: Mutex::new(VecDeque::with_capacity(SSE_REPLAY_CAPACITY)),
+                seq: AtomicU64::new(0),
+                notice_tx,
+                notice_rx: Mutex::new(Some(notice_rx)),
+                feishu: RwLock::new(None),
+                tmux: base.inner.tmux.clone(),
+                mux: base.inner.mux.clone(),
+                access_gate: base.inner.access_gate.clone(),
+                notify_router: NotifyRouter::from_config(&cfg),
+                remote_nodes,
+                remote_wake,
+                store: Store::new(root.join("state")),
+                acks: Mutex::new(HashMap::new()),
+                dirty: AtomicBool::new(false),
+                snapshot_in_flight: AtomicBool::new(false),
+                shutdown: Notify::new(),
+                last_attention: Mutex::new(Vec::new()),
+                model_catalog: Mutex::new(None),
+                slash_cache: Mutex::new(slash::SlashCache::default()),
+                telemetry: Mutex::new(TelemetryCaches::default()),
+                transcript_index: Arc::new(Mutex::new(transcript::TranscriptIndexCache::default())),
+                discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
+            }),
+        };
+
+        let mut sse = core.subscribe();
+        let sup_core = core.clone();
+        let sup_hid = hid.clone();
+        let sup = tokio::spawn(async move {
+            sup_core.run_remote_host_supervisor(sup_hid, wake).await;
+        });
+
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        loop {
+            if provider.sync_calls.load(Ordering::Acquire) >= 1
+                && provider.watcher_spawns.load(Ordering::Acquire) >= 1
+            {
+                break;
+            }
+            tokio::select! {
+                _ = &mut deadline => panic!("timed out waiting for initial supervisor sync"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+
+        let paused_rec = core.pause_host_retry(hid.as_str()).await.unwrap();
+        assert!(paused_rec.retry_paused);
+        assert_eq!(paused_rec.next_retry_ms, None);
+
+        let mut saw_paused_sse = false;
+        let sse_deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(sse_deadline);
+        while !saw_paused_sse {
+            tokio::select! {
+                _ = &mut sse_deadline => panic!("timed out waiting for paused SSE host event"),
+                Ok(ev) = sse.recv() => {
+                    if let DaemonEvent::Host { host, .. } = ev {
+                        if host.id == hid && host.retry_paused && host.next_retry_ms.is_none() {
+                            saw_paused_sse = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_paused_sse);
+
+        let calls_after_pause = provider.sync_calls.load(Ordering::Acquire);
+        core.sync_remote_host(&hid).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            provider.sync_calls.load(Ordering::Acquire),
+            calls_after_pause
+        );
+
+        provider.healthy.store(true, Ordering::Release);
+        let outcome = core.probe_host(hid.as_str()).await.unwrap();
+        assert!(!outcome.retry_paused);
+        assert_eq!(outcome.status, HostStatus::Online);
+        let hosts = core.hosts();
+        let h = hosts.iter().find(|h| h.id == hid).unwrap();
+        assert!(!h.retry_paused);
+        assert_eq!(h.status, HostStatus::Online);
 
         core.request_shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(1), sup).await;

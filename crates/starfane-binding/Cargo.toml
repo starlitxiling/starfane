@@ -1,9 +1,15 @@
 [package]
 name = "starfane-binding"
+description = "Natural-language playbook and stage model binding parser for starfane"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 starfane-proto.workspace = true

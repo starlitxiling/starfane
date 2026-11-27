@@ -27,10 +27,10 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::{broadcast, mpsc};
 
-const INDEX_HTML: &[u8] = include_bytes!("../../../web/index.html");
-const APP_JS: &[u8] = include_bytes!("../../../web/app.js");
-const APP_CSS: &[u8] = include_bytes!("../../../web/app.css");
-const LOGO_SVG: &[u8] = include_bytes!("../../../assets/logo.svg");
+const INDEX_HTML: &[u8] = include_bytes!("../embedded/web/index.html");
+const APP_JS: &[u8] = include_bytes!("../embedded/web/app.js");
+const APP_CSS: &[u8] = include_bytes!("../embedded/web/app.css");
+const LOGO_SVG: &[u8] = include_bytes!("../embedded/logo.svg");
 
 const EMBEDDED_ASSETS: &[(&str, &[u8], &str)] = &[
     ("index.html", INDEX_HTML, "text/html; charset=utf-8"),
@@ -39,67 +39,67 @@ const EMBEDDED_ASSETS: &[(&str, &[u8], &str)] = &[
     ("logo.svg", LOGO_SVG, "image/svg+xml"),
     (
         "manifest.webmanifest",
-        include_bytes!("../../../web/manifest.webmanifest"),
+        include_bytes!("../embedded/web/manifest.webmanifest"),
         "application/manifest+json",
     ),
     (
         "js/constants.js",
-        include_bytes!("../../../web/js/constants.js"),
+        include_bytes!("../embedded/web/js/constants.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/i18n.js",
-        include_bytes!("../../../web/js/i18n.js"),
+        include_bytes!("../embedded/web/js/i18n.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/store.js",
-        include_bytes!("../../../web/js/store.js"),
+        include_bytes!("../embedded/web/js/store.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/dom.js",
-        include_bytes!("../../../web/js/dom.js"),
+        include_bytes!("../embedded/web/js/dom.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/markdown.js",
-        include_bytes!("../../../web/js/markdown.js"),
+        include_bytes!("../embedded/web/js/markdown.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/terminal.js",
-        include_bytes!("../../../web/js/terminal.js"),
+        include_bytes!("../embedded/web/js/terminal.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/api.js",
-        include_bytes!("../../../web/js/api.js"),
+        include_bytes!("../embedded/web/js/api.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/topbar.js",
-        include_bytes!("../../../web/js/topbar.js"),
+        include_bytes!("../embedded/web/js/topbar.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/composer.js",
-        include_bytes!("../../../web/js/composer.js"),
+        include_bytes!("../embedded/web/js/composer.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/workspace.js",
-        include_bytes!("../../../web/js/workspace.js"),
+        include_bytes!("../embedded/web/js/workspace.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/views.js",
-        include_bytes!("../../../web/js/views.js"),
+        include_bytes!("../embedded/web/js/views.js"),
         "text/javascript; charset=utf-8",
     ),
     (
         "js/overlays.js",
-        include_bytes!("../../../web/js/overlays.js"),
+        include_bytes!("../embedded/web/js/overlays.js"),
         "text/javascript; charset=utf-8",
     ),
 ];
@@ -179,6 +179,7 @@ pub fn router(core: Core) -> Router {
         .route("/api/hosts", get(list_hosts))
         .route("/api/hosts/{id}/rename", post(rename_host))
         .route("/api/hosts/{id}/probe", post(probe_host))
+        .route("/api/hosts/{id}/pause", post(pause_host_retry))
         .route("/api/notifiers", get(list_notifiers))
         .route("/api/notifiers/mute", post(notifiers_mute))
         .route("/api/notifiers/{id}/test", post(test_notifier))
@@ -1444,6 +1445,14 @@ async fn probe_host(State(core): State<Core>, Path(id): Path<String>) -> Respons
     let r = async {
         let outcome = core.probe_host(&id).await?;
         serde_json::to_value(outcome).map_err(|e| ApiError::internal(e.to_string()))
+    };
+    respond(r.await)
+}
+
+async fn pause_host_retry(State(core): State<Core>, Path(id): Path<String>) -> Response {
+    let r = async {
+        let rec = core.pause_host_retry(&id).await?;
+        serde_json::to_value(rec).map_err(|e| ApiError::internal(e.to_string()))
     };
     respond(r.await)
 }

@@ -1,9 +1,15 @@
 [package]
 name = "starfane-daemon"
+description = "Core daemon, multi-host SSH/Peer federation, and embedded Web console for starfane"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 axum.workspace = true

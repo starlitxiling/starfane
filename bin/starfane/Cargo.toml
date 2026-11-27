@@ -1,9 +1,16 @@
 [package]
 name = "starfane"
+description = "Lightweight single-binary Rust control plane and Web console for Claude Code, Codex CLI, and Antigravity across tmux, Zellij, and remote hosts"
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "starfane"

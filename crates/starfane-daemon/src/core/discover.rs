@@ -3,8 +3,8 @@
 
 use super::metrics::{
     agy_step_timings_to_metrics, canonical_external_session_id, extract_agy_effort_from_model,
-    extract_codex_status_title, extract_session_id_from_transcript_path, infer_session_effort,
-    is_post_birth_timestamp, merge_metrics, metrics_meaningfully_equal,
+    extract_codex_status_title, extract_session_id_from_transcript_path, file_identity,
+    infer_session_effort, is_post_birth_timestamp, merge_metrics, metrics_meaningfully_equal,
     parse_codex_status_line_model_effort, parse_status_line_metrics, query_lsof_agy_presence_all,
     query_pids_birth_ms, resolve_agy_transcript_by_id_opt_home,
     resolve_claude_transcript_by_pids_in, resolve_codex_transcript_by_id_opt_home,
@@ -74,8 +74,17 @@ pub(crate) struct DiscoveryScanCache {
     last_output_watermarks: HashMap<SessionId, TranscriptWatermark>,
     /// Last broadcast live-tail hash per local session (for `DaemonEvent::Output` live tail pushes).
     last_output_tail_hash: HashMap<SessionId, u64>,
+    /// Cached Codex `resume <uuid>` -> rollout JSONL path lookups to avoid nested `read_dir` walks.
+    codex_resume_paths: HashMap<(PathBuf, String), PathBuf>,
+    /// Cached transcript birth timestamps keyed by `(path, dev, ino)` so steady-state ticks never
+    /// re-open and JSON-parse transcript headers.
+    transcript_births: HashMap<(PathBuf, u64, u64), Option<u64>>,
     pub(crate) home_override: Option<PathBuf>,
 }
+
+const MAX_CODEX_RESUME_PATH_CACHE: usize = 512;
+const MAX_TRANSCRIPT_BIRTH_CACHE: usize = 1024;
+const MIN_FINAL_EMPTY_BIRTH_FILE_LEN: u64 = 4096;
 
 impl DiscoveryScanCache {
     pub(crate) fn evict_pane(&mut self, pane: &PaneId) {
@@ -91,6 +100,22 @@ impl DiscoveryScanCache {
         let leg = legacy_session_id(pane);
         self.last_output_watermarks.remove(&leg);
         self.last_output_tail_hash.remove(&leg);
+    }
+
+    fn cached_codex_resume_path(&mut self, home: Option<&Path>, uuid: &str) -> Option<PathBuf> {
+        let home = home?;
+        let key = (home.to_path_buf(), uuid.trim().to_string());
+        if let Some(existing) = self.codex_resume_paths.get(&key) {
+            if existing.is_file() {
+                return Some(existing.clone());
+            }
+        }
+        let resolved = resolve_codex_transcript_by_id_opt_home(Some(home), uuid)?;
+        if self.codex_resume_paths.len() >= MAX_CODEX_RESUME_PATH_CACHE {
+            self.codex_resume_paths.clear();
+        }
+        self.codex_resume_paths.insert(key, resolved.clone());
+        Some(resolved)
     }
 }
 
@@ -1216,7 +1241,32 @@ impl Core {
         let Some(birth_ms) = min_birth_ms else {
             return false;
         };
-        transcript_birth_ms(path).is_some_and(|tb| !is_post_birth_timestamp(tb, birth_ms))
+        self.cached_transcript_birth_ms(path)
+            .is_some_and(|tb| !is_post_birth_timestamp(tb, birth_ms))
+    }
+
+    fn cached_transcript_birth_ms(&self, path: &Path) -> Option<u64> {
+        let (dev, ino, _mtime_ns, file_len) = file_identity(path)?;
+        let cache_key = (path.to_path_buf(), dev, ino);
+        if dev != 0 || ino != 0 {
+            if let Some(&cached) = lock(&self.inner.discovery_cache)
+                .transcript_births
+                .get(&cache_key)
+            {
+                return cached;
+            }
+        }
+        let computed = transcript_birth_ms(path);
+        if (dev != 0 || ino != 0)
+            && (computed.is_some() || file_len >= MIN_FINAL_EMPTY_BIRTH_FILE_LEN)
+        {
+            let mut dc = lock(&self.inner.discovery_cache);
+            if dc.transcript_births.len() >= MAX_TRANSCRIPT_BIRTH_CACHE {
+                dc.transcript_births.clear();
+            }
+            dc.transcript_births.insert(cache_key, computed);
+        }
+        computed
     }
 
     /// Scan tmux for existing agent panes, sync into `State`, and run heuristic completion checks.
@@ -1557,7 +1607,7 @@ impl Core {
                         }
                     } else if t.agent == AgentKind::Codex {
                         if let Some(p) = t.resume_id.as_deref().and_then(|uid| {
-                            resolve_codex_transcript_by_id_opt_home(home_for_scan.as_deref(), uid)
+                            dc.cached_codex_resume_path(home_for_scan.as_deref(), uid)
                         }) {
                             exact_paths.insert(t.pane.clone(), p);
                             authoritative_panes.insert(t.pane.clone());
@@ -1983,8 +2033,10 @@ impl Core {
                     let p = Path::new(tp);
                     let missing = !p.is_file();
                     let pre_birth = !is_auth
+                        && !missing
                         && min_birth.is_some_and(|b| {
-                            transcript_birth_ms(p).is_none_or(|tb| !is_post_birth_timestamp(tb, b))
+                            self.cached_transcript_birth_ms(p)
+                                .is_none_or(|tb| !is_post_birth_timestamp(tb, b))
                         });
                     claimed_elsewhere || missing || pre_birth
                 });
@@ -2185,6 +2237,14 @@ impl Core {
                         })
                         .collect()
                 };
+
+                let agy_kid_count: usize = agy_batches.iter().map(|b| b.kids.len()).sum();
+                let working_set = live_roots
+                    .len()
+                    .saturating_add(live_subagents.len())
+                    .saturating_add(agy_kid_count)
+                    .saturating_add(64);
+                lock(&core_tel.inner.transcript_index).ensure_min_capacity(working_set);
 
                 let mut computed = Vec::with_capacity(live_roots.len());
                 for item in live_roots {
@@ -4556,5 +4616,39 @@ mod tests {
         );
         assert!(output_pushes[0].appended_messages.is_empty());
         assert!(output_pushes[0].dirty);
+    }
+
+    #[test]
+    fn codex_resume_path_cache_and_transcript_birth_cache_preserve_freshness() {
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-disc-cache-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        let rollout_dir = dir.join(".codex/sessions/2026/11/27");
+        std::fs::create_dir_all(&rollout_dir).unwrap();
+        let uuid = "019a0000-1111-2222-3333-444455556666";
+        let rollout = rollout_dir.join(format!("rollout-2026-11-27T12-00-00-{uuid}.jsonl"));
+        std::fs::write(
+            &rollout,
+            r#"{"type":"session_meta","timestamp":"2026-11-27T12:00:00Z","payload":{"id":"s1"}}
+"#,
+        )
+        .unwrap();
+
+        let mut dc = DiscoveryScanCache::default();
+        let p1 = dc.cached_codex_resume_path(Some(&dir), uuid);
+        assert_eq!(p1.as_deref(), Some(rollout.as_path()));
+        let p2 = dc.cached_codex_resume_path(Some(&dir), uuid);
+        assert_eq!(p2.as_deref(), Some(rollout.as_path()));
+
+        // Relocating the rollout file invalidates the stale cached path and resolves the new day dir.
+        let rollout_dir2 = dir.join(".codex/sessions/2026/11/28");
+        std::fs::create_dir_all(&rollout_dir2).unwrap();
+        let rollout2 = rollout_dir2.join(format!("rollout-2026-11-28T00-00-00-{uuid}.jsonl"));
+        std::fs::rename(&rollout, &rollout2).unwrap();
+        let p3 = dc.cached_codex_resume_path(Some(&dir), uuid);
+        assert_eq!(p3.as_deref(), Some(rollout2.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

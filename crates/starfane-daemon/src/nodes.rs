@@ -424,6 +424,8 @@ pub struct HostProbeOutcome {
     pub rtt_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_retry_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry_paused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing)]
@@ -441,6 +443,7 @@ pub struct HostCircuitBreaker {
     consecutive_failures: u32,
     next_retry_ms: Option<u64>,
     last_error: Option<String>,
+    retry_paused: bool,
 }
 
 impl HostCircuitBreaker {
@@ -452,6 +455,7 @@ impl HostCircuitBreaker {
             consecutive_failures: 0,
             next_retry_ms: None,
             last_error: None,
+            retry_paused: false,
         }
     }
 
@@ -475,15 +479,29 @@ impl HostCircuitBreaker {
         self.last_error.as_deref()
     }
 
+    pub fn is_retry_paused(&self) -> bool {
+        self.retry_paused
+    }
+
+    pub fn pause_retry(&mut self) {
+        self.retry_paused = true;
+        self.next_retry_ms = None;
+    }
+
     pub fn record_success(&mut self) {
         self.consecutive_failures = 0;
         self.next_retry_ms = None;
         self.last_error = None;
+        self.retry_paused = false;
     }
 
     pub fn record_failure(&mut self, now_ms: u64, err: impl Into<String>) -> (HostStatus, u64) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_error = Some(err.into());
+        if self.retry_paused {
+            self.next_retry_ms = None;
+            return (self.status(), now_ms);
+        }
         let delay_ms = self.compute_backoff_ms(now_ms, self.consecutive_failures);
         let retry_at = now_ms.saturating_add(delay_ms);
         self.next_retry_ms = Some(retry_at);
@@ -514,6 +532,7 @@ impl HostCircuitBreaker {
 
     /// Clear the retry gate so an explicit user `probe_now` executes immediately.
     pub fn reset_for_probe(&mut self) {
+        self.retry_paused = false;
         self.next_retry_ms = None;
     }
 
@@ -523,8 +542,14 @@ impl HostCircuitBreaker {
     }
 
     /// Fast-fail silent background reads (`capture_pane`, `fetch_transcript`, `list_tmux_sessions`)
-    /// in 0ms when the host circuit is `Offline` and still inside its cooldown window.
+    /// in 0ms when the host circuit is paused or `Offline` inside its cooldown window.
     pub fn fast_fail_if_offline(&self, host_id: &HostId, now_ms: u64) -> Result<(), ApiError> {
+        if self.retry_paused {
+            return Err(ApiError::new(
+                ErrorCode::Unavailable,
+                format!("host {host_id} auto-retry is paused — click Reconnect to resume"),
+            ));
+        }
         if self.status() == HostStatus::Offline {
             if let Some(until) = self.active_backoff_until(now_ms) {
                 let rem_secs = until.saturating_sub(now_ms).div_ceil(1_000);
@@ -581,6 +606,12 @@ pub trait NodeProvider: Send + Sync {
     fn next_retry_ms(&self) -> Option<u64>;
 
     fn circuit_status(&self) -> HostStatus;
+
+    fn is_retry_paused(&self) -> bool {
+        false
+    }
+
+    fn set_retry_paused(&self, _paused: bool) {}
 
     fn sync_dirty_panes<'a>(
         &'a self,
@@ -4656,6 +4687,7 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                 rtt_ms: self.transport.rtt_ms(),
                 sync_ms: Some(elapsed_sync_ms),
                 next_retry_ms: None,
+                retry_paused: false,
             },
             sessions,
             events,
@@ -4983,6 +5015,7 @@ fi
                     rtt_ms: self.transport.rtt_ms(),
                     sync_ms: self.sync_ms(),
                     next_retry_ms: None,
+                    retry_paused: false,
                 },
                 sessions,
                 events: Vec::new(),
@@ -5408,6 +5441,7 @@ fi
                 rtt_ms: self.transport.rtt_ms(),
                 sync_ms: Some(elapsed_ms),
                 next_retry_ms: None,
+                retry_paused: false,
             },
             sessions,
             events,
@@ -5768,18 +5802,23 @@ impl SshTmuxControlWatcher {
         let mut ever_connected = false;
 
         while !tx.is_closed() {
-            // Respect open offline circuit breaker instead of hammering unreachable hosts.
-            let wait_offline = {
+            // Respect paused or open offline circuit breaker instead of hammering unreachable hosts.
+            let (paused, wait_offline) = {
                 let cb = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
-                if cb.status() == HostStatus::Offline {
+                let paused = cb.is_retry_paused();
+                let wait = if !paused && cb.status() == HostStatus::Offline {
                     let now = id::now_ms();
                     cb.active_backoff_until(now).map(|until| {
                         Duration::from_millis(until.saturating_sub(now).clamp(500, 15_000))
                     })
                 } else {
                     None
-                }
+                };
+                (paused, wait)
             };
+            if paused {
+                return;
+            }
             if let Some(dur) = wait_offline {
                 tokio::select! {
                     _ = tokio::time::sleep(dur) => continue,
@@ -7229,6 +7268,7 @@ printf 'STAGED:%s\n' "$DST"
                     status: snap.host.status,
                     rtt_ms: snap.host.rtt_ms,
                     next_retry_ms: snap.host.next_retry_ms,
+                    retry_paused: snap.host.retry_paused,
                     error: None,
                     snapshot: Some(snap),
                 }),
@@ -7239,6 +7279,7 @@ printf 'STAGED:%s\n' "$DST"
                         status: cb.status(),
                         rtt_ms: self.transport.rtt_ms(),
                         next_retry_ms: cb.next_retry_ms(),
+                        retry_paused: cb.is_retry_paused(),
                         error: Some(err),
                         snapshot: None,
                     })
@@ -7268,6 +7309,22 @@ printf 'STAGED:%s\n' "$DST"
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .status()
+    }
+
+    fn is_retry_paused(&self) -> bool {
+        self.circuit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_retry_paused()
+    }
+
+    fn set_retry_paused(&self, paused: bool) {
+        let mut cb = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+        if paused {
+            cb.pause_retry();
+        } else {
+            cb.reset_for_probe();
+        }
     }
 
     fn capture_pane<'a>(
@@ -8442,6 +8499,7 @@ impl PeerDaemonNodeProvider {
                 rtt_ms: self.pool.rtt_ms(),
                 sync_ms: Some(elapsed_sync_ms),
                 next_retry_ms: None,
+                retry_paused: false,
             },
             sessions: qualified,
             events: Vec::new(),
@@ -8713,6 +8771,7 @@ impl NodeProvider for PeerDaemonNodeProvider {
                     status: snap.host.status,
                     rtt_ms: snap.host.rtt_ms,
                     next_retry_ms: snap.host.next_retry_ms,
+                    retry_paused: snap.host.retry_paused,
                     error: None,
                     snapshot: Some(snap),
                 }),
@@ -8723,6 +8782,7 @@ impl NodeProvider for PeerDaemonNodeProvider {
                         status: cb.status(),
                         rtt_ms: self.rtt_ms(),
                         next_retry_ms: cb.next_retry_ms(),
+                        retry_paused: cb.is_retry_paused(),
                         error: Some(err),
                         snapshot: None,
                     })
@@ -8754,6 +8814,22 @@ impl NodeProvider for PeerDaemonNodeProvider {
             .status()
     }
 
+    fn is_retry_paused(&self) -> bool {
+        self.circuit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_retry_paused()
+    }
+
+    fn set_retry_paused(&self, paused: bool) {
+        let mut cb = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+        if paused {
+            cb.pause_retry();
+        } else {
+            cb.reset_for_probe();
+        }
+    }
+
     fn spawn_push_watcher(
         &self,
         tx: tokio::sync::mpsc::UnboundedSender<HostPushSignal>,
@@ -8774,6 +8850,13 @@ impl NodeProvider for PeerDaemonNodeProvider {
             let mut last_event_id: Option<String> = None;
 
             while !tx.is_closed() {
+                if circuit
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_retry_paused()
+                {
+                    return;
+                }
                 let mut sse_endpoints: Vec<PeerSseEndpoint> = Vec::new();
                 let mut using_tunnel = false;
                 if let Some(ref tun) = tunnel {
@@ -9270,6 +9353,39 @@ mod tests {
         assert_eq!(cb.status(), HostStatus::Online);
         assert_eq!(cb.consecutive_failures(), 0);
         assert_eq!(cb.next_retry_ms(), None);
+        assert!(!cb.is_retry_paused());
+    }
+
+    #[test]
+    fn circuit_breaker_pause_retry_stops_backoff_and_resume_unpauses() {
+        let host = HostId::new("gpu-paused");
+        let mut cb = HostCircuitBreaker::new(host.as_str());
+        for _ in 0..3 {
+            cb.record_failure(200_000, "timeout");
+        }
+        assert_eq!(cb.status(), HostStatus::Offline);
+        assert!(cb.next_retry_ms().is_some());
+        assert!(!cb.is_retry_paused());
+
+        // Pausing clears scheduled next_retry_ms and fast-fails with a paused message.
+        cb.pause_retry();
+        assert!(cb.is_retry_paused());
+        assert_eq!(cb.next_retry_ms(), None);
+        let err = cb.fast_fail_if_offline(&host, 201_000).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Unavailable);
+        assert!(err.message.contains("paused"));
+
+        // Further failures recorded while paused must NOT re-schedule a countdown.
+        let (st, _) = cb.record_failure(202_000, "still unreachable");
+        assert_eq!(st, HostStatus::Offline);
+        assert!(cb.is_retry_paused());
+        assert_eq!(cb.next_retry_ms(), None);
+
+        // User-triggered reconnect unpauses cleanly.
+        cb.reset_for_probe();
+        assert!(!cb.is_retry_paused());
+        assert_eq!(cb.next_retry_ms(), None);
+        assert!(cb.fast_fail_if_offline(&host, 203_000).is_ok());
     }
 
     #[test]

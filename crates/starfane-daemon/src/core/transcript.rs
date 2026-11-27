@@ -38,10 +38,15 @@ pub const MAX_TRANSCRIPT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Lines exceeding 1 MiB matching `GENERIC`/`compacted` (or >4 MiB any line) are skipped in O(1) RAM.
 const STREAM_SKIP_GIANT_THRESHOLD: usize = 1024 * 1024;
 const STREAM_HARD_LINE_LIMIT: usize = 4 * 1024 * 1024;
-/// Maximum in-memory indexed transcript files (LRU-evicted).
-const MAX_CACHED_TRANSCRIPTS: usize = 64;
+/// Leading bytes inspected once when a streaming line crosses `STREAM_SKIP_GIANT_THRESHOLD`
+/// so top-level `"type":"GENERIC"` / `"type":"compacted"` checks never re-scan multi-MiB buffers.
+const GIANT_LINE_HEADER_PEEK_BYTES: usize = 2048;
+/// Default minimum in-memory indexed transcript files (LRU-evicted); dynamically expands via
+/// `ensure_min_capacity` up to `MAX_DYNAMIC_CACHED_TRANSCRIPTS` when live session counts grow.
+const MAX_CACHED_TRANSCRIPTS: usize = 512;
+const MAX_DYNAMIC_CACHED_TRANSCRIPTS: usize = 2048;
 /// Maximum cached paginated `TranscriptResponse` snapshots (LRU-evicted).
-const MAX_CACHED_PAGES: usize = 128;
+const MAX_CACHED_PAGES: usize = 256;
 /// Soft memory ceiling across all cached response pages (32 MiB).
 const MAX_PAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -349,6 +354,7 @@ pub(crate) struct TranscriptIndex {
     pending_delegation: Option<DelegationKind>,
     telemetry: TelemetryFold,
     agy_full: Option<AgyFullIndex>,
+    cached_watermark: Option<((u64, u64, u128), TranscriptWatermark)>,
     #[cfg(test)]
     delta_bytes_scanned: u64,
 }
@@ -365,6 +371,15 @@ enum BoundedLine {
     },
 }
 
+#[inline]
+fn has_skippable_giant_type_header(buf: &[u8]) -> bool {
+    let head = &buf[..buf.len().min(GIANT_LINE_HEADER_PEEK_BYTES)];
+    contains_subslice(head, b"\"type\":\"GENERIC\"")
+        || contains_subslice(head, b"\"type\": \"GENERIC\"")
+        || contains_subslice(head, b"\"type\":\"compacted\"")
+        || contains_subslice(head, b"\"type\": \"compacted\"")
+}
+
 /// Stream a single `\n`-delimited JSONL line without pulling giant `GENERIC`/`compacted`
 /// blobs (>1 MiB) or absurd >4 MiB lines onto the heap.
 fn read_bounded_jsonl_line<R: BufRead>(
@@ -375,6 +390,7 @@ fn read_bounded_jsonl_line<R: BufRead>(
     out.clear();
     let mut consumed = 0usize;
     let mut skipping = false;
+    let mut checked_giant_header = false;
     loop {
         let avail = reader.fill_buf()?;
         if avail.is_empty() {
@@ -428,15 +444,30 @@ fn read_bounded_jsonl_line<R: BufRead>(
         } else {
             let chunk_len = avail.len();
             if !skipping {
-                if out.len() + chunk_len > STREAM_SKIP_GIANT_THRESHOLD
-                    && (contains_subslice(out, b"\"type\":\"GENERIC\"")
-                        || contains_subslice(out, b"\"type\": \"GENERIC\"")
-                        || contains_subslice(out, b"\"type\":\"compacted\"")
-                        || contains_subslice(out, b"\"type\": \"compacted\"")
-                        || out.len() + chunk_len > hard_limit)
-                {
+                let next_len = out.len() + chunk_len;
+                if next_len > hard_limit {
                     skipping = true;
                     out.clear();
+                } else if next_len > STREAM_SKIP_GIANT_THRESHOLD && !checked_giant_header {
+                    if out.len() < GIANT_LINE_HEADER_PEEK_BYTES {
+                        let need = (GIANT_LINE_HEADER_PEEK_BYTES - out.len()).min(chunk_len);
+                        out.extend_from_slice(&avail[..need]);
+                        checked_giant_header = true;
+                        if has_skippable_giant_type_header(out) {
+                            skipping = true;
+                            out.clear();
+                        } else if need < chunk_len {
+                            out.extend_from_slice(&avail[need..]);
+                        }
+                    } else {
+                        checked_giant_header = true;
+                        if has_skippable_giant_type_header(out) {
+                            skipping = true;
+                            out.clear();
+                        } else {
+                            out.extend_from_slice(avail);
+                        }
+                    }
                 } else {
                     out.extend_from_slice(avail);
                 }
@@ -462,6 +493,7 @@ impl TranscriptIndex {
             pending_delegation: None,
             telemetry: TelemetryFold::new(agent),
             agy_full: None,
+            cached_watermark: None,
             #[cfg(test)]
             delta_bytes_scanned: 0,
         }
@@ -546,7 +578,9 @@ impl TranscriptIndex {
         {
             self.delta_bytes_scanned = offset.saturating_sub(start_offset);
         }
-        let _ = start_offset;
+        if offset != start_offset {
+            self.cached_watermark = None;
+        }
         self.scanned_offset = offset;
         self.mtime_ns = mtime_ns;
         self.file_len = file_len;
@@ -1110,6 +1144,7 @@ impl TranscriptIndex {
                 }
             }
             it.hydrated = true;
+            self.cached_watermark = None;
         }
     }
 
@@ -1208,8 +1243,29 @@ impl TranscriptIndex {
         None
     }
 
-    /// Compute the current `TranscriptWatermark` for this indexed transcript.
+    /// Compute the current `TranscriptWatermark` for this indexed transcript, returning the
+    /// cached watermark in O(1) when neither `scanned_offset` nor any unhydrated AGY sibling
+    /// `transcript_full.jsonl` file signature changed.
     pub(crate) fn watermark(&mut self, path: &Path) -> TranscriptWatermark {
+        let last_needs_agy_full = self.agent == AgentKind::Agy
+            && self.pending_tools.is_empty()
+            && self.turns.last().is_some_and(|t| {
+                !t.hydrated && (t.needs_content_hydration || t.needs_tools_hydration)
+            });
+        let (full_len, full_mtime_ns) = if last_needs_agy_full {
+            sibling_transcript_full(Some(path))
+                .and_then(|fp| file_identity(&fp))
+                .map(|(_, _, fmt, flen)| (flen, fmt))
+                .unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+        let wm_key = (self.scanned_offset, full_len, full_mtime_ns);
+        if let Some((cached_key, wm)) = self.cached_watermark {
+            if cached_key == wm_key {
+                return wm;
+            }
+        }
         let total_messages = self.total_messages();
         let has_pending_tools = !self.pending_tools.is_empty();
         let last_turn_hash = if total_messages > 0 {
@@ -1217,11 +1273,23 @@ impl TranscriptIndex {
         } else {
             0
         };
-        TranscriptWatermark {
+        let post_needs_agy_full = self.agent == AgentKind::Agy
+            && self.pending_tools.is_empty()
+            && self.turns.last().is_some_and(|t| {
+                !t.hydrated && (t.needs_content_hydration || t.needs_tools_hydration)
+            });
+        let final_key = if post_needs_agy_full {
+            wm_key
+        } else {
+            (self.scanned_offset, 0, 0)
+        };
+        let wm = TranscriptWatermark {
             total_messages,
             last_turn_hash,
             has_pending_tools,
-        }
+        };
+        self.cached_watermark = Some((final_key, wm));
+        wm
     }
 
     /// Return deduplicated AGY `step_index` values within the page selected by `query` that
@@ -1388,6 +1456,7 @@ struct TranscriptCacheStats {
 #[derive(Debug)]
 pub struct TranscriptIndexCache {
     entries: HashMap<PathBuf, CachedIndex>,
+    canonical_paths: HashMap<PathBuf, PathBuf>,
     pages: HashMap<PageCacheKey, CachedPage>,
     page_bytes: usize,
     access_seq: u64,
@@ -1416,6 +1485,7 @@ impl TranscriptIndexCache {
     ) -> Self {
         Self {
             entries: HashMap::new(),
+            canonical_paths: HashMap::new(),
             pages: HashMap::new(),
             page_bytes: 0,
             access_seq: 0,
@@ -1425,6 +1495,30 @@ impl TranscriptIndexCache {
             #[cfg(test)]
             stats: TranscriptCacheStats::default(),
         }
+    }
+
+    /// Ensure `max_indices` stays above the active working set of live sessions + subagents
+    /// (bounded by `MAX_DYNAMIC_CACHED_TRANSCRIPTS`) so periodic sequential discovery scans
+    /// never suffer cyclic Belady/LRU cache thrashing.
+    pub(crate) fn ensure_min_capacity(&mut self, required_indices: usize) {
+        let target = required_indices.clamp(1, MAX_DYNAMIC_CACHED_TRANSCRIPTS);
+        if target > self.max_indices {
+            self.max_indices = target;
+        }
+    }
+
+    fn resolve_canonical_path(&mut self, path: &Path) -> PathBuf {
+        if let Some(cached) = self.canonical_paths.get(path) {
+            return cached.clone();
+        }
+        let canon = canonicalize_cache_path(path);
+        let max_canon = self.max_indices.saturating_mul(2).max(128);
+        if self.canonical_paths.len() >= max_canon {
+            self.canonical_paths.clear();
+        }
+        self.canonical_paths
+            .insert(path.to_path_buf(), canon.clone());
+        canon
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -1555,7 +1649,15 @@ impl TranscriptIndexCache {
         agent: AgentKind,
         path: &Path,
     ) -> Option<&mut TranscriptIndex> {
-        let key_path = canonicalize_cache_path(path);
+        let mut key_path = self.resolve_canonical_path(path);
+        if !key_path.is_file() {
+            self.canonical_paths.remove(path);
+            key_path = canonicalize_cache_path(path);
+            if key_path.is_file() {
+                self.canonical_paths
+                    .insert(path.to_path_buf(), key_path.clone());
+            }
+        }
         self.get_or_sync_canonical(agent, &key_path)
     }
 
@@ -1570,8 +1672,18 @@ impl TranscriptIndexCache {
         session_metrics: Option<SessionMetrics>,
         now_ms: u64,
     ) -> Option<TranscriptResponse> {
-        let key_path = canonicalize_cache_path(path);
-        let (dev, ino, mtime_ns, file_len) = file_identity(&key_path)?;
+        let mut key_path = self.resolve_canonical_path(path);
+        let (dev, ino, mtime_ns, file_len) = match file_identity(&key_path) {
+            Some(id) => id,
+            None => {
+                self.canonical_paths.remove(path);
+                key_path = canonicalize_cache_path(path);
+                let id = file_identity(&key_path)?;
+                self.canonical_paths
+                    .insert(path.to_path_buf(), key_path.clone());
+                id
+            }
+        };
         let (full_file_len, full_mtime_ns) = if agent == AgentKind::Agy {
             sibling_transcript_full(Some(&key_path))
                 .and_then(|fp| file_identity(&fp))
@@ -1654,8 +1766,8 @@ impl TranscriptIndexCache {
         agent: AgentKind,
         path: &Path,
     ) -> Option<TranscriptWatermark> {
-        let key_path = canonicalize_cache_path(path);
-        let idx = self.get_or_sync_canonical(agent, &key_path)?;
+        let key_path = self.resolve_canonical_path(path);
+        let idx = self.get_or_sync(agent, path)?;
         Some(idx.watermark(&key_path))
     }
 
@@ -1667,8 +1779,8 @@ impl TranscriptIndexCache {
         path: &Path,
         idx: usize,
     ) -> Option<u64> {
-        let key_path = canonicalize_cache_path(path);
-        let index = self.get_or_sync_canonical(agent, &key_path)?;
+        let key_path = self.resolve_canonical_path(path);
+        let index = self.get_or_sync(agent, path)?;
         index.turn_hash_at(&key_path, idx)
     }
 
@@ -1684,8 +1796,8 @@ impl TranscriptIndexCache {
         if agent != AgentKind::Agy || max_steps == 0 {
             return Vec::new();
         }
-        let key_path = canonicalize_cache_path(path);
-        let Some(idx) = self.get_or_sync_canonical(agent, &key_path) else {
+        let key_path = self.resolve_canonical_path(path);
+        let Some(idx) = self.get_or_sync(agent, path) else {
             return Vec::new();
         };
         idx.missing_agy_hydration_steps(&key_path, query, max_steps)
@@ -1694,14 +1806,21 @@ impl TranscriptIndexCache {
     /// Purge cached response pages for `path` (preserving the parsed `TranscriptIndex` so
     /// incremental hydration does not need to re-scan `transcript.jsonl`).
     pub fn invalidate_pages(&mut self, path: &Path) {
-        let key_path = canonicalize_cache_path(path);
+        let key_path = self.resolve_canonical_path(path);
         self.purge_pages_for_path(&key_path, None);
     }
 
     /// Purge both cached response pages AND the `TranscriptIndex` entry for `path`
     /// (used after atomic prefix backfill or full mirror replacement).
     pub fn invalidate_path(&mut self, path: &Path) {
+        let prev_canon = self.canonical_paths.remove(path);
         let key_path = canonicalize_cache_path(path);
+        if let Some(prev) = prev_canon {
+            if prev != key_path {
+                self.entries.remove(&prev);
+                self.purge_pages_for_path(&prev, None);
+            }
+        }
         self.entries.remove(&key_path);
         self.purge_pages_for_path(&key_path, None);
     }
@@ -1917,13 +2036,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn is_skippable_giant_line(line: &[u8]) -> bool {
-    if line.len() <= 1024 * 1024 {
-        return false;
-    }
-    contains_subslice(line, b"\"type\":\"compacted\"")
-        || contains_subslice(line, b"\"type\": \"compacted\"")
-        || contains_subslice(line, b"\"type\":\"GENERIC\"")
-        || contains_subslice(line, b"\"type\": \"GENERIC\"")
+    line.len() > STREAM_SKIP_GIANT_THRESHOLD && has_skippable_giant_type_header(line)
 }
 
 /// Read complete trailing JSONL lines totaling at most `max_bytes`, scanning backwards in
@@ -4349,5 +4462,113 @@ not valid json at all
         assert_eq!(merged.context_used_pct, Some(35.2));
         assert_eq!(merged.total_input_tokens, Some(900_000));
         assert_eq!(merged.total_output_tokens, Some(12_000));
+    }
+
+    #[test]
+    fn multi_session_150_transcripts_steady_state_and_small_append_never_evict_or_reparse() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-scale-150-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Simulate 150 concurrent root + subagent transcripts (exceeding the legacy 64 cap).
+        let session_count = 150usize;
+        let pad = "x".repeat(4_096);
+        let mut paths = Vec::with_capacity(session_count);
+        for i in 0..session_count {
+            let p = dir.join(format!("sess-{i:03}.jsonl"));
+            let mut body = String::with_capacity(20_000);
+            for step in 0..4 {
+                body.push_str(&format!(
+                    r#"{{"step_index":{step},"type":"PLANNER_RESPONSE","created_at":"2026-11-27T00:00:0{step}Z","content":"session {i} step {step} {pad}"}}"#
+                ));
+                body.push('\n');
+            }
+            std::fs::write(&p, &body).unwrap();
+            paths.push(p);
+        }
+
+        let mut cache = TranscriptIndexCache::default();
+        cache.ensure_min_capacity(session_count + 32);
+
+        // Pass 1 (cold start): indexes all 150 files once with zero evictions.
+        for p in &paths {
+            let wm = cache.watermark_for_path(AgentKind::Agy, p).unwrap();
+            assert_eq!(wm.total_messages, 4);
+        }
+        assert_eq!(cache.stats.index_evictions, 0);
+
+        // Pass 2 & Pass 3 (steady-state 3s discovery ticks): 0 evictions, 0 bytes re-scanned.
+        for _tick in 0..2 {
+            for p in &paths {
+                let idx = cache.get_or_sync(AgentKind::Agy, p).unwrap();
+                assert_eq!(idx.delta_bytes_scanned, 0);
+                let wm = idx.watermark(p);
+                assert_eq!(wm.total_messages, 4);
+            }
+        }
+        assert_eq!(cache.stats.index_evictions, 0);
+
+        // Small append to one transcript scans ONLY the appended delta bytes, never the prefix.
+        let appended = r#"{"step_index":4,"type":"PLANNER_RESPONSE","created_at":"2026-11-27T00:00:09Z","content":"incremental tail reply"}"#;
+        let appended_line = format!("{appended}\n");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&paths[42])
+                .unwrap();
+            f.write_all(appended_line.as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+        for (i, p) in paths.iter().enumerate() {
+            let idx = cache.get_or_sync(AgentKind::Agy, p).unwrap();
+            if i == 42 {
+                assert_eq!(idx.delta_bytes_scanned, appended_line.len() as u64);
+                assert_eq!(idx.watermark(p).total_messages, 5);
+            } else {
+                assert_eq!(idx.delta_bytes_scanned, 0);
+                assert_eq!(idx.watermark(p).total_messages, 4);
+            }
+        }
+        assert_eq!(cache.stats.index_evictions, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn giant_jsonl_lines_skip_generic_and_parse_large_messages_without_quadratic_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-giant-line-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("giant.jsonl");
+
+        let huge_blob = "B".repeat(2_200_000);
+        // 2.2 MiB GENERIC line (>1 MiB skip threshold) followed by a 2.2 MiB valid assistant message (<4 MiB hard cap).
+        let generic_line = format!(
+            r#"{{"step_index":1,"source":"MODEL","type":"GENERIC","created_at":"2026-11-27T01:00:00Z","content":"{huge_blob}"}}"#
+        );
+        let assistant_line = format!(
+            r#"{{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","created_at":"2026-11-27T01:00:02Z","content":"Valid prefix {huge_blob}"}}"#
+        );
+        std::fs::write(&path, format!("{generic_line}\n{assistant_line}\n")).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let mut cache = TranscriptIndexCache::default();
+        let resp = cache
+            .get_page_or_sync(AgentKind::Agy, &path, TranscriptQuery::tail(10), None, 0)
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(resp.messages.len(), 1);
+        assert!(resp.messages[0].text.starts_with("Valid prefix BBBB"));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "giant line scan took too long: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

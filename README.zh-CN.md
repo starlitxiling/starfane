@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/starlitxiling/starfane/releases"><img src="https://img.shields.io/github/v/release/starlitxiling/starfane?logo=github&label=release" alt="GitHub Release" /></a>
   <img src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust" alt="Rust 1.82+" />
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="Platform macOS | Linux" />
@@ -94,7 +95,25 @@
 - 已安装并登录至少一个编码 Agent CLI：[`claude`](https://docs.anthropic.com/en/docs/claude-code)、[`codex`](https://developers.openai.com/codex/cli) 或 `agy`
 - *（可选）* `lark-cli`（若需要飞书双向卡片通知）
 
-#### 1. 编译与安装
+#### 1. 安装
+
+**Homebrew（macOS & Linux，推荐）**：
+
+```bash
+brew install starlitxiling/tap/starfane
+```
+
+**预编译二进制包（GitHub Releases）**：
+
+从 [GitHub Releases](https://github.com/starlitxiling/starfane/releases/latest) 下载对应架构的 `starfane-<tag>-<target>.tar.gz`（支持 macOS ARM64/Intel 与 Linux x86_64/ARM64）：
+
+```bash
+tar -xzf starfane-*.tar.gz
+mkdir -p ~/.local/bin
+install -m 755 starfane-*/starfane ~/.local/bin/starfane
+```
+
+**从源码编译（Rust `1.82+`）**：
 
 ```bash
 git clone https://github.com/starlitxiling/starfane.git
