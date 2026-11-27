@@ -265,15 +265,24 @@ impl SshExec {
         self.compression
     }
 
-    /// Exponentially weighted moving average (EWMA) round-trip latency in milliseconds
-    /// observed across completed SSH invocations on this transport (`None` before first sample).
+    pub fn extra_args(&self) -> &[String] {
+        &self.extra_args
+    }
+
+    /// Exponentially weighted moving average (EWMA) pure transport round-trip latency in
+    /// milliseconds (`None` before first sample).
+    ///
+    /// Updated exclusively via [`SshExec::record_rtt_sample`] (e.g. persistent conduit zero-fork
+    /// `PING -> SF_PONG`) or [`SshExec::probe_rtt`], and never polluted by discovery/dispatch
+    /// script wall-clock durations.
     pub fn rtt_ms(&self) -> Option<u64> {
         let v = self.rtt_ewma_ms.load(Ordering::Acquire);
         (v != RTT_UNSET).then_some(v)
     }
 
-    fn record_rtt(&self, elapsed: Duration) {
-        let sample = elapsed.as_millis().min((RTT_UNSET - 1) as u128) as u64;
+    /// Record a pure transport round-trip latency sample (in milliseconds) into the EWMA.
+    pub fn record_rtt_sample(&self, sample_ms: u64) {
+        let sample = sample_ms.min(RTT_UNSET - 1);
         let mut prev = self.rtt_ewma_ms.load(Ordering::Acquire);
         loop {
             let next = if prev == RTT_UNSET {
@@ -297,6 +306,47 @@ impl SshExec {
         }
     }
 
+    /// Lightweight `printf pong` transport RTT probe for non-conduit fallback.
+    ///
+    /// Records the measured round-trip duration into [`SshExec::rtt_ms`] and returns the raw
+    /// sample in milliseconds. Retries once on a fast stale ControlMaster socket (exit `255`).
+    pub fn probe_rtt(&self) -> Result<u64, TmuxError> {
+        self.probe_rtt_with_timeout(self.timeout)
+    }
+
+    /// Variant of [`SshExec::probe_rtt`] with an explicit per-attempt timeout.
+    pub fn probe_rtt_with_timeout(&self, timeout: Duration) -> Result<u64, TmuxError> {
+        let mut ssh_args = self.ssh_prefix_args();
+        ssh_args.push("printf pong".to_string());
+        let (mut res, mut elapsed) = self.exec_ssh_bytes_once(&ssh_args, None, timeout);
+        if let Ok(ref out) = res {
+            if should_retry_stale_mux(out.exit_code, elapsed, &out.stderr) {
+                (res, elapsed) = self.exec_ssh_bytes_once(&ssh_args, None, timeout);
+            }
+        }
+        let out = res?;
+        if !out.success() {
+            return Err(TmuxError::Command {
+                args: "ssh probe_rtt (printf pong)".to_string(),
+                code: out.exit_code,
+                stderr: out.stderr,
+            });
+        }
+        let ok_pong = out.stdout == b"pong"
+            || String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.trim() == "pong");
+        if !ok_pong {
+            return Err(TmuxError::Parse(format!(
+                "ssh probe_rtt expected 'pong', got {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            )));
+        }
+        let sample_ms = elapsed.as_millis().min((RTT_UNSET - 1) as u128) as u64;
+        self.record_rtt_sample(sample_ms);
+        Ok(sample_ms)
+    }
+
     /// Best-effort cleanup of a dead/stale OpenSSH ControlMaster socket after a transport error.
     /// Runs `ssh -O exit -o ControlPath=<sock> <target>` (capped at 500ms) before unlinking any
     /// leftover socket file so wedged background `ssh [mux]` processes are reaped cleanly.
@@ -314,7 +364,12 @@ impl SshExec {
         }
     }
 
-    fn ssh_prefix_args(&self) -> Vec<String> {
+    /// Build the shared hardened OpenSSH option flags (ControlMaster, timeouts, keepalive,
+    /// compression, and `extra_args`) that precede `<target>` on the `ssh` command line.
+    ///
+    /// Also ensures the `ControlPath` parent directory exists with `0o700` permissions so
+    /// persistent conduits and `tmux -C` watchers reuse the exact same mux configuration.
+    pub fn build_ssh_base_args(&self) -> Vec<String> {
         if let Some(parent) = self.control_path.parent() {
             let _ = std::fs::create_dir_all(parent);
             #[cfg(unix)]
@@ -348,6 +403,11 @@ impl SshExec {
             args.push("Compression=yes".to_string());
         }
         args.extend(self.extra_args.iter().cloned());
+        args
+    }
+
+    fn ssh_prefix_args(&self) -> Vec<String> {
+        let mut args = self.build_ssh_base_args();
         args.push(self.target.clone());
         args.push("--".to_string());
         args
@@ -386,8 +446,7 @@ impl SshExec {
         match &res {
             Err(TmuxError::Timeout { .. }) => self.clear_stale_control_socket(),
             Ok(out) if out.exit_code == Some(255) => self.clear_stale_control_socket(),
-            Ok(_) => self.record_rtt(elapsed),
-            Err(_) => {}
+            Ok(_) | Err(_) => {}
         }
         (res, elapsed)
     }
@@ -666,6 +725,9 @@ mod tests {
             .with_extra_args(vec!["-p".into(), "2222".into()]);
 
         let args = ssh.ssh_prefix_args();
+        let base_args = ssh.build_ssh_base_args();
+        assert_eq!(&args[..base_args.len()], base_args.as_slice());
+        assert_eq!(&args[base_args.len()..], &["ubuntu@gpu-01", "--"]);
         let joined = args.join(" ");
         for expected in [
             "-o ControlMaster=auto",
@@ -737,7 +799,8 @@ exec /bin/sh -c "$1"
         let ssh_clone = ssh.clone();
         assert_eq!(ssh.rtt_ms(), None);
 
-        // 1. run_shell_bytes with stdin = None executes script via /bin/sh -s and returns raw bytes.
+        // 1. run_shell_bytes with stdin = None executes script via /bin/sh -s and returns raw bytes,
+        //    and MUST NOT pollute `rtt_ms()` with arbitrary script execution wall-clock time.
         let out = ssh
             .run_shell_bytes(
                 "printf '\\037\\213\\000\\377'",
@@ -747,8 +810,7 @@ exec /bin/sh -c "$1"
             .unwrap();
         assert!(out.success());
         assert_eq!(out.stdout, vec![0x1f, 0x8b, 0x00, 0xff]);
-        assert!(ssh.rtt_ms().is_some());
-        assert_eq!(ssh.rtt_ms(), ssh_clone.rtt_ms());
+        assert_eq!(ssh.rtt_ms(), None);
 
         // 2. run_shell_bytes with stdin = Some(binary) keeps stdin intact via /bin/sh -c '<quoted>'.
         let payload = vec![0x00, 0x89, 0x50, 0x4e, 0x47, 0xff];
@@ -757,12 +819,20 @@ exec /bin/sh -c "$1"
             .unwrap();
         assert!(echoed.success());
         assert_eq!(echoed.stdout, payload);
+        assert_eq!(ssh.rtt_ms(), None);
+
+        // 3. Explicit lightweight `probe_rtt()` measures transport RTT and updates EWMA across clones.
+        let probed = ssh.probe_rtt().unwrap();
+        assert!(probed < 5_000);
+        assert_eq!(ssh.rtt_ms(), Some(probed));
+        assert_eq!(ssh.rtt_ms(), ssh_clone.rtt_ms());
 
         let log = std::fs::read_to_string(&log_file).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert!(lines[0].ends_with("-- /bin/sh -s"), "{}", lines[0]);
         assert!(lines[1].contains("-- /bin/sh -c 'cat'"), "{}", lines[1]);
+        assert!(lines[2].ends_with("-- printf pong"), "{}", lines[2]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -819,7 +889,7 @@ exec /bin/sh -c "$1"
         assert!(ok.success, "expected recovery: {ok:?}");
         assert_eq!(ok.stdout, "recovered");
         assert!(!sock.exists(), "stale control socket should be removed");
-        assert!(ssh.rtt_ms().is_some());
+        assert_eq!(ssh.rtt_ms(), None);
 
         let log1 = std::fs::read_to_string(&log_file).unwrap();
         let lines1: Vec<&str> = log1.lines().collect();
@@ -908,11 +978,11 @@ exec /bin/sh -c "$1"
     fn ewma_rtt_initializes_and_smooths_samples() {
         let ssh = SshExec::new("gpu-01", PathBuf::from("/tmp/cm-ewma.sock"));
         assert_eq!(ssh.rtt_ms(), None);
-        ssh.record_rtt(Duration::from_millis(200));
+        ssh.record_rtt_sample(200);
         assert_eq!(ssh.rtt_ms(), Some(200));
-        ssh.record_rtt(Duration::from_millis(100));
+        ssh.record_rtt_sample(100);
         assert_eq!(ssh.rtt_ms(), Some(175));
-        ssh.record_rtt(Duration::from_millis(100));
+        ssh.record_rtt_sample(100);
         assert_eq!(ssh.rtt_ms(), Some(156));
     }
 }

@@ -19,6 +19,7 @@ import {
   loadTranscript,
   pollActivePreview,
   pollHealth,
+  refreshActiveOnResume,
   refreshReview,
   renameHostApi,
   syncStateSilent,
@@ -55,6 +56,8 @@ import { renderTop } from './js/topbar.js';
 import { viewInbox, viewPipelines, viewReviews } from './js/views.js';
 import {
   ackSessionError,
+  collectUserPrompts,
+  jumpToPrompt,
   mountOrPatchWorkspace,
   notifyOutputUpdated,
   patchTelemetryStrip,
@@ -107,9 +110,12 @@ function computeTopSig(alerts) {
 
 function renderView() {
   const el = $('#view');
+  const appEl = $('#app');
   const isWs = UI.view === 'workspace' && S.loaded;
-  const wantCls = `view${UI.view === 'workspace' ? ' full-h' : ''}`;
+  const wantFull = UI.view === 'workspace';
+  const wantCls = `view${wantFull ? ' full-h' : ''}`;
   if (el.className !== wantCls) el.className = wantCls;
+  if (appEl) appEl.classList.toggle('is-ws-view', wantFull);
   if (isWs) {
     mountOrPatchWorkspace(el);
     return;
@@ -150,7 +156,8 @@ function rerender() {
   const drawerBody = UI.drawer ? $('.drawer-body') : null;
   const drawerTop = drawerBody ? drawerBody.scrollTop : 0;
   const modalEl = $('#modal');
-  const modalTop = modalEl?.open ? modalEl.scrollTop : 0;
+  const modalScrollEl = modalEl?.open ? (modalEl.querySelector('.modal-body') || modalEl) : null;
+  const modalTop = modalScrollEl ? modalScrollEl.scrollTop : 0;
 
   const alerts = alertCount();
   const topSig = computeTopSig(alerts);
@@ -173,7 +180,10 @@ function rerender() {
     const nextDrawer = $('.drawer-body');
     if (nextDrawer) nextDrawer.scrollTop = drawerTop;
   }
-  if (modalEl?.open && modalTop) modalEl.scrollTop = modalTop;
+  if (modalEl?.open && modalTop) {
+    const nextModalScroll = modalEl.querySelector('.modal-body') || modalEl;
+    nextModalScroll.scrollTop = modalTop;
+  }
   const nextTitle = `${alerts ? `(${alerts}) ` : ''}${L('starfane · 控制面', 'starfane · Control Plane')}`;
   if (document.title !== nextTitle) document.title = nextTitle;
   if (!persistentWsMounted) {
@@ -202,6 +212,7 @@ function openSession(id) {
   onLeaveSession(prevSid, id);
   UI.selSession = id;
   UI.arg = id;
+  UI.mobileSessionsOpen = false;
   const s = S.sessions.get(id);
   if (s) loadSessionOutput(s, { silent: false });
   const wantHash = `#/workspace/${enc(id)}`;
@@ -211,6 +222,7 @@ function openSession(id) {
 
 function route() {
   const prevSid = UI.selSession;
+  UI.mobileSessionsOpen = false;
   const raw = location.hash.replace(/^#\/?/, '') || 'workspace';
   const slash = raw.indexOf('/');
   let v = slash === -1 ? raw : raw.slice(0, slash);
@@ -255,6 +267,8 @@ Object.assign(APP, {
   updateOutputClock,
   patchTelemetryStrip,
   compactTranscript,
+  collectUserPrompts,
+  jumpToPrompt,
   loadAll,
   syncStateSilent,
   loadSessionOutput,
@@ -301,6 +315,7 @@ window.addEventListener('hashchange', route);
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && UI.muteMenu) { UI.muteMenu = false; schedule(); return; }
   if (e.key === 'Escape' && UI.drawer) { closeDrawer(); return; }
+  if (e.key === 'Escape' && UI.mobileSessionsOpen) { UI.mobileSessionsOpen = false; schedule(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const t = e.target;
   if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return;
@@ -314,7 +329,45 @@ modalEl.addEventListener('close', () => { if (!S.authNeeded) UI.modal = null; })
 modalEl.addEventListener('cancel', (e) => { if (S.authNeeded) e.preventDefault(); });
 modalEl.addEventListener('click', (e) => { if (e.target.id === 'modal' && !S.authNeeded) closeModal(); });
 
+let vvRaf = 0;
+function syncMobileViewport() {
+  const narrow = window.innerWidth <= 960;
+  const vv = window.visualViewport;
+  if (!narrow || !vv) {
+    document.documentElement.style.removeProperty('--app-h');
+    document.documentElement.classList.remove('kb-open');
+    return;
+  }
+  const hPx = Math.max(240, Math.round(vv.height));
+  document.documentElement.style.setProperty('--app-h', `${hPx}px`);
+  const kbOpen = window.innerHeight - vv.height > 120;
+  const wasKbOpen = document.documentElement.classList.contains('kb-open');
+  document.documentElement.classList.toggle('kb-open', kbOpen);
+  if (kbOpen && !wasKbOpen) {
+    const vp = UI.wsShell?.vp || $('.term-viewport');
+    if (vp && vp.scrollHeight - vp.scrollTop - vp.clientHeight < 96) {
+      requestAnimationFrame(() => {
+        if (vp.isConnected) vp.scrollTop = vp.scrollHeight;
+      });
+    }
+  }
+}
+
+function scheduleViewportSync() {
+  if (vvRaf) return;
+  vvRaf = requestAnimationFrame(() => {
+    vvRaf = 0;
+    syncMobileViewport();
+  });
+}
+
 async function boot() {
+  syncMobileViewport();
+  window.addEventListener('resize', scheduleViewportSync, { passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', scheduleViewportSync, { passive: true });
+    window.visualViewport.addEventListener('scroll', scheduleViewportSync, { passive: true });
+  }
   const u = new URL(location.href);
   const tk = u.searchParams.get('token');
   if (tk) {
@@ -338,13 +391,29 @@ async function boot() {
     if (sel && !sel.isCollapsed && $('.term-viewport')?.contains(sel.anchorNode)) return;
     schedulePassive();
   }, TICK_MS);
+  let lastFocusRefreshAt = Date.now();
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       if (dirtyWhileHidden) rerender();
+      lastFocusRefreshAt = Date.now();
       pollHealth();
-      syncStateSilent();
-      pollActivePreview();
+      syncStateSilent({ refreshActive: true });
+      refreshActiveOnResume();
     }
+  });
+  window.addEventListener('focus', () => {
+    const now = Date.now();
+    if (document.hidden || (now - lastFocusRefreshAt) < 2000) return;
+    lastFocusRefreshAt = now;
+    refreshActiveOnResume();
+    syncStateSilent();
+  });
+  window.addEventListener('online', () => {
+    lastFocusRefreshAt = Date.now();
+    connectSSE();
+    pollHealth();
+    syncStateSilent({ refreshActive: true });
+    refreshActiveOnResume();
   });
 }
 

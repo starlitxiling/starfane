@@ -34,6 +34,8 @@ import {
   pvKeyOf,
   pvModeOf,
   pvReqSeq,
+  reconcileOptimisticTurns,
+  setLiveTailEntry,
   setPreviewEntry,
   setTranscriptEntry,
   stateText,
@@ -120,14 +122,14 @@ export async function act(key, fn, ok) {
 
 export function sessionsDiffSig(map) {
   return [...map.values()]
-    .map((s) => `${s.session_id}|${s.host_id || 'local'}|${s.host_display_name || ''}|${s.mux_kind || ''}|${s.state}|${s.tmux_label || ''}|${s.tmux_target || ''}|${s.pane || ''}|${s.model || ''}|${s.effort || ''}|${s.last_message || ''}|${s.last_error || ''}|${s.subagent_count || 0}|${s.metrics?.context_used_pct ?? ''}|${s.metrics?.tps ?? ''}`)
+    .map((s) => `${s.session_id}|${s.host_id || 'local'}|${s.host_display_name || ''}|${s.mux_kind || ''}|${s.state}|${s.tmux_label || ''}|${s.tmux_target || ''}|${s.pane || ''}|${s.model || ''}|${s.effort || ''}|${s.last_message || ''}|${s.last_error || ''}|${s.transcript_path || ''}|${s.last_event_ms || 0}|${s.subagent_count || 0}|${s.metrics?.context_used_pct ?? ''}|${s.metrics?.tps ?? ''}|${s.metrics?.ttft_ms ?? ''}|${s.metrics?.avg_ttft_ms ?? ''}|${s.metrics?.recent_turns?.length || 0}|${s.metrics?.recent_turns?.at(-1)?.ts_ms || 0}`)
     .sort()
     .join('\n');
 }
 
 function hostsDiffSig(list) {
   return (list || [])
-    .map((h) => `${h.id}|${h.display_name}|${h.status}|${h.session_count || 0}|${h.rtt_ms ?? ''}|${h.next_retry_ms ?? ''}|${h.error || ''}`)
+    .map((h) => `${h.id}|${h.display_name}|${h.status}|${h.session_count || 0}|${h.rtt_ms ?? ''}|${h.sync_ms ?? ''}|${h.next_retry_ms ?? ''}|${h.error || ''}`)
     .sort()
     .join('\n');
 }
@@ -141,10 +143,17 @@ export function sessionNeedsLiveTail(s, tr) {
 }
 
 let stateSyncBusy = false;
-export async function syncStateSilent() {
-  if (document.hidden || !S.loaded || S.authNeeded || stateSyncBusy) return;
+let stateSyncPendingRefresh = false;
+export async function syncStateSilent({ refreshActive = false } = {}) {
+  if (document.hidden || !S.loaded || S.authNeeded) return;
+  if (stateSyncBusy) {
+    if (refreshActive) stateSyncPendingRefresh = true;
+    return;
+  }
   stateSyncBusy = true;
+  stateSyncPendingRefresh = false;
   try {
+    const prevCur = currentSession();
     const st = await api('GET', '/api/state');
     const prevSig = sessionsDiffSig(S.sessions);
     const prevHostsSig = hostsDiffSig([...S.hosts.values()]);
@@ -179,6 +188,11 @@ export async function syncStateSilent() {
     S.lastSeq = Math.max(S.lastSeq, st.event_seq || 0);
     if (st.terminal_font || st.has_user_term_font) applyTerminalFontConfig(st.terminal_font || '', !!st.has_user_term_font);
     if (changed) {
+      const stateChangedAt = Date.now();
+      for (const [id, s] of nextSessions.entries()) {
+        const old = S.sessions.get(id);
+        if (old && old.state !== s.state) sessionStateChangedAt.set(id, stateChangedAt);
+      }
       S.sessions = nextSessions;
       S.pipelines = nextPipelines;
       S.attention = nextAttn;
@@ -196,12 +210,34 @@ export async function syncStateSilent() {
           .catch(() => {});
       }
     }
+    const nextCur = currentSession();
+    if (
+      nextCur
+      && nextCur.state !== 'ended'
+      && (
+        refreshActive
+        || !prevCur
+        || prevCur.session_id !== nextCur.session_id
+        || prevCur.state !== nextCur.state
+        || prevCur.last_message !== nextCur.last_message
+        || prevCur.last_error !== nextCur.last_error
+        || prevCur.transcript_path !== nextCur.transcript_path
+        || prevCur.last_event_ms !== nextCur.last_event_ms
+      )
+    ) {
+      loadSessionOutput(nextCur, { silent: true });
+    }
   } catch { /* silent fallback */ } finally {
     stateSyncBusy = false;
+    if (stateSyncPendingRefresh) {
+      stateSyncPendingRefresh = false;
+      queueMicrotask(() => syncStateSilent({ refreshActive: true }));
+    }
   }
 }
 
 export async function loadAll() {
+  const wasLoaded = S.loaded;
   S.lastLoad = Date.now();
   try {
     const st = await api('GET', '/api/state');
@@ -220,6 +256,12 @@ export async function loadAll() {
     S.loadError = null;
     S.authNeeded = false;
     pickDefaultSession();
+    if (wasLoaded && UI.view === 'workspace') {
+      const cur = currentSession();
+      if (cur && cur.state !== 'ended') {
+        loadSessionOutput(cur, { silent: true, force: true });
+      }
+    }
     if (!Array.isArray(st.notifiers) && !Array.isArray(st.details)) {
       loadNotifiers({ silent: true });
     }
@@ -239,8 +281,20 @@ export async function loadAll() {
 
 const trInFlight = new Set();
 const pvInFlight = new Set();
+const trPrefetchInFlight = new Map();
+const pvPrefetchInFlight = new Map();
+const trPendingRefetch = new Set();
+const pvPendingRefetch = new Map();
 const tmuxSessInFlight = new Set();
-const remotePollAt = new Map();
+const sessionPollAt = new Map();
+const sessionStateChangedAt = new Map();
+const postIdleTimers = new Map();
+let lastSseConnectAt = 0;
+let uiReloadScheduled = false;
+
+const PREFETCH_FRESH_MS = 15000;
+const SWITCH_FRESH_MS = 2500;
+const PREFETCH_COALESCE_MS = 5000;
 
 function isHostOffline(hostId) {
   if (!hostId || hostId === 'local') return false;
@@ -252,12 +306,45 @@ export function isTmuxSessionsLoading(hostId = 'local') {
   return tmuxSessInFlight.has(hid);
 }
 
-export function loadSessionOutput(s, { silent = false, forcePreview = false } = {}) {
+export function isSessionOutputFresh(s, maxAgeMs = PREFETCH_FRESH_MS) {
+  if (!s || !s.session_id) return true;
+  const now = Date.now();
+  if (s.agent === 'shell' || UI.outputMode === 'raw') {
+    if (!s.pane) return true;
+    const pv = S.previews.get(pvKeyOf(s.pane));
+    return Boolean(pv?.state === 'ok' && !pv.staleErr && pv.updatedMs && (now - pv.updatedMs) < maxAgeMs);
+  }
+  const tr = S.transcripts.get(s.session_id);
+  if (tr?.state === 'ok' && !tr.staleErr && tr.updatedMs && (now - tr.updatedMs) < maxAgeMs) {
+    return true;
+  }
+  if (tr?.unsupported && s.pane) {
+    const pv = S.previews.get(pvKeyOf(s.pane));
+    return Boolean(pv?.state === 'ok' && !pv.staleErr && pv.updatedMs && (now - pv.updatedMs) < maxAgeMs);
+  }
+  return false;
+}
+
+export function prefetchSessionOutput(s) {
+  if (!s || !s.session_id || s.state === 'ended') return false;
+  if (s.session_id === currentSession()?.session_id) return false;
+  if (isHostOffline(hostOf(s))) return false;
+  if (isSessionOutputFresh(s, PREFETCH_FRESH_MS)) return false;
+  loadSessionOutput(s, { silent: true, prefetch: true });
+  return true;
+}
+
+export function loadSessionOutput(s, { silent = false, forcePreview = false, prefetch = false, force = false } = {}) {
   if (!s) return;
-  if (silent && isHostOffline(hostOf(s))) return;
-  if (s.agent !== 'shell') loadTranscript(s.session_id, { silent });
+  if ((silent || prefetch) && isHostOffline(hostOf(s))) return;
+  if (s.agent !== 'shell') loadTranscript(s.session_id, { silent, prefetch, force });
   if (!s.pane) return;
   const pvMode = pvModeOf(s.pane);
+  if (prefetch && !forcePreview && s.agent !== 'shell' && UI.outputMode !== 'raw') {
+    const tr = S.transcripts.get(s.session_id);
+    const needsAlertTail = ['error', 'needs_permission', 'needs_input'].includes(s.state);
+    if (!needsAlertTail && !tr?.unsupported) return;
+  }
   if (silent && !forcePreview && s.agent !== 'shell' && UI.outputMode !== 'raw') {
     const tr = S.transcripts.get(s.session_id);
     const tailOpen = UI.open.has(`tail:${s.session_id}`) || Boolean($('details.live-tail')?.open);
@@ -265,15 +352,53 @@ export function loadSessionOutput(s, { silent = false, forcePreview = false } = 
   }
   // Never clobber full-history or upward-paginated terminal views during background silent polls.
   const existingPv = S.previews.get(pvKeyOf(s.pane, pvMode));
-  if (silent && !forcePreview && (pvMode === 'all' || existingPv?.paginated)) return;
-  loadPreview(s.pane, { mode: pvMode, silent });
+  if ((silent || prefetch) && !forcePreview && (pvMode === 'all' || existingPv?.paginated)) return;
+  loadPreview(s.pane, { mode: pvMode, silent, prefetch, force });
 }
 
-export async function loadTranscript(sessionId, { silent = false, limit, all = false } = {}) {
+export async function loadTranscript(sessionId, { silent = false, limit, all = false, prefetch = false, force = false } = {}) {
   if (!sessionId) return;
-  if (silent && trInFlight.has(sessionId)) return;
+  if ((silent || prefetch) && !force && trInFlight.has(sessionId)) {
+    if (!prefetch) trPendingRefetch.add(sessionId);
+    return;
+  }
   const prev = S.transcripts.get(sessionId);
   if (prev?.unsupported) return;
+  if (!force && !all && !limit && !prefetch) {
+    const pfAt = trPrefetchInFlight.get(sessionId);
+    if (pfAt && trInFlight.has(sessionId) && (Date.now() - pfAt) < PREFETCH_COALESCE_MS) {
+      if (!prev) {
+        setTranscriptEntry(sessionId, {
+          state: 'loading',
+          source: 'none',
+          messages: [],
+          hasMore: false,
+          totalMessages: 0,
+          startSeq: 0,
+          nextBefore: null,
+          explicitAll: false,
+          loadedAll: false,
+          autoPollPaused: false,
+          latestTotalMessages: null,
+          limit: TRANSCRIPT_LIMIT,
+          hash: '',
+          staleErr: null,
+          updatedMs: 0,
+        });
+        if (!silent) APP.schedule();
+      }
+      return;
+    }
+    if (!silent && S.conn === 'live' && prev?._fromPrefetch && prev?.state === 'ok' && !prev.staleErr && !prev.autoPollPaused && prev.updatedMs && (Date.now() - prev.updatedMs) < SWITCH_FRESH_MS) {
+      prev._fromPrefetch = false;
+      APP.updateOutputClock(sessionId);
+      APP.rerender();
+      return;
+    }
+    if (!silent && prev?.state === 'ok' && UI.view === 'workspace' && UI.selSession === sessionId) {
+      APP.rerender();
+    }
+  }
   // Never re-fetch `all=1` megabytes on background silent polling!
   // When user already loaded expanded/full history, silent polls fetch only a lightweight tail
   // (`limit=60`) and splice incremental updates onto the loaded prefix without rebuilding history.
@@ -291,7 +416,10 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
   const seq = (trReqSeq.get(sessionId) || 0) + 1;
   trReqSeq.set(sessionId, seq);
   trInFlight.add(sessionId);
-  if (!prev) {
+  trPendingRefetch.delete(sessionId);
+  if (prefetch) trPrefetchInFlight.set(sessionId, Date.now());
+  else trPrefetchInFlight.delete(sessionId);
+  if (!prev && !prefetch) {
     setTranscriptEntry(sessionId, {
       state: 'loading',
       source: 'none',
@@ -315,12 +443,18 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
     const q = effectiveAll ? { all: 1 } : { limit: lim };
     const data = await api('GET', `/api/sessions/${enc(sessionId)}/transcript${qs(q)}`);
     if (trReqSeq.get(sessionId) !== seq) return;
+    const latestPrev = S.transcripts.get(sessionId) || prev;
     const msgs = Array.isArray(data?.messages) ? data.messages : [];
     const source = data?.source === 'transcript' && msgs.length > 0 ? 'transcript' : 'none';
     const hasMore = Boolean(data?.has_more);
     const totalMessages = Number.isFinite(data?.total_messages) ? data.total_messages : msgs.length;
     const startSeq = Number.isFinite(data?.start_seq) ? data.start_seq : Math.max(0, totalMessages - msgs.length);
     const nextBefore = Number.isFinite(data?.next_before) ? data.next_before : (hasMore ? startSeq : null);
+    const now = Date.now();
+    const liveTail = typeof data?.live_tail === 'string' ? data.live_tail : latestPrev?.live_tail;
+    const liveTailUpdatedMs = typeof data?.live_tail === 'string' ? now : (latestPrev?.liveTailUpdatedMs || 0);
+    if (typeof data?.live_tail === 'string') setLiveTailEntry(sessionId, data.live_tail, now);
+    const isActive = currentSession()?.session_id === sessionId;
 
     if (data?.metrics && S.sessions.has(sessionId)) {
       const cur = S.sessions.get(sessionId);
@@ -347,18 +481,22 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
         }
         if (same) {
           const hadStale = Boolean(prev.staleErr);
-          prev.updatedMs = Date.now();
+          prev.updatedMs = now;
           prev.staleErr = null;
-          if (hadStale) APP.notifyOutputUpdated(sessionId);
-          else APP.updateOutputClock(sessionId);
-          if (!silent) APP.schedule();
+          const optChanged = reconcileOptimisticTurns(sessionId, prev);
+          if (hadStale || optChanged) {
+            if (!prefetch || isActive) APP.notifyOutputUpdated(sessionId);
+          } else if (isActive) {
+            APP.updateOutputClock(sessionId);
+          }
+          if (!silent && !prefetch) APP.schedule();
           return;
         }
         const merged = [...prev.messages.slice(0, prefixLen), ...msgs];
         const mergedHasMore = prevStart > 0;
         const mergedTotal = Math.max(totalMessages, prevStart + merged.length);
         const nextHash = hashTranscriptPayload(source, prevStart, mergedTotal, mergedHasMore, merged);
-        setTranscriptEntry(sessionId, {
+        const nextEntry = {
           ...prev,
           state: 'ok',
           source,
@@ -374,11 +512,15 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
           latestTotalMessages: null,
           limit: merged.length,
           hash: nextHash,
-          updatedMs: Date.now(),
+          live_tail: liveTail,
+          liveTailUpdatedMs,
+          updatedMs: now,
           err: null,
           staleErr: null,
-        });
-        APP.notifyOutputUpdated(sessionId);
+        };
+        setTranscriptEntry(sessionId, nextEntry);
+        reconcileOptimisticTurns(sessionId, nextEntry);
+        if (!prefetch || isActive) APP.notifyOutputUpdated(sessionId);
         return;
       }
       if (silent) {
@@ -389,16 +531,16 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
           autoPollPaused: true,
           latestTotalMessages: totalMessages,
           staleErr: null,
-          updatedMs: Date.now(),
+          updatedMs: now,
         });
-        APP.notifyOutputUpdated(sessionId);
+        if (!prefetch || isActive) APP.notifyOutputUpdated(sessionId);
         return;
       }
     }
 
     const nextHash = hashTranscriptPayload(source, startSeq, totalMessages, hasMore, msgs);
-    const changed = !prev || prev.state !== 'ok' || prev.hash !== nextHash || Boolean(prev.autoPollPaused) || Boolean(prev.staleErr);
-    setTranscriptEntry(sessionId, {
+    const changed = !latestPrev || latestPrev.state !== 'ok' || latestPrev.hash !== nextHash || Boolean(latestPrev.autoPollPaused) || Boolean(latestPrev.staleErr);
+    const nextEntry = {
       state: 'ok',
       source,
       transcriptPath: data?.transcript_path || null,
@@ -413,19 +555,27 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
       latestTotalMessages: null,
       limit: lim || msgs.length,
       hash: nextHash,
-      updatedMs: Date.now(),
+      live_tail: liveTail,
+      liveTailUpdatedMs,
+      _fromPrefetch: Boolean(prefetch),
+      updatedMs: now,
       err: null,
       staleErr: null,
-    });
-    if (changed) APP.notifyOutputUpdated(sessionId);
-    else {
+    };
+    setTranscriptEntry(sessionId, nextEntry);
+    const optChanged = reconcileOptimisticTurns(sessionId, nextEntry);
+    if (changed || optChanged) {
+      if (!prefetch || isActive) APP.notifyOutputUpdated(sessionId);
+    } else {
       if (UI.loadingEarlierSid === sessionId) UI.loadingEarlierSid = null;
-      APP.updateOutputClock(sessionId);
-      if (!silent) APP.schedule();
+      if (isActive) APP.updateOutputClock(sessionId);
+      if (!silent && !prefetch) APP.schedule();
     }
   } catch (e) {
     if (trReqSeq.get(sessionId) !== seq) return;
     if (UI.loadingEarlierSid === sessionId) UI.loadingEarlierSid = null;
+    const isActive = currentSession()?.session_id === sessionId;
+    if (prefetch && !isActive) return;
     if (e instanceof ApiError && e.status === 405) {
       setTranscriptEntry(sessionId, {
         state: 'ok', source: 'none', messages: [], hasMore: false, totalMessages: 0, startSeq: 0, nextBefore: null,
@@ -456,7 +606,18 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
     });
     if (changed) APP.notifyOutputUpdated(sessionId);
   } finally {
-    if (trReqSeq.get(sessionId) === seq) trInFlight.delete(sessionId);
+    if (trReqSeq.get(sessionId) === seq) {
+      trInFlight.delete(sessionId);
+      trPrefetchInFlight.delete(sessionId);
+      if (trPendingRefetch.delete(sessionId)) {
+        queueMicrotask(() => {
+          const latest = S.sessions.get(sessionId);
+          if (latest && latest.state !== 'ended' && !isHostOffline(hostOf(latest))) {
+            loadTranscript(sessionId, { silent: true });
+          }
+        });
+      }
+    }
   }
 }
 
@@ -505,17 +666,55 @@ export async function loadAllTranscript(sessionId) {
   return act(`trall:${sessionId}`, () => loadTranscript(sessionId, { silent: false, all: true }));
 }
 
-export async function loadPreview(paneId, { lines, mode, silent = false } = {}) {
+export async function loadPreview(paneId, { lines, mode, silent = false, prefetch = false, force = false } = {}) {
   if (!paneId) return;
   const effMode = mode !== undefined ? mode : (lines !== undefined ? lines : pvModeOf(paneId));
   const isAll = effMode === 'all';
   const key = pvKeyOf(paneId, effMode);
-  if (silent && pvInFlight.has(key)) return;
+  if ((silent || prefetch) && !force && pvInFlight.has(key)) {
+    if (!prefetch) pvPendingRefetch.set(key, { paneId, mode: effMode });
+    return;
+  }
   const prev = S.previews.get(key);
+  if (!force && !prefetch && !isAll) {
+    const pfAt = pvPrefetchInFlight.get(key);
+    if (pfAt && pvInFlight.has(key) && (Date.now() - pfAt) < PREFETCH_COALESCE_MS) {
+      if (!prev) {
+        setPreviewEntry(key, {
+          state: 'loading',
+          text: '',
+          hash: '',
+          totalLines: 0,
+          startLine: 0,
+          hasMore: false,
+          nextBeforeLine: null,
+          truncated: false,
+          paginated: false,
+          staleErr: null,
+          updatedMs: 0,
+        });
+        if (!silent) APP.schedule();
+      }
+      return;
+    }
+    if (!silent && S.conn === 'live' && prev?._fromPrefetch && prev?.state === 'ok' && !prev.staleErr && !prev.paginated && prev.updatedMs && (Date.now() - prev.updatedMs) < SWITCH_FRESH_MS) {
+      prev._fromPrefetch = false;
+      const cur = currentSession();
+      if (effMode === pvModeOf(paneId) && cur?.pane === paneId) APP.updateOutputClock(cur.session_id);
+      APP.rerender();
+      return;
+    }
+    if (!silent && prev?.state === 'ok' && UI.view === 'workspace' && currentSession()?.pane === paneId) {
+      APP.rerender();
+    }
+  }
   const seq = (pvReqSeq.get(key) || 0) + 1;
   pvReqSeq.set(key, seq);
   pvInFlight.add(key);
-  if (!prev) {
+  pvPendingRefetch.delete(key);
+  if (prefetch) pvPrefetchInFlight.set(key, Date.now());
+  else pvPrefetchInFlight.delete(key);
+  if (!prev && !prefetch) {
     setPreviewEntry(key, {
       state: 'loading',
       text: '',
@@ -535,6 +734,7 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
     const query = isAll ? { all: 1 } : { lines: Number(effMode) || PREVIEW_LINES };
     const data = await api('GET', `/api/panes/${enc(paneId)}/preview${qs(query)}`);
     if (pvReqSeq.get(key) !== seq) return;
+    const latestPrev = S.previews.get(key) || prev;
     const text = data?.text ?? '';
     const totalLines = Number.isFinite(data?.total_lines) ? data.total_lines : (text ? text.split('\n').length : 0);
     const startLine = Number.isFinite(data?.start_line) ? data.start_line : 0;
@@ -542,10 +742,11 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
     const nextBeforeLine = Number.isFinite(data?.next_before_line) ? data.next_before_line : (hasMore ? startLine : null);
     const truncated = Boolean(data?.truncated);
     const nextHash = hashStr(`${text}|${startLine}|${totalLines}|${hasMore ? 1 : 0}|${!!data?.in_mode}|${!!data?.dead}`);
-    const changed = !prev || prev.state !== 'ok' || prev.hash !== nextHash || Boolean(prev.staleErr);
+    const changed = !latestPrev || latestPrev.state !== 'ok' || latestPrev.hash !== nextHash || Boolean(latestPrev.staleErr);
     setPreviewEntry(key, {
       state: 'ok',
       updatedMs: Date.now(),
+      _fromPrefetch: Boolean(prefetch),
       data,
       text,
       totalLines,
@@ -563,12 +764,17 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
       if (cur?.pane === paneId) {
         if (changed) APP.notifyOutputUpdated(cur.session_id);
         else APP.updateOutputClock(cur.session_id);
+      } else if (changed && !prefetch) {
+        APP.schedulePassive();
       }
-    } else if (changed) {
+    } else if (changed && !prefetch) {
       APP.schedulePassive();
     }
   } catch (e) {
     if (pvReqSeq.get(key) !== seq) return;
+    const cur = currentSession();
+    const isActivePane = effMode === pvModeOf(paneId) && cur?.pane === paneId;
+    if (prefetch && !isActivePane) return;
     const errMsg = errText(e);
     if (silent && prev?.state === 'ok' && typeof prev.text === 'string' && prev.text.length > 0) {
       const changed = prev.staleErr !== errMsg;
@@ -578,8 +784,7 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
         updatedMs: Date.now(),
       });
       if (changed) {
-        const cur = currentSession();
-        if (effMode === pvModeOf(paneId) && cur?.pane === paneId) APP.notifyOutputUpdated(cur.session_id);
+        if (isActivePane) APP.notifyOutputUpdated(cur.session_id);
         else APP.schedulePassive();
       }
       return;
@@ -594,12 +799,30 @@ export async function loadPreview(paneId, { lines, mode, silent = false } = {}) 
       updatedMs: Date.now(),
     });
     if (changed) {
-      const cur = currentSession();
-      if (effMode === pvModeOf(paneId) && cur?.pane === paneId) APP.notifyOutputUpdated(cur.session_id);
+      if (isActivePane) APP.notifyOutputUpdated(cur.session_id);
       else APP.schedulePassive();
     }
   } finally {
-    if (pvReqSeq.get(key) === seq) pvInFlight.delete(key);
+    if (pvReqSeq.get(key) === seq) {
+      pvInFlight.delete(key);
+      pvPrefetchInFlight.delete(key);
+      const pending = pvPendingRefetch.get(key);
+      if (pending) {
+        pvPendingRefetch.delete(key);
+        queueMicrotask(() => {
+          const cur = currentSession();
+          const owner = (cur?.pane === pending.paneId ? cur : null)
+            || [...S.sessions.values()].find((x) => x.pane === pending.paneId && x.state !== 'ended');
+          if (owner && isHostOffline(hostOf(owner))) return;
+          const activeNeeds = Boolean(cur?.pane === pending.paneId && cur.state !== 'ended' && pvModeOf(cur.pane) === pending.mode);
+          const drawerNeeds = Boolean(UI.drawer?.kind === 'terminal' && UI.drawer.pane === pending.paneId && UI.drawerPvLines === pending.mode);
+          const inboxNeeds = Boolean(UI.view === 'inbox' && owner && ['needs_permission', 'needs_input'].includes(owner.state) && pvModeOf(owner.pane) === pending.mode);
+          if (activeNeeds || drawerNeeds || inboxNeeds) {
+            loadPreview(pending.paneId, { mode: pending.mode, silent: true });
+          }
+        });
+      }
+    }
   }
 }
 
@@ -655,11 +878,13 @@ export async function probeHostApi(hostId) {
     const prev = S.hosts.get(hid);
     const nextStatus = r?.status || prev?.status || 'online';
     const nextRtt = typeof r?.rtt_ms === 'number' && Number.isFinite(r.rtt_ms) ? r.rtt_ms : prev?.rtt_ms;
+    const nextSync = typeof r?.sync_ms === 'number' && Number.isFinite(r.sync_ms) ? r.sync_ms : prev?.sync_ms;
     if (prev) {
       S.hosts.set(hid, {
         ...prev,
         status: nextStatus,
         rtt_ms: nextRtt,
+        sync_ms: nextSync,
         next_retry_ms: nextStatus === 'online' ? null : (r?.next_retry_ms ?? prev.next_retry_ms),
         error: nextStatus === 'online' ? null : (r?.error ?? prev.error),
       });
@@ -706,6 +931,61 @@ export async function renameHostApi(hostId, displayName) {
     APP.schedule();
     return rec;
   }, (r) => L(`主机名称已更新为「${r?.display_name || displayName}」`, `Host renamed to "${r?.display_name || displayName}"`));
+}
+
+function keySentToastLabel(key) {
+  return {
+    Up: L('已发送 ↑ 上移按键', 'Sent ↑ Up key'),
+    Down: L('已发送 ↓ 下移按键', 'Sent ↓ Down key'),
+    Enter: L('已发送 ↵ 确认 (Enter)', 'Sent ↵ Confirm (Enter)'),
+    Escape: L('已发送 Esc 取消', 'Sent Esc Cancel'),
+  }[key] || L(`已发送按键 ${key}`, `Sent key ${key}`);
+}
+
+export async function sendSessionKeyApi(sessionId, key) {
+  const sid = String(sessionId || '').trim();
+  const k = String(key || '').trim();
+  if (!sid || !k) return undefined;
+  const busyKey = `key:${sid}`;
+  const btnBusyKey = `key:${sid}:${k}`;
+  if (UI.busy.has(busyKey)) return undefined;
+  const initialPane = S.sessions.get(sid)?.pane || null;
+  UI.busy.add(busyKey);
+  UI.busy.add(btnBusyKey);
+  APP.schedule();
+  try {
+    const res = await api('POST', `/api/sessions/${enc(sid)}/key`, { key: k });
+    toast(keySentToastLabel(k), 'ok');
+    const refreshAfterKey = () => {
+      syncStateSilent();
+      const latest = S.sessions.get(sid);
+      if (latest && latest.state !== 'ended') {
+        loadSessionOutput(latest, { silent: true, forcePreview: true, force: true });
+      } else if (initialPane) {
+        loadPreview(initialPane, { mode: pvModeOf(initialPane), silent: true, force: true });
+      }
+    };
+    setTimeout(refreshAfterKey, 180);
+    setTimeout(refreshAfterKey, 700);
+    return res;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 403) {
+      toast(
+        L('当前控制台处于只读模式，无法向终端发送交互按键', 'Console is read-only — cannot send interactive keys to terminal'),
+        'warn',
+      );
+    } else {
+      toast(
+        L(`发送按键失败：${errText(e)}`, `Failed to send key: ${errText(e)}`),
+        'err',
+      );
+    }
+    return undefined;
+  } finally {
+    UI.busy.delete(busyKey);
+    UI.busy.delete(btnBusyKey);
+    APP.schedule();
+  }
 }
 
 export async function closeSessionApi(sessionId, { isSplitPane = false } = {}) {
@@ -835,17 +1115,189 @@ export function artifact(id) {
   return a;
 }
 
+function handleOutputEvent(d) {
+  const sid = d?.session_id;
+  if (!sid || typeof sid !== 'string') return false;
+  const now = Date.now();
+  let s = S.sessions.get(sid) || null;
+  let metricsChanged = false;
+  if (d.metrics && typeof d.metrics === 'object' && s) {
+    if (JSON.stringify(s.metrics || null) !== JSON.stringify(d.metrics)) {
+      s = { ...s, metrics: d.metrics };
+      S.sessions.set(sid, s);
+      APP.patchTelemetryStrip(sid);
+      metricsChanged = true;
+    }
+  }
+  const isActive = sid === currentSession()?.session_id;
+  const hasLiveTail = typeof d.live_tail === 'string';
+  if (hasLiveTail) {
+    setLiveTailEntry(sid, d.live_tail, now);
+  }
+
+  const cur = S.transcripts.get(sid);
+  const appended = Array.isArray(d.appended_messages) ? d.appended_messages : [];
+  const hasAppended = appended.length > 0 && typeof d.start_seq === 'number' && Number.isFinite(d.start_seq);
+  let handledInline = false;
+  let needsReload = false;
+
+  if (cur?.state === 'ok' && hasAppended) {
+    if (cur.source === 'none' && d.start_seq > 0) {
+      needsReload = true;
+    } else {
+      const curStart = Number.isFinite(cur.startSeq) ? cur.startSeq : 0;
+      const curLen = Array.isArray(cur.messages) ? cur.messages.length : 0;
+      const curTotal = Number.isFinite(cur.totalMessages) ? cur.totalMessages : (curStart + curLen);
+      const curEnd = curStart + curLen;
+      const isContiguous = d.start_seq === curTotal && !cur.autoPollPaused && curEnd === curTotal;
+      const isOverlap = !isContiguous && !cur.autoPollPaused && d.start_seq >= curStart && d.start_seq < curEnd;
+      if (isContiguous || isOverlap) {
+        const prefixLen = isContiguous ? curLen : (d.start_seq - curStart);
+        const hasAuthoritativeTotal = typeof d.total_messages === 'number' && Number.isFinite(d.total_messages);
+        const isAuthoritativeTail = isOverlap && hasAuthoritativeTotal && (d.start_seq + appended.length === d.total_messages);
+        let nextMsgs = [...cur.messages.slice(0, prefixLen), ...appended];
+        if (isOverlap && !isAuthoritativeTail && prefixLen + appended.length < curLen) {
+          nextMsgs = [...nextMsgs, ...cur.messages.slice(prefixLen + appended.length)];
+        }
+        let nextStartSeq = curStart;
+        if (!cur.explicitAll) {
+          const cap = Math.max(COMPACT_TRANSCRIPT_THRESHOLD, UI.trLimit.get(sid) || TRANSCRIPT_LIMIT);
+          if (nextMsgs.length > cap) {
+            const drop = nextMsgs.length - cap;
+            nextMsgs = nextMsgs.slice(drop);
+            nextStartSeq += drop;
+          }
+        }
+        const nextHasMore = nextStartSeq > 0;
+        const nextTotal = isAuthoritativeTail
+          ? d.total_messages
+          : (hasAuthoritativeTotal
+            ? Math.max(d.total_messages, nextStartSeq + nextMsgs.length)
+            : Math.max(curTotal, nextStartSeq + nextMsgs.length));
+        const nextHash = hashTranscriptPayload('transcript', nextStartSeq, nextTotal, nextHasMore, nextMsgs);
+        const nextEntry = {
+          ...cur,
+          state: 'ok',
+          source: 'transcript',
+          messages: nextMsgs,
+          hasMore: nextHasMore,
+          totalMessages: nextTotal,
+          startSeq: nextStartSeq,
+          nextBefore: nextHasMore ? nextStartSeq : null,
+          loadedAll: !nextHasMore,
+          autoPollPaused: false,
+          latestTotalMessages: null,
+          limit: Math.max(cur.limit || TRANSCRIPT_LIMIT, nextMsgs.length),
+          hash: nextHash,
+          live_tail: hasLiveTail ? d.live_tail : cur.live_tail,
+          liveTailUpdatedMs: hasLiveTail ? now : (cur.liveTailUpdatedMs || 0),
+          err: null,
+          staleErr: null,
+          updatedMs: now,
+        };
+        setTranscriptEntry(sid, nextEntry);
+        reconcileOptimisticTurns(sid, nextEntry);
+        handledInline = true;
+        if (isActive) APP.notifyOutputUpdated(sid);
+      } else if (cur.autoPollPaused && typeof d.total_messages === 'number' && Number.isFinite(d.total_messages)) {
+        setTranscriptEntry(sid, {
+          ...cur,
+          latestTotalMessages: Math.max(cur.latestTotalMessages || 0, d.total_messages),
+          live_tail: hasLiveTail ? d.live_tail : cur.live_tail,
+          liveTailUpdatedMs: hasLiveTail ? now : (cur.liveTailUpdatedMs || 0),
+          staleErr: null,
+          updatedMs: now,
+        });
+        handledInline = true;
+        if (isActive) APP.notifyOutputUpdated(sid);
+      } else if (isActive) {
+        needsReload = true;
+      }
+    }
+  } else if (hasLiveTail && cur?.state === 'ok') {
+    cur.live_tail = d.live_tail;
+    cur.liveTailUpdatedMs = now;
+    cur.staleErr = null;
+    if (isActive && s && s.agent !== 'shell' && UI.outputMode === 'reading') {
+      APP.notifyOutputUpdated(sid);
+    }
+  } else if (hasLiveTail && isActive && s && s.agent !== 'shell' && UI.outputMode === 'reading') {
+    APP.notifyOutputUpdated(sid);
+  }
+
+  if (isActive && s && s.state !== 'ended') {
+    const isRawMode = s.agent === 'shell' || UI.outputMode === 'raw';
+    if (isRawMode) {
+      if ((d.dirty || hasLiveTail) && s.pane) {
+        const pvMode = pvModeOf(s.pane);
+        const existingPv = S.previews.get(pvKeyOf(s.pane, pvMode));
+        if (pvMode !== 'all' && !existingPv?.paginated) {
+          loadPreview(s.pane, { mode: pvMode, silent: true });
+        }
+      }
+    } else {
+      const latestTr = S.transcripts.get(sid);
+      const needsTranscriptRefresh = !handledInline && (d.dirty || needsReload || (hasAppended && (!cur || cur.state !== 'ok')));
+      if (needsTranscriptRefresh) {
+        loadSessionOutput(s, { silent: true });
+      } else if (hasLiveTail && s.pane && (!latestTr || latestTr.state !== 'ok' || latestTr.source === 'none' || latestTr.unsupported)) {
+        const pvMode = pvModeOf(s.pane);
+        const existingPv = S.previews.get(pvKeyOf(s.pane, pvMode));
+        if (pvMode !== 'all' && !existingPv?.paginated) {
+          loadPreview(s.pane, { mode: pvMode, silent: true });
+        }
+      }
+    }
+  }
+  return metricsChanged;
+}
+
 function handleEvent(type, d) {
-  if (d.seq) S.lastSeq = Math.max(S.lastSeq, d.seq);
+  if (d?.seq) S.lastSeq = Math.max(S.lastSeq, d.seq);
   switch (type) {
+    case 'ping':
+      return;
+    case 'output': {
+      if (handleOutputEvent(d)) APP.schedulePassive();
+      return;
+    }
     case 'session': {
       const ns = d.session;
-      const prev = ns?.session_id ? S.sessions.get(ns.session_id) : null;
+      const sid = ns?.session_id;
+      const prev = sid ? S.sessions.get(sid) : null;
+      if (sid && (!prev || prev.state !== ns.state)) {
+        sessionStateChangedAt.set(sid, Date.now());
+      }
+      if (sid && (!prev || prev.state !== ns.state || ns.state === 'ended')) {
+        const oldTimer = postIdleTimers.get(sid);
+        if (oldTimer) {
+          clearTimeout(oldTimer);
+          postIdleTimers.delete(sid);
+        }
+      }
       upsertSession(ns);
       pickDefaultSession();
-      if (ns?.session_id === UI.selSession && ns.state !== 'ended') {
-        if (!prev || prev.state !== ns.state || prev.last_message !== ns.last_message || prev.last_error !== ns.last_error) {
+      const activeSid = currentSession()?.session_id;
+      if (sid && sid === activeSid && ns.state !== 'ended') {
+        if (
+          !prev
+          || prev.state !== ns.state
+          || prev.last_message !== ns.last_message
+          || prev.last_error !== ns.last_error
+          || prev.transcript_path !== ns.transcript_path
+        ) {
           loadSessionOutput(ns, { silent: true });
+        }
+        if (prev && ['working', 'starting'].includes(prev.state) && !['working', 'starting'].includes(ns.state)) {
+          const timerId = setTimeout(() => {
+            postIdleTimers.delete(sid);
+            const latest = S.sessions.get(sid);
+            if (!latest || latest.state === 'ended') return;
+            if (currentSession()?.session_id !== sid) return;
+            if (isHostOffline(hostOf(latest))) return;
+            loadSessionOutput(latest, { silent: true });
+          }, 650);
+          postIdleTimers.set(sid, timerId);
         }
       }
       break;
@@ -865,7 +1317,7 @@ function handleEvent(type, d) {
     case 'pipeline': upsertPipeline(d.pipeline); break;
     case 'attention': S.attention = d.items || []; break;
     case 'notifiers': applyNotifiersSnapshot(d); break;
-    case 'resync': syncStateSilent(); return;
+    case 'resync': syncStateSilent({ refreshActive: true }); return;
     case 'review': refreshReview(d.review_id); break;
     case 'artifact': if (d.kind === 'review' && S.reviewsState === 'ok') loadReviews(); break;
     case 'delivery': {
@@ -888,12 +1340,14 @@ function handleEvent(type, d) {
 export function connectSSE() {
   clearTimeout(S.reconnectTimer);
   if (S.es) S.es.close();
+  lastSseConnectAt = Date.now();
   S.conn = 'connecting';
   const es = new EventSource('/api/events');
   S.es = es;
   es.onopen = () => {
     S.conn = 'live';
     S.retry = 0;
+    S.lastSseAt = Date.now();
     if (Date.now() - S.lastLoad > 1500) loadAll();
     APP.schedule();
   };
@@ -907,6 +1361,7 @@ export function connectSSE() {
   };
   for (const t of SSE_TYPES) {
     es.addEventListener(t, (ev) => {
+      S.lastSseAt = Date.now();
       let d;
       try { d = JSON.parse(ev.data); } catch { return; }
       handleEvent(t, d);
@@ -1047,6 +1502,7 @@ export async function pollHealth() {
   const prevFails = S.healthFails;
   const prevVer = S.version;
   const prevAuth = S.authNeeded;
+  const prevUptimeMs = S.uptimeMs;
   const prevUpMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
   try {
     const r = await api('GET', '/api/health');
@@ -1061,8 +1517,39 @@ export async function pollHealth() {
       S.authEnabled = r.auth_enabled;
       if (!r.auth_enabled) S.authNeeded = false;
     }
-    if (S.conn === 'down') connectSSE();
-    if (!S.loaded) loadAll();
+    if (typeof r?.ui_hash === 'string' && r.ui_hash) {
+      if (!S.uiHash) {
+        S.uiHash = r.ui_hash;
+      } else if (S.uiHash !== r.ui_hash) {
+        S.uiHash = r.ui_hash;
+        if (!uiReloadScheduled) {
+          const hasDraft = Boolean(UI.wsShell?.comp?.ta?.value?.trim());
+          const hasOverlay = Boolean(UI.modal || UI.drawer);
+          if (!hasDraft && !hasOverlay && S.loaded && typeof location !== 'undefined' && typeof location.reload === 'function') {
+            uiReloadScheduled = true;
+            location.reload();
+            return;
+          }
+          uiReloadScheduled = true;
+          toast(L('界面已更新，请刷新页面 (Cmd+R) 以加载新版界面', 'Web UI updated — refresh page to load new assets'), 'info');
+        }
+      }
+    }
+    const restarted = prevUptimeMs != null && r.uptime_ms != null && r.uptime_ms < prevUptimeMs;
+    const sseSilent = S.conn === 'live' && S.lastSseAt > 0 && (Date.now() - S.lastSseAt) > 45000;
+    if (restarted) {
+      console.warn('daemon restarted, reconnecting SSE and reloading state');
+      connectSSE();
+      loadAll();
+    } else {
+      if (S.conn === 'down') {
+        connectSSE();
+      } else if (sseSilent) {
+        console.warn('SSE heartbeat silent for >45s, reconnecting SSE');
+        connectSSE();
+      }
+      if (!S.loaded) loadAll();
+    }
   } catch { S.healthFails++; }
   const nextUpMin = S.uptimeMs != null ? Math.floor(S.uptimeMs / 60000) : -1;
   if (S.healthFails !== prevFails || S.version !== prevVer || S.authNeeded !== prevAuth || nextUpMin !== prevUpMin) {
@@ -1070,56 +1557,76 @@ export async function pollHealth() {
   }
 }
 
-const IDLE_READING_POLL_MS = 15000;
+export function refreshActiveOnResume() {
+  const recentlyConnecting = S.conn === 'connecting'
+    && S.es
+    && S.es.readyState === EventSource.CONNECTING
+    && (Date.now() - lastSseConnectAt) < 2000;
+  if (!recentlyConnecting && (S.conn !== 'live' || (S.lastSseAt > 0 && (Date.now() - S.lastSseAt) > 45000))) {
+    connectSSE();
+  }
+  if (S.loaded && UI.view === 'workspace') {
+    const s = currentSession();
+    if (s && s.state !== 'ended' && !isHostOffline(hostOf(s))) {
+      sessionPollAt.set(s.session_id, Date.now());
+      loadSessionOutput(s, { silent: true, force: true });
+    }
+  }
+}
+
+const SSE_LIVE_BUSY_POLL_MS = 6000;
+const SSE_LIVE_IDLE_LOCAL_POLL_MS = 12000;
+const SSE_LIVE_IDLE_REMOTE_POLL_MS = 15000;
+const IDLE_READING_POLL_MS = 12000;
 const REMOTE_BUSY_POLL_MIN_MS = 4500;
 const REMOTE_BUSY_POLL_MAX_MS = 10000;
 const REMOTE_RTT_POLL_MULT = 12;
-const REMOTE_IDLE_POLL_MS = 20000;
+const REMOTE_IDLE_POLL_MS = 15000;
+const RECENTLY_SETTLED_MS = 15000;
+const POLL_JITTER_SLOP_MS = 250;
 
 export function pollActivePreview() {
   if (document.hidden || !S.loaded || !UI.autoRefreshPreview || UI.view !== 'workspace') return;
   const s = currentSession();
   if (!s || s.state === 'ended') return;
-  // Pause automatic preview polling while user is scrolled up reviewing history.
-  const vp = UI.wsShell?.vp || $('.term-viewport');
+  const isReadingView = s.agent !== 'shell' && UI.outputMode === 'reading';
+  // Only pause automatic preview polling on scrollback in raw/shell mode; reading mode preserves scrollTop.
+  const vp = !isReadingView ? (UI.wsShell?.vp || $('.term-viewport')) : null;
   if (vp && (vp.scrollHeight - vp.scrollTop - vp.clientHeight > 120)) return;
   const hid = hostOf(s);
   const hostRec = S.hosts.get(hid);
-  if (hid !== 'local') {
-    if (hostRec?.status === 'offline') return;
-    const tr = S.transcripts.get(s.session_id);
-    const pv = s.pane ? S.previews.get(pvKeyOf(s.pane)) : null;
-    if (trInFlight.has(s.session_id) || (s.pane && pvInFlight.has(pvKeyOf(s.pane)))) return;
-    const isBusy = ['working', 'starting', 'needs_permission', 'needs_input', 'error'].includes(s.state)
-      || (s.agent !== 'shell' && UI.outputMode === 'reading' && sessionNeedsLiveTail(s, tr));
+  if (hid !== 'local' && hostRec?.status === 'offline') return;
+  const tr = S.transcripts.get(s.session_id);
+  const pv = s.pane ? S.previews.get(pvKeyOf(s.pane)) : null;
+  if (trInFlight.has(s.session_id) || (s.pane && pvInFlight.has(pvKeyOf(s.pane)))) return;
+
+  const now = Date.now();
+  const sseLive = S.conn === 'live';
+  const isBusy = ['working', 'starting', 'needs_permission', 'needs_input', 'error'].includes(s.state)
+    || (hid === 'local' && Boolean(s.discovered_only))
+    || (isReadingView && sessionNeedsLiveTail(s, tr));
+  const isRecentlySettled = (now - (sessionStateChangedAt.get(s.session_id) || 0)) < RECENTLY_SETTLED_MS;
+  const hasTranscript = isReadingView && tr?.state === 'ok' && tr?.source === 'transcript';
+  const lastActivity = Math.max(
+    sessionPollAt.get(s.session_id) || 0,
+    hasTranscript ? (tr?.updatedMs || 0) : (pv?.updatedMs || 0),
+  );
+
+  let intervalMs = 0;
+  if (sseLive && isReadingView && !tr?.unsupported) {
+    intervalMs = (isBusy || isRecentlySettled)
+      ? SSE_LIVE_BUSY_POLL_MS
+      : (hid !== 'local' ? SSE_LIVE_IDLE_REMOTE_POLL_MS : SSE_LIVE_IDLE_LOCAL_POLL_MS);
+  } else if (hid !== 'local') {
     const rtt = typeof hostRec?.rtt_ms === 'number' && Number.isFinite(hostRec.rtt_ms) ? hostRec.rtt_ms : 0;
-    const intervalMs = isBusy
+    intervalMs = (isBusy || isRecentlySettled)
       ? Math.max(REMOTE_BUSY_POLL_MIN_MS, Math.min(REMOTE_BUSY_POLL_MAX_MS, rtt * REMOTE_RTT_POLL_MULT))
       : REMOTE_IDLE_POLL_MS;
-    const lastPoll = Math.max(
-      remotePollAt.get(s.session_id) || 0,
-      tr?.updatedMs || 0,
-      pv?.updatedMs || 0,
-    );
-    if (lastPoll && (Date.now() - lastPoll) < intervalMs) return;
-    remotePollAt.set(s.session_id, Date.now());
-    loadSessionOutput(s, { silent: true });
-    return;
+  } else if (isReadingView && !(isBusy || isRecentlySettled)) {
+    intervalMs = IDLE_READING_POLL_MS;
   }
-  if (s.agent !== 'shell' && UI.outputMode === 'reading') {
-    const tr = S.transcripts.get(s.session_id);
-    const isBusy = ['working', 'starting', 'needs_permission', 'needs_input', 'error'].includes(s.state)
-      || Boolean(s.discovered_only)
-      || sessionNeedsLiveTail(s, tr);
-    if (!isBusy) {
-      const tailOpen = UI.open.has(`tail:${s.session_id}`) || Boolean($('details.live-tail')?.open);
-      const lastUpdated = tr?.updatedMs || 0;
-      if (!tailOpen && lastUpdated && (Date.now() - lastUpdated) < IDLE_READING_POLL_MS) return;
-      if (tailOpen && lastUpdated && (Date.now() - lastUpdated) < IDLE_READING_POLL_MS) {
-        // Still allow gentle 15s checks when idle with tail expanded, without 3s transcript spam.
-        return;
-      }
-    }
-  }
+
+  if (intervalMs > 0 && lastActivity && (now - lastActivity) < Math.max(0, intervalMs - POLL_JITTER_SLOP_MS)) return;
+  sessionPollAt.set(s.session_id, now);
   loadSessionOutput(s, { silent: true });
 }

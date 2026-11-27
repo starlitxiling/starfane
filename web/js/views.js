@@ -23,8 +23,19 @@ import {
   statusInd,
   toast,
 } from './dom.js';
-import { act, api, artifact, ensureReview, loadPrecision, loadReviews, refreshReview } from './api.js';
+import {
+  act,
+  api,
+  artifact,
+  ensureReview,
+  loadPrecision,
+  loadPreview,
+  loadReviews,
+  refreshReview,
+  sendSessionKeyApi,
+} from './api.js';
 import { renderInlineMd, renderMarkdown } from './markdown.js';
+import { extractInteractiveMenuSnippet } from './terminal.js';
 import {
   APP,
   S,
@@ -34,10 +45,15 @@ import {
   base,
   draft,
   enc,
+  hashStr,
+  hostOf,
   inboxItems,
   isFinished,
   lastArtifact,
   paneDisplayId,
+  pvKeyOf,
+  pvModeOf,
+  sessionLabel,
   short,
   stageName,
   stageOf,
@@ -55,6 +71,135 @@ export const focusBtn = (id, cls = 'ghost sm') => btn(L('切到终端', 'Focus p
     return L('已切换终端焦点', 'Terminal focus switched');
   }),
 });
+
+export function isInteractivePromptSession(s) {
+  return Boolean(s && !s.is_subagent && (s.state === 'needs_permission' || s.state === 'needs_input'));
+}
+
+export function promptPreviewSourceFor(s) {
+  if (!s) return { text: '', hash: '' };
+  const tr = S.transcripts.get(s.session_id);
+  const trTail = typeof tr?.live_tail === 'string' && tr.live_tail.trim()
+    ? { text: tr.live_tail, hash: `tr:${hashStr(tr.live_tail)}`, updatedMs: tr.liveTailUpdatedMs || tr.updatedMs || 0 }
+    : null;
+  const mapTailRaw = S.liveTails.get(s.session_id);
+  const mapTail = mapTailRaw?.text?.trim()
+    ? { text: mapTailRaw.text, hash: `lt:${mapTailRaw.hash}`, updatedMs: mapTailRaw.updatedMs || 0 }
+    : null;
+  const sseTail = trTail && mapTail
+    ? (trTail.updatedMs >= mapTail.updatedMs ? trTail : mapTail)
+    : (trTail || mapTail);
+
+  let pv = null;
+  if (s.pane) {
+    const direct = S.previews.get(pvKeyOf(s.pane));
+    if (direct?.text?.trim()) {
+      pv = direct;
+    } else {
+      const pfx = `${s.pane}:`;
+      for (const [k, entry] of S.previews.entries()) {
+        if (k.startsWith(pfx) && entry?.text?.trim()) {
+          if (!pv || (entry.updatedMs || 0) >= (pv.updatedMs || 0)) pv = entry;
+        }
+      }
+    }
+  }
+  if (sseTail && (!pv || sseTail.updatedMs >= (pv.updatedMs || 0))) {
+    return { text: sseTail.text, hash: sseTail.hash };
+  }
+  if (pv?.text) {
+    return { text: pv.text, hash: `pv:${pv.hash || hashStr(pv.text)}` };
+  }
+  return { text: '', hash: '' };
+}
+
+export function renderInteractivePromptBar(s, opts = {}) {
+  if (!isInteractivePromptSession(s)) return null;
+  const variant = opts.variant === 'inbox' ? 'inbox' : 'workspace';
+  const sid = s.session_id;
+  const pvSrc = promptPreviewSourceFor(s);
+  if (opts.autoFetchPreview && s.pane && !pvSrc.text) {
+    const hid = hostOf(s);
+    const offline = hid !== 'local' && S.hosts.get(hid)?.status === 'offline';
+    if (!offline && !S.previews.has(pvKeyOf(s.pane))) {
+      loadPreview(s.pane, { mode: pvModeOf(s.pane), silent: true });
+    }
+  }
+  const snippet = pvSrc.text ? extractInteractiveMenuSnippet(pvSrc.text, variant === 'inbox' ? 6 : 5) : '';
+  const sessionBusy = UI.busy.has(`key:${sid}`);
+  const canSend = Boolean(s.pane && s.state !== 'ended');
+  const reason = String(s.last_error || '').trim();
+
+  const keySpecs = [
+    {
+      key: 'Up',
+      label: L('↑ 上移', '↑ Up'),
+      cls: 'prompt-action-btn',
+      title: L('向终端发送方向上键（Up）', 'Send Up arrow key to terminal'),
+    },
+    {
+      key: 'Down',
+      label: L('↓ 下移', '↓ Down'),
+      cls: 'prompt-action-btn',
+      title: L('向终端发送方向下键（Down）', 'Send Down arrow key to terminal'),
+    },
+    {
+      key: 'Enter',
+      label: L('↵ 确认 (Enter)', '↵ Confirm (Enter)'),
+      cls: 'primary prompt-action-btn is-confirm',
+      title: L('向终端发送回车键确认当前选项（Enter）', 'Send Enter key to confirm selected option'),
+    },
+    {
+      key: 'Escape',
+      label: L('Esc 取消', 'Esc Cancel'),
+      cls: 'prompt-action-btn is-cancel',
+      title: L('向终端发送 Esc 键取消或返回（Escape）', 'Send Escape key to cancel or go back'),
+    },
+  ];
+
+  const makeKeyBtn = (spec) => {
+    const isSelfBusy = UI.busy.has(`key:${sid}:${spec.key}`);
+    return h('button', {
+      type: 'button',
+      class: `btn ${spec.cls}${isSelfBusy ? ' is-busy' : ''}`,
+      'data-prompt-key': spec.key,
+      'data-prompt-sid': sid,
+      disabled: !canSend || sessionBusy,
+      title: canSend ? spec.title : L('该会话未绑定终端 pane，无法发送交互按键', 'No terminal pane attached — cannot send interactive keys'),
+      'aria-label': spec.title,
+      onclick: () => sendSessionKeyApi(sid, spec.key),
+    }, spec.label);
+  };
+
+  const previewEl = snippet
+    ? h('pre', { class: 'prompt-action-preview', 'aria-label': L('终端交互菜单预览', 'Interactive terminal menu preview') }, snippet)
+    : null;
+  if (previewEl && typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => {
+      if (previewEl.isConnected && previewEl.scrollHeight > previewEl.clientHeight + 2) {
+        previewEl.scrollTop = previewEl.scrollHeight;
+      }
+    });
+  }
+
+  return h('div', {
+    class: `prompt-action-card is-${variant}`,
+    role: 'region',
+    'aria-label': L('终端交互确认操作栏', 'Interactive terminal confirmation controls'),
+    'data-prompt-bar-sid': sid,
+  },
+  h('div', { class: 'prompt-action-head' },
+    h('div', { class: 'prompt-action-title-wrap' },
+      h('i', { class: `dot dot-${s.state}`, 'aria-hidden': 'true' }),
+      h('strong', { class: 'prompt-action-title' }, L('等待终端交互确认', 'Interactive confirmation required'))),
+    reason ? span('tag prompt-action-reason', reason) : null),
+  previewEl
+    || h('div', { class: 'prompt-action-hint' }, L('使用下方按键直接在远端/本机终端中选择并确认', 'Use the buttons below to navigate and confirm directly in the terminal')),
+  !canSend
+    ? h('div', { class: 'prompt-action-nopane' }, L('当前会话未绑定终端 pane，无法发送交互按键', 'No terminal pane attached — interactive keys unavailable'))
+    : null,
+  h('div', { class: 'prompt-action-btns' }, keySpecs.map(makeKeyBtn)));
+}
 
 export function pipelineAction(p, payload, okMsg) {
   return act(`pa:${p.id}:${payload.action}`, async () => upsertPipeline(await api('POST', `/api/pipelines/${enc(p.id)}/action`, payload)), okMsg);
@@ -188,10 +333,40 @@ export function viewInbox() {
         btn(L('返回会话对话', 'Back to Workspace'), { cls: 'sm', onclick: () => APP.go('workspace') }))));
 }
 
+function inboxCardTitle(it, p, s, kLabel) {
+  if (it.kind === 'binding_confirm' && p) {
+    return L(`确认绑定：${p.goal || p.id}`, `Confirm bindings: ${p.goal || p.id}`);
+  }
+  if (it.kind === 'plan_approval' && p) {
+    return L(`批准计划：${p.goal || p.id}`, `Approve plan: ${p.goal || p.id}`);
+  }
+  if (it.kind === 'triage_ready' && p) {
+    return L(`快筛结论待决：${p.goal || p.id}`, `Triage decision needed: ${p.goal || p.id}`);
+  }
+  if (it.kind === 'needs_human_finding' && it.rid) {
+    return L(`评审 ${short(it.rid, 8)} 有待人工判断的发现`, `Review ${short(it.rid, 8)} has findings awaiting review`);
+  }
+  if (it.kind === 'delivery_unconfirmed' && s) {
+    return L(`${sessionLabel(s)} · 投递未确认`, `${sessionLabel(s)} · Delivery unconfirmed`);
+  }
+  if (s) {
+    return `${sessionLabel(s)} · ${stateText(s.state)}`;
+  }
+  if (p) {
+    const ah = (p.stages || []).find((st) => st.status === 'awaiting_human');
+    if (ah) {
+      return L(`${stageName(ah.id)} 需要人工处理：${p.goal || p.id}`, `${stageName(ah.id)} needs human action: ${p.goal || p.id}`);
+    }
+    return L(`流程阻塞：${p.goal || p.id}`, `Pipeline blocked: ${p.goal || p.id}`);
+  }
+  return it.title || kLabel;
+}
+
 function inboxCard(it) {
   const [kLabel, dotKind] = kindInfo(it.kind);
   const p = it.pid ? S.pipelines.get(it.pid) : null;
   const s = it.sid ? S.sessions.get(it.sid) : null;
+  const cardTitle = inboxCardTitle(it, p, s, kLabel);
   let body = null;
   if (it.kind === 'binding_confirm' && p) {
     body = [bindingEditor(p), confirmBindingBar(p)];
@@ -227,8 +402,10 @@ function inboxCard(it) {
         h('div', { class: 'row' }, btn(L('打开代码评审页', 'Open Reviews'), { cls: 'sm', onclick: () => APP.go('reviews', it.rid) })))
       : skeleton(3);
   } else if (s) {
+    const isInteractive = isInteractivePromptSession(s);
     body = [
-      s.last_error ? h('div', { class: 'callout err' }, span(null, s.last_error)) : null,
+      isInteractive ? renderInteractivePromptBar(s, { variant: 'inbox', autoFetchPreview: true }) : null,
+      !isInteractive && s.last_error ? h('div', { class: 'callout err' }, span(null, s.last_error)) : null,
       s.last_message ? h('div', { class: 'callout' }, renderMarkdown(s.last_message)) : null,
       h('div', { class: 'row' },
         btn(L('在会话对话中打开', 'Open in Workspace'), { cls: 'sm', onclick: () => APP.openSession(s.session_id) }),
@@ -248,7 +425,7 @@ function inboxCard(it) {
   return h('article', { class: 'card' },
     h('div', { class: 'card-head' },
       h('div', { class: 'grow' },
-        h('div', { class: 'card-title' }, it.title || kLabel),
+        h('div', { class: 'card-title' }, cardTitle),
         h('div', { class: 'card-meta' },
           statusInd(dotKind, kLabel),
           p ? h('a', { class: 'mono', href: `#/pipelines/${enc(p.id)}` }, p.id) : null,

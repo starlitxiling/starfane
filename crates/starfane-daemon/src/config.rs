@@ -873,7 +873,12 @@ impl Default for LocalNodeConfig {
 #[serde(rename_all = "snake_case")]
 pub enum NodeKindConfig {
     Ssh,
+    #[serde(alias = "ssh_peer")]
     Peer,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub const DEFAULT_SSH_CONNECT_TIMEOUT_SECS: u64 = 5;
@@ -888,7 +893,8 @@ pub struct NodeConfig {
     pub display_name: Option<String>,
     pub kind: NodeKindConfig,
     pub enabled: bool,
-    /// SSH target (`user@host` or `~/.ssh/config` alias) when `kind = "ssh"`.
+    /// SSH target (`user@host` or `~/.ssh/config` alias) when `kind = "ssh"`, or optional
+    /// SSH loopback tunnel bootstrap target when `kind = "peer"` / `"ssh_peer"`.
     pub ssh_target: String,
     pub ssh_args: Vec<String>,
     /// Optional `ssh` binary override (empty falls back to `STARFANE_SSH_BIN` env or `"ssh"`).
@@ -897,6 +903,10 @@ pub struct NodeConfig {
     pub connect_timeout_secs: u64,
     /// Enable OpenSSH zlib compression (`-o Compression=yes`, default `true`).
     pub compression: bool,
+    /// Enable real-time push watcher (`tmux -C` + multi-session digest on SSH, `/api/events` SSE
+    /// subscriber on Peer; default `true`).
+    #[serde(default = "default_true")]
+    pub push_watch: bool,
     pub tmux_bin: String,
     pub tmux_socket: String,
     /// Optional remote `claude` binary override for SSH spawns (empty defaults to `"claude"`).
@@ -927,6 +937,7 @@ impl Default for NodeConfig {
             ssh_bin: String::new(),
             connect_timeout_secs: DEFAULT_SSH_CONNECT_TIMEOUT_SECS,
             compression: true,
+            push_watch: true,
             tmux_bin: "tmux".into(),
             tmux_socket: String::new(),
             claude_bin: String::new(),
@@ -998,10 +1009,24 @@ impl NodeConfig {
                 validate_no_control_chars(&format!("ssh node {id:?} agy_bin"), &self.agy_bin)?;
             }
             NodeKindConfig::Peer => {
-                if self.endpoints.is_empty() || self.endpoints.iter().any(|u| u.trim().is_empty()) {
+                let has_ssh_tunnel = !self.ssh_target.trim().is_empty();
+                if self.endpoints.iter().any(|u| u.trim().is_empty()) {
                     return Err(format!(
-                        "peer node {id:?} requires at least one non-empty URL in endpoints"
+                        "peer node {id:?} endpoints cannot contain empty URLs"
                     ));
+                }
+                if self.endpoints.is_empty() && !has_ssh_tunnel {
+                    return Err(format!(
+                        "peer node {id:?} requires at least one non-empty URL in endpoints (or ssh_target for SSH tunnel bootstrap)"
+                    ));
+                }
+                if has_ssh_tunnel {
+                    if self.connect_timeout_secs == 0 {
+                        return Err(format!(
+                            "peer node {id:?} connect_timeout_secs must be >= 1 when ssh_target is set"
+                        ));
+                    }
+                    validate_no_control_chars(&format!("peer node {id:?} ssh_bin"), &self.ssh_bin)?;
                 }
             }
         }
@@ -1917,11 +1942,13 @@ ssh_target = "ubuntu@gpu-a"
         assert_eq!(node.ssh_bin_override(), None);
         assert_eq!(node.connect_timeout_secs, DEFAULT_SSH_CONNECT_TIMEOUT_SECS);
         assert!(node.compression);
+        assert!(node.push_watch);
+        assert!(!node.include_shell_panes);
         assert_eq!(node.agent_bin(starfane_proto::AgentKind::Claude), "claude");
         assert_eq!(node.agent_bin(starfane_proto::AgentKind::Codex), "codex");
         assert_eq!(node.agent_bin(starfane_proto::AgentKind::Agy), "agy");
 
-        // Explicit overrides parse and validate cleanly.
+        // Explicit overrides parse and validate cleanly (including push_watch=false and ssh_peer alias).
         let custom: StarfaneConfig = toml::from_str(
             r#"
 [[nodes]]
@@ -1931,9 +1958,16 @@ ssh_target = "ubuntu@gpu-b"
 ssh_bin = "/opt/bin/fake-ssh"
 connect_timeout_secs = 12
 compression = false
+push_watch = false
+include_shell_panes = true
 claude_bin = "/home/ubuntu/.local/bin/claude"
 codex_bin = "/home/ubuntu/.npm-global/bin/codex"
 agy_bin = "/home/ubuntu/.local/bin/agy"
+
+[[nodes]]
+id = "mac-tun"
+kind = "ssh_peer"
+ssh_target = "mac-xiling"
 "#,
         )
         .unwrap();
@@ -1942,6 +1976,8 @@ agy_bin = "/home/ubuntu/.local/bin/agy"
         assert_eq!(n.ssh_bin_override().as_deref(), Some("/opt/bin/fake-ssh"));
         assert_eq!(n.connect_timeout_secs, 12);
         assert!(!n.compression);
+        assert!(!n.push_watch);
+        assert!(n.include_shell_panes);
         assert_eq!(
             n.agent_bin(starfane_proto::AgentKind::Claude),
             "/home/ubuntu/.local/bin/claude"
@@ -1954,6 +1990,11 @@ agy_bin = "/home/ubuntu/.local/bin/agy"
             n.agent_bin(starfane_proto::AgentKind::Agy),
             "/home/ubuntu/.local/bin/agy"
         );
+        let tun = &custom.nodes[1];
+        assert_eq!(tun.kind, NodeKindConfig::Peer);
+        assert_eq!(tun.ssh_target, "mac-xiling");
+        assert!(tun.endpoints.is_empty());
+        assert!(tun.push_watch);
 
         // Zero connect_timeout_secs fails validation.
         let bad: StarfaneConfig = toml::from_str(

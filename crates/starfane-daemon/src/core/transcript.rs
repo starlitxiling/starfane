@@ -87,6 +87,16 @@ pub enum TranscriptMessageKind {
     Final,
 }
 
+/// Semantic category for assistant turns that delegated work to a subagent or
+/// Swarm worker so Web UI can visually distinguish delegated handoffs from
+/// completed stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationKind {
+    Subagent,
+    Swarm,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptMessage {
     pub role: TranscriptRole,
@@ -97,6 +107,74 @@ pub struct TranscriptMessage {
     pub tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<TranscriptMessageKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<DelegationKind>,
+}
+
+/// Content-aware watermark for a transcript index, detecting in-place mutations
+/// (synthetic trailing pending-tools replacement, Claude same-`msg_id` appends,
+/// or late AGY `transcript_full.jsonl` hydration) even when `total_messages` stays flat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TranscriptWatermark {
+    pub total_messages: usize,
+    pub last_turn_hash: u64,
+    pub has_pending_tools: bool,
+}
+
+/// Compute a deterministic 64-bit FNV-1a hash over all semantic fields of `TranscriptMessage`.
+pub fn hash_transcript_message(msg: &TranscriptMessage) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+
+    #[inline]
+    fn fnv_bytes(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    let mut h = FNV_OFFSET_BASIS;
+    let role_tag = match msg.role {
+        TranscriptRole::User => 1u8,
+        TranscriptRole::Assistant => 2u8,
+        TranscriptRole::System => 3u8,
+    };
+    fnv_bytes(&mut h, &[role_tag]);
+
+    let kind_tag = match msg.kind {
+        None => 0u8,
+        Some(TranscriptMessageKind::Plan) => 1u8,
+        Some(TranscriptMessageKind::AgentMessage) => 2u8,
+        Some(TranscriptMessageKind::Intermediate) => 3u8,
+        Some(TranscriptMessageKind::Final) => 4u8,
+    };
+    fnv_bytes(&mut h, &[kind_tag]);
+
+    let del_tag = match msg.delegation {
+        None => 0u8,
+        Some(DelegationKind::Subagent) => 1u8,
+        Some(DelegationKind::Swarm) => 2u8,
+    };
+    fnv_bytes(&mut h, &[del_tag]);
+
+    match msg.ts_ms {
+        None => fnv_bytes(&mut h, &[0u8]),
+        Some(ts) => {
+            fnv_bytes(&mut h, &[1u8]);
+            fnv_bytes(&mut h, &ts.to_le_bytes());
+        }
+    }
+
+    fnv_bytes(&mut h, &(msg.tools.len() as u64).to_le_bytes());
+    for tool in &msg.tools {
+        fnv_bytes(&mut h, &(tool.len() as u64).to_le_bytes());
+        fnv_bytes(&mut h, tool.as_bytes());
+    }
+
+    fnv_bytes(&mut h, &(msg.text.len() as u64).to_le_bytes());
+    fnv_bytes(&mut h, msg.text.as_bytes());
+    h
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -268,6 +346,7 @@ pub(crate) struct TranscriptIndex {
     turns: Vec<IndexedTurn>,
     last_claude_msg_id: Option<String>,
     pending_tools: Vec<String>,
+    pending_delegation: Option<DelegationKind>,
     telemetry: TelemetryFold,
     agy_full: Option<AgyFullIndex>,
     #[cfg(test)]
@@ -380,6 +459,7 @@ impl TranscriptIndex {
             turns: Vec::new(),
             last_claude_msg_id: None,
             pending_tools: Vec::new(),
+            pending_delegation: None,
             telemetry: TelemetryFold::new(agent),
             agy_full: None,
             #[cfg(test)]
@@ -506,6 +586,7 @@ impl TranscriptIndex {
                 {
                     last.msg.kind = msg.kind;
                 }
+                last.msg.delegation = merge_delegation(last.msg.delegation, msg.delegation);
                 return;
             }
         }
@@ -538,12 +619,14 @@ impl TranscriptIndex {
                 if let Some(clean) = extract_claude_user_text(content) {
                     self.last_claude_msg_id = None;
                     self.pending_tools.clear();
+                    self.pending_delegation = None;
                     self.push_std_turn(TranscriptMessage {
                         role: TranscriptRole::User,
                         text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                         ts_ms,
                         tools: Vec::new(),
                         kind: None,
+                        delegation: None,
                     });
                 }
             }
@@ -553,7 +636,8 @@ impl TranscriptIndex {
                 };
                 let msg_id = msg.get("id").and_then(Value::as_str).map(str::to_string);
                 let stop_reason = msg.get("stop_reason").and_then(Value::as_str);
-                let (body, tools) = extract_claude_assistant_content(msg.get("content"));
+                let (body, tools, turn_delegation) =
+                    extract_claude_assistant_content(msg.get("content"));
                 let is_tool_turn = !tools.is_empty() || stop_reason == Some("tool_use");
                 let is_final_turn =
                     matches!(stop_reason, Some("end_turn" | "stop_sequence")) && tools.is_empty();
@@ -580,6 +664,12 @@ impl TranscriptIndex {
                                 last.msg.text = truncate_utf8(&last.msg.text, MAX_MESSAGE_BYTES);
                             }
                             merge_tools(&mut last.msg.tools, &tools);
+                            last.msg.delegation =
+                                merge_delegation(last.msg.delegation, turn_delegation);
+                            if turn_delegation.is_some() {
+                                self.pending_delegation =
+                                    merge_delegation(self.pending_delegation, turn_delegation);
+                            }
                             if last.msg.ts_ms.is_none() {
                                 last.msg.ts_ms = ts_ms;
                             }
@@ -596,16 +686,23 @@ impl TranscriptIndex {
                 }
 
                 merge_tools(&mut self.pending_tools, &tools);
+                self.pending_delegation =
+                    merge_delegation(self.pending_delegation, turn_delegation);
                 if body.is_empty() {
                     return;
                 }
                 let attached = std::mem::take(&mut self.pending_tools);
+                let delegation = self.pending_delegation.take();
+                if turn_delegation.is_some() {
+                    self.pending_delegation = turn_delegation;
+                }
                 self.push_std_turn(TranscriptMessage {
                     role: TranscriptRole::Assistant,
                     text: truncate_utf8(&body, MAX_MESSAGE_BYTES),
                     ts_ms,
                     tools: attached,
                     kind: chunk_kind,
+                    delegation,
                 });
                 self.last_claude_msg_id = msg_id;
             }
@@ -634,6 +731,7 @@ impl TranscriptIndex {
                 let (body, has_image) = extract_codex_content(payload.get("content"));
                 if role == TranscriptRole::User {
                     self.pending_tools.clear();
+                    self.pending_delegation = None;
                     if let Some(clean) = clean_codex_user_text(&body, has_image) {
                         self.push_std_turn(TranscriptMessage {
                             role,
@@ -641,6 +739,7 @@ impl TranscriptIndex {
                             ts_ms,
                             tools: Vec::new(),
                             kind: None,
+                            delegation: None,
                         });
                     }
                 } else {
@@ -649,22 +748,27 @@ impl TranscriptIndex {
                         return;
                     }
                     let attached = std::mem::take(&mut self.pending_tools);
+                    let delegation = self.pending_delegation.take();
                     self.push_std_turn(TranscriptMessage {
                         role,
                         text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                         ts_ms,
                         tools: attached,
                         kind: codex_phase_kind(payload),
+                        delegation,
                     });
                 }
             }
             ("response_item", "custom_tool_call" | "function_call") => {
                 if let Some(name) = payload.get("name").and_then(Value::as_str) {
                     push_unique(&mut self.pending_tools, name);
+                    self.pending_delegation =
+                        merge_delegation(self.pending_delegation, classify_codex_tool_name(name));
                 }
             }
             ("event_msg", "user_message") => {
                 self.pending_tools.clear();
+                self.pending_delegation = None;
                 let msg = payload.get("message").and_then(Value::as_str).unwrap_or("");
                 let has_images = payload
                     .get("images")
@@ -681,6 +785,7 @@ impl TranscriptIndex {
                         ts_ms,
                         tools: Vec::new(),
                         kind: None,
+                        delegation: None,
                     });
                 }
             }
@@ -689,12 +794,14 @@ impl TranscriptIndex {
                     let clean = strip_codex_internal_tags(msg);
                     if !clean.is_empty() {
                         let attached = std::mem::take(&mut self.pending_tools);
+                        let delegation = self.pending_delegation.take();
                         self.push_std_turn(TranscriptMessage {
                             role: TranscriptRole::Assistant,
                             text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                             ts_ms,
                             tools: attached,
                             kind: codex_phase_kind(payload),
+                            delegation,
                         });
                     }
                 }
@@ -704,12 +811,14 @@ impl TranscriptIndex {
                     let clean = strip_codex_internal_tags(msg);
                     if !clean.is_empty() {
                         let attached = std::mem::take(&mut self.pending_tools);
+                        let delegation = self.pending_delegation.take();
                         self.push_std_turn(TranscriptMessage {
                             role: TranscriptRole::Assistant,
                             text: truncate_utf8(&clean, MAX_MESSAGE_BYTES),
                             ts_ms,
                             tools: attached,
                             kind: Some(TranscriptMessageKind::Final),
+                            delegation,
                         });
                     }
                 }
@@ -741,6 +850,7 @@ impl TranscriptIndex {
                 {
                     last.msg.kind = item.msg.kind;
                 }
+                last.msg.delegation = merge_delegation(last.msg.delegation, item.msg.delegation);
                 return;
             }
         }
@@ -762,6 +872,7 @@ impl TranscriptIndex {
                     return;
                 }
                 self.pending_tools.clear();
+                self.pending_delegation = None;
                 let raw = obj.get("content").and_then(Value::as_str).unwrap_or("");
                 let has_media = obj
                     .get("media")
@@ -780,6 +891,7 @@ impl TranscriptIndex {
                             ts_ms,
                             tools: Vec::new(),
                             kind: None,
+                            delegation: None,
                         },
                         step_index,
                         needs_content_hydration,
@@ -791,11 +903,30 @@ impl TranscriptIndex {
             "PLANNER_RESPONSE" => {
                 let calls = obj.get("tool_calls").and_then(Value::as_array);
                 let has_own_calls = calls.is_some_and(|c| !c.is_empty());
+                let mut step_delegation = None;
+                let mut step_has_done_post = false;
                 if let Some(calls) = calls {
                     for tc in calls {
                         if let Some(name) = tc.get("name").and_then(Value::as_str) {
                             push_unique(&mut self.pending_tools, name);
+                            if name == "post_message"
+                                && tc
+                                    .get("args")
+                                    .and_then(|a| a.get("text"))
+                                    .and_then(agy_arg_str)
+                                    .is_some_and(|txt| agy_post_message_is_done(&txt))
+                            {
+                                step_has_done_post = true;
+                            }
                         }
+                        step_delegation =
+                            merge_delegation(step_delegation, classify_agy_tool_call(tc));
+                    }
+                    if step_has_done_post && step_delegation.is_none() {
+                        self.pending_delegation = None;
+                    } else {
+                        self.pending_delegation =
+                            merge_delegation(self.pending_delegation, step_delegation);
                     }
                 }
                 let content_opt = obj
@@ -805,6 +936,7 @@ impl TranscriptIndex {
                     .filter(|s| !s.is_empty());
                 if let Some(content) = content_opt {
                     let attached = std::mem::take(&mut self.pending_tools);
+                    let delegation = self.pending_delegation.take();
                     let needs_content_hydration =
                         step_index.is_some() && agy_needs_content_hydration(obj, content);
                     let turn_kind = if has_own_calls {
@@ -819,6 +951,7 @@ impl TranscriptIndex {
                             ts_ms,
                             tools: attached,
                             kind: Some(turn_kind),
+                            delegation,
                         },
                         step_index,
                         needs_content_hydration,
@@ -828,6 +961,13 @@ impl TranscriptIndex {
                 } else if let Some(calls) = calls {
                     if let Some((tc_text, tc_kind)) = extract_agy_tool_call_text(calls) {
                         let attached = std::mem::take(&mut self.pending_tools);
+                        let delegation = self.pending_delegation.take();
+                        if tc_kind == TranscriptMessageKind::AgentMessage && delegation.is_some() {
+                            // Keep delegation armed so the immediate user-facing explanation
+                            // right after a collapsed `post_message("@worker ...")` / `send_message`
+                            // card is also highlighted as delegated.
+                            self.pending_delegation = delegation;
+                        }
                         let needs_tools_hydration =
                             step_index.is_some() && agy_needs_tools_hydration(obj);
                         self.push_agy_turn(IndexedTurn {
@@ -837,6 +977,7 @@ impl TranscriptIndex {
                                 ts_ms,
                                 tools: attached,
                                 kind: Some(tc_kind),
+                                delegation,
                             },
                             step_index,
                             needs_content_hydration: false,
@@ -849,6 +990,11 @@ impl TranscriptIndex {
             "SYSTEM_MESSAGE" => {
                 if let Some(raw) = obj.get("content").and_then(Value::as_str) {
                     if let Some(msg_text) = extract_agy_interagent_message(raw) {
+                        // A swarm / background-task wakeup starts a new post-wakeup turn so
+                        // pre-wakeup `swarm_wait` / `swarm(add)` state never leaks onto final
+                        // completion summaries after wakeup.
+                        self.pending_tools.clear();
+                        self.pending_delegation = None;
                         let needs_content_hydration =
                             step_index.is_some() && agy_needs_content_hydration(obj, raw);
                         self.push_agy_turn(IndexedTurn {
@@ -858,6 +1004,7 @@ impl TranscriptIndex {
                                 ts_ms,
                                 tools: Vec::new(),
                                 kind: None,
+                                delegation: None,
                             },
                             step_index,
                             needs_content_hydration,
@@ -876,6 +1023,7 @@ impl TranscriptIndex {
                     .filter(|s| !s.is_empty());
                 if let Some(err_text) = err {
                     let attached = std::mem::take(&mut self.pending_tools);
+                    self.pending_delegation = None;
                     self.turns.push(IndexedTurn {
                         msg: TranscriptMessage {
                             role: TranscriptRole::Assistant,
@@ -883,6 +1031,7 @@ impl TranscriptIndex {
                             ts_ms,
                             tools: attached,
                             kind: None,
+                            delegation: None,
                         },
                         step_index,
                         needs_content_hydration: false,
@@ -954,9 +1103,24 @@ impl TranscriptIndex {
                         it.msg.text = truncate_utf8(&tc_text, MAX_MESSAGE_BYTES);
                         it.msg.kind = Some(tc_kind);
                     }
+                    let hydrated_del = calls.iter().fold(None, |acc, tc| {
+                        merge_delegation(acc, classify_agy_tool_call(tc))
+                    });
+                    it.msg.delegation = merge_delegation(it.msg.delegation, hydrated_del);
                 }
             }
             it.hydrated = true;
+        }
+    }
+
+    fn trailing_pending_tools_message(&self) -> TranscriptMessage {
+        TranscriptMessage {
+            role: TranscriptRole::Assistant,
+            text: String::new(),
+            ts_ms: self.turns.last().and_then(|t| t.msg.ts_ms),
+            tools: self.pending_tools.clone(),
+            kind: None,
+            delegation: self.pending_delegation,
         }
     }
 
@@ -991,13 +1155,7 @@ impl TranscriptIndex {
             let msg = if cur < self.turns.len() {
                 self.turns[cur].msg.clone()
             } else {
-                TranscriptMessage {
-                    role: TranscriptRole::Assistant,
-                    text: String::new(),
-                    ts_ms: self.turns.last().and_then(|t| t.msg.ts_ms),
-                    tools: self.pending_tools.clone(),
-                    kind: None,
-                }
+                self.trailing_pending_tools_message()
             };
             let est_bytes = msg.text.len() + 64;
             if !kept_rev.is_empty() && bytes_used + est_bytes > MAX_TRANSCRIPT_RESPONSE_BYTES {
@@ -1031,6 +1189,39 @@ impl TranscriptIndex {
 
     pub fn total_messages(&self) -> usize {
         self.turns.len() + usize::from(!self.pending_tools.is_empty())
+    }
+
+    /// Return the content hash of message at 0-based `idx`, hydrating AGY turns first if needed,
+    /// or hashing the synthetic trailing pending-tools message when `idx == self.turns.len()`.
+    pub(crate) fn turn_hash_at(&mut self, path: &Path, idx: usize) -> Option<u64> {
+        if idx < self.turns.len() {
+            if self.agent == AgentKind::Agy {
+                self.hydrate_range(path, idx, idx + 1);
+            }
+            return Some(hash_transcript_message(&self.turns[idx].msg));
+        }
+        if idx == self.turns.len() && !self.pending_tools.is_empty() {
+            return Some(hash_transcript_message(
+                &self.trailing_pending_tools_message(),
+            ));
+        }
+        None
+    }
+
+    /// Compute the current `TranscriptWatermark` for this indexed transcript.
+    pub(crate) fn watermark(&mut self, path: &Path) -> TranscriptWatermark {
+        let total_messages = self.total_messages();
+        let has_pending_tools = !self.pending_tools.is_empty();
+        let last_turn_hash = if total_messages > 0 {
+            self.turn_hash_at(path, total_messages - 1).unwrap_or(0)
+        } else {
+            0
+        };
+        TranscriptWatermark {
+            total_messages,
+            last_turn_hash,
+            has_pending_tools,
+        }
     }
 
     /// Return deduplicated AGY `step_index` values within the page selected by `query` that
@@ -1101,13 +1292,41 @@ fn merge_transcript_metrics(
     session_metrics: Option<SessionMetrics>,
     parsed_metrics: Option<SessionMetrics>,
 ) -> Option<SessionMetrics> {
-    if session_metrics
-        .as_ref()
-        .is_some_and(|m| m.source == "cc_switch")
-    {
-        super::metrics::merge_cc_switch_with_fallback(session_metrics, parsed_metrics, None)
-    } else {
-        merge_metrics(parsed_metrics, session_metrics)
+    match (session_metrics, parsed_metrics) {
+        (Some(mut agy), Some(parsed)) if agy.source == "agy_db" => {
+            agy.context_window_tokens = agy.context_window_tokens.or(parsed.context_window_tokens);
+            agy.context_used_tokens = agy.context_used_tokens.or(parsed.context_used_tokens);
+            if let (Some(u), Some(w)) = (agy.context_used_tokens, agy.context_window_tokens) {
+                let pct = ((u as f64 / w as f64) * 100.0).clamp(0.0, 100.0);
+                if pct.is_finite() {
+                    agy.context_used_pct = Some(((pct * 10.0).round() / 10.0) as f32);
+                }
+            } else if agy.context_used_pct.is_none() {
+                agy.context_used_pct = parsed.context_used_pct;
+            }
+            agy.total_input_tokens = match (agy.total_input_tokens, parsed.total_input_tokens) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            agy.total_output_tokens = match (agy.total_output_tokens, parsed.total_output_tokens) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            if agy.tps.is_none() {
+                agy.tps = parsed.tps;
+                agy.last_output_tokens = agy.last_output_tokens.or(parsed.last_output_tokens);
+                agy.last_duration_ms = agy.last_duration_ms.or(parsed.last_duration_ms);
+            }
+            if agy.recent_turns.is_empty() && !parsed.recent_turns.is_empty() {
+                agy.recent_turns = parsed.recent_turns;
+            }
+            Some(agy)
+        }
+        (Some(agy), None) if agy.source == "agy_db" => Some(agy),
+        (sess, parsed) => {
+            let status_like = sess.filter(|m| m.source != "cc_switch");
+            merge_metrics(parsed, status_like)
+        }
     }
 }
 
@@ -1427,6 +1646,30 @@ impl TranscriptIndexCache {
     pub fn total_messages_for_path(&mut self, agent: AgentKind, path: &Path) -> Option<usize> {
         let idx = self.get_or_sync(agent, path)?;
         Some(idx.total_messages())
+    }
+
+    /// Return the content-aware `TranscriptWatermark` for `path` (syncing newly appended bytes first).
+    pub fn watermark_for_path(
+        &mut self,
+        agent: AgentKind,
+        path: &Path,
+    ) -> Option<TranscriptWatermark> {
+        let key_path = canonicalize_cache_path(path);
+        let idx = self.get_or_sync_canonical(agent, &key_path)?;
+        Some(idx.watermark(&key_path))
+    }
+
+    /// Return the content hash of turn `idx` for `path` (hydrating AGY turns from sibling
+    /// `transcript_full.jsonl` if needed).
+    pub fn turn_hash_at_for_path(
+        &mut self,
+        agent: AgentKind,
+        path: &Path,
+        idx: usize,
+    ) -> Option<u64> {
+        let key_path = canonicalize_cache_path(path);
+        let index = self.get_or_sync_canonical(agent, &key_path)?;
+        index.turn_hash_at(&key_path, idx)
     }
 
     /// Return AGY `step_index` values in the slice selected by `query` that are not yet hydrated
@@ -1828,15 +2071,18 @@ fn extract_claude_user_text(content: &Value) -> Option<String> {
     }
 }
 
-fn extract_claude_assistant_content(content: Option<&Value>) -> (String, Vec<String>) {
+fn extract_claude_assistant_content(
+    content: Option<&Value>,
+) -> (String, Vec<String>, Option<DelegationKind>) {
     let Some(val) = content else {
-        return (String::new(), Vec::new());
+        return (String::new(), Vec::new(), None);
     };
     match val {
-        Value::String(s) => (s.trim().to_string(), Vec::new()),
+        Value::String(s) => (s.trim().to_string(), Vec::new(), None),
         Value::Array(blocks) => {
             let mut texts = Vec::new();
             let mut tools = Vec::new();
+            let mut delegation = None;
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     Some("text") => {
@@ -1850,14 +2096,104 @@ fn extract_claude_assistant_content(content: Option<&Value>) -> (String, Vec<Str
                     Some("tool_use") => {
                         if let Some(name) = b.get("name").and_then(Value::as_str) {
                             push_unique(&mut tools, name);
+                            delegation =
+                                merge_delegation(delegation, classify_claude_tool_name(name));
                         }
                     }
                     _ => {} // skip thinking / redacted_thinking / server_tool_use etc.
                 }
             }
-            (texts.join("\n\n"), tools)
+            (texts.join("\n\n"), tools, delegation)
         }
-        _ => (String::new(), Vec::new()),
+        _ => (String::new(), Vec::new(), None),
+    }
+}
+
+fn merge_delegation(
+    a: Option<DelegationKind>,
+    b: Option<DelegationKind>,
+) -> Option<DelegationKind> {
+    match (a, b) {
+        (Some(DelegationKind::Swarm), _) | (_, Some(DelegationKind::Swarm)) => {
+            Some(DelegationKind::Swarm)
+        }
+        (Some(DelegationKind::Subagent), _) | (_, Some(DelegationKind::Subagent)) => {
+            Some(DelegationKind::Subagent)
+        }
+        (None, None) => None,
+    }
+}
+
+fn is_starfane_mcp_delegation_tool(name: &str) -> bool {
+    let leaf = name
+        .trim()
+        .rsplit("__")
+        .next()
+        .unwrap_or(name)
+        .rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .rsplit(':')
+        .next()
+        .unwrap_or(name);
+    matches!(leaf, "spawn_session" | "create_handoff" | "start_pipeline")
+}
+
+fn classify_claude_tool_name(name: &str) -> Option<DelegationKind> {
+    match name.trim() {
+        "TeamCreate" => Some(DelegationKind::Swarm),
+        "Agent" | "Task" | "SendMessage" => Some(DelegationKind::Subagent),
+        other if is_starfane_mcp_delegation_tool(other) => Some(DelegationKind::Subagent),
+        _ => None,
+    }
+}
+
+fn classify_codex_tool_name(name: &str) -> Option<DelegationKind> {
+    match name.trim() {
+        "spawn_agent" | "send_input" | "wait" | "wait_agent" | "resume_agent" => {
+            Some(DelegationKind::Subagent)
+        }
+        other if is_starfane_mcp_delegation_tool(other) => Some(DelegationKind::Subagent),
+        _ => None,
+    }
+}
+
+fn agy_post_message_is_done(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let rest = if trimmed.starts_with('@') {
+        trimmed
+            .split_once(char::is_whitespace)
+            .map(|(_, after)| after.trim_start())
+            .unwrap_or("")
+    } else {
+        trimmed
+    };
+    rest.get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[done]"))
+}
+
+fn classify_agy_tool_call(tc: &Value) -> Option<DelegationKind> {
+    let name = tc.get("name").and_then(Value::as_str)?.trim();
+    match name {
+        "swarm" => {
+            let action = tc
+                .get("args")
+                .and_then(|a| a.get("action"))
+                .and_then(agy_arg_str)?;
+            (action == "add").then_some(DelegationKind::Swarm)
+        }
+        "swarm_wait" => Some(DelegationKind::Swarm),
+        "post_message" => {
+            let is_done = tc
+                .get("args")
+                .and_then(|a| a.get("text"))
+                .and_then(agy_arg_str)
+                .is_some_and(|txt| agy_post_message_is_done(&txt));
+            (!is_done).then_some(DelegationKind::Swarm)
+        }
+        "invoke_subagent" | "run_workflow" | "send_message" => Some(DelegationKind::Subagent),
+        other if is_starfane_mcp_delegation_tool(other) => Some(DelegationKind::Subagent),
+        _ => None,
     }
 }
 
@@ -3435,5 +3771,583 @@ not valid json at all
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifies_agy_delegation_rules_and_hydration_without_false_positives() {
+        let agy_jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            // 1. swarm(add) + title -> Swarm on assistant reply
+            serde_json::json!({
+                "step_index": 1,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-11-26T01:00:00Z",
+                "content": "<USER_REQUEST>\n派发任务\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:00:01Z",
+                "tool_calls": [
+                    {"name": "swarm", "args": {"action": "\"title\"", "title": "\"My Swarm\""}},
+                    {"name": "swarm", "args": {"action": "\"add\"", "name": "\"worker-1\""}}
+                ]
+            }),
+            serde_json::json!({
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:00:02Z",
+                "content": "已派出 worker-1 在后台执行。"
+            }),
+            // 2. swarm(status/models/kill/model) -> None (zero false positives!)
+            serde_json::json!({
+                "step_index": 4,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-11-26T01:01:00Z",
+                "content": "<USER_REQUEST>\n检查状态\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 5,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:01:01Z",
+                "tool_calls": [
+                    {"name": "swarm", "args": {"action": "\"status\""}},
+                    {"name": "swarm", "args": {"action": "models"}},
+                    {"name": "swarm", "args": {"action": "\"kill\"", "name": "\"old\""}}
+                ]
+            }),
+            serde_json::json!({
+                "step_index": 6,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:01:02Z",
+                "content": "所有 worker 已空闲，任务收尾。"
+            }),
+            // 3. post_message("@worker ...") -> Swarm (and propagates to immediate user-facing explanation!);
+            //    post_message("[done] ...") & "@coord [done]" -> None (and clears delegation!)
+            serde_json::json!({
+                "step_index": 7,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:02:00Z",
+                "tool_calls": [
+                    {"name": "post_message", "args": {"text": "\"@worker-1 请补充测试\""}}
+                ]
+            }),
+            serde_json::json!({
+                "step_index": 70,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:02:02Z",
+                "content": "已通知 worker-1 补充单测。"
+            }),
+            serde_json::json!({
+                "step_index": 8,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:02:10Z",
+                "tool_calls": [
+                    {"name": "post_message", "args": {"text": "\"[done] 全部收尾完成\""}}
+                ]
+            }),
+            serde_json::json!({
+                "step_index": 9,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:02:12Z",
+                "tool_calls": [
+                    {"name": "post_message", "args": {"text": "\"@coordinator [done] 汇报结果\""}}
+                ]
+            }),
+            // 4. invoke_subagent -> Subagent; invoke_subagent + swarm_wait -> Swarm priority
+            serde_json::json!({
+                "step_index": 10,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:03:00Z",
+                "tool_calls": [{"name": "invoke_subagent", "args": {"SubagentName": "\"explorer\""}}]
+            }),
+            serde_json::json!({
+                "step_index": 11,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:03:02Z",
+                "content": "子代理已启动。"
+            }),
+            serde_json::json!({
+                "step_index": 12,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:03:10Z",
+                "tool_calls": [
+                    {"name": "invoke_subagent", "args": {}},
+                    {"name": "swarm_wait", "args": {"since": "10"}}
+                ],
+                "content": "等待 Swarm 汇总。"
+            }),
+            // 5. Silent swarm_wait followed by SYSTEM_MESSAGE wakeup -> post-wakeup final summary stays None!
+            serde_json::json!({
+                "step_index": 13,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:04:00Z",
+                "tool_calls": [{"name": "swarm_wait", "args": {"since": "11"}}]
+            }),
+            serde_json::json!({
+                "step_index": 14,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "created_at": "2026-11-26T01:04:30Z",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T01:04:30Z sender=board-1 priority=HIGH content=[swarm] new board message #12\n</SYSTEM_MESSAGE>"
+            }),
+            serde_json::json!({
+                "step_index": 15,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:04:35Z",
+                "tool_calls": [{"name": "read_board", "args": {}}],
+                "content": "最终验收完成，全部绿灯。"
+            }),
+            // 6. Starfane MCP cross-agent tool -> Subagent
+            serde_json::json!({
+                "step_index": 16,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:05:00Z",
+                "tool_calls": [{"name": "mcp__starfane__spawn_session", "args": {}}],
+                "content": "已通过 MCP 拉起远程会话。"
+            }),
+            // 7. Trailing in-flight swarm_wait with no content yet -> synthetic trailing card gets Swarm
+            serde_json::json!({
+                "step_index": 17,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:06:00Z",
+                "tool_calls": [{"name": "swarm_wait", "args": {"since": "12"}}]
+            }),
+        );
+
+        let msgs = parse_agy_jsonl_with_hydration(&agy_jsonl, None, 30);
+        // Expected messages:
+        // 0: User("派发任务")
+        // 1: Assistant("已派出 worker-1...") -> Swarm
+        // 2: User("检查状态")
+        // 3: Assistant("所有 worker 已空闲...") -> None
+        // 4: Assistant("[群组消息]\n@worker-1...") -> Swarm
+        // 5: Assistant("已通知 worker-1 补充单测。") -> Swarm (propagated from AgentMessage!)
+        // 6: Assistant("[群组消息]\n[done] 全部收尾完成") -> None
+        // 7: Assistant("[群组消息]\n@coordinator [done] 汇报结果") -> None
+        // 8: Assistant("子代理已启动。") -> Subagent
+        // 9: Assistant("等待 Swarm 汇总。") -> Swarm
+        // 10: System("[Swarm 通知]\n...") -> None
+        // 11: Assistant("最终验收完成，全部绿灯。") -> None
+        // 12: Assistant("已通过 MCP 拉起远程会话。") -> Subagent
+        // 13: Assistant("") trailing pending_tools=["swarm_wait"] -> Swarm
+        assert_eq!(msgs.len(), 14, "{msgs:?}");
+        assert_eq!(msgs[0].delegation, None);
+        assert_eq!(msgs[1].delegation, Some(DelegationKind::Swarm));
+        assert_eq!(msgs[3].delegation, None);
+        assert_eq!(msgs[4].delegation, Some(DelegationKind::Swarm));
+        assert_eq!(msgs[4].kind, Some(TranscriptMessageKind::AgentMessage));
+        assert_eq!(msgs[5].delegation, Some(DelegationKind::Swarm));
+        assert_eq!(msgs[6].delegation, None);
+        assert_eq!(msgs[7].delegation, None);
+        assert_eq!(msgs[8].delegation, Some(DelegationKind::Subagent));
+        assert_eq!(msgs[9].delegation, Some(DelegationKind::Swarm));
+        assert_eq!(msgs[10].role, TranscriptRole::System);
+        assert_eq!(msgs[11].delegation, None);
+        assert_eq!(msgs[12].delegation, Some(DelegationKind::Subagent));
+        assert_eq!(msgs[13].text, "");
+        assert_eq!(msgs[13].delegation, Some(DelegationKind::Swarm));
+
+        // Verify hydration from transcript_full.jsonl preserves delegation!
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-agy-del-hyd-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compact = dir.join("transcript.jsonl");
+        let full = dir.join("transcript_full.jsonl");
+        let compact_text = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:10:00Z",
+                "tool_calls": [{"name": "swarm", "args": {"action": "\"add\""}}]
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:10:01Z",
+                "content": "已派发...<truncated 120 bytes>",
+                "truncated_fields": ["content"]
+            }),
+        );
+        let full_text = format!(
+            "{}\n",
+            serde_json::json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-26T01:10:01Z",
+                "content": "已派发完整的 Swarm 协作任务详情。"
+            })
+        );
+        std::fs::write(&compact, &compact_text).unwrap();
+        std::fs::write(&full, &full_text).unwrap();
+        let hydrated = parse_agy_jsonl_with_hydration(&compact_text, Some(&compact), 10);
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].text, "已派发完整的 Swarm 协作任务详情。");
+        assert_eq!(hydrated[0].delegation, Some(DelegationKind::Swarm));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classifies_claude_delegation_rules_including_async_background_agents() {
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            // 1. Silent Agent tool_use -> tool_result -> async reply ("Launched background agent")
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-11-26T02:00:00Z",
+                "message": {"role": "user", "content": "Investigate memory leak"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-26T02:00:01Z",
+                "message": {
+                    "id": "m1",
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "name": "Agent", "input": {"run_in_background": true}}]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-11-26T02:00:02Z",
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Async agent launched"}]}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-26T02:00:03Z",
+                "message": {
+                    "id": "m2",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "I launched a background Agent to profile the heap."}]
+                }
+            }),
+            // 2. Streaming same-msg_id text + TeamCreate -> tool_result -> follow-up text -> BOTH Swarm
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-11-26T02:01:00Z",
+                "message": {"role": "user", "content": "Spin up a team"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-26T02:01:01Z",
+                "message": {
+                    "id": "m3",
+                    "stop_reason": null,
+                    "content": [{"type": "text", "text": "Creating an agent team now..."}]
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-26T02:01:02Z",
+                "message": {
+                    "id": "m3",
+                    "stop_reason": "tool_use",
+                    "content": [{"type": "tool_use", "name": "TeamCreate", "input": {}}]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-11-26T02:01:03Z",
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "team created"}]}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-26T02:01:04Z",
+                "message": {
+                    "id": "m4",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "Team is active in background."}]
+                }
+            }),
+            // 3. Task / SendMessage / MCP starfane tool -> Subagent
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-11-26T02:02:00Z",
+                "message": {"role": "user", "content": "Hand off task"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-26T02:02:01Z",
+                "message": {
+                    "id": "m5",
+                    "stop_reason": "tool_use",
+                    "content": [
+                        {"type": "text", "text": "Dispatching via Task & SendMessage."},
+                        {"type": "tool_use", "name": "Task", "input": {}},
+                        {"type": "tool_use", "name": "SendMessage", "input": {}}
+                    ]
+                }
+            }),
+            // 4. Normal Read/Bash turn after new user prompt -> None
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-11-26T02:03:00Z",
+                "message": {"role": "user", "content": "Check git status"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-11-26T02:03:01Z",
+                "message": {
+                    "id": "m6",
+                    "stop_reason": "end_turn",
+                    "content": [
+                        {"type": "tool_use", "name": "Read", "input": {}},
+                        {"type": "tool_use", "name": "Bash", "input": {}},
+                        {"type": "text", "text": "Working tree is clean."}
+                    ]
+                }
+            }),
+        );
+
+        let msgs = parse_transcript_for_agent(AgentKind::Claude, &jsonl, 20);
+        assert_eq!(msgs.len(), 9, "{msgs:?}");
+        assert_eq!(msgs[0].role, TranscriptRole::User);
+        assert_eq!(msgs[1].delegation, Some(DelegationKind::Subagent));
+        assert_eq!(msgs[2].role, TranscriptRole::User);
+        assert_eq!(msgs[3].delegation, Some(DelegationKind::Swarm));
+        assert_eq!(msgs[4].delegation, Some(DelegationKind::Swarm));
+        assert_eq!(msgs[5].role, TranscriptRole::User);
+        assert_eq!(msgs[6].delegation, Some(DelegationKind::Subagent));
+        assert_eq!(msgs[7].role, TranscriptRole::User);
+        assert_eq!(msgs[8].delegation, None);
+    }
+
+    #[test]
+    fn classifies_codex_delegation_rules_and_mcp_tools_preserving_across_dedup() {
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            // 1. spawn_agent -> function_call_output -> message + agent_message + task_complete dedup -> Subagent
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:00:00Z",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Delegate review"}]}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:00:01Z",
+                "payload": {"type": "function_call", "name": "spawn_agent", "call_id": "c1"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:00:02Z",
+                "payload": {"type": "function_call_output", "call_id": "c1", "output": "{\"agent_id\":\"a1\"}"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:00:03Z",
+                "payload": {"type": "message", "role": "assistant", "phase": "final_answer", "content": [{"type": "output_text", "text": "Spawned worker a1 to review the PR."}]}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-11-26T03:00:03.100Z",
+                "payload": {"type": "agent_message", "message": "Spawned worker a1 to review the PR."}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-11-26T03:00:03.200Z",
+                "payload": {"type": "task_complete", "last_agent_message": "Spawned worker a1 to review the PR."}
+            }),
+            // 2. wait_agent & send_input -> Subagent
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:01:00Z",
+                "payload": {"type": "function_call", "name": "send_input", "call_id": "c2"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:01:01Z",
+                "payload": {"type": "function_call", "name": "wait_agent", "call_id": "c3"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-11-26T03:01:02Z",
+                "payload": {"type": "agent_message", "message": "Waiting for worker a1 response."}
+            }),
+            // 3. close_agent & exec_command -> None (zero false positives!)
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:02:00Z",
+                "payload": {"type": "function_call", "name": "close_agent", "call_id": "c4"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:02:01Z",
+                "payload": {"type": "custom_tool_call", "name": "exec_command", "call_id": "c5"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": "2026-11-26T03:02:02Z",
+                "payload": {"type": "task_complete", "last_agent_message": "Closed worker and verified tests."}
+            }),
+            // 4. Starfane MCP tool -> Subagent
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:03:00Z",
+                "payload": {"type": "function_call", "name": "mcp__starfane__spawn_session", "call_id": "c6"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:03:01Z",
+                "payload": {"type": "message", "role": "assistant", "phase": "final_answer", "content": [{"type": "output_text", "text": "Spawned Starfane session."}]}
+            }),
+            // 5. In-flight trailing spawn_agent -> synthetic message has Subagent
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-11-26T03:04:00Z",
+                "payload": {"type": "function_call", "name": "spawn_agent", "call_id": "c7"}
+            }),
+        );
+
+        let msgs = parse_transcript_for_agent(AgentKind::Codex, &jsonl, 20);
+        assert_eq!(msgs.len(), 6, "{msgs:?}");
+        assert_eq!(msgs[0].role, TranscriptRole::User);
+        assert_eq!(msgs[1].text, "Spawned worker a1 to review the PR.");
+        assert_eq!(msgs[1].delegation, Some(DelegationKind::Subagent));
+        assert_eq!(msgs[1].kind, Some(TranscriptMessageKind::Final));
+        assert_eq!(msgs[2].delegation, Some(DelegationKind::Subagent));
+        assert_eq!(msgs[3].text, "Closed worker and verified tests.");
+        assert_eq!(msgs[3].delegation, None);
+        assert_eq!(msgs[4].delegation, Some(DelegationKind::Subagent));
+        assert_eq!(msgs[5].text, "");
+        assert_eq!(msgs[5].delegation, Some(DelegationKind::Subagent));
+    }
+
+    #[test]
+    fn watermark_tracks_in_place_pending_tools_claude_merge_and_agy_hydration() {
+        let dir = std::env::temp_dir().join(format!(
+            "starfane-wm-test-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. AGY: trailing synthetic pending_tools -> final PLANNER_RESPONSE keeps total_messages == 2
+        //    while changing last_turn_hash & has_pending_tools, and late hydration changes hash again.
+        let agy_compact = dir.join("transcript.jsonl");
+        let agy_full = dir.join("transcript_full.jsonl");
+        let u1 = r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-26T00:00:00Z","content":"run checks"}"#;
+        let p_tools = r#"{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-11-26T00:00:01Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"cargo test"}}]}"#;
+        std::fs::write(&agy_compact, format!("{u1}\n{p_tools}\n")).unwrap();
+
+        let mut cache = TranscriptIndexCache::default();
+        let wm1 = cache
+            .watermark_for_path(AgentKind::Agy, &agy_compact)
+            .unwrap();
+        assert_eq!(wm1.total_messages, 2);
+        assert!(wm1.has_pending_tools);
+
+        // Final PLANNER_RESPONSE replaces synthetic pending_tools at index 1 (still total_messages == 2),
+        // initially truncated in compact transcript.jsonl.
+        let p_final_trunc = r#"{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-11-26T00:00:02Z","content":"Short preview... <truncated 200 chars>","truncated_fields":["content"]}"#;
+        std::fs::write(&agy_compact, format!("{u1}\n{p_tools}\n{p_final_trunc}\n")).unwrap();
+        let wm2 = cache
+            .watermark_for_path(AgentKind::Agy, &agy_compact)
+            .unwrap();
+        assert_eq!(wm2.total_messages, 2);
+        assert!(!wm2.has_pending_tools);
+        assert_ne!(wm2.last_turn_hash, wm1.last_turn_hash);
+
+        // Late write to sibling transcript_full.jsonl hydrates step 2 without changing total_messages!
+        let p_final_full = r#"{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-11-26T00:00:02Z","content":"All 42 workspace tests passed cleanly."}"#;
+        std::fs::write(&agy_full, format!("{p_final_full}\n")).unwrap();
+        let wm3 = cache
+            .watermark_for_path(AgentKind::Agy, &agy_compact)
+            .unwrap();
+        assert_eq!(wm3.total_messages, 2);
+        assert!(!wm3.has_pending_tools);
+        assert_ne!(wm3.last_turn_hash, wm2.last_turn_hash);
+
+        // 2. Claude: same-msg_id in-place append mutates last_turn_hash with flat total_messages.
+        let claude_path = dir.join("claude.jsonl");
+        let c_user =
+            r#"{"type":"user","timestamp":"2026-11-26T00:00:00Z","message":{"content":"hi"}}"#;
+        let c_a1 = r#"{"type":"assistant","timestamp":"2026-11-26T00:00:01Z","message":{"id":"msg_1","stop_reason":null,"content":[{"type":"text","text":"Working on it"}]}}"#;
+        std::fs::write(&claude_path, format!("{c_user}\n{c_a1}\n")).unwrap();
+        let c_wm1 = cache
+            .watermark_for_path(AgentKind::Claude, &claude_path)
+            .unwrap();
+        assert_eq!(c_wm1.total_messages, 2);
+
+        let c_a2 = r#"{"type":"assistant","timestamp":"2026-11-26T00:00:02Z","message":{"id":"msg_1","stop_reason":"end_turn","content":[{"type":"text","text":"Done!"}]}}"#;
+        std::fs::write(&claude_path, format!("{c_user}\n{c_a1}\n{c_a2}\n")).unwrap();
+        let c_wm2 = cache
+            .watermark_for_path(AgentKind::Claude, &claude_path)
+            .unwrap();
+        assert_eq!(c_wm2.total_messages, 2);
+        assert_ne!(c_wm2.last_turn_hash, c_wm1.last_turn_hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_transcript_metrics_preserves_agy_db_ttft_and_recent_turns() {
+        let agy_db = SessionMetrics {
+            context_used_tokens: Some(180_000),
+            context_window_tokens: None,
+            context_used_pct: None,
+            tps: Some(95.4),
+            ttft_ms: Some(3_100),
+            avg_ttft_ms: Some(2_800),
+            last_output_tokens: Some(450),
+            last_duration_ms: Some(4_716),
+            total_input_tokens: None,
+            total_output_tokens: None,
+            recent_turns: vec![starfane_proto::TurnMetricSample {
+                ts_ms: 5_000,
+                ttft_ms: Some(3_100),
+                tps: Some(95.4),
+                output_tokens: Some(450),
+                duration_ms: Some(4_716),
+            }],
+            source: "agy_db".into(),
+            updated_ms: 5_000,
+        };
+        let parsed = SessionMetrics {
+            context_used_tokens: Some(175_000),
+            context_window_tokens: Some(512_000),
+            context_used_pct: Some(34.2),
+            tps: Some(50.0),
+            ttft_ms: None,
+            avg_ttft_ms: None,
+            last_output_tokens: Some(200),
+            last_duration_ms: Some(4_000),
+            total_input_tokens: Some(900_000),
+            total_output_tokens: Some(12_000),
+            recent_turns: Vec::new(),
+            source: "transcript".into(),
+            updated_ms: 4_900,
+        };
+        let merged = merge_transcript_metrics(Some(agy_db), Some(parsed)).unwrap();
+        assert_eq!(merged.source, "agy_db");
+        assert_eq!(merged.ttft_ms, Some(3_100));
+        assert_eq!(merged.avg_ttft_ms, Some(2_800));
+        assert_eq!(merged.tps, Some(95.4));
+        assert_eq!(merged.recent_turns.len(), 1);
+        assert_eq!(merged.context_window_tokens, Some(512_000));
+        assert_eq!(merged.context_used_tokens, Some(180_000));
+        assert_eq!(merged.context_used_pct, Some(35.2));
+        assert_eq!(merged.total_input_tokens, Some(900_000));
+        assert_eq!(merged.total_output_tokens, Some(12_000));
     }
 }

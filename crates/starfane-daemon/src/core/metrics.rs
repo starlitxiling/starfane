@@ -1,29 +1,47 @@
-//! Session context-window & generation-speed (TPS) telemetry extraction:
-//! - Read-only `~/.cc-switch/cc-switch.db` streaming TPS (`duration - ttft`), TTFT, and
-//!   `input_token_semantics`-aware context usage (cached by DB + WAL `(mtime, len)`).
+//! Session context-window & generation-speed (TPS) + TTFT telemetry extraction:
+//! - Native AGY SQLite protobuf step-timing extractor (`<home>/.gemini/antigravity-cli/conversations/<conv_id>.db`,
+//!   `step_type = 15 AND status = 3`) with `(mtime_ns, len)` DB+WAL caching (`AgyStepTimingCache`) and
+//!   buffered-burst / reliability filtering.
 //! - Exact transcript JSONL resolution (Claude subtree PIDs → `~/.claude/sessions/<pid>.json`,
 //!   Codex `resume <uuid>` & `~/.codex/state_5.sqlite` `threads.name` + `cwd`, AGY
 //!   `conversation_summaries.db` unique-cwd root conversation).
-//! - Transcript JSONL metrics with `(mtime, len)` file caching + status-line fallback.
+//! - Transcript JSONL metrics (Claude / Codex / AGY fallback) with `(mtime, len)` file caching +
+//!   status-line context-window fallback (100% independent of `cc-switch.db`).
 
 use super::transcript::parse_iso8601_ms;
 #[cfg(test)]
 use super::transcript::{read_tail_utf8, MAX_TRANSCRIPT_READ_BYTES};
 use serde::Deserialize;
 use serde_json::Value;
-use starfane_proto::{AgentKind, SessionMetrics, SessionRecord};
+use starfane_proto::{AgentKind, SessionMetrics, SessionRecord, TurnMetricSample};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-/// Minimum generation duration (ms) accepted for TPS calculation (avoids divide-by-zero / jitter spikes).
-const MIN_TPS_DURATION_MS: u64 = 100;
+/// Minimum streaming generation duration (ms) for reliable sustained TPS.
+pub(crate) const MIN_STREAM_TPS_DURATION_MS: u64 = 1_500;
+/// Minimum output tokens for reliable sustained TPS.
+pub(crate) const MIN_STREAM_TPS_OUTPUT_TOKENS: u64 = 150;
+/// Minimum visible (non-reasoning) output tokens for Codex streaming TPS.
+pub(crate) const MIN_CODEX_STREAM_VISIBLE_TOKENS: u64 = 80;
+/// Minimum duration (ms) for fallback TPS when no reliable streaming turn exists yet.
+pub(crate) const MIN_FALLBACK_TPS_DURATION_MS: u64 = 1_000;
+/// Minimum output tokens for fallback TPS when no reliable streaming turn exists yet.
+pub(crate) const MIN_FALLBACK_TPS_OUTPUT_TOKENS: u64 = 40;
 /// Maximum single-call generation duration (ms) accepted for TPS calculation (5 minutes).
-const MAX_TPS_DURATION_MS: u64 = 300_000;
+pub(crate) const MAX_TPS_DURATION_MS: u64 = 300_000;
+/// Minimum plausible TTFT (ms) accepted for first-token latency reporting.
+pub(crate) const MIN_TTFT_MS: u64 = 50;
+/// Maximum plausible TTFT (ms) accepted for first-token latency reporting (3 minutes).
+pub(crate) const MAX_TTFT_MS: u64 = 180_000;
 /// Sanity upper bound on computed TPS to guard against clock skew / batched timestamps.
-const MAX_PLAUSIBLE_TPS: f64 = 5_000.0;
+pub(crate) const MAX_PLAUSIBLE_TPS: f64 = 400.0;
+/// Maximum number of per-turn samples retained in `SessionMetrics.recent_turns`.
+pub(crate) const MAX_TURN_HISTORY: usize = 20;
+/// Maximum number of AGY conversation DB caches retained in memory.
+const MAX_AGY_STEP_CACHE_ENTRIES: usize = 128;
 /// Clock-granularity tolerance (5s) when comparing conversation/file timestamps against OS process
 /// start time (`ps -o etime=` has 1-second integer resolution).
 pub(crate) const PROCESS_BIRTH_SLACK_MS: u64 = 5_000;
@@ -296,463 +314,520 @@ pub(crate) fn infer_session_effort(
 // Removed leftover tail lines after cached_transcript_metrics refactor.
 
 // ---------------------------------------------------------------------------
-// `~/.cc-switch/cc-switch.db` read-only cache & cc-switch streaming TPS math
+// Telemetry math helpers & native AGY protobuf step-timing extractor
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct CcSwitchRow {
-    pub session_id: String,
-    #[serde(default)]
-    pub app_type: String,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
+/// Insert a per-turn telemetry sample in chronological (`ts_ms`) order, capped at [`MAX_TURN_HISTORY`].
+pub(crate) fn push_turn_sample(turns: &mut Vec<TurnMetricSample>, sample: TurnMetricSample) {
+    let idx = turns.partition_point(|t| t.ts_ms <= sample.ts_ms);
+    turns.insert(idx, sample);
+    if turns.len() > MAX_TURN_HISTORY {
+        let excess = turns.len() - MAX_TURN_HISTORY;
+        turns.drain(..excess);
+    }
+}
+
+/// Compute average valid TTFT (ms) across `turns` in `[MIN_TTFT_MS, MAX_TTFT_MS]`.
+pub(crate) fn compute_avg_ttft_ms(turns: &[TurnMetricSample]) -> Option<u64> {
+    let mut sum: u128 = 0;
+    let mut count: u128 = 0;
+    for t in turns {
+        if let Some(ttft) = t
+            .ttft_ms
+            .filter(|&d| (MIN_TTFT_MS..=MAX_TTFT_MS).contains(&d))
+        {
+            sum = sum.saturating_add(u128::from(ttft));
+            count += 1;
+        }
+    }
+    sum.checked_div(count)
+        .and_then(|avg| u64::try_from(avg).ok())
+}
+
+/// Compute reliability-filtered tokens-per-second rounded to 1 decimal place.
+pub(crate) fn compute_tps_checked(
+    output_tokens: u64,
+    duration_ms: u64,
+    min_tokens: u64,
+    min_dur_ms: u64,
+) -> Option<f32> {
+    if output_tokens == 0
+        || output_tokens < min_tokens
+        || duration_ms < min_dur_ms.max(1)
+        || duration_ms > MAX_TPS_DURATION_MS
+    {
+        return None;
+    }
+    let raw = (output_tokens as f64) / ((duration_ms as f64) / 1000.0);
+    if !raw.is_finite() || raw <= 0.0 || raw > MAX_PLAUSIBLE_TPS {
+        return None;
+    }
+    Some(((raw * 10.0).round() / 10.0) as f32)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct AgyStepTiming {
+    pub idx: i64,
+    pub created_at_ms: Option<u64>,
+    pub first_token_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
     pub input_tokens: u64,
-    #[serde(default)]
     pub output_tokens: u64,
-    #[serde(default)]
     pub cache_read_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_tokens: u64,
-    #[serde(default)]
-    pub latency_ms: Option<u64>,
-    #[serde(default)]
-    pub first_token_ms: Option<u64>,
-    #[serde(default)]
-    pub duration_ms: Option<u64>,
-    /// `0` = Claude exclusive, `1` = Codex inclusive (`input_tokens` already includes cache),
-    /// `2` = AGY exclusive (`input_tokens + cache_read_tokens + cache_creation_tokens`).
-    #[serde(default)]
-    pub input_token_semantics: i64,
-    #[serde(default)]
-    pub created_at: u64,
-    #[serde(default)]
-    pub total_input_tokens: u64,
-    #[serde(default)]
-    pub total_output_tokens: u64,
+    pub thinking_tokens: u64,
+    pub visible_tokens: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct CcSwitchRawRow {
-    pub rowid: i64,
-    pub session_id: String,
-    #[serde(default)]
-    pub app_type: String,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub input_tokens: u64,
-    #[serde(default)]
-    pub output_tokens: u64,
-    #[serde(default)]
-    pub cache_read_tokens: u64,
-    #[serde(default)]
-    pub cache_creation_tokens: u64,
-    #[serde(default)]
-    pub latency_ms: Option<u64>,
-    #[serde(default)]
-    pub first_token_ms: Option<u64>,
-    #[serde(default)]
-    pub duration_ms: Option<u64>,
-    #[serde(default)]
-    pub input_token_semantics: i64,
-    #[serde(default)]
-    pub created_at: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct CcSwitchSeedRow {
-    #[serde(flatten)]
-    row: CcSwitchRow,
-    #[serde(default)]
-    best_rowid: i64,
-    #[serde(default)]
-    max_rowid: i64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CcSwitchEntry {
-    pub metrics: SessionMetrics,
-    pub model: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct CcSwitchAcc {
-    best_rank: (u8, u64, i64),
-    best_row: CcSwitchRow,
-    entry: CcSwitchEntry,
-}
-
-fn cc_switch_model_rank(model: Option<&str>) -> u8 {
-    let lower = model.unwrap_or("").to_ascii_lowercase();
-    if lower.contains("haiku") || lower.contains("flash-worker") {
-        0
-    } else {
-        1
-    }
-}
-
-fn cc_switch_row_input_total(row: &CcSwitchRawRow) -> u64 {
-    if row.input_token_semantics == 1 {
-        row.input_tokens
-    } else {
-        row.input_tokens
-            .saturating_add(row.cache_read_tokens)
-            .saturating_add(row.cache_creation_tokens)
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct CcSwitchCache {
-    sig: Option<DbSig>,
-    db_ino: Option<(u64, u64)>,
-    last_max_rowid: i64,
-    codex_default_window: Option<u64>,
-    by_session: HashMap<String, CcSwitchAcc>,
-}
-
-impl CcSwitchCache {
-    /// Refresh from `<home>/.cc-switch/cc-switch.db` only when DB or WAL `(mtime, len)` changed.
-    /// Uses incremental `WHERE rowid > last_max_rowid` queries after initial seed to avoid
-    /// full-table `ROW_NUMBER()` + `GROUP BY` scans on every WAL flush.
-    pub(crate) fn refresh_if_needed_in(&mut self, home: Option<&Path>, now_ms: u64) {
-        let Some(home) = home else {
-            return;
-        };
-        let db_path = home.join(".cc-switch/cc-switch.db");
-        if self.codex_default_window.is_none() {
-            self.codex_default_window = read_codex_default_context_window(home);
+fn read_proto_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut val: u64 = 0;
+    let mut shift: u32 = 0;
+    for _ in 0..10 {
+        let &b = buf.get(*pos)?;
+        *pos += 1;
+        val |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some(val);
         }
-        self.refresh_from_path(&db_path, now_ms);
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
     }
+    None
+}
 
-    pub(crate) fn refresh_from_path(&mut self, db_path: &Path, now_ms: u64) {
-        let sig = db_signature(db_path);
-        if sig.db.is_none() {
-            return;
+fn skip_proto_field(buf: &[u8], pos: &mut usize, wire_type: u64) -> Option<()> {
+    match wire_type {
+        0 => {
+            read_proto_varint(buf, pos)?;
+            Some(())
         }
-        if self.sig.as_ref() == Some(&sig) {
-            return;
-        }
-        let cur_ino = file_identity(db_path).map(|(d, i, _, _)| (d, i));
-        let prev_db_len = self.sig.as_ref().and_then(|s| s.db).map(|(_, l)| l);
-        let cur_db_len = sig.db.map(|(_, l)| l);
-        let db_replaced_or_shrunk = (self.db_ino.is_some() && cur_ino != self.db_ino)
-            || match (prev_db_len, cur_db_len) {
-                (Some(prev), Some(cur)) => cur < prev,
-                _ => false,
-            };
-
-        if db_replaced_or_shrunk || self.last_max_rowid == 0 {
-            if self.seed_full(db_path, now_ms) {
-                self.sig = Some(sig);
-                self.db_ino = cur_ino;
+        1 => {
+            if buf.len().checked_sub(*pos)? < 8 {
+                return None;
             }
-            return;
+            *pos += 8;
+            Some(())
         }
-
-        // Incremental cursor query: B-tree seek on `rowid > last_max_rowid`.
-        let sql = format!(
-            "SELECT rowid, session_id, app_type, model, \
-                    COALESCE(input_tokens, 0) AS input_tokens, \
-                    COALESCE(output_tokens, 0) AS output_tokens, \
-                    COALESCE(cache_read_tokens, 0) AS cache_read_tokens, \
-                    COALESCE(cache_creation_tokens, 0) AS cache_creation_tokens, \
-                    latency_ms, first_token_ms, duration_ms, \
-                    COALESCE(input_token_semantics, 0) AS input_token_semantics, \
-                    COALESCE(created_at, 0) AS created_at \
-             FROM proxy_request_logs \
-             WHERE rowid > {} \
-               AND status_code = 200 \
-               AND session_id IS NOT NULL \
-               AND session_id != '' \
-               AND (COALESCE(input_tokens, 0) > 0 OR COALESCE(output_tokens, 0) > 0) \
-             ORDER BY rowid ASC;",
-            self.last_max_rowid
-        );
-        let Some(json_out) = run_sqlite_json(db_path, &sql) else {
-            return;
-        };
-        let Ok(delta_rows) = serde_json::from_str::<Vec<CcSwitchRawRow>>(&json_out) else {
-            return;
-        };
-        self.merge_incremental_rows(delta_rows, now_ms);
-        self.sig = Some(sig);
-        self.db_ino = cur_ino;
-    }
-
-    fn seed_full(&mut self, db_path: &Path, now_ms: u64) -> bool {
-        let sql = r#"
-WITH valid AS (
-  SELECT rowid, session_id, app_type, model,
-         COALESCE(input_tokens, 0) AS input_tokens,
-         COALESCE(output_tokens, 0) AS output_tokens,
-         COALESCE(cache_read_tokens, 0) AS cache_read_tokens,
-         COALESCE(cache_creation_tokens, 0) AS cache_creation_tokens,
-         latency_ms, first_token_ms, duration_ms,
-         COALESCE(input_token_semantics, 0) AS input_token_semantics,
-         COALESCE(created_at, 0) AS created_at
-  FROM proxy_request_logs
-  WHERE status_code = 200
-    AND session_id IS NOT NULL
-    AND session_id != ''
-    AND (COALESCE(input_tokens, 0) > 0 OR COALESCE(output_tokens, 0) > 0)
-),
-ranked AS (
-  SELECT *,
-         ROW_NUMBER() OVER (
-           PARTITION BY session_id
-           ORDER BY
-             CASE WHEN LOWER(COALESCE(model, '')) LIKE '%haiku%'
-                    OR LOWER(COALESCE(model, '')) LIKE '%flash-worker%'
-                  THEN 1 ELSE 0 END ASC,
-             created_at DESC,
-             rowid DESC
-         ) AS rn
-  FROM valid
-),
-totals AS (
-  SELECT session_id,
-         SUM(CASE WHEN input_token_semantics = 1 THEN input_tokens
-                  ELSE input_tokens + cache_read_tokens + cache_creation_tokens END) AS total_input_tokens,
-         SUM(output_tokens) AS total_output_tokens
-  FROM valid
-  GROUP BY session_id
-),
-hi AS (
-  SELECT COALESCE(MAX(rowid), 0) AS max_rowid FROM proxy_request_logs
-)
-SELECT r.session_id, r.app_type, r.model,
-       r.input_tokens, r.output_tokens, r.cache_read_tokens, r.cache_creation_tokens,
-       r.latency_ms, r.first_token_ms, r.duration_ms,
-       r.input_token_semantics, r.created_at,
-       t.total_input_tokens, t.total_output_tokens,
-       r.rowid AS best_rowid, hi.max_rowid
-FROM ranked r
-JOIN totals t ON r.session_id = t.session_id
-CROSS JOIN hi
-WHERE r.rn = 1;
-"#;
-        let Some(json_out) = run_sqlite_json(db_path, sql) else {
-            return false;
-        };
-        let Ok(rows) = serde_json::from_str::<Vec<CcSwitchSeedRow>>(&json_out) else {
-            return false;
-        };
-        let mut map = HashMap::with_capacity(rows.len());
-        let mut max_rowid = 0i64;
-        let cx_win = self.codex_default_window;
-        for seed in rows {
-            max_rowid = max_rowid.max(seed.max_rowid).max(seed.best_rowid);
-            let row = seed.row;
-            let model = row
-                .model
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let metrics = cc_switch_row_to_metrics(&row, cx_win, now_ms);
-            let rank = (
-                cc_switch_model_rank(row.model.as_deref()),
-                row.created_at,
-                seed.best_rowid,
-            );
-            let sid = row.session_id.clone();
-            map.insert(
-                sid,
-                CcSwitchAcc {
-                    best_rank: rank,
-                    best_row: row,
-                    entry: CcSwitchEntry { metrics, model },
-                },
-            );
-        }
-        self.by_session = map;
-        self.last_max_rowid = max_rowid;
-        true
-    }
-
-    /// Merge newly inserted `proxy_request_logs` rows incrementally into the cached map.
-    pub(crate) fn merge_incremental_rows(&mut self, rows: Vec<CcSwitchRawRow>, now_ms: u64) {
-        let cx_win = self.codex_default_window;
-        for raw in rows {
-            if raw.rowid > self.last_max_rowid {
-                self.last_max_rowid = raw.rowid;
+        2 => {
+            let len = usize::try_from(read_proto_varint(buf, pos)?).ok()?;
+            let end = pos.checked_add(len)?;
+            if end > buf.len() {
+                return None;
             }
-            let add_in = cc_switch_row_input_total(&raw);
-            let add_out = raw.output_tokens;
-            let cand_rank = (
-                cc_switch_model_rank(raw.model.as_deref()),
-                raw.created_at,
-                raw.rowid,
-            );
-            let sid = raw.session_id.clone();
-            match self.by_session.get_mut(&sid) {
-                Some(acc) => {
-                    let next_total_in = acc.best_row.total_input_tokens.saturating_add(add_in);
-                    let next_total_out = acc.best_row.total_output_tokens.saturating_add(add_out);
-                    if cand_rank >= acc.best_rank {
-                        acc.best_rank = cand_rank;
-                        acc.best_row = CcSwitchRow {
-                            session_id: raw.session_id,
-                            app_type: raw.app_type,
-                            model: raw.model,
-                            input_tokens: raw.input_tokens,
-                            output_tokens: raw.output_tokens,
-                            cache_read_tokens: raw.cache_read_tokens,
-                            cache_creation_tokens: raw.cache_creation_tokens,
-                            latency_ms: raw.latency_ms,
-                            first_token_ms: raw.first_token_ms,
-                            duration_ms: raw.duration_ms,
-                            input_token_semantics: raw.input_token_semantics,
-                            created_at: raw.created_at,
-                            total_input_tokens: next_total_in,
-                            total_output_tokens: next_total_out,
-                        };
-                    } else {
-                        acc.best_row.total_input_tokens = next_total_in;
-                        acc.best_row.total_output_tokens = next_total_out;
-                    }
-                    let model = acc
-                        .best_row
-                        .model
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string);
-                    let metrics = cc_switch_row_to_metrics(&acc.best_row, cx_win, now_ms);
-                    acc.entry = CcSwitchEntry { metrics, model };
-                }
-                None => {
-                    let row = CcSwitchRow {
-                        session_id: raw.session_id,
-                        app_type: raw.app_type,
-                        model: raw.model,
-                        input_tokens: raw.input_tokens,
-                        output_tokens: raw.output_tokens,
-                        cache_read_tokens: raw.cache_read_tokens,
-                        cache_creation_tokens: raw.cache_creation_tokens,
-                        latency_ms: raw.latency_ms,
-                        first_token_ms: raw.first_token_ms,
-                        duration_ms: raw.duration_ms,
-                        input_token_semantics: raw.input_token_semantics,
-                        created_at: raw.created_at,
-                        total_input_tokens: add_in,
-                        total_output_tokens: add_out,
-                    };
-                    let model = row
-                        .model
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string);
-                    let metrics = cc_switch_row_to_metrics(&row, cx_win, now_ms);
-                    self.by_session.insert(
-                        sid,
-                        CcSwitchAcc {
-                            best_rank: cand_rank,
-                            best_row: row,
-                            entry: CcSwitchEntry { metrics, model },
-                        },
-                    );
-                }
-            }
+            *pos = end;
+            Some(())
         }
-    }
-
-    pub(crate) fn get(&self, session_id: &str) -> Option<&CcSwitchEntry> {
-        self.by_session.get(session_id).map(|acc| &acc.entry)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_max_rowid(&self) -> i64 {
-        self.last_max_rowid
-    }
-}
-
-/// Convert a single `cc-switch` `proxy_request_logs` row into `SessionMetrics`:
-/// - Streaming TPS: uses `total_ms - first_token_ms` when `total_ms > first_token_ms` and diff >= 100ms,
-///   excluding TTFT wait time; falls back to `total_ms` otherwise.
-/// - Context tokens: respects `input_token_semantics` (`1` = inclusive, `0|2` = exclusive).
-pub(crate) fn cc_switch_row_to_metrics(
-    row: &CcSwitchRow,
-    codex_default_window: Option<u64>,
-    now_ms: u64,
-) -> SessionMetrics {
-    let ctx_used = if row.input_token_semantics == 1 {
-        row.input_tokens
-    } else {
-        row.input_tokens
-            .saturating_add(row.cache_read_tokens)
-            .saturating_add(row.cache_creation_tokens)
-    };
-    let ctx_used_opt = (ctx_used > 0).then_some(ctx_used);
-
-    let agent = match row.app_type.as_str() {
-        "claude" => AgentKind::Claude,
-        "codex" => AgentKind::Codex,
-        "agy" => AgentKind::Agy,
-        _ => AgentKind::Claude,
-    };
-
-    let ctx_window = infer_context_window(
-        agent,
-        row.model.as_deref(),
-        ctx_used_opt,
-        codex_default_window,
-    );
-    let ctx_pct = match (ctx_used_opt, ctx_window) {
-        (Some(u), Some(w)) => pct_1dp(u, w),
+        5 => {
+            if buf.len().checked_sub(*pos)? < 4 {
+                return None;
+            }
+            *pos += 4;
+            Some(())
+        }
         _ => None,
-    };
+    }
+}
 
-    let total_ms = row
-        .duration_ms
-        .filter(|&v| v > 0)
-        .or_else(|| row.latency_ms.filter(|&v| v > 0));
-    let ttft_ms = row.first_token_ms.filter(|&v| v > 0);
-    let gen_ms = match (total_ms, ttft_ms) {
-        (Some(tot), Some(ttft)) if tot > ttft && (tot - ttft) >= MIN_TPS_DURATION_MS => {
-            Some(tot - ttft)
+fn decode_proto_timestamp_ms(bytes: &[u8]) -> Option<Option<u64>> {
+    let mut pos = 0usize;
+    let mut secs: u64 = 0;
+    let mut nanos: u64 = 0;
+    while pos < bytes.len() {
+        let tag = read_proto_varint(bytes, &mut pos)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        if field == 0 {
+            return None;
         }
-        (Some(tot), _) => Some(tot),
-        _ => None,
-    };
-    let tps = gen_ms.and_then(|d| compute_tps(row.output_tokens, d));
+        match (field, wire_type) {
+            (1, 0) => secs = read_proto_varint(bytes, &mut pos)?,
+            (2, 0) => nanos = read_proto_varint(bytes, &mut pos)?,
+            _ => skip_proto_field(bytes, &mut pos, wire_type)?,
+        }
+    }
+    if secs == 0 {
+        return Some(None);
+    }
+    let ms = secs.checked_mul(1_000)?.checked_add(nanos / 1_000_000)?;
+    Some(Some(ms))
+}
 
-    let updated_ms = if row.created_at > 0 {
-        // `created_at` in cc-switch.db is Unix seconds (10 digits); accept ms if already 13 digits.
-        if row.created_at < 10_000_000_000 {
-            row.created_at * 1000
+fn decode_proto_usage(bytes: &[u8], out: &mut AgyStepTiming) -> Option<()> {
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let tag = read_proto_varint(bytes, &mut pos)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        if field == 0 {
+            return None;
+        }
+        match (field, wire_type) {
+            (2, 0) => out.input_tokens = read_proto_varint(bytes, &mut pos)?,
+            (3, 0) => out.output_tokens = read_proto_varint(bytes, &mut pos)?,
+            (5, 0) => out.cache_read_tokens = read_proto_varint(bytes, &mut pos)?,
+            (9, 0) => out.thinking_tokens = read_proto_varint(bytes, &mut pos)?,
+            (10, 0) => out.visible_tokens = read_proto_varint(bytes, &mut pos)?,
+            _ => skip_proto_field(bytes, &mut pos, wire_type)?,
+        }
+    }
+    Some(())
+}
+
+/// Zero-dependency pure-Rust protobuf wire decoder for AGY `steps.metadata` blobs
+/// (`step_type = 15 AND status = 3`). Safely skips unknown fields in any order.
+pub(crate) fn parse_agy_step_metadata_proto(bytes: &[u8]) -> Option<AgyStepTiming> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut out = AgyStepTiming::default();
+    let mut pos = 0usize;
+    let mut saw_any = false;
+    while pos < bytes.len() {
+        let tag = read_proto_varint(bytes, &mut pos)?;
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        if field == 0 {
+            return None;
+        }
+        if wire_type == 2 {
+            let len = usize::try_from(read_proto_varint(bytes, &mut pos)?).ok()?;
+            let end = pos.checked_add(len)?;
+            let sub = bytes.get(pos..end)?;
+            pos = end;
+            match field {
+                1 => {
+                    out.created_at_ms = decode_proto_timestamp_ms(sub)?;
+                    saw_any |= out.created_at_ms.is_some();
+                }
+                6 => {
+                    out.first_token_at_ms = decode_proto_timestamp_ms(sub)?;
+                    saw_any |= out.first_token_at_ms.is_some();
+                }
+                7 => {
+                    out.completed_at_ms = decode_proto_timestamp_ms(sub)?;
+                    saw_any |= out.completed_at_ms.is_some();
+                }
+                9 => {
+                    decode_proto_usage(sub, &mut out)?;
+                    saw_any |= out.input_tokens > 0
+                        || out.output_tokens > 0
+                        || out.cache_read_tokens > 0
+                        || out.thinking_tokens > 0
+                        || out.visible_tokens > 0;
+                }
+                _ => {}
+            }
         } else {
-            row.created_at
+            skip_proto_field(bytes, &mut pos, wire_type)?;
         }
-    } else {
-        now_ms
-    };
+    }
+    saw_any.then_some(out)
+}
 
-    SessionMetrics {
-        context_used_tokens: ctx_used_opt,
+/// Decode an uppercase/lowercase hexadecimal string into raw bytes.
+pub(crate) fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    let trimmed = hex.trim();
+    if trimmed.is_empty() || trimmed.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 2);
+    let bytes = trimmed.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// Parse tab-delimited `idx\thex(metadata)` rows returned by remote `sqlite3` queries.
+pub(crate) fn parse_agy_step_timing_tsv(text: &str) -> Vec<AgyStepTiming> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((idx_raw, hex_raw)) = trimmed.split_once('\t') else {
+            continue;
+        };
+        let Ok(idx) = idx_raw.trim().parse::<i64>() else {
+            continue;
+        };
+        let Some(bytes) = decode_hex(hex_raw.trim()) else {
+            continue;
+        };
+        if let Some(mut timing) = parse_agy_step_metadata_proto(&bytes) {
+            timing.idx = idx;
+            out.push(timing);
+        }
+    }
+    out
+}
+
+/// Convert decoded AGY `steps.metadata` timings into `SessionMetrics` (`source: "agy_db"`),
+/// preserving cumulative totals & context window from `base_transcript` while recording
+/// per-turn TTFT + sustained streaming TPS with buffered-burst filtering.
+pub(crate) fn agy_step_timings_to_metrics(
+    timings: &[AgyStepTiming],
+    model: Option<&str>,
+    base_transcript: Option<SessionMetrics>,
+    now_ms: u64,
+) -> Option<SessionMetrics> {
+    if timings.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<&AgyStepTiming> = timings.iter().collect();
+    sorted.sort_by_key(|t| t.idx);
+
+    let mut recent_turns: Vec<TurnMetricSample> = Vec::new();
+    let mut reliable_tps: Option<(f32, u64, u64)> = None;
+    let mut fallback_tps: Option<(f32, u64, u64)> = None;
+    let mut latest_db_ctx: Option<u64> = None;
+    let mut latest_ts: Option<u64> = None;
+    let mut sum_in: u64 = 0;
+    let mut sum_out: u64 = 0;
+
+    for t in &sorted {
+        let out = if t.output_tokens > 0 {
+            t.output_tokens
+        } else {
+            t.thinking_tokens.saturating_add(t.visible_tokens)
+        };
+        let ctx = t.input_tokens.saturating_add(t.cache_read_tokens);
+        if ctx > 0 {
+            latest_db_ctx = Some(ctx);
+            sum_in = sum_in.saturating_add(ctx);
+        }
+        if out > 0 {
+            sum_out = sum_out.saturating_add(out);
+        }
+
+        let ttft_ms = match (t.created_at_ms, t.first_token_at_ms) {
+            (Some(f1), Some(f6)) if f6 > f1 => {
+                let d = f6 - f1;
+                (MIN_TTFT_MS..=MAX_TTFT_MS).contains(&d).then_some(d)
+            }
+            _ => None,
+        };
+        let total_ms = match (t.created_at_ms, t.completed_at_ms) {
+            (Some(f1), Some(f7)) if f7 > f1 => Some(f7 - f1),
+            _ => None,
+        };
+        let gen_ms = match (t.first_token_at_ms, t.completed_at_ms) {
+            (Some(f6), Some(f7)) if f7 > f6 => Some(f7 - f6),
+            _ => None,
+        };
+
+        let is_buffered_burst = total_ms
+            .is_some_and(|tot| gen_ms.is_some_and(|g| g.saturating_mul(20) < tot && out < 400));
+        let stream_tps = if !is_buffered_burst {
+            gen_ms.and_then(|g| {
+                compute_tps_checked(
+                    out,
+                    g,
+                    MIN_STREAM_TPS_OUTPUT_TOKENS,
+                    MIN_STREAM_TPS_DURATION_MS,
+                )
+            })
+        } else {
+            None
+        };
+
+        let (turn_tps, turn_dur) = if let Some(st) = stream_tps {
+            let g = gen_ms.unwrap_or(0);
+            reliable_tps = Some((st, out, g));
+            (Some(st), gen_ms)
+        } else {
+            let fb = total_ms.and_then(|tot| {
+                compute_tps_checked(
+                    out,
+                    tot,
+                    MIN_FALLBACK_TPS_OUTPUT_TOKENS,
+                    MIN_FALLBACK_TPS_DURATION_MS,
+                )
+            });
+            if reliable_tps.is_none() {
+                if let Some(f_tps) = fb {
+                    let tot = total_ms.unwrap_or(0);
+                    fallback_tps = Some((f_tps, out, tot));
+                }
+            }
+            (fb, total_ms.or(gen_ms))
+        };
+
+        if let Some(ts_ms) = t.completed_at_ms.or(t.created_at_ms) {
+            latest_ts = Some(latest_ts.map_or(ts_ms, |cur| cur.max(ts_ms)));
+            if ttft_ms.is_some() || turn_tps.is_some() || out > 0 {
+                push_turn_sample(
+                    &mut recent_turns,
+                    TurnMetricSample {
+                        ts_ms,
+                        ttft_ms,
+                        tps: turn_tps,
+                        output_tokens: (out > 0).then_some(out),
+                        duration_ms: turn_dur,
+                    },
+                );
+            }
+        }
+    }
+
+    let base_ctx_used = base_transcript.as_ref().and_then(|b| b.context_used_tokens);
+    let ctx_used = latest_db_ctx.or(base_ctx_used);
+    let base_ctx_window = base_transcript
+        .as_ref()
+        .and_then(|b| b.context_window_tokens);
+    let ctx_window =
+        infer_context_window(AgentKind::Agy, model, ctx_used, None).or(base_ctx_window);
+    let ctx_pct = match (ctx_used, ctx_window) {
+        (Some(u), Some(w)) => pct_1dp(u, w),
+        _ => base_transcript.as_ref().and_then(|b| b.context_used_pct),
+    };
+    let total_input_tokens = base_transcript
+        .as_ref()
+        .and_then(|b| b.total_input_tokens)
+        .or((sum_in > 0).then_some(sum_in));
+    let total_output_tokens = base_transcript
+        .as_ref()
+        .and_then(|b| b.total_output_tokens)
+        .or((sum_out > 0).then_some(sum_out));
+
+    let chosen_tps = reliable_tps.or(fallback_tps);
+    let ttft_ms = recent_turns.iter().rev().find_map(|t| t.ttft_ms);
+    let avg_ttft_ms = compute_avg_ttft_ms(&recent_turns);
+    let updated_ms = latest_ts
+        .or_else(|| base_transcript.as_ref().map(|b| b.updated_ms))
+        .unwrap_or(now_ms);
+
+    Some(SessionMetrics {
+        context_used_tokens: ctx_used,
         context_window_tokens: ctx_window,
         context_used_pct: ctx_pct,
-        tps,
+        tps: chosen_tps.map(|x| x.0),
         ttft_ms,
-        last_output_tokens: (row.output_tokens > 0).then_some(row.output_tokens),
-        last_duration_ms: gen_ms,
-        total_input_tokens: (row.total_input_tokens > 0).then_some(row.total_input_tokens),
-        total_output_tokens: (row.total_output_tokens > 0).then_some(row.total_output_tokens),
-        source: "cc_switch".into(),
+        avg_ttft_ms,
+        last_output_tokens: chosen_tps.map(|x| x.1),
+        last_duration_ms: chosen_tps.map(|x| x.2),
+        total_input_tokens,
+        total_output_tokens,
+        recent_turns,
+        source: "agy_db".into(),
         updated_ms,
-    }
+    })
 }
 
-/// Read top-level `model_context_window` from `~/.codex/config.toml` if present.
-pub(crate) fn read_codex_default_context_window(home: &Path) -> Option<u64> {
-    let text = std::fs::read_to_string(home.join(".codex/config.toml")).ok()?;
-    let doc: toml::Value = toml::from_str(&text).ok()?;
-    doc.get("model_context_window")
-        .and_then(toml::Value::as_integer)
-        .and_then(|v| (v > 0).then_some(v as u64))
+#[derive(Debug, Clone, Deserialize)]
+struct AgyStepMetaRow {
+    idx: i64,
+    #[serde(default)]
+    meta_hex: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AgyStepCacheEntry {
+    sig: DbSig,
+    timings: Vec<AgyStepTiming>,
+    last_used: u64,
+}
+
+/// Bounded LRU cache (128 entries) of decoded AGY `steps.metadata` step timings keyed by `conv_id`.
+/// Re-queries SQLite ONLY when `<home>/.gemini/antigravity-cli/conversations/<conv_id>.db`
+/// or its `-wal` `(mtime_ns, len)` signature changes.
+#[derive(Debug, Default)]
+pub(crate) struct AgyStepTimingCache {
+    entries: HashMap<String, AgyStepCacheEntry>,
+    access_seq: u64,
+}
+
+impl AgyStepTimingCache {
+    pub(crate) fn get_or_refresh_in(
+        &mut self,
+        home: Option<&Path>,
+        conv_id: &str,
+    ) -> &[AgyStepTiming] {
+        let Some(home) = home else {
+            return &[];
+        };
+        let cid = conv_id.trim();
+        if cid.is_empty() || cid.contains('/') || cid.contains("..") {
+            return &[];
+        }
+        let db_path = home
+            .join(".gemini/antigravity-cli/conversations")
+            .join(format!("{cid}.db"));
+        self.refresh_from_path(cid, &db_path)
+    }
+
+    pub(crate) fn refresh_from_path(&mut self, conv_id: &str, db_path: &Path) -> &[AgyStepTiming] {
+        let sig = db_signature(db_path);
+        if sig.db.is_none() {
+            self.entries.remove(conv_id);
+            return &[];
+        }
+        self.access_seq = self.access_seq.wrapping_add(1);
+        let seq = self.access_seq;
+        if let Some(hit) = self.entries.get_mut(conv_id) {
+            if hit.sig == sig {
+                hit.last_used = seq;
+                return &self.entries[conv_id].timings;
+            }
+        }
+
+        let sql = "SELECT idx, hex(metadata) AS meta_hex FROM steps WHERE step_type = 15 AND status = 3 AND metadata IS NOT NULL ORDER BY idx DESC LIMIT 32;";
+        let Some(json_out) = run_sqlite_json(db_path, sql) else {
+            return self
+                .entries
+                .get(conv_id)
+                .map(|e| e.timings.as_slice())
+                .unwrap_or(&[]);
+        };
+        let Ok(rows) = serde_json::from_str::<Vec<AgyStepMetaRow>>(&json_out) else {
+            return self
+                .entries
+                .get(conv_id)
+                .map(|e| e.timings.as_slice())
+                .unwrap_or(&[]);
+        };
+        let mut timings = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(hex_str) = row.meta_hex.as_deref() else {
+                continue;
+            };
+            let Some(bytes) = decode_hex(hex_str) else {
+                continue;
+            };
+            if let Some(mut t) = parse_agy_step_metadata_proto(&bytes) {
+                t.idx = row.idx;
+                timings.push(t);
+            }
+        }
+        timings.sort_by_key(|t| t.idx);
+
+        if !self.entries.contains_key(conv_id) && self.entries.len() >= MAX_AGY_STEP_CACHE_ENTRIES {
+            if let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&victim);
+            }
+        }
+        self.entries.insert(
+            conv_id.to_string(),
+            AgyStepCacheEntry {
+                sig,
+                timings,
+                last_used: seq,
+            },
+        );
+        self.entries
+            .get(conv_id)
+            .map(|e| e.timings.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 /// Known model context window lookup (strictly documented/observed windows; unknown models → `None`).
@@ -1203,6 +1278,19 @@ impl CodexThreadCache {
         self.db_path = Some(db_path);
     }
 
+    /// Match a Codex pane against `state_5.sqlite` by its explicit live bottom status-bar title +
+    /// `cwd`, without requiring `unique_in_cwd` or `min_birth_ms` (supports multi-pane same-CWD
+    /// layouts and interactive TUI `/resume` of older threads). Blank panes return `None`.
+    pub(crate) fn match_pane_by_title(
+        &self,
+        cwd: &str,
+        tail: &str,
+        claimed_ids: &HashSet<String>,
+    ) -> Option<(String, PathBuf)> {
+        match_codex_thread_with_birth(&self.rows, cwd, tail, claimed_ids, None)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn match_pane_with_birth(
         &self,
         cwd: &str,
@@ -1218,8 +1306,41 @@ impl CodexThreadCache {
     }
 }
 
-/// Extract Codex bottom status-bar thread title (3rd ` · ` segment of the model/path/title line).
-pub(crate) fn extract_codex_status_title(tail: &str) -> Option<String> {
+fn is_codex_model_token(tok: &str) -> bool {
+    let t = tok.to_ascii_lowercase();
+    let valid_chars = !t.is_empty()
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'/' | b':'));
+    valid_chars
+        && (t.starts_with("gpt-")
+            || t.starts_with("codex-")
+            || t.starts_with("chatgpt-")
+            || t == "o1"
+            || t.starts_with("o1-")
+            || t == "o3"
+            || t.starts_with("o3-")
+            || t == "o4"
+            || t.starts_with("o4-"))
+}
+
+fn normalize_codex_effort_token(tok: &str) -> Option<&'static str> {
+    match tok.to_ascii_lowercase().as_str() {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" => Some("xhigh"),
+        "max" => Some("max"),
+        "minimal" => Some("minimal"),
+        _ => None,
+    }
+}
+
+/// Locate the bottom-most active Codex status-bar line (e.g. `GPT-6.1-Sol high · ~/Work/foo · <title>`
+/// or blank prompt `GPT-6.1-Sol low · ~/Work/foo`) within the last 8 non-empty lines of `tail`.
+///
+/// Stopping at the bottom-most status-bar line prevents stale status bars left in scrollback from an
+/// exited previous Codex process from leaking titles or models into a freshly started blank prompt.
+fn find_codex_status_bar_line(tail: &str) -> Option<&str> {
     let lines: Vec<&str> = tail
         .lines()
         .map(str::trim)
@@ -1231,24 +1352,75 @@ pub(crate) fn extract_codex_status_title(tail: &str) -> Option<String> {
         &lines[..]
     };
     for line in bottom.iter().rev() {
-        let lower = line.to_ascii_lowercase();
-        if line.contains(" · ")
-            && (lower.contains("gpt-")
-                || lower.contains("o3")
-                || lower.contains("o4")
-                || line.contains("~/"))
+        if !line.contains(" · ") {
+            continue;
+        }
+        let mut parts = line.split(" · ");
+        let seg0 = parts.next().unwrap_or("").trim();
+        let seg1 = parts.next().unwrap_or("").trim();
+        let first_tok = seg0.split_whitespace().next().unwrap_or("");
+        if is_codex_model_token(first_tok)
+            || seg1.starts_with("~/")
+            || (seg1.starts_with('/') && !seg0.starts_with('←') && !seg0.starts_with('?'))
         {
-            let parts: Vec<&str> = line.split(" · ").collect();
-            if parts.len() >= 3 {
-                // Strip right-aligned status text separated by multiple spaces (e.g. `Goal stalled ...`).
-                let raw = parts[2].split("  ").next().unwrap_or("").trim();
-                if !raw.is_empty() {
-                    return Some(raw.to_string());
-                }
-            }
+            return Some(line);
         }
     }
     None
+}
+
+/// Extract Codex bottom status-bar thread title (3rd ` · ` segment of the active model/path/title line).
+/// Returns `None` immediately when the active bottom-most status bar is a blank prompt (`<model> · <cwd>`)
+/// or only displays status chrome (`N% context left`, `← for agents`, `? for shortcuts`).
+pub(crate) fn extract_codex_status_title(tail: &str) -> Option<String> {
+    let line = find_codex_status_bar_line(tail)?;
+    let parts: Vec<&str> = line.split(" · ").collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    // Strip right-aligned status text separated by multiple spaces (e.g. `Goal stalled ...`).
+    let raw = parts[2].split("  ").next().unwrap_or("").trim();
+    let rl = raw.to_ascii_lowercase();
+    if raw.is_empty()
+        || rl.ends_with("% context left")
+        || rl.ends_with("% left")
+        || rl.starts_with("← for agents")
+        || rl.starts_with("? for shortcuts")
+        || rl == "main [default]"
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Parse Codex's active bottom status bar (`GPT-6.1-Sol high · ~/Work/foo · ...` or
+/// `GPT-6.1-Sol low · ~/Work/foo`) into normalized `(model, effort)`.
+/// Intended strictly as a fallback when verified transcript / CLI args / spawn metadata omit them.
+pub fn parse_codex_status_line_model_effort(tail: &str) -> (Option<String>, Option<String>) {
+    let Some(line) = find_codex_status_bar_line(tail) else {
+        return (None, None);
+    };
+    let seg0 = line.split(" · ").next().unwrap_or("").trim();
+    let toks: Vec<&str> = seg0.split_whitespace().collect();
+    let Some(&first) = toks.first() else {
+        return (None, None);
+    };
+    if !is_codex_model_token(first) {
+        return (None, None);
+    }
+    let model = Some(first.to_ascii_lowercase());
+    let effort = match (toks.get(1).copied(), toks.get(2).copied()) {
+        (Some(t1), _) if normalize_codex_effort_token(t1).is_some() => {
+            normalize_codex_effort_token(t1).map(str::to_string)
+        }
+        (Some(t1), Some(t2))
+            if t1.eq_ignore_ascii_case("extra") && t2.eq_ignore_ascii_case("high") =>
+        {
+            Some("xhigh".to_string())
+        }
+        _ => None,
+    };
+    (model, effort)
 }
 
 /// Strictly match a Codex pane against `state_5.sqlite` threads using its status-line title + `cwd`,
@@ -1769,7 +1941,7 @@ pub(crate) fn match_agy_conversation_with_birth_in(
     matches.pop()
 }
 
-/// Derive the canonical external `session_id` (used as key in `cc-switch.db`) for `session`.
+/// Derive the canonical external `session_id` (used for AGY DB & claimed IDs) for `session`.
 pub(crate) fn canonical_external_session_id(session: &SessionRecord) -> Option<String> {
     if !session.discovered_only && !session.session_id.as_str().starts_with("tmux-") {
         return Some(session.session_id.0.clone());
@@ -1833,9 +2005,12 @@ pub(crate) fn encode_claude_project_dir(path: &str) -> String {
 
 #[derive(Debug, Clone)]
 struct ClaudeMsgStats {
+    req_start_ts: Option<u64>,
     first_ts: Option<u64>,
     last_ts: Option<u64>,
-    prev_ts: Option<u64>,
+    block_count: u32,
+    has_thinking: bool,
+    first_had_stop_reason: bool,
     context_tokens: u64,
     output_tokens: u64,
     model: Option<String>,
@@ -1845,7 +2020,7 @@ struct ClaudeMsgStats {
 struct ClaudeFold {
     order: Vec<String>,
     by_msg: HashMap<String, ClaudeMsgStats>,
-    prev_event_ts: Option<u64>,
+    prev_user_ts: Option<u64>,
     latest_event_ts: Option<u64>,
     latest_model: Option<String>,
     seq: u64,
@@ -1857,12 +2032,108 @@ struct CodexFold {
     ctx_window: Option<u64>,
     total_in: Option<u64>,
     total_out: Option<u64>,
-    call_start_ts: Option<u64>,
+    req_start_ts: Option<u64>,
+    first_item_ts: Option<u64>,
+    saw_model_item: bool,
+    saw_reasoning_item: bool,
+    closed_via_usage_record: bool,
     latest_event_ts: Option<u64>,
-    last_tps: Option<(f32, u64, u64)>,
+    reliable_tps: Option<(f32, u64, u64)>,
+    fallback_tps: Option<(f32, u64, u64)>,
+    latest_ttft_ms: Option<u64>,
+    recent_turns: Vec<TurnMetricSample>,
     prev_total_out: Option<u64>,
     latest_model: Option<String>,
     latest_effort: Option<String>,
+}
+
+impl CodexFold {
+    fn record_turn(&mut self, ts_ms: Option<u64>, out_tok: u64, reasoning_tok: u64) {
+        let ttft_ms = match (self.req_start_ts, self.first_item_ts) {
+            (Some(r), Some(fi)) if fi > r => {
+                let d = fi - r;
+                (MIN_TTFT_MS..=MAX_TTFT_MS).contains(&d).then_some(d)
+            }
+            _ => None,
+        };
+        if let Some(t) = ttft_ms {
+            self.latest_ttft_ms = Some(t);
+        }
+        let gen_ms = match (self.first_item_ts, ts_ms) {
+            (Some(fi), Some(t)) if t > fi => Some(t - fi),
+            _ => None,
+        };
+        let tot_ms = match (self.req_start_ts, ts_ms) {
+            (Some(r), Some(t)) if t > r => Some(t - r),
+            _ => None,
+        };
+
+        let stream_res = if reasoning_tok > 0 && self.saw_reasoning_item {
+            let vis = out_tok.saturating_sub(reasoning_tok);
+            gen_ms.and_then(|g| {
+                compute_tps_checked(
+                    vis,
+                    g,
+                    MIN_CODEX_STREAM_VISIBLE_TOKENS,
+                    MIN_STREAM_TPS_DURATION_MS,
+                )
+                .map(|tps| (tps, vis, g))
+            })
+        } else if reasoning_tok == 0 {
+            gen_ms.and_then(|g| {
+                compute_tps_checked(
+                    out_tok,
+                    g,
+                    MIN_STREAM_TPS_OUTPUT_TOKENS,
+                    MIN_STREAM_TPS_DURATION_MS,
+                )
+                .map(|tps| (tps, out_tok, g))
+            })
+        } else {
+            None
+        };
+
+        let fb_res = tot_ms.and_then(|tot| {
+            compute_tps_checked(
+                out_tok,
+                tot,
+                MIN_FALLBACK_TPS_OUTPUT_TOKENS,
+                MIN_FALLBACK_TPS_DURATION_MS,
+            )
+            .map(|tps| (tps, out_tok, tot))
+        });
+
+        let (turn_tps, turn_out, turn_dur) = if let Some((tps, tok, dur)) = stream_res {
+            self.reliable_tps = Some((tps, tok, dur));
+            (Some(tps), Some(tok), Some(dur))
+        } else {
+            if self.reliable_tps.is_none() {
+                if let Some((tps, tok, dur)) = fb_res {
+                    self.fallback_tps = Some((tps, tok, dur));
+                }
+            }
+            (
+                fb_res.map(|x| x.0),
+                (out_tok > 0).then_some(out_tok),
+                tot_ms.or(gen_ms),
+            )
+        };
+
+        if let Some(t) = ts_ms {
+            if ttft_ms.is_some() || turn_tps.is_some() || out_tok > 0 {
+                push_turn_sample(
+                    &mut self.recent_turns,
+                    TurnMetricSample {
+                        ts_ms: t,
+                        ttft_ms,
+                        tps: turn_tps,
+                        output_tokens: turn_out,
+                        duration_ms: turn_dur,
+                    },
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1872,6 +2143,7 @@ struct AgyFold {
     total_in: u64,
     total_out: u64,
     last_tps: Option<(f32, u64, u64)>,
+    recent_turns: Vec<TurnMetricSample>,
     pending_pr: Option<(u64, u64)>,
     latest_event_ts: Option<u64>,
 }
@@ -1929,6 +2201,13 @@ impl TelemetryFold {
             f.latest_event_ts = Some(f.latest_event_ts.map_or(t, |cur| cur.max(t)));
         }
 
+        if kind == "user" {
+            if let Some(t) = ts_ms {
+                f.prev_user_ts = Some(t);
+            }
+            return;
+        }
+
         if kind == "assistant" {
             if let Some(msg) = obj.get("message") {
                 let model = msg
@@ -1953,6 +2232,21 @@ impl TelemetryFold {
                         let out = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
                         let ctx = inp.saturating_add(cache_r).saturating_add(cache_w);
                         if ctx > 0 || out > 0 {
+                            let chunk_has_thinking = msg
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .is_some_and(|blocks| {
+                                    blocks.iter().any(|b| {
+                                        matches!(
+                                            b.get("type").and_then(Value::as_str),
+                                            Some("thinking" | "redacted_thinking")
+                                        )
+                                    })
+                                });
+                            let first_had_stop = msg
+                                .get("stop_reason")
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| !s.trim().is_empty());
                             let id = msg
                                 .get("id")
                                 .and_then(Value::as_str)
@@ -1964,14 +2258,19 @@ impl TelemetryFold {
                             let entry = f.by_msg.entry(id.clone()).or_insert_with(|| {
                                 f.order.push(id);
                                 ClaudeMsgStats {
+                                    req_start_ts: f.prev_user_ts,
                                     first_ts: ts_ms,
                                     last_ts: ts_ms,
-                                    prev_ts: f.prev_event_ts,
+                                    block_count: 0,
+                                    has_thinking: false,
+                                    first_had_stop_reason: first_had_stop,
                                     context_tokens: 0,
                                     output_tokens: 0,
                                     model: (!model.is_empty()).then(|| model.to_string()),
                                 }
                             });
+                            entry.block_count = entry.block_count.saturating_add(1);
+                            entry.has_thinking |= chunk_has_thinking;
                             if entry.first_ts.is_none() {
                                 entry.first_ts = ts_ms;
                             }
@@ -1983,12 +2282,6 @@ impl TelemetryFold {
                         }
                     }
                 }
-            }
-        }
-
-        if let Some(t) = ts_ms {
-            if matches!(kind, "user" | "assistant" | "system") {
-                f.prev_event_ts = Some(t);
             }
         }
     }
@@ -2041,14 +2334,73 @@ impl TelemetryFold {
             ("response_item", "message") => {
                 if payload.and_then(|p| p.get("role")).and_then(Value::as_str) == Some("user") {
                     if let Some(t) = ts_ms {
-                        f.call_start_ts = Some(t);
+                        f.req_start_ts = Some(t);
                     }
+                    f.first_item_ts = None;
+                    f.saw_model_item = false;
+                    f.saw_reasoning_item = false;
+                    f.closed_via_usage_record = false;
+                } else {
+                    if let Some(t) = ts_ms {
+                        f.first_item_ts = f.first_item_ts.or(Some(t));
+                    }
+                    f.saw_model_item = true;
                 }
             }
             ("response_item", "custom_tool_call_output" | "function_call_output") => {
-                if let Some(t) = ts_ms {
-                    f.call_start_ts = Some(t);
+                if !f.saw_model_item {
+                    if let Some(t) = ts_ms {
+                        f.req_start_ts = Some(t);
+                    }
+                    f.first_item_ts = None;
+                    f.saw_model_item = false;
+                    f.saw_reasoning_item = false;
                 }
+            }
+            ("response_item", "reasoning" | "custom_tool_call" | "function_call") => {
+                if let Some(t) = ts_ms {
+                    f.first_item_ts = f.first_item_ts.or(Some(t));
+                }
+                f.saw_model_item = true;
+                if ptype == "reasoning" {
+                    f.saw_reasoning_item = true;
+                }
+            }
+            ("event_msg", "item_completed") => {
+                if let Some(item_type) = payload
+                    .and_then(|p| p.get("item"))
+                    .and_then(|it| it.get("type"))
+                    .and_then(Value::as_str)
+                {
+                    if matches!(item_type, "Reasoning" | "AgentMessage" | "Message") {
+                        if let Some(t) = ts_ms {
+                            f.first_item_ts = f.first_item_ts.or(Some(t));
+                        }
+                        f.saw_model_item = true;
+                        if item_type == "Reasoning" {
+                            f.saw_reasoning_item = true;
+                        }
+                    }
+                }
+            }
+            ("token_usage_record", _) | ("event_msg", "token_usage_record") => {
+                let usage = payload.and_then(|p| p.get("usage")).or(payload);
+                let out_tok = usage
+                    .and_then(|u| u.get("output_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let reasoning_tok = usage
+                    .and_then(|u| u.get("reasoning_output_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                f.record_turn(ts_ms, out_tok, reasoning_tok);
+                if let Some(t) = ts_ms {
+                    f.req_start_ts = Some(t);
+                }
+                f.first_item_ts = None;
+                f.saw_model_item = false;
+                f.saw_reasoning_item = false;
+                f.closed_via_usage_record = true;
             }
             ("event_msg", "token_count") => {
                 let Some(info) = payload
@@ -2082,30 +2434,55 @@ impl TelemetryFold {
                         .get("output_tokens")
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
+                    let reasoning_tok = last
+                        .get("reasoning_output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     let changed = f.total_out != f.prev_total_out;
-                    if changed && out_tok > 0 {
-                        if let (Some(start), Some(end)) = (f.call_start_ts, ts_ms) {
-                            let dur = end.saturating_sub(start);
-                            if let Some(tps) = compute_tps(out_tok, dur) {
-                                f.last_tps = Some((tps, out_tok, dur));
-                            }
-                        }
+                    let was_closed = f.closed_via_usage_record;
+                    f.closed_via_usage_record = false;
+                    if changed && !was_closed && out_tok > 0 {
+                        f.record_turn(ts_ms, out_tok, reasoning_tok);
                     }
                     f.prev_total_out = f.total_out;
-                    if let Some(t) = ts_ms {
-                        f.call_start_ts = Some(t);
+                    if f.saw_model_item || (changed && !was_closed) {
+                        if let Some(t) = ts_ms {
+                            f.req_start_ts = Some(t);
+                        }
+                        f.first_item_ts = None;
+                        f.saw_model_item = false;
+                        f.saw_reasoning_item = false;
                     }
                 }
             }
-            ("event_msg", "task_complete") if f.last_tps.is_none() => {
+            ("event_msg", "task_complete")
+                if f.reliable_tps.is_none() && f.fallback_tps.is_none() =>
+            {
                 if let (Some(dur), Some(out_tok)) = (
                     payload
                         .and_then(|p| p.get("duration_ms"))
                         .and_then(Value::as_u64),
                     f.total_out.filter(|&v| v > 0),
                 ) {
-                    if let Some(tps) = compute_tps(out_tok, dur) {
-                        f.last_tps = Some((tps, out_tok, dur));
+                    if let Some(tps) = compute_tps_checked(
+                        out_tok,
+                        dur,
+                        MIN_FALLBACK_TPS_OUTPUT_TOKENS,
+                        MIN_FALLBACK_TPS_DURATION_MS,
+                    ) {
+                        f.fallback_tps = Some((tps, out_tok, dur));
+                        if let Some(t) = ts_ms {
+                            push_turn_sample(
+                                &mut f.recent_turns,
+                                TurnMetricSample {
+                                    ts_ms: t,
+                                    ttft_ms: None,
+                                    tps: Some(tps),
+                                    output_tokens: Some(out_tok),
+                                    duration_ms: Some(dur),
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -2125,10 +2502,24 @@ impl TelemetryFold {
         }
 
         if let (Some((pr_start, pr_out)), Some(next_ts)) = (f.pending_pr.take(), ts_ms) {
-            if kind != "USER_INPUT" {
+            if !matches!(kind, "USER_INPUT" | "SYSTEM_MESSAGE" | "PLANNER_RESPONSE") {
                 let dur = next_ts.saturating_sub(pr_start);
-                if let Some(tps) = compute_tps(pr_out, dur) {
-                    f.last_tps = Some((tps, pr_out, dur));
+                if dur >= 3_000 {
+                    if let Some(tps) =
+                        compute_tps_checked(pr_out, dur, MIN_STREAM_TPS_OUTPUT_TOKENS, 3_000)
+                    {
+                        f.last_tps = Some((tps, pr_out, dur));
+                        push_turn_sample(
+                            &mut f.recent_turns,
+                            TurnMetricSample {
+                                ts_ms: next_ts,
+                                ttft_ms: None,
+                                tps: Some(tps),
+                                output_tokens: Some(pr_out),
+                                duration_ms: Some(dur),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -2201,7 +2592,9 @@ impl TelemetryFold {
         let mut total_out: u64 = 0;
         let mut latest_ctx: Option<u64> = None;
         let mut latest_model: Option<String> = None;
-        let mut best_tps: Option<(f32, u64, u64)> = None;
+        let mut reliable_tps: Option<(f32, u64, u64)> = None;
+        let mut fallback_tps: Option<(f32, u64, u64)> = None;
+        let mut recent_turns: Vec<TurnMetricSample> = Vec::new();
 
         for id in &f.order {
             let Some(m) = f.by_msg.get(id) else { continue };
@@ -2213,22 +2606,74 @@ impl TelemetryFold {
                     latest_model = m.model.clone();
                 }
             }
-            if m.output_tokens > 0 {
-                let chunk_span = match (m.first_ts, m.last_ts) {
-                    (Some(a), Some(b)) if b > a => b - a,
-                    _ => 0,
-                };
-                let call_span = match (m.prev_ts, m.last_ts) {
-                    (Some(a), Some(b)) if b > a => b - a,
-                    _ => 0,
-                };
-                let dur = if (MIN_TPS_DURATION_MS..=MAX_TPS_DURATION_MS).contains(&call_span) {
-                    call_span
-                } else {
-                    chunk_span
-                };
-                if let Some(tps) = compute_tps(m.output_tokens, dur) {
-                    best_tps = Some((tps, m.output_tokens, dur));
+
+            let ttft_ms = if m.block_count >= 2 || !m.first_had_stop_reason || m.output_tokens < 50
+            {
+                match (m.req_start_ts, m.first_ts) {
+                    (Some(r), Some(fi)) if fi > r => {
+                        let d = fi - r;
+                        (MIN_TTFT_MS..=MAX_TTFT_MS).contains(&d).then_some(d)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let chunk_span = match (m.first_ts, m.last_ts) {
+                (Some(a), Some(b)) if b > a => b - a,
+                _ => 0,
+            };
+            let call_span = match (m.req_start_ts, m.last_ts) {
+                (Some(a), Some(b)) if b > a => b - a,
+                _ => 0,
+            };
+            let dur = if (MIN_FALLBACK_TPS_DURATION_MS..=MAX_TPS_DURATION_MS).contains(&call_span) {
+                call_span
+            } else if !m.has_thinking {
+                chunk_span
+            } else {
+                0
+            };
+
+            let stream_tps = compute_tps_checked(
+                m.output_tokens,
+                dur,
+                MIN_STREAM_TPS_OUTPUT_TOKENS,
+                MIN_STREAM_TPS_DURATION_MS,
+            );
+            let fb_tps = if stream_tps.is_none() {
+                compute_tps_checked(
+                    m.output_tokens,
+                    dur,
+                    MIN_FALLBACK_TPS_OUTPUT_TOKENS,
+                    MIN_FALLBACK_TPS_DURATION_MS,
+                )
+            } else {
+                None
+            };
+
+            if let Some(tps) = stream_tps {
+                reliable_tps = Some((tps, m.output_tokens, dur));
+            } else if reliable_tps.is_none() {
+                if let Some(tps) = fb_tps {
+                    fallback_tps = Some((tps, m.output_tokens, dur));
+                }
+            }
+
+            let turn_tps = stream_tps.or(fb_tps);
+            if let Some(ts) = m.last_ts.or(m.first_ts) {
+                if ttft_ms.is_some() || turn_tps.is_some() || m.output_tokens > 0 {
+                    push_turn_sample(
+                        &mut recent_turns,
+                        TurnMetricSample {
+                            ts_ms: ts,
+                            ttft_ms,
+                            tps: turn_tps,
+                            output_tokens: (m.output_tokens > 0).then_some(m.output_tokens),
+                            duration_ms: (dur > 0).then_some(dur),
+                        },
+                    );
                 }
             }
         }
@@ -2239,17 +2684,22 @@ impl TelemetryFold {
             (Some(u), Some(w)) => pct_1dp(u, w),
             _ => None,
         };
+        let chosen_tps = reliable_tps.or(fallback_tps);
+        let ttft_ms = recent_turns.iter().rev().find_map(|t| t.ttft_ms);
+        let avg_ttft_ms = compute_avg_ttft_ms(&recent_turns);
 
         Some(SessionMetrics {
             context_used_tokens: latest_ctx,
             context_window_tokens: ctx_window,
             context_used_pct: ctx_pct,
-            tps: best_tps.map(|x| x.0),
-            ttft_ms: None,
-            last_output_tokens: best_tps.map(|x| x.1),
-            last_duration_ms: best_tps.map(|x| x.2),
+            tps: chosen_tps.map(|x| x.0),
+            ttft_ms,
+            avg_ttft_ms,
+            last_output_tokens: chosen_tps.map(|x| x.1),
+            last_duration_ms: chosen_tps.map(|x| x.2),
             total_input_tokens: (total_in > 0).then_some(total_in),
             total_output_tokens: (total_out > 0).then_some(total_out),
+            recent_turns,
             source: "transcript".into(),
             updated_ms: f.latest_event_ts.unwrap_or(now_ms),
         })
@@ -2260,7 +2710,9 @@ impl TelemetryFold {
         if f.ctx_used.is_none()
             && f.ctx_window.is_none()
             && f.total_in.is_none()
-            && f.last_tps.is_none()
+            && f.reliable_tps.is_none()
+            && f.fallback_tps.is_none()
+            && f.recent_turns.is_empty()
         {
             return None;
         }
@@ -2268,16 +2720,23 @@ impl TelemetryFold {
             (Some(u), Some(w)) => pct_1dp(u, w),
             _ => None,
         };
+        let chosen_tps = f.reliable_tps.or(f.fallback_tps);
+        let ttft_ms = f
+            .latest_ttft_ms
+            .or_else(|| f.recent_turns.iter().rev().find_map(|t| t.ttft_ms));
+        let avg_ttft_ms = compute_avg_ttft_ms(&f.recent_turns);
         Some(SessionMetrics {
             context_used_tokens: f.ctx_used,
             context_window_tokens: f.ctx_window,
             context_used_pct: ctx_pct,
-            tps: f.last_tps.map(|x| x.0),
-            ttft_ms: None,
-            last_output_tokens: f.last_tps.map(|x| x.1),
-            last_duration_ms: f.last_tps.map(|x| x.2),
+            tps: chosen_tps.map(|x| x.0),
+            ttft_ms,
+            avg_ttft_ms,
+            last_output_tokens: chosen_tps.map(|x| x.1),
+            last_duration_ms: chosen_tps.map(|x| x.2),
             total_input_tokens: f.total_in,
             total_output_tokens: f.total_out,
+            recent_turns: f.recent_turns.clone(),
             source: "transcript".into(),
             updated_ms: f.latest_event_ts.unwrap_or(now_ms),
         })
@@ -2304,10 +2763,12 @@ impl TelemetryFold {
             context_used_pct: ctx_pct,
             tps: f.last_tps.map(|x| x.0),
             ttft_ms: None,
+            avg_ttft_ms: None,
             last_output_tokens: f.last_tps.map(|x| x.1),
             last_duration_ms: f.last_tps.map(|x| x.2),
             total_input_tokens: (f.total_in > 0).then_some(f.total_in),
             total_output_tokens: (f.total_out > 0).then_some(f.total_out),
+            recent_turns: f.recent_turns.clone(),
             source: "transcript".into(),
             updated_ms: f.latest_event_ts.unwrap_or(now_ms),
         })
@@ -2327,17 +2788,6 @@ pub(crate) fn extract_transcript_metrics(
     let mut fold = TelemetryFold::new(agent);
     fold.feed_text(text);
     fold.snapshot(now_ms).0
-}
-
-fn compute_tps(output_tokens: u64, duration_ms: u64) -> Option<f32> {
-    if output_tokens == 0 || !(MIN_TPS_DURATION_MS..=MAX_TPS_DURATION_MS).contains(&duration_ms) {
-        return None;
-    }
-    let raw = (output_tokens as f64) / ((duration_ms as f64) / 1000.0);
-    if !raw.is_finite() || raw <= 0.0 || raw > MAX_PLAUSIBLE_TPS {
-        return None;
-    }
-    Some(((raw * 10.0).round() / 10.0) as f32)
 }
 
 fn pct_1dp(used: u64, window: u64) -> Option<f32> {
@@ -2408,10 +2858,12 @@ pub fn parse_status_line_metrics(
         context_used_pct: used_pct,
         tps: None,
         ttft_ms: None,
+        avg_ttft_ms: None,
         last_output_tokens: None,
         last_duration_ms: None,
         total_input_tokens: None,
         total_output_tokens: None,
+        recent_turns: Vec::new(),
         source: "status_line".into(),
         updated_ms: now_ms,
     })
@@ -2435,66 +2887,7 @@ fn extract_percent_left(lower: &str) -> Option<f32> {
     None
 }
 
-/// Priority merger: `cc_switch` (streaming TPS + TTFT) > `transcript` > `status_line`.
-/// Enriches `cc_switch` with exact per-session `model_context_window` from transcript (e.g. Codex)
-/// or explicit `(1M context)` / `N% context left` from status line.
-pub(crate) fn merge_cc_switch_with_fallback(
-    cc: Option<SessionMetrics>,
-    transcript: Option<SessionMetrics>,
-    status: Option<SessionMetrics>,
-) -> Option<SessionMetrics> {
-    let fallback = merge_metrics(transcript, status);
-    match (cc, fallback) {
-        (Some(mut c), Some(fb)) => {
-            if fb.source == "transcript" && fb.updated_ms > c.updated_ms.saturating_add(15_000) {
-                c.context_used_tokens = fb.context_used_tokens.or(c.context_used_tokens);
-                c.context_window_tokens = fb.context_window_tokens.or(c.context_window_tokens);
-                if let (Some(u), Some(w)) = (c.context_used_tokens, c.context_window_tokens) {
-                    c.context_used_pct = pct_1dp(u, w);
-                } else if fb.context_used_pct.is_some() {
-                    c.context_used_pct = fb.context_used_pct;
-                }
-                c.tps = fb.tps.or(c.tps);
-                c.last_output_tokens = fb.last_output_tokens.or(c.last_output_tokens);
-                c.last_duration_ms = fb.last_duration_ms.or(c.last_duration_ms);
-                c.total_input_tokens = fb.total_input_tokens.or(c.total_input_tokens);
-                c.total_output_tokens = fb.total_output_tokens.or(c.total_output_tokens);
-                c.updated_ms = fb.updated_ms;
-                return Some(c);
-            }
-            // Prefer exact per-rollout window (e.g. Codex 258.4K / 828.4K) or fill missing window.
-            if (fb.source == "transcript" && fb.context_window_tokens.is_some())
-                || c.context_window_tokens.is_none()
-            {
-                c.context_window_tokens = fb.context_window_tokens;
-            }
-            if c.context_used_tokens.is_none() {
-                c.context_used_tokens = fb.context_used_tokens;
-            }
-            if let (Some(u), Some(w)) = (c.context_used_tokens, c.context_window_tokens) {
-                c.context_used_pct = pct_1dp(u, w);
-            } else if c.context_used_pct.is_none() {
-                c.context_used_pct = fb.context_used_pct;
-            }
-            if c.tps.is_none() {
-                c.tps = fb.tps;
-                c.last_output_tokens = c.last_output_tokens.or(fb.last_output_tokens);
-                c.last_duration_ms = c.last_duration_ms.or(fb.last_duration_ms);
-            }
-            if c.total_input_tokens.is_none() {
-                c.total_input_tokens = fb.total_input_tokens;
-            }
-            if c.total_output_tokens.is_none() {
-                c.total_output_tokens = fb.total_output_tokens;
-            }
-            Some(c)
-        }
-        (Some(c), None) => Some(c),
-        (None, fb) => fb,
-    }
-}
-
-/// Merge transcript metrics with optional status-line metrics.
+/// Merge transcript metrics (`"agy_db"` / `"transcript"`) with optional status-line metrics.
 pub(crate) fn merge_metrics(
     transcript: Option<SessionMetrics>,
     status: Option<SessionMetrics>,
@@ -2532,10 +2925,13 @@ pub(crate) fn metrics_meaningfully_equal(
                 && x.context_used_pct == y.context_used_pct
                 && x.tps == y.tps
                 && x.ttft_ms == y.ttft_ms
+                && x.avg_ttft_ms == y.avg_ttft_ms
                 && x.last_output_tokens == y.last_output_tokens
                 && x.last_duration_ms == y.last_duration_ms
                 && x.total_input_tokens == y.total_input_tokens
                 && x.total_output_tokens == y.total_output_tokens
+                && x.recent_turns.len() == y.recent_turns.len()
+                && x.recent_turns.last() == y.recent_turns.last()
                 && x.source == y.source
         }
         _ => false,
@@ -3223,83 +3619,355 @@ pub fn remote_agy_children_of(
 mod tests {
     use super::*;
 
+    fn encode_varint(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn encode_len_field(field: u64, payload: &[u8], out: &mut Vec<u8>) {
+        encode_varint((field << 3) | 2, out);
+        encode_varint(payload.len() as u64, out);
+        out.extend_from_slice(payload);
+    }
+
+    fn encode_varint_field(field: u64, val: u64, out: &mut Vec<u8>) {
+        encode_varint(field << 3, out);
+        encode_varint(val, out);
+    }
+
+    fn encode_ts_msg(ms: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_varint_field(1, ms / 1_000, &mut buf);
+        encode_varint_field(2, (ms % 1_000) * 1_000_000, &mut buf);
+        buf
+    }
+
+    fn encode_agy_step_meta(t: &AgyStepTiming) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Put an unknown field first to verify field-order independence.
+        encode_varint_field(3, 2, &mut buf);
+        if let Some(ms) = t.created_at_ms {
+            encode_len_field(1, &encode_ts_msg(ms), &mut buf);
+        }
+        if let Some(ms) = t.first_token_at_ms {
+            encode_len_field(6, &encode_ts_msg(ms), &mut buf);
+        }
+        if let Some(ms) = t.completed_at_ms {
+            encode_len_field(7, &encode_ts_msg(ms), &mut buf);
+        }
+        let mut usage = Vec::new();
+        encode_varint_field(1, 1669, &mut usage);
+        encode_varint_field(2, t.input_tokens, &mut usage);
+        encode_varint_field(3, t.output_tokens, &mut usage);
+        encode_varint_field(5, t.cache_read_tokens, &mut usage);
+        encode_len_field(7, b"bot-1234", &mut usage);
+        encode_varint_field(9, t.thinking_tokens, &mut usage);
+        encode_varint_field(10, t.visible_tokens, &mut usage);
+        encode_len_field(9, &usage, &mut buf);
+        encode_len_field(35, b"deadbeef", &mut buf);
+        buf
+    }
+
+    fn bytes_to_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+
     #[test]
-    fn cc_switch_streaming_tps_and_input_token_semantics() {
-        // AGY (semantics = 2 exclusive): input + cache_read = 284,077 / 512,000 = 55.5%,
-        // streaming dur = 18922 - 5467 = 13455ms, tps = 2016 / 13.455 = 149.8 tok/s
-        let agy_row = CcSwitchRow {
-            session_id: "s-agy".into(),
-            app_type: "agy".into(),
-            model: Some("gemini-4-neon-high".into()),
-            input_tokens: 3_829,
-            output_tokens: 2_016,
-            cache_read_tokens: 280_248,
-            cache_creation_tokens: 0,
-            latency_ms: Some(18_922),
-            first_token_ms: Some(5_467),
-            duration_ms: None,
-            input_token_semantics: 2,
-            created_at: 1_795_237_572,
-            total_input_tokens: 900_000,
-            total_output_tokens: 12_000,
+    fn agy_protobuf_decode_burst_filter_ttft_avg_and_recent_turns_cap() {
+        let sample = AgyStepTiming {
+            idx: 10,
+            created_at_ms: Some(1_795_685_617_123),
+            first_token_at_ms: Some(1_795_685_623_581),
+            completed_at_ms: Some(1_795_685_626_075),
+            input_tokens: 4_088,
+            output_tokens: 613,
+            cache_read_tokens: 339_112,
+            thinking_tokens: 274,
+            visible_tokens: 339,
         };
-        let m_agy = cc_switch_row_to_metrics(&agy_row, Some(872_000), 999);
-        assert_eq!(m_agy.source, "cc_switch");
-        assert_eq!(m_agy.context_used_tokens, Some(284_077));
-        assert_eq!(m_agy.context_window_tokens, Some(512_000));
-        assert_eq!(m_agy.context_used_pct, Some(55.5));
-        assert_eq!(m_agy.ttft_ms, Some(5_467));
-        assert_eq!(m_agy.last_duration_ms, Some(13_455));
-        assert_eq!(m_agy.tps, Some(149.8));
+        let raw = encode_agy_step_meta(&sample);
+        let decoded = parse_agy_step_metadata_proto(&raw).unwrap();
+        assert_eq!(decoded.created_at_ms, Some(1_795_685_617_123));
+        assert_eq!(decoded.first_token_at_ms, Some(1_795_685_623_581));
+        assert_eq!(decoded.completed_at_ms, Some(1_795_685_626_075));
+        assert_eq!(decoded.input_tokens, 4_088);
+        assert_eq!(decoded.output_tokens, 613);
+        assert_eq!(decoded.cache_read_tokens, 339_112);
+        assert_eq!(decoded.thinking_tokens, 274);
+        assert_eq!(decoded.visible_tokens, 339);
 
-        // Codex (semantics = 1 INCLUSIVE): input_tokens ALREADY includes cache_read_tokens!
-        let cx_row = CcSwitchRow {
-            session_id: "s-cx".into(),
-            app_type: "codex".into(),
-            model: Some("gpt-6.2-sol".into()),
-            input_tokens: 156_646,
-            output_tokens: 873,
-            cache_read_tokens: 155_776,
-            cache_creation_tokens: 0,
-            latency_ms: Some(21_660),
-            first_token_ms: Some(5_768),
-            duration_ms: None,
-            input_token_semantics: 1,
-            created_at: 1_795_235_354,
-            total_input_tokens: 7_500_000,
-            total_output_tokens: 22_000,
-        };
-        let m_cx = cc_switch_row_to_metrics(&cx_row, Some(872_000), 999);
-        assert_eq!(m_cx.context_used_tokens, Some(156_646)); // NOT 312,422!
-        assert_eq!(m_cx.context_window_tokens, Some(872_000));
-        assert_eq!(m_cx.context_used_pct, Some(18.0));
-        assert_eq!(m_cx.ttft_ms, Some(5_768));
-        assert_eq!(m_cx.last_duration_ms, Some(15_892));
-        assert_eq!(m_cx.tps, Some(54.9));
+        // Corrupt / empty protobuf payloads fail gracefully.
+        assert!(parse_agy_step_metadata_proto(&[]).is_none());
+        assert!(parse_agy_step_metadata_proto(&[0x0a, 0xff, 0x01]).is_none());
 
-        // Claude (semantics = 0 exclusive, >200K → 1M window, fallback to total_ms when first_token_ms is None).
-        let cl_row = CcSwitchRow {
-            session_id: "s-cl".into(),
-            app_type: "claude".into(),
-            model: Some("claude-fable-5-2".into()),
-            input_tokens: 2,
-            output_tokens: 1_331,
-            cache_read_tokens: 568_048,
-            cache_creation_tokens: 8_693,
-            latency_ms: Some(20_000),
-            first_token_ms: None,
-            duration_ms: None,
-            input_token_semantics: 0,
-            created_at: 1_795_032_801,
-            total_input_tokens: 1_200_000,
-            total_output_tokens: 10_000,
+        // Test buffered-burst rejection + reliable TPS preservation + TTFT average + 20-turn cap.
+        let mut timings = Vec::new();
+        let base_ts = 1_795_600_000_000u64;
+        // 23 normal turns (indices 0..23): TTFT = 1_000ms + i*100ms, streaming TPS = 100.0 (400 tok / 4000ms).
+        for i in 0..23u64 {
+            let f1 = base_ts + i * 20_000;
+            let ttft = 1_000 + i * 100;
+            let f6 = f1 + ttft;
+            let f7 = f6 + 4_000;
+            timings.push(AgyStepTiming {
+                idx: (23 - i) as i64, // intentionally unsorted input to test ascending idx sort
+                created_at_ms: Some(f1),
+                first_token_at_ms: Some(f6),
+                completed_at_ms: Some(f7),
+                input_tokens: 3_000,
+                output_tokens: 400,
+                cache_read_tokens: 170_000,
+                thinking_tokens: 100,
+                visible_tokens: 300,
+            });
+        }
+        // Reverse idx mapping so idx 100 is latest, and insert a buffered-burst turn at idx 200:
+        // total_ms = 52_000, gen_ms = 2_000 (2_000*20=40_000 < 52_000), out = 300 < 400 -> burst!
+        for (pos, t) in timings.iter_mut().enumerate() {
+            t.idx = pos as i64;
+        }
+        let burst_f1 = base_ts + 23 * 20_000;
+        let burst_f6 = burst_f1 + 50_000;
+        let burst_f7 = burst_f6 + 2_000;
+        timings.push(AgyStepTiming {
+            idx: 23,
+            created_at_ms: Some(burst_f1),
+            first_token_at_ms: Some(burst_f6),
+            completed_at_ms: Some(burst_f7),
+            input_tokens: 4_000,
+            output_tokens: 300,
+            cache_read_tokens: 180_000,
+            thinking_tokens: 50,
+            visible_tokens: 250,
+        });
+
+        let base_tr = SessionMetrics {
+            context_used_tokens: Some(150_000),
+            context_window_tokens: Some(512_000),
+            context_used_pct: Some(29.3),
+            tps: Some(50.0),
+            ttft_ms: None,
+            avg_ttft_ms: None,
+            last_output_tokens: Some(200),
+            last_duration_ms: Some(4_000),
+            total_input_tokens: Some(2_500_000),
+            total_output_tokens: Some(18_000),
+            recent_turns: Vec::new(),
+            source: "transcript".into(),
+            updated_ms: 123,
         };
-        let m_cl = cc_switch_row_to_metrics(&cl_row, None, 999);
-        assert_eq!(m_cl.context_used_tokens, Some(576_743));
-        assert_eq!(m_cl.context_window_tokens, Some(1_000_000));
-        assert_eq!(m_cl.context_used_pct, Some(57.7));
-        assert_eq!(m_cl.ttft_ms, None);
-        assert_eq!(m_cl.tps, Some(66.6));
+        let m =
+            agy_step_timings_to_metrics(&timings, Some("gemini-4-neon-high"), Some(base_tr), 999)
+                .unwrap();
+        assert_eq!(m.source, "agy_db");
+        assert_eq!(m.context_used_tokens, Some(184_000));
+        assert_eq!(m.context_window_tokens, Some(512_000));
+        assert_eq!(m.total_input_tokens, Some(2_500_000));
+        assert_eq!(m.total_output_tokens, Some(18_000));
+        // Reliable streaming TPS (100.0) must NOT be replaced by buffered burst (150.0 or 5.8)!
+        assert_eq!(m.tps, Some(100.0));
+        // Latest valid TTFT comes from the burst step (50_000ms) and is retained in recent_turns.
+        assert_eq!(m.ttft_ms, Some(50_000));
+        // Capped at 20 turns in chronological order (indices 4..=23).
+        assert_eq!(m.recent_turns.len(), 20);
+        assert!(m.recent_turns.windows(2).all(|w| w[0].ts_ms <= w[1].ts_ms));
+        // Average TTFT over indices 4..=22 (1400..=3200, avg 2300, 19 turns) + index 23 (50000):
+        // (19*2300 + 50000) / 20 = 93700 / 20 = 4685.
+        assert_eq!(m.avg_ttft_ms, Some(4_685));
+
+        let hex_blob = bytes_to_hex(&raw);
+        let tsv_parsed = parse_agy_step_timing_tsv(&format!("42\t{hex_blob}\nbad-line\n"));
+        assert_eq!(tsv_parsed.len(), 1);
+        assert_eq!(tsv_parsed[0].idx, 42);
+        assert_eq!(tsv_parsed[0].output_tokens, 613);
+
+        // Verify metrics_meaningfully_equal covers avg_ttft_ms + recent_turns length/last.
+        let mut m1_eq = m.clone();
+        assert!(metrics_meaningfully_equal(
+            &Some(m.clone()),
+            &Some(m1_eq.clone())
+        ));
+        m1_eq.avg_ttft_ms = Some(999);
+        assert!(!metrics_meaningfully_equal(
+            &Some(m.clone()),
+            &Some(m1_eq.clone())
+        ));
+        m1_eq.avg_ttft_ms = m.avg_ttft_ms;
+        m1_eq.recent_turns.last_mut().unwrap().ttft_ms = Some(1_111);
+        assert!(!metrics_meaningfully_equal(
+            &Some(m.clone()),
+            &Some(m1_eq.clone())
+        ));
+        m1_eq.recent_turns.pop();
+        assert!(!metrics_meaningfully_equal(&Some(m.clone()), &Some(m1_eq)));
+
+        // Verify AgyStepTimingCache reads from real SQLite DB and hits cache when unchanged.
+        let dir = std::env::temp_dir().join(format!(
+            "sf-agydb-cache-{}",
+            starfane_proto::id::new_id("T")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conv-1.db");
+        let init_sql = format!(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB);
+             INSERT INTO steps VALUES (10, 15, 3, X'{hex_blob}');
+             INSERT INTO steps VALUES (11, 5, 3, X'{hex_blob}');"
+        );
+        if Command::new("sqlite3")
+            .arg(&db)
+            .arg(&init_sql)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let mut cache = AgyStepTimingCache::default();
+            let got = cache.refresh_from_path("conv-1", &db);
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].idx, 10);
+            assert_eq!(got[0].output_tokens, 613);
+            // Cache hit returns identical slice without SQLite re-query.
+            assert_eq!(cache.refresh_from_path("conv-1", &db).len(), 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agy_transcript_fallback_filters_idle_gaps_and_short_turns() {
+        // PLANNER_RESPONSE followed by USER_INPUT / SYSTEM_MESSAGE / PLANNER_RESPONSE, or <150 tok,
+        // or <3_000ms must NOT produce TPS; followed by GENERIC >=3_000ms and >=150 tok succeeds.
+        let jsonl = r#"
+{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-11-21T04:40:00Z","model":"gemini-4-neon-high","input_tokens":1000,"cache_read_tokens":0,"output_tokens":500}
+{"step_index":2,"type":"USER_INPUT","created_at":"2026-11-21T04:40:05Z","content":"next user"}
+{"step_index":3,"type":"PLANNER_RESPONSE","created_at":"2026-11-21T04:41:00Z","model":"gemini-4-neon-high","input_tokens":1000,"cache_read_tokens":0,"output_tokens":500}
+{"step_index":4,"type":"SYSTEM_MESSAGE","created_at":"2026-11-21T04:41:05Z","content":"wakeup"}
+{"step_index":5,"type":"PLANNER_RESPONSE","created_at":"2026-11-21T04:42:00Z","model":"gemini-4-neon-high","input_tokens":1000,"cache_read_tokens":0,"output_tokens":100}
+{"step_index":6,"type":"GENERIC","created_at":"2026-11-21T04:42:05Z","content":"small output"}
+{"step_index":7,"type":"PLANNER_RESPONSE","created_at":"2026-11-21T04:43:00Z","model":"gemini-4-neon-high","input_tokens":1000,"cache_read_tokens":0,"output_tokens":200}
+{"step_index":8,"type":"GENERIC","created_at":"2026-11-21T04:43:02Z","content":"too fast"}
+"#;
+        let m_filtered = extract_transcript_metrics(AgentKind::Agy, jsonl, 1000).unwrap();
+        assert_eq!(m_filtered.tps, None);
+        assert!(m_filtered.recent_turns.is_empty());
+
+        let valid_jsonl = format!(
+            "{jsonl}{}\n{}\n",
+            r#"{"step_index":9,"type":"PLANNER_RESPONSE","created_at":"2026-11-21T04:44:00Z","model":"gemini-4-neon-high","input_tokens":2000,"cache_read_tokens":1000,"output_tokens":300}"#,
+            r#"{"step_index":10,"type":"GENERIC","created_at":"2026-11-21T04:44:03Z","content":"tool"}"#
+        );
+        let m_valid = extract_transcript_metrics(AgentKind::Agy, &valid_jsonl, 1000).unwrap();
+        assert_eq!(m_valid.tps, Some(100.0));
+        assert_eq!(m_valid.recent_turns.len(), 1);
+        assert_eq!(m_valid.recent_turns[0].tps, Some(100.0));
+        assert_eq!(m_valid.recent_turns[0].duration_ms, Some(3_000));
+    }
+
+    #[test]
+    fn codex_token_usage_record_reasoning_visible_tps_ttft_and_tool_output_ordering() {
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-11-25T07:20:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:20:04.000Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning","id":"r1"}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:20:04.005Z","type":"response_item","payload":{"type":"reasoning","id":"r1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:20:06.500Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"a1"}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:20:08.000Z","type":"token_usage_record","payload":{"usage":{"input_tokens":50000,"output_tokens":240,"reasoning_output_tokens":80}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:20:08.100Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:20:08.101Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50000,"output_tokens":240},"last_token_usage":{"input_tokens":50000,"output_tokens":240,"reasoning_output_tokens":80},"model_context_window":828400}}}"#,
+            "\n",
+            // Turn 2: starts at 08.100 (custom_tool_call_output when !saw_model_item),
+            // Reasoning item at 10.100 -> TTFT=2000ms, visible=50 (<80) -> fallback TPS = 120/4s = 30.0,
+            // reliable TPS stays 40.0 from Turn 1!
+            r#"{"timestamp":"2026-11-25T07:20:10.100Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning","id":"r2"}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:20:12.100Z","type":"token_usage_record","payload":{"usage":{"input_tokens":60000,"output_tokens":120,"reasoning_output_tokens":70}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:20:12.105Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110000,"output_tokens":360},"last_token_usage":{"input_tokens":60000,"output_tokens":120,"reasoning_output_tokens":70},"model_context_window":828400}}}"#,
+            "\n",
+        );
+        let m = extract_transcript_metrics(AgentKind::Codex, jsonl, 999).unwrap();
+        assert_eq!(m.source, "transcript");
+        assert_eq!(m.tps, Some(40.0));
+        assert_eq!(m.last_output_tokens, Some(160));
+        assert_eq!(m.last_duration_ms, Some(4_000));
+        assert_eq!(m.ttft_ms, Some(2_000));
+        assert_eq!(m.avg_ttft_ms, Some(3_000));
+        assert_eq!(m.recent_turns.len(), 2);
+        assert_eq!(m.recent_turns[0].tps, Some(40.0));
+        assert_eq!(m.recent_turns[0].ttft_ms, Some(4_000));
+        assert_eq!(m.recent_turns[1].tps, Some(30.0));
+        assert_eq!(m.recent_turns[1].ttft_ms, Some(2_000));
+
+        // Legacy Codex without `token_usage_record`: `custom_tool_call_output` AFTER `custom_tool_call`
+        // must NOT overwrite `req_start_ts` 1ms before `token_count`!
+        let legacy_jsonl = concat!(
+            r#"{"timestamp":"2026-11-25T07:30:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:30:02.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"shell","call_id":"c1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:30:04.999Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"ok"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-11-25T07:30:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"output_tokens":200},"last_token_usage":{"input_tokens":10000,"output_tokens":200,"reasoning_output_tokens":0},"model_context_window":258400}}}"#,
+            "\n",
+        );
+        let ml = extract_transcript_metrics(AgentKind::Codex, legacy_jsonl, 999).unwrap();
+        assert_eq!(ml.ttft_ms, Some(2_000));
+        assert_eq!(ml.tps, Some(66.7)); // 200 / 3.0s over gen_ms (NOT 200 / 0.001s!)
+    }
+
+    #[test]
+    fn claude_thinking_suppresses_chunk_span_and_single_block_ttft() {
+        let jsonl = concat!(
+            // Turn 1: single-block completed message >=50 tokens -> TTFT suppressed (None), TPS over call_span = 200/4s = 50.0.
+            r#"{"type":"user","timestamp":"2026-11-25T08:00:00.000Z","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-11-25T08:00:04.000Z","message":{"id":"m1","model":"claude-opus-5-5","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":1000,"cache_read_input_tokens":9000,"cache_creation_input_tokens":0,"output_tokens":200}}}"#,
+            "\n",
+            // Turn 2: multi-block with thinking -> TTFT = 2500ms, TPS over call_span (16.5 - 10.0 = 6.5s) = 400/6.5 = 61.5.
+            r#"{"type":"user","timestamp":"2026-11-25T08:00:10.000Z","message":{"role":"user","content":"think"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-11-25T08:00:12.500Z","message":{"id":"m2","model":"claude-opus-5-5","stop_reason":null,"content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":1000,"cache_read_input_tokens":10000,"cache_creation_input_tokens":0,"output_tokens":100}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-11-25T08:00:16.500Z","message":{"id":"m2","model":"claude-opus-5-5","stop_reason":"end_turn","content":[{"type":"text","text":"answer"}],"usage":{"input_tokens":1000,"cache_read_input_tokens":10000,"cache_creation_input_tokens":0,"output_tokens":400}}}"#,
+            "\n",
+        );
+        let m = extract_transcript_metrics(AgentKind::Claude, jsonl, 999).unwrap();
+        assert_eq!(m.tps, Some(61.5));
+        assert_eq!(m.ttft_ms, Some(2_500));
+        assert_eq!(m.avg_ttft_ms, Some(2_500));
+        assert_eq!(m.recent_turns.len(), 2);
+        assert_eq!(m.recent_turns[0].ttft_ms, None);
+        assert_eq!(m.recent_turns[0].tps, Some(50.0));
+        assert_eq!(m.recent_turns[1].ttft_ms, Some(2_500));
+        assert_eq!(m.recent_turns[1].tps, Some(61.5));
+
+        // Orphan assistant message with `has_thinking = true` and NO `user` timestamp must NEVER
+        // fall back to `chunk_span`!
+        let orphan_thinking = concat!(
+            r#"{"type":"assistant","timestamp":"2026-11-25T08:05:00.000Z","message":{"id":"m_orphan","model":"claude-opus-5-5","stop_reason":null,"content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":1000,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-11-25T08:05:02.000Z","message":{"id":"m_orphan","model":"claude-opus-5-5","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1000,"output_tokens":300}}}"#,
+            "\n",
+        );
+        let mo = extract_transcript_metrics(AgentKind::Claude, orphan_thinking, 999).unwrap();
+        assert_eq!(mo.tps, None);
     }
 
     #[test]
@@ -3437,11 +4105,13 @@ mod tests {
 
     #[test]
     fn compute_tps_guards_zero_tiny_and_huge_durations() {
-        assert_eq!(compute_tps(0, 1000), None);
-        assert_eq!(compute_tps(100, 0), None);
-        assert_eq!(compute_tps(100, 50), None);
-        assert_eq!(compute_tps(100, 400_000), None);
-        assert_eq!(compute_tps(500, 2_000), Some(250.0));
+        assert_eq!(compute_tps_checked(0, 1000, 1, 100), None);
+        assert_eq!(compute_tps_checked(100, 0, 1, 100), None);
+        assert_eq!(compute_tps_checked(100, 50, 1, 100), None);
+        assert_eq!(compute_tps_checked(100, 400_000, 1, 100), None);
+        assert_eq!(compute_tps_checked(100, 2_000, 150, 1_500), None);
+        assert_eq!(compute_tps_checked(10_000, 2_000, 150, 1_500), None); // >400 tok/s capped
+        assert_eq!(compute_tps_checked(500, 2_000, 150, 1_500), Some(250.0));
     }
 
     #[test]
@@ -3452,13 +4122,13 @@ mod tests {
         let file = dir.join("c.jsonl");
         std::fs::write(
             &file,
-            r#"{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-11-21T04:44:02Z","input_tokens":1000,"cache_read_tokens":500,"output_tokens":100}
-{"step_index":2,"type":"GENERIC","created_at":"2026-11-21T04:44:04Z","content":"ok"}
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-11-21T04:44:02Z","input_tokens":1000,"cache_read_tokens":500,"output_tokens":200}
+{"step_index":2,"type":"GENERIC","created_at":"2026-11-21T04:44:06Z","content":"ok"}
 "#,
         )
         .unwrap();
 
-        let ts_initial = parse_iso8601_ms("2026-11-21T04:44:04Z").unwrap();
+        let ts_initial = parse_iso8601_ms("2026-11-21T04:44:06Z").unwrap();
         let ts_appended = parse_iso8601_ms("2026-11-21T04:44:10Z").unwrap();
         let mut cache = HashMap::new();
         let m1 = cached_transcript_telemetry(&mut cache, AgentKind::Agy, &file, 100)
@@ -3913,165 +4583,6 @@ n/Users/demo/.gemini/antigravity-cli/brain/other/file.txt
     }
 
     #[test]
-    fn cc_switch_incremental_merge_matches_full_scan_and_deprioritizes_workers() {
-        let mut cache = CcSwitchCache::default();
-        cache.merge_incremental_rows(
-            vec![
-                CcSwitchRawRow {
-                    rowid: 1,
-                    session_id: "s1".into(),
-                    app_type: "claude".into(),
-                    model: Some("claude-opus-5-5".into()),
-                    input_tokens: 10_000,
-                    output_tokens: 200,
-                    cache_read_tokens: 40_000,
-                    cache_creation_tokens: 0,
-                    latency_ms: Some(3000),
-                    first_token_ms: Some(1000),
-                    duration_ms: Some(3000),
-                    input_token_semantics: 0,
-                    created_at: 1_760_000_100,
-                },
-                // Newer haiku worker row should NOT replace opus as best_row, only add to totals!
-                CcSwitchRawRow {
-                    rowid: 2,
-                    session_id: "s1".into(),
-                    app_type: "claude".into(),
-                    model: Some("claude-haiku-4-5".into()),
-                    input_tokens: 2_000,
-                    output_tokens: 50,
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
-                    latency_ms: Some(500),
-                    first_token_ms: Some(100),
-                    duration_ms: Some(500),
-                    input_token_semantics: 0,
-                    created_at: 1_760_000_200,
-                },
-            ],
-            5000,
-        );
-        assert_eq!(cache.last_max_rowid(), 2);
-        let e = cache.get("s1").unwrap();
-        assert_eq!(e.model.as_deref(), Some("claude-opus-5-5"));
-        assert_eq!(e.metrics.context_used_tokens, Some(50_000));
-        assert_eq!(e.metrics.total_input_tokens, Some(52_000));
-        assert_eq!(e.metrics.total_output_tokens, Some(250));
-
-        // Newer primary row updates best_row AND accumulates totals.
-        cache.merge_incremental_rows(
-            vec![CcSwitchRawRow {
-                rowid: 3,
-                session_id: "s1".into(),
-                app_type: "claude".into(),
-                model: Some("claude-opus-5-5".into()),
-                input_tokens: 20_000,
-                output_tokens: 400,
-                cache_read_tokens: 60_000,
-                cache_creation_tokens: 0,
-                latency_ms: Some(5000),
-                first_token_ms: Some(1000),
-                duration_ms: Some(5000),
-                input_token_semantics: 0,
-                created_at: 1_760_000_300,
-            }],
-            6000,
-        );
-        assert_eq!(cache.last_max_rowid(), 3);
-        let e2 = cache.get("s1").unwrap();
-        assert_eq!(e2.metrics.context_used_tokens, Some(80_000));
-        assert_eq!(e2.metrics.total_input_tokens, Some(132_000));
-        assert_eq!(e2.metrics.total_output_tokens, Some(650));
-        assert_eq!(e2.metrics.tps, Some(100.0));
-    }
-
-    #[test]
-    fn cc_switch_refresh_from_real_sqlite_handles_empty_delta_and_incremental_rows() {
-        let dir = std::env::temp_dir().join(format!(
-            "sf-ccswitch-sqlite-{}",
-            starfane_proto::id::new_id("T")
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("cc-switch.db");
-        let init_sql = "
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE proxy_request_logs (
-                session_id TEXT,
-                app_type TEXT,
-                model TEXT,
-                status_code INTEGER,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                cache_read_tokens INTEGER,
-                cache_creation_tokens INTEGER,
-                latency_ms INTEGER,
-                first_token_ms INTEGER,
-                duration_ms INTEGER,
-                input_token_semantics INTEGER,
-                created_at INTEGER
-            );
-            INSERT INTO proxy_request_logs VALUES
-              ('sess-a', 'claude', 'claude-opus-5-5', 200, 1000, 100, 5000, 0, 2000, 500, 2000, 0, 1760000100);
-        ";
-        let ok = Command::new("sqlite3")
-            .arg(&db)
-            .arg(init_sql)
-            .status()
-            .is_ok_and(|s| s.success());
-        if !ok {
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
-
-        let mut cache = CcSwitchCache::default();
-        cache.refresh_from_path(&db, 1000);
-        assert_eq!(cache.last_max_rowid(), 1);
-        assert_eq!(
-            cache.get("sess-a").unwrap().metrics.total_input_tokens,
-            Some(6000)
-        );
-        let sig1 = cache.sig.clone();
-        assert!(sig1.is_some());
-
-        // Insert a status_code=500 row -> WAL changes, incremental SELECT returns 0 rows (`sqlite3 -json` prints empty stdout!).
-        // Cache MUST still advance `self.sig` instead of re-querying sqlite3 forever.
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        assert!(Command::new("sqlite3")
-            .arg(&db)
-            .arg("INSERT INTO proxy_request_logs VALUES ('sess-a', 'claude', 'claude-opus-5-5', 500, 0, 0, 0, 0, 100, 0, 100, 0, 1760000200);")
-            .status()
-            .unwrap()
-            .success());
-        cache.refresh_from_path(&db, 2000);
-        assert_eq!(cache.sig, Some(db_signature(&db)));
-        assert_eq!(
-            cache.get("sess-a").unwrap().metrics.total_input_tokens,
-            Some(6000)
-        );
-
-        // Insert a second valid 200 row -> incremental query merges only the new row.
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        assert!(Command::new("sqlite3")
-            .arg(&db)
-            .arg("INSERT INTO proxy_request_logs VALUES ('sess-a', 'claude', 'claude-opus-5-5', 200, 2000, 200, 8000, 0, 3000, 500, 3000, 0, 1760000300);")
-            .status()
-            .unwrap()
-            .success());
-        cache.refresh_from_path(&db, 3000);
-        assert_eq!(cache.last_max_rowid(), 3);
-        assert_eq!(
-            cache.get("sess-a").unwrap().metrics.total_input_tokens,
-            Some(16000)
-        );
-        assert_eq!(
-            cache.get("sess-a").unwrap().metrics.total_output_tokens,
-            Some(300)
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn remote_zero_install_pure_parsers_claude_codex_agy_and_status() {
         // 1. Remote Claude `<pid>.json` parsing + recycled-PID skew + claimed exclusion.
         let birth_ms = 1_795_600_000_000u64;
@@ -4293,5 +4804,77 @@ n/Users/demo/.gemini/antigravity-cli/presence/11111111-2222-3333-4444-5555555555
         )
         .unwrap();
         assert_eq!(st.context_used_pct, Some(25.0));
+    }
+
+    #[test]
+    fn codex_status_line_model_effort_and_stale_scrollback_title_isolation() {
+        // Blank Codex prompts (`%20`, `%28`, `%36`) expose model + effort and return `None` for title.
+        let blank_tail = "\
+› Ask Codex to do anything
+
+  GPT-6.1-Sol low · ~/Work/chatgpt-register
+  ← for agents · ? for shortcuts
+";
+        assert_eq!(
+            parse_codex_status_line_model_effort(blank_tail),
+            (Some("gpt-6.1-sol".into()), Some("low".into()))
+        );
+        assert_eq!(extract_codex_status_title(blank_tail), None);
+
+        // Active / resumed Codex pane (`%21`) exposes model, effort, AND explicit thread title.
+        let active_tail = "\
+› Ask Codex to do anything
+
+  GPT-6.1-Sol high · ~/Work/chatgpt-register · 新增 zjc API 并按本地样式打包
+  ← for agents · ? for shortcuts
+";
+        assert_eq!(
+            parse_codex_status_line_model_effort(active_tail),
+            (Some("gpt-6.1-sol".into()), Some("high".into()))
+        );
+        assert_eq!(
+            extract_codex_status_title(active_tail).as_deref(),
+            Some("新增 zjc API 并按本地样式打包")
+        );
+
+        // Stale exited Codex status bar in scrollback ABOVE a fresh blank Codex prompt (live `%28`/`%36`):
+        // MUST stop at bottom-most status bar -> returns `None` title and current `gpt-6.1-sol`/`low`!
+        let restarted_blank_tail = "\
+  GPT-6-Astra high · ~/Work/lingbot-vla-v2 · 安装 lingbot-vla-v2 环境并确认日志工具 · Main [default] · ← for agents
+❯ codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+  >_ OpenAI Codex (v0.169.0)
+     ~/Work/lingbot-vla-v2
+› Ask Codex to do anything
+  GPT-6.1-Sol low · ~/Work/lingbot-vla-v2
+  ← for agents · ? for shortcuts
+";
+        assert_eq!(extract_codex_status_title(restarted_blank_tail), None);
+        assert_eq!(
+            parse_codex_status_line_model_effort(restarted_blank_tail),
+            (Some("gpt-6.1-sol".into()), Some("low".into()))
+        );
+
+        // Various model families and effort values (`o3`, `o4-mini`, `codex-mini`, `xhigh`, no effort).
+        assert_eq!(
+            parse_codex_status_line_model_effort("  o4-mini xhigh · ~/repo · Debug test\n"),
+            (Some("o4-mini".into()), Some("xhigh".into()))
+        );
+        assert_eq!(
+            parse_codex_status_line_model_effort("  codex-mini medium · ~/repo\n"),
+            (Some("codex-mini".into()), Some("medium".into()))
+        );
+        assert_eq!(
+            parse_codex_status_line_model_effort("  o3 · ~/repo\n"),
+            (Some("o3".into()), None)
+        );
+        assert_eq!(
+            parse_codex_status_line_model_effort("  ← for agents · ? for shortcuts\n"),
+            (None, None)
+        );
+        // Context-left suffix is NOT treated as a thread title.
+        assert_eq!(
+            extract_codex_status_title("GPT-6.2-Sol high · ~/work · 75% context left\n"),
+            None
+        );
     }
 }

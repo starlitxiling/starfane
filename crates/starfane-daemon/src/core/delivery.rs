@@ -15,7 +15,10 @@ type PaneInjectLockMap = HashMap<(usize, PaneId), Weak<tokio::sync::Mutex<()>>>;
 /// Per-(Core, Pane) async serialization lock so concurrent dispatches to the same pane never
 /// interleave `paste-buffer`, paste-settle delay, and `submit_enter`. Weak entries auto-prune
 /// once no dispatch is in flight.
-fn acquire_pane_inject_lock(core_key: usize, pane: &PaneId) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn acquire_pane_inject_lock(
+    core_key: usize,
+    pane: &PaneId,
+) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<PaneInjectLockMap>> = OnceLock::new();
     let map_mutex = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = lock(map_mutex);

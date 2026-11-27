@@ -22,7 +22,9 @@ use crate::error::TmuxError;
 use crate::exec::{ExecTransport, LocalExec};
 use crate::gate::{validate_interactive_text, validate_pointer_text, GateConfig};
 use crate::model::{ClientInfo, PaneInfo, PaneStatus};
-use crate::mux::{parse_zellij_pane_id, MuxCapabilities, MuxKind, TerminalMux};
+use crate::mux::{
+    parse_zellij_pane_id, validate_interactive_key, MuxCapabilities, MuxKind, TerminalMux,
+};
 use crate::{FocusOutcome, SpawnWindow, DEFAULT_DETACHED_SESSION};
 use serde::Deserialize;
 use starfane_proto::PaneId;
@@ -360,6 +362,41 @@ impl TerminalMux for ZellijMux {
         Ok(())
     }
 
+    fn send_key(&self, pane: &PaneId, key: &str) -> Result<(), TmuxError> {
+        let (sess, numeric) = self.require_pane(pane)?;
+        let zj_key = map_interactive_key_for_zellij(key)?;
+        let args = vec![
+            "send-keys".to_string(),
+            "-p".to_string(),
+            format!("terminal_{numeric}"),
+            zj_key.to_string(),
+        ];
+        match self.run_session_action(sess, &args) {
+            Ok(_) => Ok(()),
+            Err(TmuxError::Command {
+                args: cmd_args,
+                code,
+                stderr,
+            }) => {
+                let lower = stderr.to_ascii_lowercase();
+                if lower.contains("unexpected argument")
+                    || lower.contains("wasn't expected")
+                    || lower.contains("unrecognized subcommand")
+                {
+                    return Err(TmuxError::InvalidRequest(
+                        "installed zellij does not support targeted `action send-keys -p`; upgrade to zellij >= 0.44".into(),
+                    ));
+                }
+                Err(TmuxError::Command {
+                    args: cmd_args,
+                    code,
+                    stderr,
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn spawn_window(&self, req: &SpawnWindow) -> Result<PaneId, TmuxError> {
         if req.argv.is_empty() || req.argv[0].is_empty() {
             return Err(TmuxError::InvalidRequest("argv is empty".into()));
@@ -477,6 +514,30 @@ impl TerminalMux for ZellijMux {
 
     fn dump_layout(&self, session: &str) -> Result<String, TmuxError> {
         self.run_session_action(session, &["dump-layout".to_string()])
+    }
+}
+
+fn map_interactive_key_for_zellij(key: &str) -> Result<&'static str, TmuxError> {
+    validate_interactive_key(key)?;
+    match key {
+        "Enter" => Ok("Enter"),
+        "Escape" => Ok("Esc"),
+        "Up" => Ok("Up"),
+        "Down" => Ok("Down"),
+        "Left" => Ok("Left"),
+        "Right" => Ok("Right"),
+        "Tab" => Ok("Tab"),
+        "Space" => Ok("Space"),
+        "C-c" => Ok("Ctrl c"),
+        "y" => Ok("y"),
+        "n" => Ok("n"),
+        "1" => Ok("1"),
+        "2" => Ok("2"),
+        "3" => Ok("3"),
+        "4" => Ok("4"),
+        _ => Err(TmuxError::InvalidRequest(format!(
+            "unsupported interactive key {key:?}"
+        ))),
     }
 }
 
@@ -1059,6 +1120,122 @@ mod tests {
         });
         let zj_gone = ZellijMux::with_transport(PathBuf::from("zellij"), gone_exec);
         zj_gone.kill_pane(&PaneId::new("zj:work/11")).unwrap();
+    }
+
+    #[test]
+    fn send_key_validates_allowlist_and_maps_keys_to_targeted_zellij_send_keys() {
+        use crate::exec::ExecOutput;
+        use std::path::Path;
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct CaptureExec {
+            calls: Mutex<Vec<Vec<String>>>,
+        }
+        impl ExecTransport for CaptureExec {
+            fn run(
+                &self,
+                _bin: &Path,
+                args: &[String],
+                _stdin: Option<&[u8]>,
+            ) -> Result<ExecOutput, TmuxError> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                Ok(ExecOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    success: true,
+                    code: Some(0),
+                })
+            }
+            fn run_shell(&self, _script: &str) -> Result<ExecOutput, TmuxError> {
+                unreachable!()
+            }
+            fn run_shell_bytes(
+                &self,
+                _script: &str,
+                _stdin: Option<&[u8]>,
+                _timeout: std::time::Duration,
+            ) -> Result<crate::exec::ExecBytesOutput, TmuxError> {
+                unreachable!()
+            }
+            fn is_local(&self) -> bool {
+                true
+            }
+        }
+
+        let exec = Arc::new(CaptureExec::default());
+        let zj = ZellijMux::with_transport(PathBuf::from("zellij"), exec.clone());
+        let pane = PaneId::new("zj:work/9");
+
+        zj.send_key(&pane, "Down").unwrap();
+        zj.send_key(&pane, "Enter").unwrap();
+        zj.send_key(&pane, "Escape").unwrap();
+        zj.send_key(&pane, "C-c").unwrap();
+        zj.send_key(&pane, "1").unwrap();
+
+        assert!(matches!(
+            zj.send_key(&pane, "Enter; rm -rf /"),
+            Err(TmuxError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            zj.send_key(&PaneId::new("%9"), "Enter"),
+            Err(TmuxError::InvalidRequest(_))
+        ));
+
+        let calls = exec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(
+            calls[0],
+            vec![
+                "-s",
+                "work",
+                "action",
+                "send-keys",
+                "-p",
+                "terminal_9",
+                "Down"
+            ]
+        );
+        assert_eq!(
+            calls[1],
+            vec![
+                "-s",
+                "work",
+                "action",
+                "send-keys",
+                "-p",
+                "terminal_9",
+                "Enter"
+            ]
+        );
+        assert_eq!(
+            calls[2],
+            vec![
+                "-s",
+                "work",
+                "action",
+                "send-keys",
+                "-p",
+                "terminal_9",
+                "Esc"
+            ]
+        );
+        assert_eq!(
+            calls[3],
+            vec![
+                "-s",
+                "work",
+                "action",
+                "send-keys",
+                "-p",
+                "terminal_9",
+                "Ctrl c"
+            ]
+        );
+        assert_eq!(
+            calls[4],
+            vec!["-s", "work", "action", "send-keys", "-p", "terminal_9", "1"]
+        );
     }
 
     #[test]

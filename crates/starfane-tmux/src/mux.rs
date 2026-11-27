@@ -91,6 +91,7 @@ pub trait TerminalMux: Send + Sync {
 
     fn paste_interactive_text(&self, pane: &PaneId, text: &str) -> Result<(), TmuxError>;
     fn submit_enter(&self, pane: &PaneId) -> Result<(), TmuxError>;
+    fn send_key(&self, pane: &PaneId, key: &str) -> Result<(), TmuxError>;
 
     fn spawn_window(&self, req: &SpawnWindow) -> Result<PaneId, TmuxError>;
     fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError>;
@@ -98,6 +99,31 @@ pub trait TerminalMux: Send + Sync {
     fn set_status(&self, pane: &PaneId, st: &PaneStatus) -> Result<(), TmuxError>;
     fn clear_status(&self, pane: &PaneId) -> Result<(), TmuxError>;
     fn dump_layout(&self, session: &str) -> Result<String, TmuxError>;
+}
+
+/// Validate an explicit human-triggered interactive menu/approval key against the strict allowlist
+/// and map it to its safe `tmux send-keys` token. Rejects arbitrary strings or shell metacharacters.
+pub fn validate_interactive_key(key: &str) -> Result<&'static str, TmuxError> {
+    match key {
+        "Enter" => Ok("C-m"),
+        "Escape" => Ok("Escape"),
+        "Up" => Ok("Up"),
+        "Down" => Ok("Down"),
+        "Left" => Ok("Left"),
+        "Right" => Ok("Right"),
+        "Tab" => Ok("Tab"),
+        "Space" => Ok("Space"),
+        "y" => Ok("y"),
+        "n" => Ok("n"),
+        "1" => Ok("1"),
+        "2" => Ok("2"),
+        "3" => Ok("3"),
+        "4" => Ok("4"),
+        "C-c" => Ok("C-c"),
+        _ => Err(TmuxError::InvalidRequest(format!(
+            "unsupported interactive key {key:?}; allowed: Enter, Escape, Up, Down, Left, Right, Tab, Space, y, n, 1, 2, 3, 4, C-c"
+        ))),
+    }
 }
 
 /// True if `id` is a local tmux pane id like `"%12"`.
@@ -192,5 +218,47 @@ mod tests {
         );
         assert_eq!(pane_mux_kind("mac-xiling:zj:dev/3"), MuxKind::Zellij);
         assert_eq!(pane_mux_kind("tencent:%12"), MuxKind::Tmux);
+    }
+
+    #[test]
+    fn validate_interactive_key_allows_strict_set_and_rejects_injection() {
+        assert_eq!(validate_interactive_key("Enter").unwrap(), "C-m");
+        assert_eq!(validate_interactive_key("Escape").unwrap(), "Escape");
+        assert_eq!(validate_interactive_key("Up").unwrap(), "Up");
+        assert_eq!(validate_interactive_key("Down").unwrap(), "Down");
+        assert_eq!(validate_interactive_key("Left").unwrap(), "Left");
+        assert_eq!(validate_interactive_key("Right").unwrap(), "Right");
+        assert_eq!(validate_interactive_key("Tab").unwrap(), "Tab");
+        assert_eq!(validate_interactive_key("Space").unwrap(), "Space");
+        assert_eq!(validate_interactive_key("y").unwrap(), "y");
+        assert_eq!(validate_interactive_key("n").unwrap(), "n");
+        assert_eq!(validate_interactive_key("1").unwrap(), "1");
+        assert_eq!(validate_interactive_key("2").unwrap(), "2");
+        assert_eq!(validate_interactive_key("3").unwrap(), "3");
+        assert_eq!(validate_interactive_key("4").unwrap(), "4");
+        assert_eq!(validate_interactive_key("C-c").unwrap(), "C-c");
+
+        for bad in [
+            "",
+            "Enter ",
+            " Enter",
+            "enter",
+            "C-m",
+            "C-d",
+            "Enter; rm -rf /",
+            "y\n",
+            "5",
+            "Y",
+            "foo",
+            "$(whoami)",
+        ] {
+            assert!(
+                matches!(
+                    validate_interactive_key(bad),
+                    Err(TmuxError::InvalidRequest(_))
+                ),
+                "expected InvalidRequest for {bad:?}"
+            );
+        }
     }
 }

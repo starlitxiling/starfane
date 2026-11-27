@@ -20,8 +20,8 @@ pub(crate) mod util;
 use crate::access::AccessGate;
 use crate::config::{StarfaneConfig, TeamConfig};
 use crate::nodes::{
-    build_remote_providers_with_transcript_cache, HostProbeOutcome, LocalMuxPool, NodeProvider,
-    NodeSnapshot,
+    build_remote_providers_with_transcript_cache, HostProbeOutcome, HostPushSignal, LocalMuxPool,
+    NodeProvider, NodeSnapshot,
 };
 use crate::notice::{FeishuSender, Notice, NoticeKind};
 use crate::notify::{NotifyRouteContext, NotifyRouter};
@@ -43,18 +43,25 @@ const REMOTE_SYNC_BUSY_FAST_INTERVAL: Duration = Duration::from_secs(3);
 const REMOTE_SYNC_BUSY_SLOW_INTERVAL: Duration = Duration::from_secs(5);
 const REMOTE_SYNC_RECENT_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 const REMOTE_SYNC_IDLE_INTERVAL: Duration = Duration::from_secs(8);
+const REMOTE_PEER_SSE_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const REMOTE_IDLE_LONG_MS: u64 = 60_000;
 const REMOTE_BACKOFF_SLACK_MS: u64 = 25;
 const REMOTE_RETRY_MAX_SLEEP_MS: u64 = 65_000;
 const EVENT_CHANNEL: usize = 1024;
 const FEISHU_RATE_WINDOW_MS: u64 = 60_000;
 const MAX_FEISHU_NOTICES_PER_WINDOW: usize = 6;
+/// Maximum serialized byte size of inline `appended_messages` in `DaemonEvent::Output` (32 KiB).
+pub(crate) const MAX_INLINE_OUTPUT_BYTES: usize = 32 * 1024;
+/// Maximum byte length of inline `live_tail` in `DaemonEvent::Output` (8 KiB).
+pub(crate) const MAX_INLINE_LIVE_TAIL_BYTES: usize = 8 * 1024;
+/// Maximum number of messages serialized inline in a single `DaemonEvent::Output` push.
+pub(crate) const MAX_INLINE_OUTPUT_MESSAGES: usize = 64;
 
 /// Off-state IO caches (SQLite, `lsof`, transcript telemetry) kept outside `Mutex<State>`
 /// so blocking disk/subprocess queries never contend with control-plane reads/writes.
 #[derive(Debug, Default)]
 pub(crate) struct TelemetryCaches {
-    pub cc_switch_cache: metrics::CcSwitchCache,
+    pub agy_step_timings_cache: metrics::AgyStepTimingCache,
     pub codex_threads_cache: metrics::CodexThreadCache,
     pub agy_convs_cache: metrics::AgyConvCache,
     pub agy_presence_cache: metrics::AgyPresenceCache,
@@ -273,6 +280,7 @@ impl Core {
                 error: None,
                 session_count: 0,
                 rtt_ms: None,
+                sync_ms: None,
                 next_retry_ms: None,
             },
         );
@@ -294,6 +302,7 @@ impl Core {
                     error: None,
                     session_count: 0,
                     rtt_ms: None,
+                    sync_ms: None,
                     next_retry_ms: None,
                 },
             );
@@ -784,6 +793,115 @@ impl Core {
         Ok(payload)
     }
 
+    /// Send an explicit human-clicked allowlisted interactive key (e.g. `Enter`, `Up`, `Down`,
+    /// `Escape`, `1`, `y`, `n`, `C-c`) to a live local or federated remote session pane.
+    ///
+    /// Serializes with text injection via the per-`(Core, Host, Pane)` lock and triggers a
+    /// rapid post-key discovery/dirty-pane refresh (~120ms settle) so resolved approval/input
+    /// prompts clear the pending attention queue promptly.
+    pub async fn send_session_key(
+        &self,
+        session_id: &SessionId,
+        key: &str,
+    ) -> Result<serde_json::Value, ApiError> {
+        starfane_tmux::validate_interactive_key(key)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+        let (pane, host_id) = {
+            let st = lock(&self.inner.state);
+            let s = st
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| ApiError::not_found(format!("session {session_id}")))?;
+            if s.is_subagent {
+                return Err(ApiError::bad_request(
+                    "cannot send interactive key to subagent or session without terminal pane",
+                ));
+            }
+            let Some(pane) = s.pane.clone() else {
+                return Err(ApiError::bad_request(
+                    "cannot send interactive key to subagent or session without terminal pane",
+                ));
+            };
+            (pane, HostId::new(s.effective_host_id()))
+        };
+
+        let core_key = Arc::as_ptr(&self.inner) as usize;
+        let lock_pane = if host_id.as_str() == LOCAL_HOST_ID {
+            pane.clone()
+        } else {
+            qualify_pane_idempotent(&host_id, &pane)
+        };
+        let pane_lock = delivery::acquire_pane_inject_lock(core_key, &lock_pane);
+        let pane_guard = pane_lock.lock().await;
+
+        let refresh_local_pane = if host_id.as_str() != LOCAL_HOST_ID {
+            let provider = self
+                .inner
+                .remote_nodes
+                .get(&host_id)
+                .cloned()
+                .ok_or_else(|| ApiError::not_found(format!("unknown remote host {host_id}")))?;
+            let (_, local_pane_str) = starfane_tmux::split_host_prefix(pane.as_str());
+            let local_pane = PaneId::new(local_pane_str);
+            let remote_sid = session_id
+                .as_str()
+                .strip_prefix(&format!("{}:", host_id.as_str()))
+                .map(SessionId::new)
+                .unwrap_or_else(|| session_id.clone());
+            provider.send_key(&remote_sid, &local_pane, key).await?;
+            Some(local_pane)
+        } else {
+            let core = self.clone();
+            let pane_for_mux = pane.clone();
+            let key_owned = key.to_string();
+            tokio::task::spawn_blocking(move || core.inner.mux.send_key(&pane_for_mux, &key_owned))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .map_err(|e| match e {
+                    starfane_tmux::TmuxError::InvalidRequest(m) => ApiError::bad_request(m),
+                    other => ApiError::new(ErrorCode::Unavailable, format!("send key: {other}")),
+                })?;
+            None
+        };
+        drop(pane_guard);
+
+        self.audit(
+            "web",
+            serde_json::json!({
+                "action": "send_session_key",
+                "session_id": session_id,
+                "pane": pane,
+                "host_id": host_id,
+                "key": key,
+            }),
+        );
+
+        let core_refresh = self.clone();
+        let refresh_host = host_id;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            if refresh_host.as_str() == LOCAL_HOST_ID {
+                core_refresh.sync_discovered_panes().await;
+            } else {
+                if let Some(lp) = refresh_local_pane {
+                    core_refresh
+                        .sync_remote_host_dirty_panes(&refresh_host, &[lp])
+                        .await;
+                }
+                if let Some(wake) = core_refresh.inner.remote_wake.get(&refresh_host) {
+                    wake.notify_one();
+                }
+            }
+        });
+
+        Ok(serde_json::json!({
+            "session_id": session_id,
+            "key": key,
+            "sent": true,
+        }))
+    }
+
     /// Return all known hosts (local + federated remote hosts) with live session counts.
     pub fn hosts(&self) -> Vec<HostRecord> {
         let st = lock(&self.inner.state);
@@ -821,6 +939,7 @@ impl Core {
                     error: None,
                     session_count: count,
                     rtt_ms: None,
+                    sync_ms: None,
                     next_retry_ms: None,
                 });
             }
@@ -894,6 +1013,7 @@ impl Core {
                     error: None,
                     session_count: count,
                     rtt_ms: None,
+                    sync_ms: None,
                     next_retry_ms: None,
                 });
             rec.session_count = count;
@@ -929,12 +1049,35 @@ impl Core {
     }
 
     async fn run_remote_host_supervisor(self, host_id: HostId, wake: Arc<Notify>) {
+        // Initial full sync so sessions & host status appear immediately on startup.
+        self.sync_remote_host(&host_id).await;
+
+        let (push_tx, mut push_rx) = mpsc::unbounded_channel::<HostPushSignal>();
+        let mut watcher_handle = self
+            .inner
+            .remote_nodes
+            .get(&host_id)
+            .and_then(|p| p.spawn_push_watcher(push_tx.clone()));
+        let has_push_watcher = watcher_handle.is_some();
+
         loop {
-            self.sync_remote_host(&host_id).await;
+            let sleep_dur = self.compute_remote_host_sleep_with_push(&host_id, has_push_watcher);
+            let sleep_fut = tokio::time::sleep(sleep_dur);
+            tokio::pin!(sleep_fut);
+
             loop {
-                let sleep_dur = self.compute_remote_host_sleep(&host_id);
                 tokio::select! {
-                    _ = self.inner.shutdown.notified() => return,
+                    _ = self.inner.shutdown.notified() => {
+                        if let Some(h) = watcher_handle.take() {
+                            h.abort();
+                        }
+                        return;
+                    }
+                    Some(sig) = push_rx.recv() => {
+                        if self.handle_remote_push_signal(&host_id, sig, &mut push_rx, &push_tx).await {
+                            break;
+                        }
+                    }
                     _ = wake.notified() => {
                         let should_sync_now = {
                             let now = id::now_ms();
@@ -952,13 +1095,117 @@ impl Core {
                             !recently_synced && !in_backoff
                         };
                         if should_sync_now {
+                            self.sync_remote_host(&host_id).await;
                             break;
                         }
                     }
-                    _ = tokio::time::sleep(sleep_dur) => break,
+                    _ = &mut sleep_fut => {
+                        self.sync_remote_host(&host_id).await;
+                        break;
+                    }
                 }
             }
         }
+    }
+
+    /// Process a push signal from a host's `tmux -C` or Peer `/api/events` watcher.
+    /// Returns `true` when a full sync was performed and the supervisor's reconciliation timer
+    /// should reset.
+    async fn handle_remote_push_signal(
+        &self,
+        host_id: &HostId,
+        first: HostPushSignal,
+        push_rx: &mut mpsc::UnboundedReceiver<HostPushSignal>,
+        push_tx: &mpsc::UnboundedSender<HostPushSignal>,
+    ) -> bool {
+        match first {
+            HostPushSignal::DirtyPanes(mut panes) => {
+                // Drain any already-queued signals so bursts coalesce into 1 targeted sync.
+                let mut need_full = false;
+                while let Ok(next) = push_rx.try_recv() {
+                    match next {
+                        HostPushSignal::DirtyPanes(more) => panes.extend(more),
+                        HostPushSignal::FullSync | HostPushSignal::Reconnect => {
+                            need_full = true;
+                        }
+                        HostPushSignal::PeerSnapshot(snap) => {
+                            if let Some(provider) = self.inner.remote_nodes.get(host_id).cloned() {
+                                let _ = self
+                                    .apply_remote_snapshot(
+                                        host_id,
+                                        provider.as_ref(),
+                                        *snap,
+                                        false,
+                                        false,
+                                    )
+                                    .await;
+                            }
+                        }
+                        HostPushSignal::PeerEvent(ev) => {
+                            self.apply_remote_peer_event(host_id, ev).await;
+                        }
+                    }
+                }
+                if need_full {
+                    self.sync_remote_host(host_id).await;
+                    return true;
+                }
+                panes.sort();
+                panes.dedup();
+                if !panes.is_empty() {
+                    let transitioned = self
+                        .sync_remote_host_dirty_panes_with_transitions(host_id, &panes)
+                        .await;
+                    if !transitioned.is_empty() {
+                        // Catch late transcript JSONL flushes ~900ms after a pane settles out of
+                        // Working/Starting with zero loop risk (the follow-up won't re-transition).
+                        let delayed_tx = push_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(900)) => {
+                                    let _ = delayed_tx.send(HostPushSignal::DirtyPanes(transitioned));
+                                }
+                                _ = delayed_tx.closed() => {}
+                            }
+                        });
+                    }
+                }
+                false
+            }
+            HostPushSignal::PeerEvent(ev) => {
+                self.apply_remote_peer_event(host_id, ev).await;
+                false
+            }
+            HostPushSignal::PeerSnapshot(snap) => {
+                if let Some(provider) = self.inner.remote_nodes.get(host_id).cloned() {
+                    let _ = self
+                        .apply_remote_snapshot(host_id, provider.as_ref(), *snap, false, false)
+                        .await;
+                }
+                true
+            }
+            HostPushSignal::FullSync | HostPushSignal::Reconnect => {
+                self.sync_remote_host(host_id).await;
+                true
+            }
+        }
+    }
+
+    fn compute_remote_host_sleep_with_push(
+        &self,
+        host_id: &HostId,
+        has_push_watcher: bool,
+    ) -> Duration {
+        if has_push_watcher {
+            if let Some(provider) = self.inner.remote_nodes.get(host_id) {
+                if provider.kind() == HostKind::Peer
+                    && provider.circuit_status() == HostStatus::Online
+                {
+                    return REMOTE_PEER_SSE_RECONCILE_INTERVAL;
+                }
+            }
+        }
+        self.compute_remote_host_sleep(host_id)
     }
 
     /// Compute the adaptive sleep interval for a remote host's independent supervisor task:
@@ -1042,11 +1289,57 @@ impl Core {
         };
         match provider.sync_with_claimed(&display, &claimed).await {
             Ok(snap) => {
-                self.apply_remote_snapshot(host_id, provider.kind(), snap, false)
+                let _ = self
+                    .apply_remote_snapshot(host_id, provider.as_ref(), snap, false, false)
                     .await;
             }
             Err(err) => {
                 self.apply_remote_sync_error(host_id, display, provider.as_ref(), err, false);
+            }
+        }
+    }
+
+    /// Execute a targeted fast sync for specific dirty panes signaled by `tmux -C` push watch,
+    /// applying returned partial updates and broadcasting all `output_deltas` without reaping
+    /// non-dirty sibling sessions.
+    pub async fn sync_remote_host_dirty_panes(&self, host_id: &HostId, dirty_panes: &[PaneId]) {
+        let _ = self
+            .sync_remote_host_dirty_panes_with_transitions(host_id, dirty_panes)
+            .await;
+    }
+
+    async fn sync_remote_host_dirty_panes_with_transitions(
+        &self,
+        host_id: &HostId,
+        dirty_panes: &[PaneId],
+    ) -> Vec<PaneId> {
+        if dirty_panes.is_empty() {
+            return Vec::new();
+        }
+        let Some(provider) = self.inner.remote_nodes.get(host_id).cloned() else {
+            return Vec::new();
+        };
+        let (display, claimed) = {
+            let st = lock(&self.inner.state);
+            let display = st
+                .host_display_names
+                .get(host_id)
+                .cloned()
+                .unwrap_or_else(|| provider.default_display_name().to_string());
+            let claimed = collect_claimed_external_ids_for_host(&st, host_id);
+            (display, claimed)
+        };
+        match provider
+            .sync_dirty_panes(&display, dirty_panes, &claimed)
+            .await
+        {
+            Ok(snap) => {
+                self.apply_remote_snapshot(host_id, provider.as_ref(), snap, false, true)
+                    .await
+            }
+            Err(err) => {
+                self.apply_remote_sync_error(host_id, display, provider.as_ref(), err, false);
+                Vec::new()
             }
         }
     }
@@ -1070,15 +1363,219 @@ impl Core {
         }
     }
 
+    /// Qualify and apply a real-time SSE event pushed by a remote peer `starfaned` daemon.
+    pub(crate) async fn apply_remote_peer_event(&self, hid: &HostId, ev: DaemonEvent) {
+        match ev {
+            DaemonEvent::Session { mut session, .. } => {
+                // Import only sessions local to that peer (or already qualified to `hid`).
+                if !session.is_local_host() && session.effective_host_id() != hid.as_str() {
+                    return;
+                }
+                let (changed_session, updated_host) = {
+                    let mut st = lock(&self.inner.state);
+                    let display = st
+                        .host_display_names
+                        .get(hid)
+                        .cloned()
+                        .or_else(|| {
+                            self.inner
+                                .remote_nodes
+                                .get(hid)
+                                .map(|p| p.default_display_name().to_string())
+                        })
+                        .unwrap_or_else(|| hid.0.clone());
+                    session.session_id = qualify_session_idempotent(hid, &session.session_id);
+                    session.pane = session
+                        .pane
+                        .as_ref()
+                        .map(|p| qualify_pane_idempotent(hid, p));
+                    session.parent_session_id = session
+                        .parent_session_id
+                        .as_ref()
+                        .map(|p| qualify_session_idempotent(hid, p));
+                    session.host_id = Some(hid.clone());
+                    session.host_display_name = Some(display);
+
+                    let changed_session = if st.sessions.get(&session.session_id) != Some(&session)
+                    {
+                        st.sessions
+                            .insert(session.session_id.clone(), session.clone());
+                        Some(session)
+                    } else {
+                        None
+                    };
+                    let now_ms = id::now_ms();
+                    let count = st
+                        .sessions
+                        .values()
+                        .filter(|s| {
+                            !s.is_subagent
+                                && s.state != SessionState::Ended
+                                && s.effective_host_id() == hid.as_str()
+                        })
+                        .count();
+                    let provider_opt = self.inner.remote_nodes.get(hid);
+                    let updated_host = if let Some(host) = st.hosts.get_mut(hid) {
+                        let prev = host.clone();
+                        host.status = HostStatus::Online;
+                        host.error = None;
+                        host.next_retry_ms = None;
+                        host.last_seen_ms = Some(now_ms);
+                        host.session_count = count;
+                        if let Some(rtt) = provider_opt.and_then(|p| p.rtt_ms()) {
+                            host.rtt_ms = Some(rtt);
+                        }
+                        if let Some(sm) = provider_opt.and_then(|p| p.sync_ms()) {
+                            host.sync_ms = Some(sm);
+                        }
+                        let diff = prev.status != host.status
+                            || prev.error != host.error
+                            || prev.session_count != host.session_count
+                            || prev.rtt_ms != host.rtt_ms
+                            || prev.sync_ms != host.sync_ms
+                            || prev.next_retry_ms != host.next_retry_ms;
+                        diff.then(|| host.clone())
+                    } else {
+                        None
+                    };
+                    (changed_session, updated_host)
+                };
+                if let Some(s) = changed_session {
+                    self.mark_dirty();
+                    self.publish_session(s);
+                    self.refresh_attention();
+                }
+                if let Some(h) = updated_host {
+                    self.publish_host(h);
+                }
+            }
+            DaemonEvent::Output {
+                session_id,
+                start_seq,
+                total_messages,
+                appended_messages,
+                live_tail,
+                metrics,
+                dirty,
+                ..
+            } => {
+                if is_foreign_federated_session_id(hid, &session_id) {
+                    return;
+                }
+                let qualified_sid = qualify_session_idempotent(hid, &session_id);
+                if let Some(ref m) = metrics {
+                    let mut st = lock(&self.inner.state);
+                    if let Some(rec) = st.sessions.get_mut(&qualified_sid) {
+                        if !metrics::metrics_meaningfully_equal(&rec.metrics, &Some(m.clone())) {
+                            rec.metrics = Some(m.clone());
+                        }
+                    }
+                }
+                self.publish_output(
+                    qualified_sid,
+                    start_seq,
+                    total_messages,
+                    appended_messages,
+                    live_tail,
+                    metrics,
+                    dirty,
+                );
+            }
+            DaemonEvent::Event { mut event, .. } => {
+                if is_foreign_federated_session_id(hid, &event.session_id) {
+                    return;
+                }
+                event.session_id = qualify_session_idempotent(hid, &event.session_id);
+                event.pane = event.pane.as_ref().map(|p| qualify_pane_idempotent(hid, p));
+                self.publish(|seq| DaemonEvent::Event {
+                    seq,
+                    event: event.clone(),
+                });
+                let sess_opt = lock(&self.inner.state)
+                    .sessions
+                    .get(&event.session_id)
+                    .cloned();
+                if let Some(sess) = sess_opt {
+                    self.on_session_event(&sess, &event, None, sess.is_subagent)
+                        .await;
+                }
+                self.refresh_attention();
+            }
+            DaemonEvent::Attention { .. } => {
+                self.refresh_attention();
+            }
+            DaemonEvent::Delivery {
+                mut report,
+                mut target,
+                ..
+            } => {
+                report.pane = report
+                    .pane
+                    .as_ref()
+                    .map(|p| qualify_pane_idempotent(hid, p));
+                match &mut target {
+                    DispatchTarget::Session { id } => {
+                        *id = qualify_session_idempotent(hid, id);
+                    }
+                    DispatchTarget::Pane { id } => {
+                        *id = qualify_pane_idempotent(hid, id);
+                    }
+                    DispatchTarget::Stage { .. } => {}
+                }
+                self.publish(|seq| DaemonEvent::Delivery {
+                    seq,
+                    report,
+                    target,
+                });
+            }
+            DaemonEvent::Host { .. }
+            | DaemonEvent::Pipeline { .. }
+            | DaemonEvent::Artifact { .. }
+            | DaemonEvent::Review { .. }
+            | DaemonEvent::Notifiers { .. } => {}
+        }
+    }
+
+    fn broadcast_remote_output_event(&self, hid: &HostId, ev: DaemonEvent) {
+        if let DaemonEvent::Output {
+            session_id,
+            start_seq,
+            total_messages,
+            appended_messages,
+            live_tail,
+            metrics,
+            dirty,
+            ..
+        } = ev
+        {
+            if is_foreign_federated_session_id(hid, &session_id) {
+                return;
+            }
+            let qualified_sid = qualify_session_idempotent(hid, &session_id);
+            self.publish_output(
+                qualified_sid,
+                start_seq,
+                total_messages,
+                appended_messages,
+                live_tail,
+                metrics,
+                dirty,
+            );
+        }
+    }
+
     async fn apply_remote_snapshot(
         &self,
         hid: &HostId,
-        kind: HostKind,
+        provider: &dyn NodeProvider,
         mut snap: NodeSnapshot,
         force_publish_host: bool,
-    ) {
+        is_partial: bool,
+    ) -> Vec<PaneId> {
+        let kind = provider.kind();
         let now_ms = id::now_ms();
         let mut updated_sessions = Vec::new();
+        let mut transitioned_local_panes = Vec::new();
         let mut changed = false;
         let updated_host;
         {
@@ -1094,6 +1591,25 @@ impl Core {
                 snap.sessions.iter().map(|s| s.session_id.clone()).collect();
             for mut s in snap.sessions {
                 s.host_display_name = Some(display.clone());
+                if let Some(prev) = st.sessions.get(&s.session_id) {
+                    if matches!(prev.state, SessionState::Working | SessionState::Starting)
+                        && matches!(
+                            s.state,
+                            SessionState::Idle
+                                | SessionState::NeedsPermission
+                                | SessionState::NeedsInput
+                                | SessionState::Error
+                        )
+                    {
+                        if let Some(ref p) = s.pane {
+                            let (_, raw_pane) = starfane_tmux::split_host_prefix(p.as_str());
+                            let local_pane = PaneId::new(raw_pane);
+                            if !transitioned_local_panes.contains(&local_pane) {
+                                transitioned_local_panes.push(local_pane);
+                            }
+                        }
+                    }
+                }
                 // Zero-install SSH discovery may stamp fresh poll timestamps on subagents or
                 // re-parsed metrics; preserve stable timestamps when meaningful fields did not
                 // change so we never trigger endless fsync/SSE floods or reset idle timers.
@@ -1135,40 +1651,43 @@ impl Core {
             }
 
             // Transition previously live remote sessions that disappeared from a HEALTHY host.
+            // Skipped for partial dirty-pane push snapshots so non-dirty sibling sessions remain live.
             // Already-`Ended` sessions are left untouched so closed transcripts remain in
             // `claimed_external_ids` and SSE does not emit duplicate `Ended` tombstones.
-            let gone: Vec<SessionId> = st
-                .sessions
-                .iter()
-                .filter(|(sid, s)| {
-                    s.effective_host_id() == hid.as_str()
-                        && s.state != SessionState::Ended
-                        && !live_ids.contains(*sid)
-                })
-                .map(|(sid, _)| sid.clone())
-                .collect();
-            for sid in gone {
-                let keep_for_claim = st.sessions.get(&sid).is_some_and(|s| {
-                    !s.is_subagent && (!s.discovered_only || s.transcript_path.is_some())
-                });
-                if keep_for_claim {
-                    if let Some(old) = st.sessions.get_mut(&sid) {
+            if !is_partial {
+                let gone: Vec<SessionId> = st
+                    .sessions
+                    .iter()
+                    .filter(|(sid, s)| {
+                        s.effective_host_id() == hid.as_str()
+                            && s.state != SessionState::Ended
+                            && !live_ids.contains(*sid)
+                    })
+                    .map(|(sid, _)| sid.clone())
+                    .collect();
+                for sid in gone {
+                    let keep_for_claim = st.sessions.get(&sid).is_some_and(|s| {
+                        !s.is_subagent && (!s.discovered_only || s.transcript_path.is_some())
+                    });
+                    if keep_for_claim {
+                        if let Some(old) = st.sessions.get_mut(&sid) {
+                            old.state = SessionState::Ended;
+                            old.state_since_ms = now_ms;
+                            old.last_event_ms = now_ms;
+                            old.last_error = None;
+                            old.active_subagents = 0;
+                            updated_sessions.push(old.clone());
+                            changed = true;
+                        }
+                    } else if let Some(mut old) = st.sessions.remove(&sid) {
                         old.state = SessionState::Ended;
                         old.state_since_ms = now_ms;
                         old.last_event_ms = now_ms;
                         old.last_error = None;
                         old.active_subagents = 0;
-                        updated_sessions.push(old.clone());
+                        updated_sessions.push(old);
                         changed = true;
                     }
-                } else if let Some(mut old) = st.sessions.remove(&sid) {
-                    old.state = SessionState::Ended;
-                    old.state_since_ms = now_ms;
-                    old.last_event_ms = now_ms;
-                    old.last_error = None;
-                    old.active_subagents = 0;
-                    updated_sessions.push(old);
-                    changed = true;
                 }
             }
 
@@ -1182,6 +1701,16 @@ impl Core {
                 })
                 .count();
             let prev_host = st.hosts.get(hid);
+            if snap.host.rtt_ms.is_none() {
+                snap.host.rtt_ms = provider
+                    .rtt_ms()
+                    .or_else(|| prev_host.and_then(|p| p.rtt_ms));
+            }
+            if snap.host.sync_ms.is_none() {
+                snap.host.sync_ms = provider
+                    .sync_ms()
+                    .or_else(|| prev_host.and_then(|p| p.sync_ms));
+            }
             let host_diff = force_publish_host
                 || prev_host.is_none_or(|p| {
                     p.status != snap.host.status
@@ -1190,6 +1719,7 @@ impl Core {
                         || p.display_name != snap.host.display_name
                         || p.session_count != snap.host.session_count
                         || p.rtt_ms != snap.host.rtt_ms
+                        || p.sync_ms != snap.host.sync_ms
                         || p.next_retry_ms != snap.host.next_retry_ms
                 });
             updated_host = host_diff.then(|| snap.host.clone());
@@ -1205,6 +1735,10 @@ impl Core {
         }
         if let Some(host) = updated_host {
             self.publish_host(host);
+        }
+
+        for delta in snap.output_deltas {
+            self.broadcast_remote_output_event(hid, delta);
         }
 
         if !snap.events.is_empty() {
@@ -1224,6 +1758,7 @@ impl Core {
             }
             self.refresh_attention();
         }
+        transitioned_local_panes
     }
 
     fn apply_remote_sync_error(
@@ -1245,6 +1780,7 @@ impl Core {
         };
         let next_retry_ms = provider.next_retry_ms();
         let rtt_ms = provider.rtt_ms();
+        let sync_ms = provider.sync_ms();
         let kind = provider.kind();
 
         let publish_rec = {
@@ -1270,6 +1806,7 @@ impl Core {
                 error: Some(err),
                 session_count: count,
                 rtt_ms: rtt_ms.or_else(|| prev.as_ref().and_then(|p| p.rtt_ms)),
+                sync_ms: sync_ms.or_else(|| prev.as_ref().and_then(|p| p.sync_ms)),
                 next_retry_ms,
             };
             let diff = force_publish_host
@@ -1278,6 +1815,7 @@ impl Core {
                         || p.error != degraded.error
                         || p.session_count != degraded.session_count
                         || p.rtt_ms != degraded.rtt_ms
+                        || p.sync_ms != degraded.sync_ms
                         || p.next_retry_ms != degraded.next_retry_ms
                         || p.display_name != degraded.display_name
                 });
@@ -1307,7 +1845,7 @@ impl Core {
 
         let mut outcome = provider.probe_now().await?;
         if let Some(snap) = outcome.snapshot.take() {
-            self.apply_remote_snapshot(&hid, provider.kind(), snap, true)
+            self.apply_remote_snapshot(&hid, provider.as_ref(), snap, true, false)
                 .await;
         } else {
             let display = {
@@ -1459,6 +1997,31 @@ impl Core {
 
     pub(crate) fn publish_host(&self, host: HostRecord) {
         self.publish(|seq| DaemonEvent::Host { seq, host });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_output(
+        &self,
+        session_id: SessionId,
+        start_seq: Option<usize>,
+        total_messages: Option<usize>,
+        appended_messages: Vec<serde_json::Value>,
+        live_tail: Option<String>,
+        metrics: Option<SessionMetrics>,
+        dirty: bool,
+    ) {
+        self.publish(|seq| {
+            make_output_event(
+                seq,
+                session_id,
+                start_seq,
+                total_messages,
+                appended_messages,
+                live_tail,
+                metrics,
+                dirty,
+            )
+        });
     }
 
     pub(crate) fn publish_pipeline(&self, p: PipelineSpec) {
@@ -1914,8 +2477,82 @@ pub(crate) fn collect_claimed_external_ids_for_host(
     claimed
 }
 
+fn qualify_session_idempotent(hid: &HostId, sid: &SessionId) -> SessionId {
+    let prefix = format!("{}:", hid.as_str());
+    if sid.as_str().starts_with(&prefix) {
+        sid.clone()
+    } else {
+        starfane_tmux::qualify_host_session(hid, sid)
+    }
+}
+
+fn qualify_pane_idempotent(hid: &HostId, pane: &PaneId) -> PaneId {
+    let prefix = format!("{}:", hid.as_str());
+    if pane.as_str().starts_with(&prefix) {
+        pane.clone()
+    } else {
+        starfane_tmux::qualify_host_pane(hid, pane)
+    }
+}
+
+fn is_foreign_federated_session_id(hid: &HostId, sid: &SessionId) -> bool {
+    let raw = sid.as_str();
+    let own_prefix = format!("{}:", hid.as_str());
+    if raw.starts_with(&own_prefix) {
+        return false;
+    }
+    if starfane_tmux::parse_zellij_pane_id(raw).is_some() {
+        return false;
+    }
+    if let Some((prefix, _)) = raw.split_once(':') {
+        return !prefix.is_empty() && prefix != "zj" && prefix != "bind";
+    }
+    false
+}
+
 pub(crate) fn to_json<T: serde::Serialize>(v: T) -> Result<serde_json::Value, ApiError> {
     serde_json::to_value(v).map_err(|e| ApiError::internal(format!("serialize: {e}")))
+}
+
+/// Build a [`DaemonEvent::Output`] frame enforcing the 32 KiB inline payload budget for
+/// `appended_messages`: if serialized messages exceed [`MAX_INLINE_OUTPUT_BYTES`], omits
+/// `appended_messages` and sets `dirty = true` so the browser triggers an immediate
+/// incremental `GET /api/sessions/{id}/transcript`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn make_output_event(
+    seq: u64,
+    session_id: SessionId,
+    start_seq: Option<usize>,
+    total_messages: Option<usize>,
+    appended_messages: Vec<serde_json::Value>,
+    live_tail: Option<String>,
+    metrics: Option<SessionMetrics>,
+    dirty: bool,
+) -> DaemonEvent {
+    let mut final_dirty = dirty;
+    let final_appended = if appended_messages.is_empty() {
+        Vec::new()
+    } else {
+        match serde_json::to_vec(&appended_messages) {
+            Ok(bytes) if bytes.len() <= MAX_INLINE_OUTPUT_BYTES => appended_messages,
+            _ => {
+                final_dirty = true;
+                Vec::new()
+            }
+        }
+    };
+    let final_tail =
+        live_tail.map(|t| starfane_tmux::trim_and_cap_tail(&t, 20, MAX_INLINE_LIVE_TAIL_BYTES));
+    DaemonEvent::Output {
+        seq,
+        session_id,
+        start_seq,
+        total_messages,
+        appended_messages: final_appended,
+        live_tail: final_tail,
+        metrics,
+        dirty: final_dirty,
+    }
 }
 
 /// Derive "needs you" items from state.
@@ -2147,4 +2784,823 @@ pub(crate) async fn run(cfg: DaemonConfig) -> Result<(), DaemonError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use crate::config::NotifyOwnership;
+    use crate::core::transcript::TranscriptResponse;
+    use crate::nodes::{RemoteSpawnOutcome, RemoteSpawnReq};
+    use crate::notice::BoxFuture;
+    use starfane_tmux::{CaptureRequest, PanePreview};
+    use std::sync::atomic::AtomicUsize;
+
+    struct MockPushProvider {
+        host_id: HostId,
+        kind: HostKind,
+        push_tx_slot: Mutex<Option<mpsc::UnboundedSender<HostPushSignal>>>,
+        full_syncs: AtomicUsize,
+        dirty_syncs: Mutex<Vec<Vec<PaneId>>>,
+    }
+
+    impl MockPushProvider {
+        fn new(id: &str, kind: HostKind) -> Self {
+            Self {
+                host_id: HostId::new(id),
+                kind,
+                push_tx_slot: Mutex::new(None),
+                full_syncs: AtomicUsize::new(0),
+                dirty_syncs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn mk_session(&self, raw_sid: &str, raw_pane: &str, state: SessionState) -> SessionRecord {
+            SessionRecord {
+                session_id: starfane_tmux::qualify_host_session(
+                    &self.host_id,
+                    &SessionId::new(raw_sid),
+                ),
+                agent: AgentKind::Claude,
+                pane: Some(starfane_tmux::qualify_host_pane(
+                    &self.host_id,
+                    &PaneId::new(raw_pane),
+                )),
+                pane_resolution: PaneResolution::Env,
+                cwd: Some("/srv/app".into()),
+                git_root: Some("/srv/app".into()),
+                model: Some("opus".into()),
+                effort: None,
+                state,
+                state_since_ms: 1_000,
+                last_event_id: None,
+                last_event_ms: 1_000,
+                last_message: None,
+                last_error: None,
+                parent_session_id: None,
+                is_subagent: false,
+                subagent_count: 0,
+                active_subagents: 0,
+                stage: None,
+                unread_inbox: 0,
+                confidence: Confidence::Heuristic,
+                tmux_target: Some("dev:0.0".into()),
+                tmux_label: Some("dev-main".into()),
+                discovered_only: true,
+                transcript_path: None,
+                metrics: None,
+                host_id: Some(self.host_id.clone()),
+                host_display_name: Some("Mock Host".into()),
+                mux_kind: Some("tmux".into()),
+            }
+        }
+    }
+
+    impl NodeProvider for MockPushProvider {
+        fn host_id(&self) -> &HostId {
+            &self.host_id
+        }
+        fn kind(&self) -> HostKind {
+            self.kind
+        }
+        fn default_display_name(&self) -> &str {
+            "Mock Host"
+        }
+        fn notify_ownership(&self) -> NotifyOwnership {
+            NotifyOwnership::Hub
+        }
+        fn sync_with_claimed<'a>(
+            &'a self,
+            display_name: &'a str,
+            _claimed_external_ids: &'a HashSet<String>,
+        ) -> BoxFuture<'a, Result<NodeSnapshot, String>> {
+            let n = self.full_syncs.fetch_add(1, Ordering::SeqCst) + 1;
+            let disp = display_name.to_string();
+            Box::pin(async move {
+                Ok(NodeSnapshot {
+                    host: HostRecord {
+                        id: self.host_id.clone(),
+                        display_name: disp,
+                        kind: self.kind,
+                        status: HostStatus::Online,
+                        active_endpoint: Some("ssh://mock".into()),
+                        last_seen_ms: Some(id::now_ms()),
+                        error: None,
+                        session_count: 2,
+                        rtt_ms: Some(11),
+                        sync_ms: Some(42 + n as u64),
+                        next_retry_ms: None,
+                    },
+                    sessions: vec![
+                        self.mk_session("tmux-%1", "%1", SessionState::Idle),
+                        self.mk_session("tmux-%2", "%2", SessionState::Idle),
+                    ],
+                    events: Vec::new(),
+                    output_deltas: Vec::new(),
+                })
+            })
+        }
+        fn sync_dirty_panes<'a>(
+            &'a self,
+            display_name: &'a str,
+            dirty_panes: &'a [PaneId],
+            _claimed_external_ids: &'a HashSet<String>,
+        ) -> BoxFuture<'a, Result<NodeSnapshot, String>> {
+            self.dirty_syncs.lock().unwrap().push(dirty_panes.to_vec());
+            let disp = display_name.to_string();
+            Box::pin(async move {
+                // Return ONLY the dirty session %1 plus an inline Output delta; sibling %2 is omitted!
+                Ok(NodeSnapshot {
+                    host: HostRecord {
+                        id: self.host_id.clone(),
+                        display_name: disp,
+                        kind: self.kind,
+                        status: HostStatus::Online,
+                        active_endpoint: Some("ssh://mock".into()),
+                        last_seen_ms: Some(id::now_ms()),
+                        error: None,
+                        session_count: 1,
+                        rtt_ms: Some(10),
+                        sync_ms: Some(18),
+                        next_retry_ms: None,
+                    },
+                    sessions: vec![self.mk_session("tmux-%1", "%1", SessionState::Working)],
+                    events: Vec::new(),
+                    output_deltas: vec![DaemonEvent::Output {
+                        seq: 0,
+                        session_id: SessionId::new("tmux-%1"),
+                        start_seq: Some(3),
+                        total_messages: Some(4),
+                        appended_messages: vec![
+                            serde_json::json!({"role":"assistant","text":"fast push"}),
+                        ],
+                        live_tail: Some("streaming...".into()),
+                        metrics: None,
+                        dirty: false,
+                    }],
+                })
+            })
+        }
+        fn spawn_push_watcher(
+            &self,
+            tx: mpsc::UnboundedSender<HostPushSignal>,
+        ) -> Option<tokio::task::JoinHandle<()>> {
+            *self.push_tx_slot.lock().unwrap() = Some(tx);
+            Some(tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }))
+        }
+        fn list_tmux_sessions(&self) -> BoxFuture<'_, Result<Vec<String>, ApiError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn spawn_session<'a>(
+            &'a self,
+            _display_name: &'a str,
+            _req: &'a RemoteSpawnReq,
+        ) -> BoxFuture<'a, Result<RemoteSpawnOutcome, ApiError>> {
+            Box::pin(async { Err(ApiError::internal("unused")) })
+        }
+        fn stage_input_files<'a>(
+            &'a self,
+            _files: &'a [(String, PathBuf)],
+        ) -> BoxFuture<'a, Result<HashMap<PathBuf, String>, ApiError>> {
+            Box::pin(async { Ok(HashMap::new()) })
+        }
+        fn probe_now(&self) -> BoxFuture<'_, Result<HostProbeOutcome, ApiError>> {
+            Box::pin(async { Err(ApiError::internal("unused")) })
+        }
+        fn rtt_ms(&self) -> Option<u64> {
+            Some(10)
+        }
+        fn sync_ms(&self) -> Option<u64> {
+            Some(18)
+        }
+        fn next_retry_ms(&self) -> Option<u64> {
+            None
+        }
+        fn circuit_status(&self) -> HostStatus {
+            HostStatus::Online
+        }
+        fn capture_pane<'a>(
+            &'a self,
+            _local_pane: &'a PaneId,
+            _req: &'a CaptureRequest,
+        ) -> BoxFuture<'a, Result<PanePreview, ApiError>> {
+            Box::pin(async { Err(ApiError::internal("unused")) })
+        }
+        fn fetch_transcript<'a>(
+            &'a self,
+            _remote_session: &'a SessionId,
+            _query: &'a TranscriptQuery,
+        ) -> BoxFuture<'a, Result<TranscriptResponse, ApiError>> {
+            Box::pin(async { Err(ApiError::internal("unused")) })
+        }
+        fn dispatch_interactive<'a>(
+            &'a self,
+            _remote_session: Option<&'a SessionId>,
+            _local_pane: &'a PaneId,
+            _text: &'a str,
+            _settle_ms: u64,
+        ) -> BoxFuture<'a, Result<DeliveryReport, ApiError>> {
+            Box::pin(async { Err(ApiError::internal("unused")) })
+        }
+        fn focus_pane<'a>(
+            &'a self,
+            _remote_session: &'a SessionId,
+            _local_pane: &'a PaneId,
+        ) -> BoxFuture<'a, Result<serde_json::Value, ApiError>> {
+            Box::pin(async { Err(ApiError::internal("unused")) })
+        }
+        fn close_pane<'a>(
+            &'a self,
+            _remote_session: &'a SessionId,
+            _local_pane: &'a PaneId,
+        ) -> BoxFuture<'a, Result<serde_json::Value, ApiError>> {
+            Box::pin(async { Err(ApiError::internal("unused")) })
+        }
+    }
+
+    fn build_core_with_mock_provider(
+        root: &Path,
+        provider: Arc<MockPushProvider>,
+    ) -> (Core, HostId, Arc<Notify>) {
+        let mut cfg = StarfaneConfig::default();
+        cfg.paths.tmux = "/usr/bin/false".into();
+        cfg.zellij.enabled = false;
+        let base = Core::new(&DaemonConfig {
+            state_dir: root.join("state"),
+            socket: root.join("state/starfaned.sock"),
+            config: cfg.clone(),
+            web_dir: None,
+            foreground: true,
+        })
+        .unwrap();
+        let hid = provider.host_id().clone();
+        let wake = Arc::new(Notify::new());
+        let mut remote_nodes: HashMap<HostId, Arc<dyn NodeProvider>> = HashMap::new();
+        remote_nodes.insert(hid.clone(), provider);
+        let mut remote_wake = HashMap::new();
+        remote_wake.insert(hid.clone(), wake.clone());
+        let mut state = State::default();
+        state.hosts.insert(
+            hid.clone(),
+            HostRecord {
+                id: hid.clone(),
+                display_name: "Mock Host".into(),
+                kind: HostKind::Ssh,
+                status: HostStatus::Offline,
+                active_endpoint: None,
+                last_seen_ms: None,
+                error: None,
+                session_count: 0,
+                rtt_ms: None,
+                sync_ms: None,
+                next_retry_ms: None,
+            },
+        );
+        let (events, _) = broadcast::channel(EVENT_CHANNEL);
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let core = Core {
+            inner: Arc::new(Inner {
+                cfg: base.inner.cfg.clone(),
+                state_dir: base.inner.state_dir.clone(),
+                web_dir: None,
+                started_ms: base.inner.started_ms,
+                web_token: base.inner.web_token.clone(),
+                state: Mutex::new(state),
+                events,
+                replay: Mutex::new(VecDeque::with_capacity(SSE_REPLAY_CAPACITY)),
+                seq: AtomicU64::new(0),
+                notice_tx,
+                notice_rx: Mutex::new(Some(notice_rx)),
+                feishu: RwLock::new(None),
+                tmux: base.inner.tmux.clone(),
+                mux: base.inner.mux.clone(),
+                access_gate: base.inner.access_gate.clone(),
+                notify_router: NotifyRouter::from_config(&cfg),
+                remote_nodes,
+                remote_wake,
+                store: Store::new(root.join("state")),
+                acks: Mutex::new(HashMap::new()),
+                dirty: AtomicBool::new(false),
+                snapshot_in_flight: AtomicBool::new(false),
+                shutdown: Notify::new(),
+                last_attention: Mutex::new(Vec::new()),
+                model_catalog: Mutex::new(None),
+                slash_cache: Mutex::new(slash::SlashCache::default()),
+                telemetry: Mutex::new(TelemetryCaches::default()),
+                transcript_index: Arc::new(Mutex::new(transcript::TranscriptIndexCache::default())),
+                discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
+            }),
+        };
+        (core, hid, wake)
+    }
+
+    #[test]
+    fn make_output_event_enforces_32kib_inline_budget() {
+        let small = make_output_event(
+            1,
+            SessionId::new("s1"),
+            Some(0),
+            Some(1),
+            vec![serde_json::json!({"role": "assistant", "text": "ok"})],
+            Some("tail".into()),
+            None,
+            false,
+        );
+        match small {
+            DaemonEvent::Output {
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert_eq!(appended_messages.len(), 1);
+                assert!(!dirty);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let big = make_output_event(
+            2,
+            SessionId::new("s1"),
+            Some(1),
+            Some(2),
+            vec![serde_json::json!({"role": "assistant", "text": "a".repeat(33 * 1024)})],
+            None,
+            None,
+            false,
+        );
+        match big {
+            DaemonEvent::Output {
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert!(appended_messages.is_empty());
+                assert!(dirty);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_push_supervisor_handles_dirty_panes_peer_events_and_full_sync() {
+        let root = std::env::temp_dir().join(format!("starfane-push-sup-{}", id::new_id("T")));
+        let provider = Arc::new(MockPushProvider::new("mac-xiling", HostKind::Ssh));
+        let (core, hid, wake) = build_core_with_mock_provider(&root, provider.clone());
+        let mut sse = core.subscribe();
+
+        let sup_core = core.clone();
+        let sup_hid = hid.clone();
+        let sup = tokio::spawn(async move {
+            sup_core.run_remote_host_supervisor(sup_hid, wake).await;
+        });
+
+        // Wait until initial sync finishes and push watcher registers its tx.
+        let push_tx = loop {
+            if let Some(tx) = provider.push_tx_slot.lock().unwrap().clone() {
+                break tx;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(provider.full_syncs.load(Ordering::SeqCst), 1);
+        {
+            let st = lock(&core.inner.state);
+            assert!(st
+                .sessions
+                .contains_key(&SessionId::new("mac-xiling:tmux-%1")));
+            assert!(st
+                .sessions
+                .contains_key(&SessionId::new("mac-xiling:tmux-%2")));
+            assert_eq!(st.hosts[&hid].sync_ms, Some(43));
+        }
+
+        // 1. Send DirtyPanes([%1]) -> targeted sync_dirty_panes updates %1, keeps %2 alive, updates sync_ms=18, broadcasts Output!
+        push_tx
+            .send(HostPushSignal::DirtyPanes(vec![PaneId::new("%1")]))
+            .unwrap();
+
+        let mut saw_dirty_output = false;
+        let mut saw_sync_ms_18 = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline);
+        while !saw_dirty_output || !saw_sync_ms_18 {
+            tokio::select! {
+                _ = &mut deadline => panic!("timed out waiting for DirtyPanes output/host SSE"),
+                Ok(ev) = sse.recv() => {
+                    match ev {
+                        DaemonEvent::Output { session_id, start_seq, total_messages, appended_messages, dirty, .. }
+                            if session_id.as_str() == "mac-xiling:tmux-%1" =>
+                        {
+                            assert_eq!(start_seq, Some(3));
+                            assert_eq!(total_messages, Some(4));
+                            assert_eq!(appended_messages.len(), 1);
+                            assert!(!dirty);
+                            saw_dirty_output = true;
+                        }
+                        DaemonEvent::Host { host, .. } if host.id == hid && host.sync_ms == Some(18) => {
+                            assert_eq!(host.session_count, 2, "partial dirty sync must NOT reap non-dirty sibling %2");
+                            saw_sync_ms_18 = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(provider.dirty_syncs.lock().unwrap().len(), 1);
+        assert!(lock(&core.inner.state)
+            .sessions
+            .get(&SessionId::new("mac-xiling:tmux-%2"))
+            .is_some_and(|s| s.state != SessionState::Ended));
+
+        // 2. Send PeerEvent(Output) for unqualified session -> qualified & forwarded to Hub SSE!
+        push_tx
+            .send(HostPushSignal::PeerEvent(DaemonEvent::Output {
+                seq: 99,
+                session_id: SessionId::new("tmux-%2"),
+                start_seq: Some(10),
+                total_messages: Some(11),
+                appended_messages: vec![serde_json::json!({"role":"assistant","text":"peer push"})],
+                live_tail: None,
+                metrics: None,
+                dirty: false,
+            }))
+            .unwrap();
+        // Foreign-federated session must be ignored (no loop).
+        push_tx
+            .send(HostPushSignal::PeerEvent(DaemonEvent::Output {
+                seq: 100,
+                session_id: SessionId::new("other-host:tmux-%9"),
+                start_seq: Some(0),
+                total_messages: Some(1),
+                appended_messages: Vec::new(),
+                live_tail: None,
+                metrics: None,
+                dirty: true,
+            }))
+            .unwrap();
+
+        let mut saw_peer_output = false;
+        let deadline2 = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(deadline2);
+        while !saw_peer_output {
+            tokio::select! {
+                _ = &mut deadline2 => panic!("timed out waiting for PeerEvent output SSE"),
+                Ok(ev) = sse.recv() => {
+                    if let DaemonEvent::Output { session_id, appended_messages, .. } = ev {
+                        assert_ne!(session_id.as_str(), "other-host:tmux-%9");
+                        if session_id.as_str() == "mac-xiling:tmux-%2" {
+                            assert_eq!(appended_messages[0]["text"], "peer push");
+                            saw_peer_output = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Send Reconnect -> triggers immediate full sync (full_syncs == 2).
+        push_tx.send(HostPushSignal::Reconnect).unwrap();
+        let deadline3 = tokio::time::Instant::now() + Duration::from_secs(2);
+        while provider.full_syncs.load(Ordering::SeqCst) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline3,
+                "timed out waiting for Reconnect full sync"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        core.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), sup).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn dirty_panes_transition_out_of_working_schedules_single_followup() {
+        struct TransitionMockProvider {
+            host_id: HostId,
+            push_tx_slot: Mutex<Option<mpsc::UnboundedSender<HostPushSignal>>>,
+            next_dirty_state: Mutex<SessionState>,
+            dirty_syncs: Mutex<Vec<Vec<PaneId>>>,
+        }
+
+        impl TransitionMockProvider {
+            fn mk_session(
+                &self,
+                raw_sid: &str,
+                raw_pane: &str,
+                state: SessionState,
+            ) -> SessionRecord {
+                SessionRecord {
+                    session_id: starfane_tmux::qualify_host_session(
+                        &self.host_id,
+                        &SessionId::new(raw_sid),
+                    ),
+                    agent: AgentKind::Claude,
+                    pane: Some(starfane_tmux::qualify_host_pane(
+                        &self.host_id,
+                        &PaneId::new(raw_pane),
+                    )),
+                    pane_resolution: PaneResolution::Env,
+                    cwd: Some("/srv/app".into()),
+                    git_root: None,
+                    model: None,
+                    effort: None,
+                    state,
+                    state_since_ms: 1_000,
+                    last_event_id: None,
+                    last_event_ms: 1_000,
+                    last_message: None,
+                    last_error: None,
+                    parent_session_id: None,
+                    is_subagent: false,
+                    subagent_count: 0,
+                    active_subagents: 0,
+                    stage: None,
+                    unread_inbox: 0,
+                    confidence: Confidence::Heuristic,
+                    tmux_target: Some("dev:0.0".into()),
+                    tmux_label: Some("dev-main".into()),
+                    discovered_only: true,
+                    transcript_path: None,
+                    metrics: None,
+                    host_id: Some(self.host_id.clone()),
+                    host_display_name: Some("Mock Host".into()),
+                    mux_kind: Some("tmux".into()),
+                }
+            }
+        }
+
+        impl NodeProvider for TransitionMockProvider {
+            fn host_id(&self) -> &HostId {
+                &self.host_id
+            }
+            fn kind(&self) -> HostKind {
+                HostKind::Ssh
+            }
+            fn default_display_name(&self) -> &str {
+                "Mock Host"
+            }
+            fn notify_ownership(&self) -> NotifyOwnership {
+                NotifyOwnership::Hub
+            }
+            fn sync_with_claimed<'a>(
+                &'a self,
+                display_name: &'a str,
+                _claimed: &'a HashSet<String>,
+            ) -> BoxFuture<'a, Result<NodeSnapshot, String>> {
+                let disp = display_name.to_string();
+                Box::pin(async move {
+                    Ok(NodeSnapshot {
+                        host: HostRecord {
+                            id: self.host_id.clone(),
+                            display_name: disp,
+                            kind: HostKind::Ssh,
+                            status: HostStatus::Online,
+                            active_endpoint: Some("ssh://mock".into()),
+                            last_seen_ms: Some(id::now_ms()),
+                            error: None,
+                            session_count: 1,
+                            rtt_ms: Some(5),
+                            sync_ms: Some(5),
+                            next_retry_ms: None,
+                        },
+                        sessions: vec![self.mk_session("tmux-%1", "%1", SessionState::Working)],
+                        events: Vec::new(),
+                        output_deltas: Vec::new(),
+                    })
+                })
+            }
+            fn sync_dirty_panes<'a>(
+                &'a self,
+                display_name: &'a str,
+                dirty_panes: &'a [PaneId],
+                _claimed: &'a HashSet<String>,
+            ) -> BoxFuture<'a, Result<NodeSnapshot, String>> {
+                self.dirty_syncs.lock().unwrap().push(dirty_panes.to_vec());
+                let call_idx = self.dirty_syncs.lock().unwrap().len();
+                let st = *self.next_dirty_state.lock().unwrap();
+                let disp = display_name.to_string();
+                Box::pin(async move {
+                    let deltas = if call_idx >= 2 {
+                        vec![DaemonEvent::Output {
+                            seq: 0,
+                            session_id: SessionId::new("tmux-%1"),
+                            start_seq: Some(1),
+                            total_messages: Some(2),
+                            appended_messages: vec![
+                                serde_json::json!({"role":"assistant","text":"late flush"}),
+                            ],
+                            live_tail: None,
+                            metrics: None,
+                            dirty: false,
+                        }]
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(NodeSnapshot {
+                        host: HostRecord {
+                            id: self.host_id.clone(),
+                            display_name: disp,
+                            kind: HostKind::Ssh,
+                            status: HostStatus::Online,
+                            active_endpoint: Some("ssh://mock".into()),
+                            last_seen_ms: Some(id::now_ms()),
+                            error: None,
+                            session_count: 1,
+                            rtt_ms: Some(5),
+                            sync_ms: Some(5),
+                            next_retry_ms: None,
+                        },
+                        sessions: vec![self.mk_session("tmux-%1", "%1", st)],
+                        events: Vec::new(),
+                        output_deltas: deltas,
+                    })
+                })
+            }
+            fn spawn_push_watcher(
+                &self,
+                tx: mpsc::UnboundedSender<HostPushSignal>,
+            ) -> Option<tokio::task::JoinHandle<()>> {
+                *self.push_tx_slot.lock().unwrap() = Some(tx);
+                Some(tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }))
+            }
+            fn list_tmux_sessions(&self) -> BoxFuture<'_, Result<Vec<String>, ApiError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn spawn_session<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a RemoteSpawnReq,
+            ) -> BoxFuture<'a, Result<RemoteSpawnOutcome, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn stage_input_files<'a>(
+                &'a self,
+                _: &'a [(String, PathBuf)],
+            ) -> BoxFuture<'a, Result<HashMap<PathBuf, String>, ApiError>> {
+                Box::pin(async { Ok(HashMap::new()) })
+            }
+            fn probe_now(&self) -> BoxFuture<'_, Result<HostProbeOutcome, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn rtt_ms(&self) -> Option<u64> {
+                Some(5)
+            }
+            fn sync_ms(&self) -> Option<u64> {
+                Some(5)
+            }
+            fn next_retry_ms(&self) -> Option<u64> {
+                None
+            }
+            fn circuit_status(&self) -> HostStatus {
+                HostStatus::Online
+            }
+            fn capture_pane<'a>(
+                &'a self,
+                _: &'a PaneId,
+                _: &'a CaptureRequest,
+            ) -> BoxFuture<'a, Result<PanePreview, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn fetch_transcript<'a>(
+                &'a self,
+                _: &'a SessionId,
+                _: &'a TranscriptQuery,
+            ) -> BoxFuture<'a, Result<TranscriptResponse, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn dispatch_interactive<'a>(
+                &'a self,
+                _: Option<&'a SessionId>,
+                _: &'a PaneId,
+                _: &'a str,
+                _: u64,
+            ) -> BoxFuture<'a, Result<DeliveryReport, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn focus_pane<'a>(
+                &'a self,
+                _: &'a SessionId,
+                _: &'a PaneId,
+            ) -> BoxFuture<'a, Result<serde_json::Value, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+            fn close_pane<'a>(
+                &'a self,
+                _: &'a SessionId,
+                _: &'a PaneId,
+            ) -> BoxFuture<'a, Result<serde_json::Value, ApiError>> {
+                Box::pin(async { Err(ApiError::internal("unused")) })
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("starfane-followup-{}", id::new_id("T")));
+        let provider = Arc::new(TransitionMockProvider {
+            host_id: HostId::new("ssh-follow"),
+            push_tx_slot: Mutex::new(None),
+            next_dirty_state: Mutex::new(SessionState::Idle),
+            dirty_syncs: Mutex::new(Vec::new()),
+        });
+
+        let mut cfg = StarfaneConfig::default();
+        cfg.paths.tmux = "/usr/bin/false".into();
+        cfg.zellij.enabled = false;
+        let base = Core::new(&DaemonConfig {
+            state_dir: root.join("state"),
+            socket: root.join("state/starfaned.sock"),
+            config: cfg.clone(),
+            web_dir: None,
+            foreground: true,
+        })
+        .unwrap();
+        let hid = provider.host_id().clone();
+        let wake = Arc::new(Notify::new());
+        let mut remote_nodes: HashMap<HostId, Arc<dyn NodeProvider>> = HashMap::new();
+        remote_nodes.insert(hid.clone(), provider.clone());
+        let mut remote_wake = HashMap::new();
+        remote_wake.insert(hid.clone(), wake.clone());
+        let (events, _) = broadcast::channel(EVENT_CHANNEL);
+        let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+        let core = Core {
+            inner: Arc::new(Inner {
+                cfg: base.inner.cfg.clone(),
+                state_dir: base.inner.state_dir.clone(),
+                web_dir: None,
+                started_ms: base.inner.started_ms,
+                web_token: base.inner.web_token.clone(),
+                state: Mutex::new(State::default()),
+                events,
+                replay: Mutex::new(VecDeque::with_capacity(SSE_REPLAY_CAPACITY)),
+                seq: AtomicU64::new(0),
+                notice_tx,
+                notice_rx: Mutex::new(Some(notice_rx)),
+                feishu: RwLock::new(None),
+                tmux: base.inner.tmux.clone(),
+                mux: base.inner.mux.clone(),
+                access_gate: base.inner.access_gate.clone(),
+                notify_router: NotifyRouter::from_config(&cfg),
+                remote_nodes,
+                remote_wake,
+                store: Store::new(root.join("state")),
+                acks: Mutex::new(HashMap::new()),
+                dirty: AtomicBool::new(false),
+                snapshot_in_flight: AtomicBool::new(false),
+                shutdown: Notify::new(),
+                last_attention: Mutex::new(Vec::new()),
+                model_catalog: Mutex::new(None),
+                slash_cache: Mutex::new(slash::SlashCache::default()),
+                telemetry: Mutex::new(TelemetryCaches::default()),
+                transcript_index: Arc::new(Mutex::new(transcript::TranscriptIndexCache::default())),
+                discovery_cache: Mutex::new(discover::DiscoveryScanCache::default()),
+            }),
+        };
+
+        let mut sse = core.subscribe();
+        let sup_core = core.clone();
+        let sup_hid = hid.clone();
+        let sup = tokio::spawn(async move {
+            sup_core.run_remote_host_supervisor(sup_hid, wake).await;
+        });
+
+        let push_tx = loop {
+            if let Some(tx) = provider.push_tx_slot.lock().unwrap().clone() {
+                break tx;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        // Trigger DirtyPanes([%1]) which transitions Working -> Idle.
+        push_tx
+            .send(HostPushSignal::DirtyPanes(vec![PaneId::new("%1")]))
+            .unwrap();
+
+        let mut saw_late_flush = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(3));
+        tokio::pin!(deadline);
+        while !saw_late_flush {
+            tokio::select! {
+                _ = &mut deadline => panic!("timed out waiting for 900ms follow-up output"),
+                Ok(ev) = sse.recv() => {
+                    if let DaemonEvent::Output { session_id, appended_messages, .. } = ev {
+                        if session_id.as_str() == "ssh-follow:tmux-%1"
+                            && appended_messages.first().and_then(|m| m["text"].as_str()) == Some("late flush")
+                        {
+                            saw_late_flush = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_late_flush);
+
+        // Wait 1.1s to verify the follow-up does NOT re-trigger/loop!
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(provider.dirty_syncs.lock().unwrap().len(), 2);
+
+        core.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(1), sup).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

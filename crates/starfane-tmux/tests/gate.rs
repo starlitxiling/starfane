@@ -474,6 +474,112 @@ Implemented trust detection for 'Do you trust the contents of this project?' and
 }
 
 #[test]
+fn gate_blocks_claude_project_mcp_server_confirmation_prompt() {
+    let p = pane("%31");
+    let cfg = GateConfig::default();
+
+    // Exact live `%31` (`openkernel-claude`) capture including previous session footer in scrollback above!
+    let claude_mcp_screen = "\
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ? for shortcuts
+❯ claude --allow-dangerously-skip-permissions
+
+────────────────────────────────────────────────────────────────────────────────
+  New MCP server found in this project: ida-pro
+
+  MCP servers may execute code or access system resources. All tool calls require approval. Learn more in the MCP documentation.
+
+    Use this MCP server
+    Use this and all future MCP servers in this project
+  ❯ Continue without using this MCP server
+
+  Enter to confirm · Esc to cancel
+";
+    assert_eq!(
+        detect_folder_trust_prompt(AgentKind::Claude, claude_mcp_screen),
+        Some("claude waiting for mcp server approval")
+    );
+    assert_eq!(
+        detect_blocking_startup_prompt(AgentKind::Claude, claude_mcp_screen),
+        Some("claude waiting for mcp server approval")
+    );
+    assert_eq!(
+        detect_folder_trust_prompt(AgentKind::Codex, claude_mcp_screen),
+        None
+    );
+
+    let r = check_injection_gate_with_screen(
+        &p,
+        &[],
+        SessionState::Idle,
+        AgentKind::Claude,
+        "❯ Continue without using this MCP server",
+        Some(claude_mcp_screen),
+        &cfg,
+        NOW,
+    );
+    assert!(!r.passed);
+    assert_eq!(r.failed_checks(), vec![GateCheck::InputEmpty]);
+    assert!(r
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains("claude waiting for mcp server approval"));
+
+    // Plural MCP servers variant and single-line cursor checks.
+    for line in [
+        "❯ Continue without using this MCP server",
+        "❯ Use this and all future MCP servers in this project",
+        "❯ Use this MCP server",
+        "New MCP servers found in this project: ida-pro, playwright",
+        "❯ Continue without using these MCP servers",
+    ] {
+        let r_line = gate(&p, &[], SessionState::Idle, AgentKind::Claude, line);
+        assert!(!r_line.passed, "{line:?}");
+        assert_eq!(
+            r_line.failed_checks(),
+            vec![GateCheck::InputEmpty],
+            "{line:?}"
+        );
+        assert!(
+            r_line
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("claude waiting for mcp server approval"),
+            "{line:?}: {:?}",
+            r_line.detail
+        );
+    }
+
+    // False-positive guard: normal Claude chat discussing MCP server approval alongside live chat chrome.
+    let normal_claude_chat = "\
+Added detection for 'Continue without using this MCP server' and 'Use this and all future MCP servers in this project'.
+────────────────────────────────────────
+❯ 
+────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+";
+    assert_eq!(
+        detect_folder_trust_prompt(AgentKind::Claude, normal_claude_chat),
+        None
+    );
+    let r_ok = check_injection_gate_with_screen(
+        &p,
+        &[],
+        SessionState::Idle,
+        AgentKind::Claude,
+        "❯ ",
+        Some(normal_claude_chat),
+        &cfg,
+        NOW,
+    );
+    assert!(r_ok.passed, "{r_ok:?}");
+}
+
+#[test]
 fn gate_blocks_codex_update_available_startup_modal() {
     let p = pane("%1");
     let cfg = GateConfig::default();

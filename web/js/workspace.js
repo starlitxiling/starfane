@@ -30,12 +30,16 @@ import {
   errorBanner,
   field,
   fmtBytes,
+  fmtMs,
   h,
+  isFin,
   skeleton,
   span,
   statusInd,
   toast,
   tpsOf,
+  ttftOf,
+  ttftTone,
 } from './dom.js';
 import {
   act,
@@ -48,6 +52,7 @@ import {
   loadSessionOutput,
   loadSlashCommands,
   loadTranscript,
+  prefetchSessionOutput,
   probeHostApi,
   qs,
   sessionNeedsLiveTail,
@@ -71,8 +76,10 @@ import { L, getLang } from './i18n.js';
 import { canCloseSessionWindow, openCloseSessionModal, windowGroupKeyOf } from './overlays.js';
 import {
   APP,
+  OPTIMISTIC_EXPIRE_MS,
   S,
   UI,
+  addOptimisticTurn,
   base,
   currentSession,
   draft,
@@ -80,6 +87,7 @@ import {
   fmtRtt,
   formatRetryCountdown,
   groupDisplayName,
+  hasOptimisticTurn,
   hashMessage,
   hashStr,
   hostDisplayName,
@@ -92,14 +100,18 @@ import {
   pickDefaultSession,
   pvKeyOf,
   pvModeOf,
+  reconcileOptimisticTurns,
+  removeOptimisticTurn,
   rootSessions,
   rttTone,
   saveCollapsedGroups,
+  saveCollapsedHosts,
   sessionLabel,
   stateText,
   subagentDisplayName,
   subagentsOf,
   tmuxGroupOf,
+  updateOptimisticTurnStatus,
   upsertSession,
 } from './store.js';
 import {
@@ -110,9 +122,189 @@ import {
   parseTerminalTurns,
   renderChunkedTerminal,
 } from './terminal.js';
+import { isInteractivePromptSession, promptPreviewSourceFor, renderInteractivePromptBar } from './views.js';
+
+export { renderInteractivePromptBar };
 
 const TIMELINE_CHUNK_SIZE = 20;
+const HOVER_PREFETCH_MS = 120;
+const SIDEBAR_WIDTH_KEY = 'starfane_sidebar_width';
+const SIDEBAR_DEFAULT_W = 300;
+const SIDEBAR_MIN_W = 220;
+const SIDEBAR_MAX_W = 560;
 const composerDeliveryIssues = new Map();
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+export function sidebarMaxWidth() {
+  const vw = (typeof window !== 'undefined' && window.innerWidth) || 1440;
+  return Math.max(SIDEBAR_DEFAULT_W, Math.min(SIDEBAR_MAX_W, Math.floor(vw * 0.48)));
+}
+
+export function clampSidebarWidth(w) {
+  const maxW = sidebarMaxWidth();
+  return Math.round(Math.min(maxW, Math.max(SIDEBAR_MIN_W, Number.isFinite(w) ? w : SIDEBAR_DEFAULT_W)));
+}
+
+let hoverPrefetchTimer = 0;
+let hoverPrefetchSid = null;
+
+function cancelHoverPrefetch(sid = null) {
+  if (sid && hoverPrefetchSid !== sid) return;
+  if (hoverPrefetchTimer) {
+    clearTimeout(hoverPrefetchTimer);
+    hoverPrefetchTimer = 0;
+  }
+  hoverPrefetchSid = null;
+}
+
+function scheduleHoverPrefetch(s, e) {
+  if (e && e.pointerType === 'touch') return;
+  if (!s || !s.session_id || s.state === 'ended') return;
+  if (s.session_id === currentSession()?.session_id) return;
+  const hid = hostOf(s);
+  if (hid !== 'local' && S.hosts.get(hid)?.status === 'offline') return;
+  cancelHoverPrefetch();
+  hoverPrefetchSid = s.session_id;
+  hoverPrefetchTimer = setTimeout(() => {
+    hoverPrefetchTimer = 0;
+    const targetSid = hoverPrefetchSid;
+    hoverPrefetchSid = null;
+    if (!targetSid) return;
+    const latest = S.sessions.get(targetSid);
+    if (latest) prefetchSessionOutput(latest);
+  }, HOVER_PREFETCH_MS);
+}
+
+function prefetchTopMobileSessions(list) {
+  const curId = currentSession()?.session_id;
+  let picked = 0;
+  for (let i = 0; i < list.length && picked < 2; i++) {
+    const s = list[i];
+    if (!s || s.session_id === curId || s.state === 'ended') continue;
+    const hid = hostOf(s);
+    if (hid !== 'local' && S.hosts.get(hid)?.status === 'offline') continue;
+    picked++;
+    prefetchSessionOutput(s);
+  }
+}
+
+function wsSvg(attrs, kids = []) {
+  const el = document.createElementNS(SVG_NS, 'svg');
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v != null) el.setAttribute(k, String(v));
+  }
+  for (const [tag, pattrs] of kids) {
+    const child = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(pattrs)) {
+      if (v != null) child.setAttribute(k, String(v));
+    }
+    el.appendChild(child);
+  }
+  return el;
+}
+
+function closeCrossIcon() {
+  return wsSvg({
+    class: 'ws-close-ico',
+    viewBox: '0 0 16 16',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '2.1',
+    'stroke-linecap': 'round',
+    'aria-hidden': 'true',
+  }, [
+    ['path', { d: 'M4 4L12 12' }],
+    ['path', { d: 'M12 4L4 12' }],
+  ]);
+}
+
+function menuDrawerIcon() {
+  return wsSvg({
+    class: 'ws-head-ico',
+    viewBox: '0 0 20 20',
+    width: '18',
+    height: '18',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.85',
+    'stroke-linecap': 'round',
+    'aria-hidden': 'true',
+  }, [
+    ['line', { x1: 3, y1: 5.5, x2: 17, y2: 5.5 }],
+    ['line', { x1: 3, y1: 10, x2: 17, y2: 10 }],
+    ['line', { x1: 3, y1: 14.5, x2: 13, y2: 14.5 }],
+  ]);
+}
+
+function outlineListIcon() {
+  return wsSvg({
+    class: 'ws-head-ico',
+    viewBox: '0 0 20 20',
+    width: '15',
+    height: '15',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.85',
+    'stroke-linecap': 'round',
+    'aria-hidden': 'true',
+  }, [
+    ['line', { x1: 7, y1: 5.5, x2: 17, y2: 5.5 }],
+    ['line', { x1: 7, y1: 10, x2: 17, y2: 10 }],
+    ['line', { x1: 7, y1: 14.5, x2: 14.5, y2: 14.5 }],
+    ['circle', { cx: 3.75, cy: 5.5, r: 0.9, fill: 'currentColor', stroke: 'none' }],
+    ['circle', { cx: 3.75, cy: 10, r: 0.9, fill: 'currentColor', stroke: 'none' }],
+    ['circle', { cx: 3.75, cy: 14.5, r: 0.9, fill: 'currentColor', stroke: 'none' }],
+  ]);
+}
+
+function modeSwitchIcon(toRaw) {
+  if (toRaw) {
+    return wsSvg({
+      class: 'ws-head-ico',
+      viewBox: '0 0 20 20',
+      width: '14',
+      height: '14',
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': '1.85',
+      'stroke-linecap': 'round',
+      'stroke-linejoin': 'round',
+      'aria-hidden': 'true',
+    }, [
+      ['rect', { x: 2.5, y: 3.5, width: 15, height: 13, rx: 2.5 }],
+      ['path', { d: 'M6.5 8L9.2 10.2L6.5 12.4' }],
+      ['line', { x1: 10.8, y1: 12.4, x2: 13.8, y2: 12.4 }],
+    ]);
+  }
+  return wsSvg({
+    class: 'ws-head-ico',
+    viewBox: '0 0 20 20',
+    width: '14',
+    height: '14',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.85',
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+    'aria-hidden': 'true',
+  }, [
+    ['rect', { x: 3.5, y: 3, width: 13, height: 14, rx: 2 }],
+    ['line', { x1: 6.5, y1: 7.2, x2: 13.5, y2: 7.2 }],
+    ['line', { x1: 6.5, y1: 10.2, x2: 13.5, y2: 10.2 }],
+    ['line', { x1: 6.5, y1: 13.2, x2: 11, y2: 13.2 }],
+  ]);
+}
+
+function buildMobCtxEl(s) {
+  const pctVal = ctxPctOf(s?.metrics);
+  if (pctVal == null) return h('span', { class: 'ws-mob-ctx ws-hidden', 'data-mob-tel-sid': s?.session_id || '' });
+  const tone = ctxTone(pctVal);
+  const toneCls = tone === 'high' ? ' ws-tel-high' : tone === 'warn' ? ' ws-tel-warn' : '';
+  return h('span', {
+    class: `ws-mob-ctx${toneCls}`,
+    'data-mob-tel-sid': s?.session_id || '',
+  }, `CTX ${Math.round(pctVal)}%`);
+}
 
 function describeDeliveryIssue(r) {
   if (!r || typeof r !== 'object') {
@@ -180,7 +372,7 @@ export function updateOutputClock(sessionId) {
 function telemetrySigOf(s) {
   const m = s?.metrics;
   if (!m) return `${s?.session_id || ''}:none:${getLang()}`;
-  return `${s.session_id}:${m.source || ''}:${m.context_used_pct ?? ''}:${m.context_used_tokens ?? ''}:${m.context_window_tokens ?? ''}:${m.tps ?? ''}:${m.ttft_ms ?? ''}:${m.total_input_tokens ?? ''}:${m.total_output_tokens ?? ''}:${m.last_output_tokens ?? ''}:${m.last_duration_ms ?? ''}:${getLang()}`;
+  return `${s.session_id}:${m.source || ''}:${m.context_used_pct ?? ''}:${m.context_used_tokens ?? ''}:${m.context_window_tokens ?? ''}:${m.tps ?? ''}:${m.ttft_ms ?? ''}:${m.avg_ttft_ms ?? ''}:${m.recent_turns?.length || 0}:${m.recent_turns?.at(-1)?.ts_ms || 0}:${m.total_input_tokens ?? ''}:${m.total_output_tokens ?? ''}:${m.last_output_tokens ?? ''}:${m.last_duration_ms ?? ''}:${getLang()}`;
 }
 
 export function patchTelemetryStrip(sessionId) {
@@ -192,6 +384,8 @@ export function patchTelemetryStrip(sessionId) {
     const nextTelSig = telemetrySigOf(s);
     if (W && W.telSig === nextTelSig) return;
     el.replaceWith(buildTelemetryStrip(s));
+    const mobCtx = W?.headEl?.querySelector('.ws-mob-ctx[data-mob-tel-sid]');
+    if (mobCtx && mobCtx.dataset.mobTelSid === sessionId) mobCtx.replaceWith(buildMobCtxEl(s));
     if (W) W.telSig = nextTelSig;
   }
 }
@@ -384,6 +578,22 @@ function syncOutlineRail(W, s, effectiveMode) {
   const isShell = s.agent === 'shell';
   const cached = isShell ? { prompts: [], sig: 'empty' } : collectUserPromptsCached(s);
   const prompts = cached.prompts;
+  const showMobToc = effectiveMode === 'reading' && prompts.length > 0;
+  const mobBtn = W.mobOutlineBtn || W.headEl?.querySelector('.ws-outline-mob-btn');
+  if (mobBtn) {
+    mobBtn.classList.toggle('ws-hidden', !showMobToc);
+    if (showMobToc) {
+      const cntStr = String(prompts.length);
+      if (mobBtn.dataset.cnt !== cntStr) {
+        mobBtn.dataset.cnt = cntStr;
+        const cntEl = mobBtn.querySelector('.ws-outline-cnt');
+        if (cntEl) cntEl.textContent = cntStr;
+      }
+      const lbl = L(`打开提问目录（${prompts.length} 条）`, `Open prompt outline (${prompts.length})`);
+      mobBtn.setAttribute('aria-label', lbl);
+      mobBtn.title = lbl;
+    }
+  }
   const railSig = `${s.session_id}|${effectiveMode}|${UI.outlineCollapsed ? 1 : 0}|${getLang()}|${cached.sig}`;
   if (W.railSig !== railSig || (!UI.outlineCollapsed && prompts.length > 0 && effectiveMode === 'reading' && !W.rail?.isConnected)) {
     W.railSig = railSig;
@@ -399,6 +609,38 @@ function syncOutlineRail(W, s, effectiveMode) {
   }
 }
 
+function syncInteractivePromptBar(W, s) {
+  if (!W?.promptBarSlot) return;
+  if (!isInteractivePromptSession(s)) {
+    if (W.promptBarSig || !W.promptBarSlot.classList.contains('ws-hidden')) {
+      W.promptBarSig = '';
+      W.promptBarSlot.classList.add('ws-hidden');
+      W.promptBarSlot.replaceChildren();
+    }
+    return;
+  }
+  const sid = s.session_id;
+  const pvSrc = promptPreviewSourceFor(s);
+  const busySig = [
+    UI.busy.has(`key:${sid}`) ? 1 : 0,
+    UI.busy.has(`key:${sid}:Up`) ? 1 : 0,
+    UI.busy.has(`key:${sid}:Down`) ? 1 : 0,
+    UI.busy.has(`key:${sid}:Enter`) ? 1 : 0,
+    UI.busy.has(`key:${sid}:Escape`) ? 1 : 0,
+  ].join('');
+  const sig = `${sid}|${s.state}|${s.pane || ''}|${hashStr(s.last_error || '')}|${pvSrc.hash}|${busySig}|${UI.termGlyphMode}:${effectiveGlyphMode()}|${getLang()}`;
+  if (W.promptBarSig === sig && !W.promptBarSlot.classList.contains('ws-hidden')) return;
+  W.promptBarSig = sig;
+  const node = renderInteractivePromptBar(s, { variant: 'workspace' });
+  if (node) {
+    W.promptBarSlot.classList.remove('ws-hidden');
+    W.promptBarSlot.replaceChildren(node);
+  } else {
+    W.promptBarSlot.classList.add('ws-hidden');
+    W.promptBarSlot.replaceChildren();
+  }
+}
+
 export function notifyOutputUpdated(sessionId) {
   if (UI.view !== 'workspace' || currentSession()?.session_id !== sessionId) { APP.schedulePassive(); return; }
   const W = UI.wsShell;
@@ -411,7 +653,10 @@ export function notifyOutputUpdated(sessionId) {
   }
   syncOutputViewport(vp, s);
   updateOutputClock(sessionId);
-  if (W) syncOutlineRail(W, s, effMode);
+  if (W) {
+    syncOutlineRail(W, s, effMode);
+    syncInteractivePromptBar(W, s);
+  }
 }
 
 export function ackSessionError(s) {
@@ -426,6 +671,7 @@ export function ackSessionError(s) {
 
 function sessionAlertBanner(s) {
   if (!s || (s.state !== 'error' && !s.last_error)) return null;
+  if (isInteractivePromptSession(s)) return null;
   const detail = s.last_error || L('Agent 上报了错误状态，请查看下方终端实时行或事件记录。', 'Agent reported an error state — check the live terminal tail or recent events below.');
   return h('div', { class: 'callout err' },
     h('div', { class: 'stack-xs grow' },
@@ -434,13 +680,17 @@ function sessionAlertBanner(s) {
     btn(L('清除异常状态', 'Clear error state'), { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => ackSessionError(s) }));
 }
 
-function buildRttPill(rttMs) {
+function buildRttPill(rttMs, syncMs = null) {
   if (typeof rttMs !== 'number' || !Number.isFinite(rttMs) || rttMs < 0) return null;
   const label = fmtRtt(rttMs);
   if (!label) return null;
+  const hasSync = typeof syncMs === 'number' && Number.isFinite(syncMs) && syncMs >= 0;
+  const title = hasSync
+    ? L(`网络延迟 ${Math.round(rttMs)}ms · 同步耗时 ${Math.round(syncMs)}ms`, `Network RTT ${Math.round(rttMs)}ms · Sync ${Math.round(syncMs)}ms`)
+    : L(`往返延迟 ${label}`, `Round-trip latency ${label}`);
   return h('span', {
     class: `tag mono rtt-pill rtt-${rttTone(rttMs)}`,
-    title: L(`往返延迟 ${label}`, `Round-trip latency ${label}`),
+    title,
   }, label);
 }
 
@@ -609,6 +859,56 @@ const INTERMEDIATE_COLLAPSE_CHARS = 280;
 const LEGACY_MID_COLLAPSE_LINES = 8;
 const LEGACY_MID_COLLAPSE_CHARS = 400;
 
+const SWARM_FALLBACK_TOOLS = new Set(['swarm_wait', 'TeamCreate']);
+const SUBAGENT_FALLBACK_TOOLS = new Set([
+  'invoke_subagent',
+  'run_workflow',
+  'Agent',
+  'Task',
+  'SendMessage',
+  'spawn_agent',
+  'wait_agent',
+  'resume_agent',
+  'spawn_session',
+  'create_handoff',
+  'start_pipeline',
+]);
+
+function toolLeafName(name) {
+  const raw = String(name || '').trim();
+  if (!raw) return '';
+  const afterDunder = raw.includes('__') ? raw.slice(raw.lastIndexOf('__') + 2) : raw;
+  const afterDot = afterDunder.includes('.') ? afterDunder.slice(afterDunder.lastIndexOf('.') + 1) : afterDunder;
+  return afterDot.includes(':') ? afterDot.slice(afterDot.lastIndexOf(':') + 1) : afterDot;
+}
+
+function delegationKindOf(msg) {
+  if (!msg || msg.role !== 'assistant') return null;
+  if (msg.delegation === 'swarm' || msg.delegation === 'subagent') return msg.delegation;
+  if (!Array.isArray(msg.tools) || !msg.tools.length) return null;
+  let foundSubagent = false;
+  for (let i = 0; i < msg.tools.length; i++) {
+    const leaf = toolLeafName(msg.tools[i]);
+    if (!leaf) continue;
+    if (SWARM_FALLBACK_TOOLS.has(leaf)) return 'swarm';
+    if (SUBAGENT_FALLBACK_TOOLS.has(leaf)) foundSubagent = true;
+  }
+  return foundSubagent ? 'subagent' : null;
+}
+
+function buildDelegationPill(kind) {
+  if (!kind) return null;
+  const label = kind === 'swarm'
+    ? L('Swarm 协作派发', 'Swarm Delegated')
+    : L('子代理派发', 'Subagent Delegated');
+  const title = kind === 'swarm'
+    ? L('该回复已向 Swarm 协作组派发后台任务', 'This turn delegated background work to a Swarm worker')
+    : L('该回复已派发子代理在后台执行任务', 'This turn delegated background work to a subagent');
+  return h('span', { class: `msg-delegation-pill is-${kind}`, title },
+    h('i', { class: 'msg-delegation-dot', 'aria-hidden': 'true' }),
+    label);
+}
+
 function classifyCollapsibleAssistant(msg, hasLaterAssistantInTurn) {
   if (!msg || msg.role !== 'assistant') return null;
   const raw = String(msg.text || '');
@@ -707,6 +1007,8 @@ function renderMessageCard(s, msg, absSeq, userIdx = null, hasLaterAssistantInTu
     },
   }, L('引用', 'Quote')) : null);
 
+  const delegation = isUser ? null : delegationKindOf(msg);
+  const delCls = delegation ? ` is-delegation is-delegation-${delegation}` : '';
   const collapsible = classifyCollapsibleAssistant(msg, hasLaterAssistantInTurn);
   if (collapsible) {
     const midKey = `mid:${s.session_id}:${msg.ts_ms || absSeq}:${hashStr(String(msg.text || '').slice(0, 120))}`;
@@ -715,7 +1017,7 @@ function renderMessageCard(s, msg, absSeq, userIdx = null, hasLaterAssistantInTu
     const bodyEl = h('div', { class: 'msg-mid-body' });
     let bodyRendered = false;
     const summaryEl = h('summary', { class: 'msg-mid-summary' },
-      h('i', { class: `dot agent-dot-${s.agent || 'x'}` }),
+      h('i', { class: `dot ${delegation ? 'msg-delegation-dot' : `agent-dot-${s.agent || 'x'}`}` }),
       span('msg-mid-tag', collapsible.tag),
       span('msg-mid-preview trunc grow', summarizeCollapsePreview(msg.text)),
       span('msg-mid-meta tabular', metaText),
@@ -739,7 +1041,8 @@ function renderMessageCard(s, msg, absSeq, userIdx = null, hasLaterAssistantInTu
         h('div', { class: 'msg-mid-body-head' },
           h('span', { class: 'row' },
             span(`tag a-${s.agent || 'x'}`, agentName),
-            meLabel ? span('mono muted', meLabel) : null),
+            meLabel ? span('mono muted', meLabel) : null,
+            buildDelegationPill(delegation)),
           h('span', { class: 'row' }, makeQuoteBtn())),
         renderMarkdown(msg.text),
       );
@@ -755,14 +1058,18 @@ function renderMessageCard(s, msg, absSeq, userIdx = null, hasLaterAssistantInTu
       summaryEl.addEventListener('click', () => { if (!detailsEl.open) hydrateMid(); });
       detailsEl.addEventListener('toggle', () => { if (detailsEl.open) hydrateMid(); });
     }
-    cardEl = h('article', { class: 'msg-card intermediate' }, detailsEl);
+    cardEl = h('article', {
+      class: `msg-card intermediate${delCls}`,
+      'data-delegation': delegation || null,
+    }, detailsEl);
     return cardEl;
   }
 
   const turnIdxEl = isUser && userIdx != null ? span('turn-idx', `#${userIdx}`) : null;
   cardEl = h('article', {
-    class: `msg-card ${isUser ? 'user' : 'assistant'}`,
+    class: `msg-card ${isUser ? 'user' : 'assistant'}${delCls}`,
     id: isUser && userIdx != null ? `turn-u-${userIdx}` : null,
+    'data-delegation': delegation || null,
   },
   h('div', { class: 'msg-head' },
     isUser
@@ -770,9 +1077,18 @@ function renderMessageCard(s, msg, absSeq, userIdx = null, hasLaterAssistantInTu
       : h('span', { class: 'row' },
         h('i', { class: `dot agent-dot-${s.agent || 'x'}` }),
         span(`tag a-${s.agent || 'x'}`, agentName),
-        meLabel ? span('mono muted', meLabel) : null),
+        meLabel ? span('mono muted', meLabel) : null,
+        buildDelegationPill(delegation)),
     h('span', { class: 'row' }, makeQuoteBtn(), msg.ts_ms ? span('tabular dim', clock(msg.ts_ms)) : null)),
-  msg.text ? renderMarkdown(msg.text) : (tools.length ? h('div', { class: 'muted', style: 'font-size:13px' }, L('正在调用工具…', 'Calling tools…')) : null),
+  msg.text
+    ? renderMarkdown(msg.text)
+    : (delegation
+      ? h('div', { class: 'msg-delegation-pending' },
+        h('i', { class: 'msg-delegation-dot', 'aria-hidden': 'true' }),
+        delegation === 'swarm'
+          ? L('已派发 Swarm 协作任务，正在后台执行…', 'Delegated to Swarm worker, running in background…')
+          : L('已派发子代理，正在后台执行…', 'Delegated to subagent, running in background…'))
+      : (tools.length ? h('div', { class: 'muted', style: 'font-size:13px' }, L('正在调用工具…', 'Calling tools…')) : null)),
   tools.length ? h('details', { class: 'msg-tools', 'data-k': tKey, open: UI.open.has(tKey) },
     h('summary', null, L(`调用了 ${tools.length} 个工具`, `Used ${tools.length} tool${tools.length === 1 ? '' : 's'}`)),
     h('div', { class: 'msg-tool-list' }, tools.map((t) => span('tag mono', t)))) : null);
@@ -855,24 +1171,79 @@ function syncChildrenMinimal(parent, desired) {
   parent.replaceChildren(...desired);
 }
 
+function optimisticTurnsFor(sid) {
+  return (sid && UI.optimisticTurns.get(sid)) || [];
+}
+
+function optimisticSigOf(sid, lang) {
+  const list = optimisticTurnsFor(sid);
+  if (!list.length) return '';
+  return `${lang}:${list.map((o) => `${o.nonce}:${o.status}`).join(',')}`;
+}
+
+function renderOptimisticCard(entry) {
+  const isSending = entry.status === 'sending';
+  const statusLabel = isSending
+    ? L('发送中…', 'Sending…')
+    : L('已送达 · 思考中…', 'Delivered · Thinking…');
+  const atts = Array.isArray(entry.attachments) ? entry.attachments : [];
+  return h('article', {
+    class: `msg-card user is-optimistic is-opt-${entry.status}`,
+    'data-opt-nonce': entry.nonce,
+  },
+  h('div', { class: 'msg-head' },
+    h('span', { class: 'row' },
+      span('msg-user-tag', L('你', 'You')),
+      h('span', { class: `msg-opt-chip${isSending ? ' is-sending' : ' is-sent'}` },
+        h('i', { class: `msg-opt-dot${isSending ? ' is-sending' : ' is-sent'}`, 'aria-hidden': 'true' }),
+        statusLabel)),
+    entry.created_ms ? span('tabular dim', clock(entry.created_ms)) : null),
+  entry.text ? renderMarkdown(entry.text) : null,
+  atts.length ? h('div', { class: 'msg-opt-atts' }, atts.map((a) => span(
+    'tag mono',
+    a.token || a.title || (a.kind === 'image' ? L('图片', 'Image') : L('粘贴片段', 'Paste')),
+  ))) : null);
+}
+
+function renderOptimisticCards(sid) {
+  const list = optimisticTurnsFor(sid);
+  return list.length ? list.map(renderOptimisticCard) : [];
+}
+
+function resolveLiveTailSource(s, tr, pv) {
+  const trTail = typeof tr?.live_tail === 'string'
+    ? { text: tr.live_tail, hash: hashStr(tr.live_tail), updatedMs: tr.liveTailUpdatedMs || tr.updatedMs || 0 }
+    : null;
+  const mapTail = S.liveTails.get(s.session_id) || null;
+  const sseTail = trTail && mapTail
+    ? (trTail.updatedMs >= mapTail.updatedMs ? trTail : mapTail)
+    : (trTail || mapTail);
+  const useSse = Boolean(sseTail && typeof sseTail.text === 'string' && (!pv?.text || sseTail.updatedMs >= (pv.updatedMs || 0)));
+  if (useSse) return { rawText: sseTail.text, hashPart: `sse:${sseTail.hash}` };
+  return { rawText: pv?.text || '', hashPart: pv?.hash || '' };
+}
+
 function createTimelineView(sid) {
   const alertSlot = h('div', { class: 'timeline-slot timeline-alert-slot' });
   const historySlot = h('div', { class: 'timeline-slot timeline-history-slot' });
   const chunksEl = h('div', { class: 'timeline-chunks' });
+  const optimisticSlot = h('div', { class: 'timeline-slot timeline-optimistic-slot' });
   const tailSlot = h('div', { class: 'timeline-slot timeline-tail-slot' });
-  const root = h('div', { class: 'timeline' }, alertSlot, historySlot, chunksEl, tailSlot);
+  const root = h('div', { class: 'timeline' }, alertSlot, historySlot, chunksEl, optimisticSlot, tailSlot);
   return {
     sid,
     root,
     alertSlot,
     historySlot,
     chunksEl,
+    optimisticSlot,
     tailSlot,
     chunkMap: new Map(),
     chunkOrder: [],
     errSig: '',
     historySig: '',
     messagesSig: '',
+    optSig: '',
     tailSig: '',
     tailKey: '',
     tailDetails: null,
@@ -920,7 +1291,7 @@ function reconcileTimelineChunks(tv, s, tr) {
     const userIdx = msg.role === 'user' ? ++uIdx : null;
     const hasLater = hasLaterAssistant[i];
     const effectiveHasLater = msg.role === 'assistant' && !msg.kind && hasLater;
-    const cardSig = `${hashMessage(msg)}|${effectiveHasLater ? 1 : 0}|${cardCtxSig}`;
+    const cardSig = `${hashMessage(msg)}|${delegationKindOf(msg) || ''}|${effectiveHasLater ? 1 : 0}|${cardCtxSig}`;
     arr.push({ absSeq, msg, userIdx, hasLater, cardSig });
   }
 
@@ -971,9 +1342,9 @@ function reconcileTimelineChunks(tv, s, tr) {
   syncChildrenMinimal(tv.chunksEl, desiredChunkEls);
 }
 
-function patchLiveTail(tv, s, pv, autoOpenTail, tailSig) {
+function patchLiveTail(tv, s, rawTailText, autoOpenTail, tailSig) {
   tv.tailSig = tailSig;
-  const tailText = pv?.text ? extractLiveTail(pv.text, LIVE_TAIL_LINES) : '';
+  const tailText = rawTailText ? extractLiveTail(rawTailText, LIVE_TAIL_LINES) : '';
   const tailKey = `tail:${s.session_id}`;
   if (!tailText) {
     if (tv.tailDetails) {
@@ -1013,7 +1384,7 @@ function patchLiveTail(tv, s, pv, autoOpenTail, tailSig) {
   tv.prevAutoOpenTail = autoOpenTail;
 }
 
-function computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, errSig, lang) {
+function computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, errSig, optSig, lang) {
   const staleSig = pv?.staleErr ? hashStr(pv.staleErr) : '';
   if (mode === 'raw') {
     if (!pane) return `raw:nopane:${s.session_id}:${errSig}:${lang}`;
@@ -1023,16 +1394,16 @@ function computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, err
     return `raw:ok:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
   }
   if (!pane) {
-    if (tr?.state === 'loading') return `read:trload:${s.session_id}:${errSig}:${lang}`;
-    if (s.last_message) return `read:last:${s.session_id}:${hashStr(s.last_message)}:${errSig}:${lang}`;
-    return `read:empty:${s.session_id}:${errSig}:${lang}`;
+    if (tr?.state === 'loading' && !optSig) return `read:trload:${s.session_id}:${errSig}:${lang}`;
+    if (s.last_message) return `read:last:${s.session_id}:${hashStr(s.last_message)}:${errSig}:${optSig}:${lang}`;
+    return `read:empty:${s.session_id}:${errSig}:${optSig}:${lang}`;
   }
-  if ((!pv || (pv.state === 'loading' && !pv.text)) && (!tr || tr.state === 'loading')) {
+  if ((!pv || (pv.state === 'loading' && !pv.text)) && (!tr || tr.state === 'loading') && !optSig) {
     return `read:loading:${s.session_id}:${curPvMode}:${errSig}:${lang}`;
   }
-  if (pv?.state === 'err' && !pv.text) return `read:err:${pane}:${curPvMode}:${pv.err}:${errSig}:${lang}`;
-  if (!pv?.text?.trim()) return `read:empty:${pane}:${curPvMode}:${errSig}:${lang}`;
-  return `read:pv:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
+  if (pv?.state === 'err' && !pv.text) return `read:err:${pane}:${curPvMode}:${pv.err}:${errSig}:${optSig}:${lang}`;
+  if (!pv?.text?.trim()) return `read:empty:${pane}:${curPvMode}:${errSig}:${optSig}:${lang}`;
+  return `read:pv:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${optSig}:${lang}`;
 }
 
 export function buildOutputBody(s) {
@@ -1047,6 +1418,8 @@ export function buildOutputBody(s) {
   const hid = hostOf(s);
   const hStatus = isRemoteHost(hid) ? (S.hosts.get(hid)?.status || 'online') : 'online';
   const errSig = `${s.state}:${hashStr(s.last_error || '')}:${UI.busy.has(`ack:${s.session_id}`) ? 1 : 0}:${hStatus}:${UI.busy.has(`probe-host:${hid}`) ? 1 : 0}`;
+  const optSig = mode === 'reading' ? optimisticSigOf(s.session_id, lang) : '';
+  const optCards = optSig ? renderOptimisticCards(s.session_id) : [];
   const alertBanner = sessionAlertBanner(s);
   const pvStaleBanner = pv?.staleErr
     ? buildStaleBanner(s, pv.staleErr, () => loadPreview(pane, { mode: curPvMode, silent: false }))
@@ -1104,45 +1477,52 @@ export function buildOutputBody(s) {
     const tv = createTimelineView(s.session_id);
     const trStaleErr = tr.staleErr || pv?.staleErr || '';
     const trStaleBanner = trStaleErr
-      ? buildStaleBanner(s, trStaleErr, () => loadSessionOutput(s, { silent: false, forcePreview: Boolean(pv?.staleErr) }))
+      ? buildStaleBanner(s, trStaleErr, () => loadSessionOutput(s, { silent: false, forcePreview: Boolean(pv?.staleErr), force: true }))
       : null;
     const alertNodes = [alertBanner, trStaleBanner].filter(Boolean);
     if (alertNodes.length) tv.alertSlot.replaceChildren(...alertNodes);
     const hb = buildHistoryBar(s, tr);
     if (hb) tv.historySlot.replaceChildren(hb);
     reconcileTimelineChunks(tv, s, tr);
-    patchLiveTail(tv, s, pv, sessionNeedsLiveTail(s, tr), `${pv?.hash || ''}:${glyphSig}`);
+    if (optCards.length) tv.optimisticSlot.replaceChildren(...optCards);
+    const tailSrc = resolveLiveTailSource(s, tr, pv);
+    patchLiveTail(tv, s, tailSrc.rawText, sessionNeedsLiveTail(s, tr), `${tailSrc.hashPart}:${glyphSig}`);
     return {
-      sig: `read:tr:${s.session_id}:${tr.hash}:${hashStr(trStaleErr)}:${errSig}:${lang}`,
+      sig: `read:tr:${s.session_id}:${tr.hash}:${hashStr(trStaleErr)}:${errSig}:${optSig}:${lang}`,
       sourceLabel: L('对话记录', 'Transcript'),
       node: tv.root,
     };
   }
 
   if (!pane) {
-    if (tr?.state === 'loading') return { sig: `read:trload:${s.session_id}:${errSig}:${lang}`, sourceLabel: L('阅读视图', 'Reading view'), node: h('div', { class: 'timeline' }, alertBanner, skeleton(5)) };
-    if (s.last_message) return { sig: `read:last:${s.session_id}:${hashStr(s.last_message)}:${errSig}:${lang}`, sourceLabel: L('最近摘要', 'Latest summary'), node: h('div', { class: 'timeline' }, alertBanner, renderMessageCard(s, { role: 'assistant', text: s.last_message }, 0)) };
+    if (tr?.state === 'loading' && !optCards.length) return { sig: `read:trload:${s.session_id}:${errSig}:${lang}`, sourceLabel: L('阅读视图', 'Reading view'), node: h('div', { class: 'timeline' }, alertBanner, skeleton(5)) };
+    if (s.last_message) return { sig: `read:last:${s.session_id}:${hashStr(s.last_message)}:${errSig}:${optSig}:${lang}`, sourceLabel: L('最近摘要', 'Latest summary'), node: h('div', { class: 'timeline' }, alertBanner, renderMessageCard(s, { role: 'assistant', text: s.last_message }, 0), ...optCards) };
+    if (optCards.length) return { sig: `read:empty:${s.session_id}:${errSig}:${optSig}:${lang}`, sourceLabel: L('阅读视图', 'Reading view'), node: h('div', { class: 'timeline' }, alertBanner, ...optCards) };
     return { sig: `read:empty:${s.session_id}:${errSig}:${lang}`, sourceLabel: L('阅读视图', 'Reading view'), node: h('div', { class: 'timeline' }, alertBanner, emptyState(L('暂无可阅读内容', 'Nothing to read yet'), L('该会话尚未产生对话记录且未绑定终端 pane。', 'This session has no transcript yet and no terminal pane attached.'))) };
   }
-  if ((!pv || (pv.state === 'loading' && !pv.text)) && (!tr || tr.state === 'loading')) {
+  if ((!pv || (pv.state === 'loading' && !pv.text)) && (!tr || tr.state === 'loading') && !optCards.length) {
     return { sig: `read:loading:${s.session_id}:${curPvMode}:${errSig}:${lang}`, sourceLabel: L('阅读视图', 'Reading view'), node: h('div', { class: 'timeline' }, alertBanner, skeleton(6)) };
   }
   if (pv?.state === 'err' && !pv.text) {
     return {
-      sig: `read:err:${pane}:${curPvMode}:${pv.err}:${errSig}:${lang}`,
+      sig: `read:err:${pane}:${curPvMode}:${pv.err}:${errSig}:${optSig}:${lang}`,
       sourceLabel: L('终端 Markdown', 'Terminal Markdown'),
       node: h('div', { class: 'timeline' },
         alertBanner,
-        errorBanner(L(`读取终端失败：${pv.err}`, `Failed to read terminal: ${pv.err}`), L('重试获取终端', 'Retry terminal'), () => loadSessionOutput(s, { silent: false, forcePreview: true })),
-        s.last_message ? renderMessageCard(s, { role: 'assistant', text: s.last_message }, 0) : null),
+        errorBanner(L(`读取终端失败：${pv.err}`, `Failed to read terminal: ${pv.err}`), L('重试获取终端', 'Retry terminal'), () => loadSessionOutput(s, { silent: false, forcePreview: true, force: true })),
+        s.last_message ? renderMessageCard(s, { role: 'assistant', text: s.last_message }, 0) : null,
+        ...optCards),
     };
   }
   if (!pv?.text?.trim()) {
+    if (optCards.length) {
+      return { sig: `read:empty:${pane}:${curPvMode}:${errSig}:${optSig}:${lang}`, sourceLabel: L('阅读视图', 'Reading view'), node: h('div', { class: 'timeline' }, alertBanner, ...optCards) };
+    }
     return { sig: `read:empty:${pane}:${curPvMode}:${errSig}:${lang}`, sourceLabel: L('终端 Markdown', 'Terminal Markdown'), node: h('div', { class: 'timeline' }, alertBanner, emptyState(L('终端暂无可见输出', 'No visible terminal output'), s.last_message || L('向下方输入框发送一条消息试试。', 'Try sending a message from the composer below.'))) };
   }
   const turns = parseTerminalTurns(pv.text, s.agent);
   const fallbackToolbar = buildRawToolbar(pane, curPvMode, pv.text.split('\n').length, pv);
-  const pvSig = `read:pv:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${lang}`;
+  const pvSig = `read:pv:${pane}:${curPvMode}:${pv.hash}:${staleSig}:${glyphSig}:${errSig}:${UI.busy.has(`pvmore:${pane}`) ? 1 : 0}:${optSig}:${lang}`;
   if (!turns.length) {
     return {
       sig: pvSig,
@@ -1152,20 +1532,22 @@ export function buildOutputBody(s) {
         fallbackToolbar,
         pvStaleBanner,
         buildRawOlderBar(pane, pv),
-        h('article', { class: 'msg-card assistant' }, renderChunkedTerminal(formatTerminalText(pv.text)))),
+        h('article', { class: 'msg-card assistant' }, renderChunkedTerminal(formatTerminalText(pv.text))),
+        ...optCards),
     };
   }
   return {
     sig: pvSig,
     sourceLabel: L('终端 Markdown', 'Terminal Markdown'),
-    node: h('div', { class: 'timeline' }, alertBanner, fallbackToolbar, pvStaleBanner, buildRawOlderBar(pane, pv), renderTimelineCards(s, turns)),
+    node: h('div', { class: 'timeline' }, alertBanner, fallbackToolbar, pvStaleBanner, buildRawOlderBar(pane, pv), renderTimelineCards(s, turns), ...optCards),
   };
 }
 
 /**
  * Signature-first, decoupled output viewport synchronizer:
- * - In structured transcript mode, `.timeline-chunks` and `.live-tail` are completely decoupled;
- *   tail ticks patch `<pre>.textContent` in-place with ZERO `.msg-card` destruction or Markdown parsing.
+ * - In structured transcript mode, `.timeline-chunks`, `.timeline-optimistic-slot`, and `.live-tail`
+ *   are completely decoupled; tail ticks patch `<pre>.textContent` in-place with ZERO `.msg-card`
+ *   destruction or Markdown parsing.
  * - Message updates reconcile only changed/appended/prepended cards inside 20-card `.timeline-chunk`s.
  * - In raw/fallback modes, computes signature BEFORE building any DOM so unchanged renders are O(1).
  */
@@ -1181,34 +1563,44 @@ function syncOutputViewport(vp, s) {
   const hid = hostOf(s);
   const hStatus = isRemoteHost(hid) ? (S.hosts.get(hid)?.status || 'online') : 'online';
   const baseErrSig = `${s.state}:${hashStr(s.last_error || '')}:${UI.busy.has(`ack:${s.session_id}`) ? 1 : 0}:${hStatus}:${UI.busy.has(`probe-host:${hid}`) ? 1 : 0}:${lang}`;
+  const optSig = mode === 'reading' ? optimisticSigOf(s.session_id, lang) : '';
   const sameView = vp.dataset.sid === s.session_id && vp.dataset.mode === mode;
   const isTranscript = mode === 'reading' && tr?.state === 'ok' && tr.source === 'transcript' && tr.messages.length > 0;
+  const forceBottom = UI.forceScrollBottomSid === s.session_id;
+  if (forceBottom) UI.forceScrollBottomSid = null;
 
   if (isTranscript) {
     const autoOpenTail = sessionNeedsLiveTail(s, tr);
     const tailOpen = UI.open.has(`tail:${s.session_id}`) || autoOpenTail;
     const staleErr = tr.staleErr || (tailOpen ? (pv?.staleErr || '') : '');
     const errSig = `${baseErrSig}:${hashStr(staleErr)}`;
-    const tailSig = `${pv?.hash || ''}:${glyphSig}:${autoOpenTail ? 1 : 0}:${paneDisplayId(s)}:${lang}`;
+    const tailSrc = resolveLiveTailSource(s, tr, pv);
+    const tailSig = `${tailSrc.hashPart}:${glyphSig}:${autoOpenTail ? 1 : 0}:${paneDisplayId(s)}:${lang}`;
     const historySig = `${tr.startSeq}:${tr.totalMessages}:${tr.messages.length}:${tr.hasMore ? 1 : 0}:${tr.explicitAll ? 1 : 0}:${tr.autoPollPaused ? 1 : 0}:${tr.latestTotalMessages || 0}:${UI.busy.has(`trmore:${s.session_id}`) ? 1 : 0}:${UI.busy.has(`trall:${s.session_id}`) ? 1 : 0}:${lang}`;
-    const messagesSig = `${s.session_id}:${s.agent}:${s.model || ''}:${s.effort || ''}:${s.is_subagent ? 1 : 0}:${s.state === 'ended' ? 1 : 0}:${tr.hash}:${lang}`;
-    const fullSig = `read:tr:${messagesSig}`;
+    let delSig = '';
+    for (let i = 0; i < tr.messages.length; i++) {
+      const dk = tr.messages[i]?.delegation;
+      if (dk) delSig += `${i}:${dk},`;
+    }
+    const messagesSig = `${s.session_id}:${s.agent}:${s.model || ''}:${s.effort || ''}:${s.is_subagent ? 1 : 0}:${s.state === 'ended' ? 1 : 0}:${tr.hash}:${delSig}:${lang}`;
+    const fullSig = `read:tr:${messagesSig}:${optSig}`;
     const renderAlertNodes = () => [
       sessionAlertBanner(s),
-      staleErr ? buildStaleBanner(s, staleErr, () => loadSessionOutput(s, { silent: false, forcePreview: Boolean(pv?.staleErr) })) : null,
+      staleErr ? buildStaleBanner(s, staleErr, () => loadSessionOutput(s, { silent: false, forcePreview: Boolean(pv?.staleErr), force: true })) : null,
     ].filter(Boolean);
 
     const tv = vp._tv;
     if (sameView && tv && tv.sid === s.session_id && tv.root.isConnected) {
-      if (tv.errSig === errSig && tv.historySig === historySig && tv.messagesSig === messagesSig && tv.tailSig === tailSig) {
+      if (tv.errSig === errSig && tv.historySig === historySig && tv.messagesSig === messagesSig && tv.optSig === optSig && tv.tailSig === tailSig) {
+        if (forceBottom) scrollViewportToBottom(vp);
         return;
       }
-      const onlyTailChanged = tv.errSig === errSig && tv.historySig === historySig && tv.messagesSig === messagesSig;
+      const onlyTailChanged = tv.errSig === errSig && tv.historySig === historySig && tv.messagesSig === messagesSig && tv.optSig === optSig;
       if (onlyTailChanged) {
         const isTailOpen = Boolean(tv.tailDetails?.open);
         const atBottom = isTailOpen && (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 64);
-        patchLiveTail(tv, s, pv, autoOpenTail, tailSig);
-        if (atBottom && tv.tailDetails?.open) {
+        patchLiveTail(tv, s, tailSrc.rawText, autoOpenTail, tailSig);
+        if ((atBottom && tv.tailDetails?.open) || forceBottom) {
           vp.scrollTop = vp.scrollHeight;
         }
         return;
@@ -1233,14 +1625,20 @@ function syncOutputViewport(vp, s) {
         tv.messagesSig = messagesSig;
         reconcileTimelineChunks(tv, s, tr);
       }
+      if (tv.optSig !== optSig) {
+        tv.optSig = optSig;
+        const optCards = optSig ? renderOptimisticCards(s.session_id) : [];
+        if (optCards.length) tv.optimisticSlot.replaceChildren(...optCards);
+        else tv.optimisticSlot.replaceChildren();
+      }
       if (tv.tailSig !== tailSig) {
-        patchLiveTail(tv, s, pv, autoOpenTail, tailSig);
+        patchLiveTail(tv, s, tailSrc.rawText, autoOpenTail, tailSig);
       }
       vp.dataset.sig = fullSig;
       if (expandingReading) {
         UI.loadingEarlierSid = null;
         vp.scrollTop = Math.max(0, prevTop + (vp.scrollHeight - prevHeight));
-      } else if (atBottom) {
+      } else if (atBottom || forceBottom) {
         scrollViewportToBottom(vp);
       } else {
         vp.scrollTop = prevTop;
@@ -1259,7 +1657,10 @@ function syncOutputViewport(vp, s) {
     if (hb) nextTv.historySlot.replaceChildren(hb);
     nextTv.messagesSig = messagesSig;
     reconcileTimelineChunks(nextTv, s, tr);
-    patchLiveTail(nextTv, s, pv, autoOpenTail, tailSig);
+    nextTv.optSig = optSig;
+    const initOptCards = optSig ? renderOptimisticCards(s.session_id) : [];
+    if (initOptCards.length) nextTv.optimisticSlot.replaceChildren(...initOptCards);
+    patchLiveTail(nextTv, s, tailSrc.rawText, autoOpenTail, tailSig);
     vp._tv = nextTv;
     vp.dataset.sid = s.session_id;
     vp.dataset.mode = mode;
@@ -1273,13 +1674,16 @@ function syncOutputViewport(vp, s) {
   }
 
   // Non-transcript path: compute cheap signature BEFORE building any DOM!
-  const nextSig = computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, baseErrSig, lang);
-  if (sameView && vp.dataset.sig === nextSig) return;
+  const nextSig = computeNonTranscriptSig(s, mode, pane, curPvMode, pv, tr, glyphSig, baseErrSig, optSig, lang);
+  if (sameView && vp.dataset.sig === nextSig) {
+    if (forceBottom) scrollViewportToBottom(vp);
+    return;
+  }
 
   const prevHeight = sameView ? vp.scrollHeight : 0;
   const wasLoading = sameView && Boolean(vp.dataset.sig?.includes(':loading:'));
   const prevTop = sameView ? vp.scrollTop : 0;
-  const atBottom = !sameView || wasLoading || (prevHeight - prevTop - vp.clientHeight < 64);
+  const atBottom = !sameView || wasLoading || forceBottom || (prevHeight - prevTop - vp.clientHeight < 64);
   const expandingRaw = sameView && pane && UI.loadingEarlierPane === pane && mode === 'raw';
   const built = buildOutputBody(s);
   vp._tv = null;
@@ -1390,6 +1794,7 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
   const subsOpen = childSelected || UI.open.has(subOpenKey);
   const pctVal = ctxPctOf(s.metrics);
   const tpsVal = tpsOf(s.metrics);
+  const ttftVal = ttftOf(s.metrics);
   const tone = ctxTone(pctVal);
   const primaryTitle = s.tmux_label || s.tmux_target || base(s.git_root || s.cwd);
   const subMeta = s.tmux_label && s.tmux_target ? s.tmux_target : base(s.git_root || s.cwd);
@@ -1402,7 +1807,9 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
     type: 'button',
     class: `ws-item${sel ? ' sel' : ''}`,
     'data-sid': s.session_id,
-    onclick: () => APP.openSession(s.session_id),
+    onpointerenter: (e) => scheduleHoverPrefetch(s, e),
+    onpointerleave: () => cancelHoverPrefetch(s.session_id),
+    onclick: () => { cancelHoverPrefetch(); APP.openSession(s.session_id); },
   },
   h('div', { class: 'ws-item-top' },
     h('i', { class: `dot dot-${s.state}`, title: stateText(s.state) }),
@@ -1415,15 +1822,21 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
     s.discovered_only && mux !== 'zellij' ? span('tag legacy', L('tmux 发现', 'tmux discovered')) : null,
     subCount ? span('tag tabular', L(`${subCount} 子会话`, `${subCount} subagents`)) : null),
   meLabel ? h('div', { class: 'ws-item-model', title: meLabel }, meLabel) : null,
-  (pctVal != null || tpsVal != null) ? h('div', { class: 'ws-item-metrics' },
+  (pctVal != null || tpsVal != null || ttftVal != null) ? h('div', { class: 'ws-item-metrics' },
     pctVal != null ? h('span', { class: `row-nowrap${tone === 'high' ? ' ws-tel-high' : tone === 'warn' ? ' ws-tel-warn' : ''}`, style: 'gap:5px' },
       `CTX ${Math.round(pctVal)}%`, ctxBar(pctVal, true)) : null,
-    tpsVal != null ? span('muted', `${tpsVal.toFixed(1)} tok/s`) : null) : null,
+    tpsVal != null ? span('muted', `${tpsVal.toFixed(1)} tok/s`) : null,
+    ttftVal != null ? h('span', {
+      class: `ws-item-ttft${ttftTone(ttftVal) === 'fast' ? ' ttft-fast' : ttftTone(ttftVal) === 'slow' ? ' ttft-slow' : ' muted'}`,
+      title: isFin(s.metrics?.avg_ttft_ms) && s.metrics.avg_ttft_ms > 0
+        ? L(`最近首字 ${fmtMs(ttftVal)} · 平均 ${fmtMs(s.metrics.avg_ttft_ms)}`, `Latest TTFT ${fmtMs(ttftVal)} · Avg ${fmtMs(s.metrics.avg_ttft_ms)}`)
+        : L(`最近首字延迟 ${fmtMs(ttftVal)}`, `Latest TTFT ${fmtMs(ttftVal)}`),
+    }, L(`首字 ${fmtMs(ttftVal)}`, `TTFT ${fmtMs(ttftVal)}`)) : null) : null,
   s.last_message ? h('div', { class: 'ws-item-msg' }, s.last_message) : null);
   const closeTip = isSplit
     ? L(`关闭窗格 ${sessionLabel(s)}`, `Close pane ${sessionLabel(s)}`)
     : L(`关闭窗口 ${sessionLabel(s)}`, `Close window ${sessionLabel(s)}`);
-  const card = h('div', { class: `ws-item-wrap${closable ? ' has-close' : ''}` },
+  const card = h('div', { class: `ws-item-wrap${closable ? ' has-close' : ''}${sel ? ' is-sel' : ''}` },
     cardBtn,
     closable ? h('button', {
       type: 'button',
@@ -1435,7 +1848,7 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
         e.stopPropagation();
         openCloseSessionModal(s.session_id);
       },
-    }, '×') : null);
+    }, closeCrossIcon()) : null);
   if (!subs.length) return card;
   const subTree = h('div', { class: 'ws-sub-wrap' },
     h('button', {
@@ -1450,7 +1863,9 @@ function sidebarSessionItem(s, splitWindowKeys = null) {
     subsOpen ? subs.map((c) => h('button', {
       type: 'button',
       class: `ws-sub-item${curId === c.session_id ? ' sel' : ''}`,
-      onclick: () => APP.openSession(c.session_id),
+      onpointerenter: (e) => scheduleHoverPrefetch(c, e),
+      onpointerleave: () => cancelHoverPrefetch(c.session_id),
+      onclick: () => { cancelHoverPrefetch(); APP.openSession(c.session_id); },
     },
     h('i', { class: `dot dot-${c.state}`, title: stateText(c.state) }),
     h('span', { class: 'trunc grow' }, subagentDisplayName(c)),
@@ -1489,11 +1904,26 @@ export function createWorkspaceShell() {
     },
   });
   const sideList = h('div', { class: 'ws-side-list' });
+  sideList.addEventListener('pointerleave', () => cancelHoverPrefetch());
+  const sideCloseBtn = h('button', {
+    type: 'button',
+    class: 'ws-side-close',
+    'aria-label': L('关闭会话列表', 'Close sessions list'),
+    title: L('关闭', 'Close'),
+    onclick: () => { UI.mobileSessionsOpen = false; APP.rerender(); },
+  }, '×');
+  const sideBackdrop = h('div', {
+    class: 'ws-side-backdrop',
+    'aria-hidden': 'true',
+    onclick: () => { UI.mobileSessionsOpen = false; APP.rerender(); },
+  });
   const sidebar = h('aside', { class: 'ws-sidebar', 'aria-label': L('会话列表', 'Sessions') },
     h('div', { class: 'ws-side-head' },
       h('div', { class: 'ws-side-top' },
         h('div', { class: 'ws-side-title' }, L('会话列表', 'Sessions'), sideCount),
-        btn(L('+ 新建交互会话', '+ New Session'), { cls: 'sm', title: L('在 tmux 中新开 claude / codex / agy 交互会话（快捷键 n）', 'Spawn interactive claude / codex / agy session in tmux (shortcut n)'), onclick: () => APP.openSpawnModal() })),
+        h('div', { class: 'row-nowrap ws-side-top-acts', style: 'gap:6px' },
+          btn(L('+ 新建交互会话', '+ New Session'), { cls: 'sm', title: L('在 tmux 中新开 claude / codex / agy 交互会话（快捷键 n）', 'Spawn interactive claude / codex / agy session in tmux (shortcut n)'), onclick: () => APP.openSpawnModal() }),
+          sideCloseBtn)),
       h('div', { class: 'ws-search-row' }, sideSearch, sideToggleSlot),
       h('div', { class: 'row' },
         sideChips,
@@ -1520,7 +1950,24 @@ export function createWorkspaceShell() {
   const latestBtn = h('button', {
     type: 'button',
     class: 'scroll-latest-btn',
-    onclick: () => { vp.scrollTo({ top: vp.scrollHeight, behavior: 'smooth' }); },
+    onclick: () => {
+      const s = currentSession();
+      const isRaw = !s || s.agent === 'shell' || UI.outputMode === 'raw';
+      const tr = s && !isRaw ? S.transcripts.get(s.session_id) : null;
+      const pv = s && isRaw && s.pane ? S.previews.get(pvKeyOf(s.pane)) : null;
+      const needsRefresh = Boolean(s && s.state !== 'ended' && (
+        isRaw
+          ? (!pv || !pv.updatedMs || (Date.now() - pv.updatedMs) > 3000)
+          : (!tr || !tr.updatedMs || (Date.now() - tr.updatedMs) > 3000 || tr.autoPollPaused)
+      ));
+      if (needsRefresh) {
+        vp.scrollTop = vp.scrollHeight;
+        syncScrollLatestBtn(vp);
+        loadSessionOutput(s, { silent: !tr?.autoPollPaused });
+      } else {
+        vp.scrollTo({ top: vp.scrollHeight, behavior: 'smooth' });
+      }
+    },
   }, L('↓ 回到最新', '↓ Latest'));
   const chatStage = h('div', { class: 'chat-stage' }, vp, latestBtn);
   const slashEl = h('div', { class: 'slash-menu ws-hidden' });
@@ -1531,7 +1978,7 @@ export function createWorkspaceShell() {
     'data-mode': k,
     onclick: () => { UI.composerMode = k; closeSlashMenu(); APP.rerender(); },
   }, l));
-  const modeHint = h('span', { class: 'dim', style: 'font-size:12px' });
+  const modeHint = h('span', { class: 'dim mode-hint', style: 'font-size:12px' });
   const modeBar = h('div', { class: 'mode-bar' },
     h('div', { class: 'mode-seg', role: 'tablist', 'aria-label': L('输入模式', 'Composer mode') }, modeBtns),
     modeHint);
@@ -1607,8 +2054,74 @@ export function createWorkspaceShell() {
     const sentAttIds = new Set(attsSnapshot.map((a) => a.id));
     if (attsSnapshot.some((a) => a.status === 'uploading')) { toast(L('图片仍在上传中，请稍候再发送', 'Image still uploading, please wait'), 'warn'); return; }
     if (!text && !attsSnapshot.length) { toast(L('请输入要发送的内容、图片或粘贴片段', 'Enter a message, image, or pasted snippet'), 'warn'); return; }
-    UI.drafts.set(dk, rawBefore);
     closeSlashMenu();
+
+    const useOptimistic = s.agent !== 'shell' && UI.outputMode === 'reading' && UI.composerMode === 'direct';
+    let optNonce = null;
+    let optEntry = null;
+    if (useOptimistic) {
+      const curTr = S.transcripts.get(sid);
+      const anchorTotal = (curTr?.state === 'ok' && curTr.source === 'transcript')
+        ? Math.max(curTr.totalMessages || 0, (Number.isFinite(curTr.startSeq) ? curTr.startSeq : 0) + (curTr.messages?.length || 0))
+        : 0;
+      optNonce = `opt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+      optEntry = addOptimisticTurn(sid, {
+        nonce: optNonce,
+        text,
+        created_ms: Date.now(),
+        anchor_total: anchorTotal,
+        status: 'sending',
+        rawBefore,
+        attachments: attsSnapshot,
+        _expireTimer: 0,
+      });
+      composerDeliveryIssues.delete(sid);
+      renderDeliveryAlert(s);
+      // Clear composer & sent attachments immediately in the same frame; rawBefore + attsSnapshot stay safe in memory.
+      UI.drafts.delete(dk);
+      ta.value = '';
+      ta.style.height = 'auto';
+      autoGrow(ta);
+      syncTaMetrics();
+      comp.lastSel = { sid, start: 0, end: 0 };
+      const curAtts = UI.attachments.get(sid) || [];
+      const keptAtts = curAtts.filter((a) => !sentAttIds.has(a.id));
+      if (keptAtts.length) UI.attachments.set(sid, keptAtts);
+      else UI.attachments.delete(sid);
+      renderAttachBar(sid);
+      UI.forceScrollBottomSid = sid;
+      notifyOutputUpdated(sid);
+    } else {
+      UI.drafts.set(dk, rawBefore);
+    }
+
+    const rollbackOptimistic = () => {
+      if (!useOptimistic || !optNonce) return;
+      const removed = removeOptimisticTurn(sid, optNonce);
+      if (removed) {
+        if (comp.sid === sid) {
+          if (!ta.value.trim()) {
+            UI.drafts.set(dk, rawBefore);
+            ta.value = rawBefore;
+            ta.style.height = 'auto';
+            autoGrow(ta);
+            syncTaMetrics();
+            comp.lastSel = { sid, start: rawBefore.length, end: rawBefore.length };
+          }
+        } else if (!draft(dk).trim()) {
+          UI.drafts.set(dk, rawBefore);
+        }
+        if (attsSnapshot.length) {
+          const curAtts = UI.attachments.get(sid) || [];
+          const existingIds = new Set(curAtts.map((a) => a.id));
+          const restored = [...attsSnapshot.filter((a) => !existingIds.has(a.id)), ...curAtts];
+          UI.attachments.set(sid, restored);
+        }
+        if (comp.sid === sid) renderAttachBar(sid);
+      }
+      notifyOutputUpdated(sid);
+    };
+
     act(`send:${sid}`, async () => {
       const payload = { target: { type: 'session', id: sid }, text, interactive: true };
       if (attsSnapshot.length) {
@@ -1621,7 +2134,8 @@ export function createWorkspaceShell() {
         r = await api('POST', '/api/dispatch', payload);
       } catch (e) {
         // Preserve draft and attachments on network/HTTP error and surface 1-click Retry.
-        if (!UI.drafts.has(dk) && rawBefore) UI.drafts.set(dk, rawBefore);
+        rollbackOptimistic();
+        if (!useOptimistic && !UI.drafts.has(dk) && rawBefore) UI.drafts.set(dk, rawBefore);
         composerDeliveryIssues.set(sid, {
           status: 'error',
           reason: errText(e),
@@ -1635,7 +2149,8 @@ export function createWorkspaceShell() {
       const delivered = Boolean(r && (r.status === 'delivered' || r.status === 'sent'));
       if (!delivered) {
         // NEVER silently wipe composer draft or attachments when delivery failed, queued, or unconfirmed.
-        if (!UI.drafts.has(dk) && rawBefore) UI.drafts.set(dk, rawBefore);
+        rollbackOptimistic();
+        if (!useOptimistic && !UI.drafts.has(dk) && rawBefore) UI.drafts.set(dk, rawBefore);
         composerDeliveryIssues.set(sid, {
           status: r?.status || 'failed',
           reason: describeDeliveryIssue(r),
@@ -1648,37 +2163,59 @@ export function createWorkspaceShell() {
       }
 
       composerDeliveryIssues.delete(sid);
-      const curAtts = UI.attachments.get(sid) || [];
-      const keptAtts = curAtts.filter((a) => !sentAttIds.has(a.id));
-      if (keptAtts.length) UI.attachments.set(sid, keptAtts);
-      else UI.attachments.delete(sid);
-
-      if (comp.sid === sid) {
-        // Only clear the textarea if the user has not already started typing a new message in-flight.
-        if (ta.value === rawBefore) {
-          UI.drafts.delete(dk);
-          ta.value = '';
-          ta.style.height = 'auto';
-          autoGrow(ta);
-          syncTaMetrics();
-          comp.lastSel = { sid, start: 0, end: 0 };
-        } else {
-          UI.drafts.set(dk, ta.value);
+      if (useOptimistic && optNonce) {
+        updateOptimisticTurnStatus(sid, optNonce, 'sent');
+        if (optEntry && hasOptimisticTurn(sid, optNonce)) {
+          optEntry._expireTimer = setTimeout(() => {
+            if (removeOptimisticTurn(sid, optNonce)) notifyOutputUpdated(sid);
+          }, OPTIMISTIC_EXPIRE_MS);
         }
-        renderAttachBar(sid);
-      } else if (draft(dk) === rawBefore) {
-        UI.drafts.delete(dk);
+        reconcileOptimisticTurns(sid, S.transcripts.get(sid));
+        notifyOutputUpdated(sid);
+      } else {
+        const curAtts = UI.attachments.get(sid) || [];
+        const keptAtts = curAtts.filter((a) => !sentAttIds.has(a.id));
+        if (keptAtts.length) UI.attachments.set(sid, keptAtts);
+        else UI.attachments.delete(sid);
+
+        if (comp.sid === sid) {
+          // Only clear the textarea if the user has not already started typing a new message in-flight.
+          if (ta.value === rawBefore) {
+            UI.drafts.delete(dk);
+            ta.value = '';
+            ta.style.height = 'auto';
+            autoGrow(ta);
+            syncTaMetrics();
+            comp.lastSel = { sid, start: 0, end: 0 };
+          } else {
+            UI.drafts.set(dk, ta.value);
+          }
+          renderAttachBar(sid);
+        } else if (draft(dk) === rawBefore) {
+          UI.drafts.delete(dk);
+        }
       }
       renderDeliveryAlert(S.sessions.get(sid) || s);
       if (s.pane) {
         const hid = hostOf(s);
         const hRec = isRemoteHost(hid) ? S.hosts.get(hid) : null;
         const rttShift = isRemoteHost(hid) && typeof hRec?.rtt_ms === 'number' && Number.isFinite(hRec.rtt_ms)
-          ? Math.max(0, Math.round(hRec.rtt_ms))
+          ? Math.max(0, Math.min(300, Math.round(hRec.rtt_ms)))
           : 0;
-        setTimeout(() => loadSessionOutput(s, { silent: true }), 550 + rttShift);
-        setTimeout(() => loadSessionOutput(s, { silent: true }), 1600 + rttShift);
-        setTimeout(() => loadSessionOutput(s, { silent: true }), 3200 + rttShift);
+        if (useOptimistic && optNonce && S.conn === 'live') {
+          const checkIfPending = () => {
+            if (hasOptimisticTurn(sid, optNonce)) {
+              const latest = S.sessions.get(sid) || s;
+              loadSessionOutput(latest, { silent: true });
+            }
+          };
+          setTimeout(checkIfPending, 900 + rttShift);
+          setTimeout(checkIfPending, 2600 + rttShift);
+        } else {
+          setTimeout(() => loadSessionOutput(S.sessions.get(sid) || s, { silent: true }), 450 + rttShift);
+          setTimeout(() => loadSessionOutput(S.sessions.get(sid) || s, { silent: true }), 1500 + rttShift);
+          setTimeout(() => loadSessionOutput(S.sessions.get(sid) || s, { silent: true }), 3000 + rttShift);
+        }
       }
       return r;
     }, (r) => {
@@ -1696,30 +2233,34 @@ export function createWorkspaceShell() {
     });
   };
   const syncTaMetrics = () => {
+    const minH = window.innerWidth <= 768 ? 34 : 52;
     lastTaLen = ta.value.length;
-    lastTaHeight = parseInt(ta.style.height, 10) || 52;
+    lastTaHeight = parseInt(ta.style.height, 10) || minH;
   };
   let lastTaLen = 0;
   let lastTaHeight = 52;
   const fastAutoGrow = () => {
+    const isMob = window.innerWidth <= 768;
+    const minH = isMob ? 34 : 52;
+    const maxH = isMob ? 132 : 220;
     const val = ta.value;
     const len = val.length;
     const shrank = len < lastTaLen;
     lastTaLen = len;
     if (!shrank) {
-      if (lastTaHeight >= 220) return;
+      if (lastTaHeight >= maxH) return;
       const sh = ta.scrollHeight;
       if (sh <= ta.clientHeight) return;
-      const nextH = Math.min(220, Math.max(52, sh));
+      const nextH = Math.min(maxH, Math.max(minH, sh));
       if (nextH !== lastTaHeight) {
         ta.style.height = `${nextH}px`;
         lastTaHeight = nextH;
       }
       return;
     }
-    if (lastTaHeight <= 52) return;
+    if (lastTaHeight <= minH) return;
     autoGrow(ta);
-    lastTaHeight = parseInt(ta.style.height, 10) || 52;
+    lastTaHeight = parseInt(ta.style.height, 10) || minH;
   };
   ta.addEventListener('input', () => {
     if (comp.sid) UI.drafts.set(`ws:msg:${comp.sid}`, ta.value);
@@ -1800,14 +2341,44 @@ export function createWorkspaceShell() {
       imgInput.value = '';
     },
   });
+  const slashBtn = h('button', {
+    type: 'button',
+    class: 'btn ghost sm comp-slash-btn',
+    title: L('快捷命令（输入 /）', 'Quick commands (insert /)'),
+    'aria-label': L('快捷命令', 'Quick commands'),
+    onclick: () => {
+      if (UI.slash.open) {
+        closeSlashMenu();
+        return;
+      }
+      if (comp.agent === 'shell') return;
+      const val = ta.value || '';
+      if (!/^\s*\//.test(val)) {
+        const next = val ? `/${val}` : '/';
+        ta.value = next;
+        if (comp.sid) UI.drafts.set(`ws:msg:${comp.sid}`, next);
+        autoGrow(ta);
+        syncTaMetrics();
+        ta.focus({ preventScroll: true });
+        ta.setSelectionRange(1, 1);
+        saveComposerSelection(ta);
+      } else {
+        const slashPos = val.indexOf('/') + 1;
+        ta.focus({ preventScroll: true });
+        ta.setSelectionRange(slashPos, slashPos);
+        saveComposerSelection(ta);
+      }
+      updateSlashFromInput(ta, comp.agent);
+    },
+  }, '/');
   const imgBtn = h('button', {
     type: 'button',
-    class: 'btn ghost sm',
+    class: 'btn ghost sm comp-img-btn',
     title: L('上传图片或截图（支持粘贴与拖拽）', 'Upload image or screenshot (supports paste & drag-drop)'),
     onclick: () => imgInput.click(),
   }, L('图片', 'Image'));
-  const sendBtn = h('button', { type: 'button', class: 'btn primary sm', onclick: sendDirect }, L('发送', 'Send'));
-  const directRow = h('div', { class: 'composer-direct-row' }, ta, h('div', { class: 'composer-actions' }, imgInput, imgBtn, sendBtn));
+  const sendBtn = h('button', { type: 'button', class: 'btn primary sm comp-send-btn', onclick: sendDirect }, L('发送', 'Send'));
+  const directRow = h('div', { class: 'composer-direct-row' }, ta, h('div', { class: 'composer-actions' }, imgInput, slashBtn, imgBtn, sendBtn));
   const pipeSlot = h('div', { class: 'stack-sm ws-hidden' });
   const readonlyHint = h('div', { class: 'comp-readonly ws-hidden' });
   const card = h('div', { class: 'composer-card' }, slashEl, readonlyHint, modeBar, deliveryAlertEl, attachBar, directRow, pipeSlot);
@@ -1837,19 +2408,123 @@ export function createWorkspaceShell() {
       uploadImageFiles(comp.sid, imgs);
     }
   });
+  const promptBarSlot = h('div', { class: 'prompt-dock-wrap ws-hidden' });
   const dock = h('div', { class: 'composer-dock' }, card);
-  const comp = { dock, card, slashEl, readonlyHint, modeBtns, modeHint, deliveryAlertEl, renderDeliveryAlert, attachBar, directRow, ta, imgBtn, sendBtn, pipeSlot, sid: null, agent: null, lastSel: null, syncTaMetrics };
-  const convCol = h('div', { class: 'ws-conv-col' }, reopenBtn, chatStage, dock);
+  const comp = { dock, card, slashEl, readonlyHint, modeBtns, modeHint, deliveryAlertEl, renderDeliveryAlert, attachBar, directRow, ta, slashBtn, imgBtn, sendBtn, pipeSlot, sid: null, agent: null, lastSel: null, syncTaMetrics };
+  const convCol = h('div', { class: 'ws-conv-col' }, reopenBtn, chatStage, promptBarSlot, dock);
   const bodySplit = h('div', { class: 'ws-body-split' }, convCol);
   const emptyMain = emptyState(L('选择一个会话开始对话', 'Select a Session to Start'), L('从左侧点击任意正在运行的 tmux / Zellij 会话，即可查看实时终端并直接发送指令。', 'Pick any running tmux or Zellij session on the left to inspect output and send messages.'),
-    btn(L('新建交互会话', 'New Session'), { cls: 'primary', onclick: () => APP.openSpawnModal() }));
+    h('div', { class: 'row', style: 'justify-content:center;margin-top:4px' },
+      btn(L('打开会话列表', 'Browse Sessions'), { cls: 'ws-empty-side-btn', onclick: () => { UI.mobileSessionsOpen = true; APP.rerender(); } }),
+      btn(L('新建交互会话', 'New Session'), { cls: 'primary', onclick: () => APP.openSpawnModal() })));
   emptyMain.classList.add('ws-hidden');
   const main = h('section', { class: 'ws-main' }, headEl, crumbEl, bodySplit, emptyMain);
-  const grid = h('div', { class: 'ws-grid' }, sidebar, main);
+  const sideResizer = h('div', {
+    class: 'ws-side-resizer',
+    role: 'separator',
+    tabindex: '0',
+    'aria-orientation': 'vertical',
+    'aria-label': L('拖动调整左侧会话栏宽度（双击恢复默认）', 'Drag to resize sessions sidebar (double-click to reset)'),
+    title: L('拖动调整宽度 · 双击恢复默认', 'Drag to resize · Double-click to reset'),
+  });
+  const grid = h('div', { class: 'ws-grid' }, sideBackdrop, sidebar, sideResizer, main);
+
+  let savedW = SIDEBAR_DEFAULT_W;
+  try {
+    const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+    if (raw != null && raw.trim() !== '') {
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed) && parsed > 0) savedW = parsed;
+    }
+  } catch { /* ignore */ }
+  let currentW = clampSidebarWidth(savedW);
+  const applySidebarWidth = (w, { persist = false } = {}) => {
+    const maxW = sidebarMaxWidth();
+    const clamped = clampSidebarWidth(w);
+    currentW = clamped;
+    grid.style.setProperty('--ws-side-w', `${clamped}px`);
+    sideResizer.setAttribute('aria-valuemin', String(SIDEBAR_MIN_W));
+    sideResizer.setAttribute('aria-valuemax', String(maxW));
+    sideResizer.setAttribute('aria-valuenow', String(clamped));
+    if (persist) {
+      savedW = clamped;
+      try {
+        if (clamped === SIDEBAR_DEFAULT_W) localStorage.removeItem(SIDEBAR_WIDTH_KEY);
+        else localStorage.setItem(SIDEBAR_WIDTH_KEY, String(clamped));
+      } catch { /* ignore */ }
+    }
+    return clamped;
+  };
+  applySidebarWidth(savedW, { persist: false });
+
+  let dragCleanup = null;
+  sideResizer.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || ((typeof window !== 'undefined' && window.innerWidth) || 1440) <= 960) return;
+    if (dragCleanup) dragCleanup(false);
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = currentW;
+    const pointerId = e.pointerId;
+    let active = true;
+    grid.classList.add('is-resizing');
+    document.body.classList.add('is-col-resizing');
+    try { sideResizer.setPointerCapture(pointerId); } catch { /* ignore */ }
+    const onMove = (ev) => {
+      if (!active) return;
+      applySidebarWidth(startW + (ev.clientX - startX), { persist: false });
+    };
+    const cleanup = (persist = true) => {
+      if (!active) return;
+      active = false;
+      dragCleanup = null;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onEnd);
+      window.removeEventListener('pointercancel', onEnd);
+      grid.classList.remove('is-resizing');
+      document.body.classList.remove('is-col-resizing');
+      try {
+        if (sideResizer.hasPointerCapture?.(pointerId)) sideResizer.releasePointerCapture(pointerId);
+      } catch { /* ignore */ }
+      if (persist) applySidebarWidth(currentW, { persist: true });
+    };
+    const onEnd = () => cleanup(true);
+    dragCleanup = cleanup;
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onEnd);
+    window.addEventListener('pointercancel', onEnd);
+  });
+  sideResizer.addEventListener('dblclick', (e) => {
+    if (((typeof window !== 'undefined' && window.innerWidth) || 1440) <= 960) return;
+    e.preventDefault();
+    applySidebarWidth(SIDEBAR_DEFAULT_W, { persist: true });
+  });
+  sideResizer.addEventListener('keydown', (e) => {
+    if (((typeof window !== 'undefined' && window.innerWidth) || 1440) <= 960) return;
+    const step = e.shiftKey ? 40 : 16;
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      applySidebarWidth(currentW - step, { persist: true });
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      applySidebarWidth(currentW + step, { persist: true });
+    } else if (e.key === 'Home' || e.key === 'Enter') {
+      e.preventDefault();
+      applySidebarWidth(SIDEBAR_DEFAULT_W, { persist: true });
+    }
+  });
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('resize', () => {
+      if (!grid.isConnected) return;
+      applySidebarWidth(savedW, { persist: false });
+    }, { passive: true });
+  }
+
   const errSlot = h('div', { class: 'ws-hidden', style: 'padding:10px 16px 0' });
   return {
     errSlot,
     grid,
+    sideResizer,
+    syncSidebarWidth: () => applySidebarWidth(savedW, { persist: false }),
     sideCount,
     sideSearch,
     sideToggleSlot,
@@ -1857,16 +2532,19 @@ export function createWorkspaceShell() {
     sideShowEnded,
     sideList,
     headEl,
+    mobOutlineBtn: null,
     crumbEl,
     bodySplit,
     convCol,
     reopenBtn,
     vp,
     latestBtn,
+    promptBarSlot,
     emptyMain,
     comp,
     rail: null,
     railSig: '',
+    promptBarSig: '',
     errBannerSig: '',
     sideSig: '',
     toggleSig: '',
@@ -1875,6 +2553,7 @@ export function createWorkspaceShell() {
     telSig: '',
     crumbSig: '',
     pipeSig: '',
+    wasMobileSideOpen: false,
   };
 }
 
@@ -1883,6 +2562,7 @@ export function mountOrPatchWorkspace(el) {
   const W = UI.wsShell;
   if (W.grid.parentNode !== el) {
     el.replaceChildren(W.errSlot, W.grid);
+    W.syncSidebarWidth?.();
   }
   const errBannerSig = S.loadError ? `${S.loadError}:${getLang()}` : '';
   if (W.errBannerSig !== errBannerSig) {
@@ -1959,10 +2639,21 @@ export function patchWorkspace(W) {
     }
     saveCollapsedGroups();
   }
-  const allCollapsed = allCollapseKeys.length > 0 && allCollapseKeys.every(({ cKey }) => UI.collapsedGroups.has(cKey));
+  const isSideOpen = Boolean(UI.mobileSessionsOpen);
+  if (isSideOpen && !W.wasMobileSideOpen) {
+    prefetchTopMobileSessions(shown);
+  }
+  W.wasMobileSideOpen = isSideOpen;
+  W.grid.classList.toggle('is-side-open', isSideOpen);
+
+  const allGroupsCollapsed = allCollapseKeys.length > 0 && allCollapseKeys.every(({ cKey }) => UI.collapsedGroups.has(cKey));
+  const allHostsCollapsed = hostOrder.length > 0 && hostOrder.every((hid) => UI.collapsedHosts.has(hid));
+  const allCollapsed = allGroupsCollapsed || allHostsCollapsed;
   const toggleAllGroups = () => {
     if (allCollapsed) {
       UI.collapsedGroups.clear();
+      UI.collapsedHosts.clear();
+      saveCollapsedHosts();
       try { localStorage.setItem(NON_TMUX_OPEN_KEY, '1'); } catch { /* ignore */ }
     } else {
       allCollapseKeys.forEach(({ cKey }) => UI.collapsedGroups.add(cKey));
@@ -1978,10 +2669,11 @@ export function patchWorkspace(W) {
   if (document.activeElement !== W.sideSearch && W.sideSearch.value !== draft('ws:filter')) W.sideSearch.value = draft('ws:filter');
   if (W.sideShowEnded.checked !== UI.showEnded) W.sideShowEnded.checked = UI.showEnded;
 
-  const toggleSig = `${allCollapseKeys.length > 1 ? 1 : 0}:${allCollapsed ? 1 : 0}:${lang}`;
+  const showToggleAll = allCollapseKeys.length > 1 || UI.collapsedHosts.size > 0;
+  const toggleSig = `${showToggleAll ? 1 : 0}:${allCollapsed ? 1 : 0}:${lang}`;
   if (W.toggleSig !== toggleSig) {
     W.toggleSig = toggleSig;
-    W.sideToggleSlot.replaceChildren(allCollapseKeys.length > 1 ? btn(allCollapsed ? L('全部展开', 'Expand all') : L('全部收起', 'Collapse all'), { cls: 'ghost xs', onclick: toggleAllGroups }) : '');
+    W.sideToggleSlot.replaceChildren(showToggleAll ? btn(allCollapsed ? L('全部展开', 'Expand all') : L('全部收起', 'Collapse all'), { cls: 'ghost xs', onclick: toggleAllGroups }) : '');
   }
 
   const filterAgents = (roots.some((s) => s.agent === 'shell') || UI.agentFilter === 'shell') ? [...AGENTS, 'shell'] : AGENTS;
@@ -2023,7 +2715,8 @@ export function patchWorkspace(W) {
     const retryCd = hb.id !== 'local' && (hRec?.status === 'degraded' || hRec?.status === 'offline')
       ? formatRetryCountdown(hRec?.next_retry_ms)
       : '';
-    sideSigParts.push(`H:${hb.id}:${hRec?.display_name || ''}:${hRec?.status || ''}:${hRec?.rtt_ms ?? ''}:${retryCd}:${UI.busy.has(`probe-host:${hb.id}`) ? 1 : 0}:${hRec?.error || ''}:${hb.total}`);
+    const hostCollapsed = !q && UI.collapsedHosts.has(hb.id);
+    sideSigParts.push(`H:${hb.id}:${hostCollapsed ? 1 : 0}:${hRec?.display_name || ''}:${hRec?.status || ''}:${hRec?.rtt_ms ?? ''}:${hRec?.sync_ms ?? ''}:${retryCd}:${UI.busy.has(`probe-host:${hb.id}`) ? 1 : 0}:${hRec?.error || ''}:${hb.total}`);
     for (const [g, list] of hb.groups.entries()) {
       const cKey = hb.id === 'local' ? g : `${hb.id}:${g}`;
       const isCollapsed = !q && UI.collapsedGroups.has(cKey);
@@ -2034,7 +2727,7 @@ export function patchWorkspace(W) {
         const subOpen = UI.open.has(`subs:${x.session_id}`) || subs.some((c) => c.session_id === curId);
         const subSig = subs.length ? `${subOpen ? 1 : 0}:${subs.map((c) => `${c.session_id}:${c.state}:${c.tmux_label || ''}`).join(',')}` : '';
         const isSplit = splitWindowKeys.has(windowGroupKeyOf(x)) ? 1 : 0;
-        sideSigParts.push(`S:${x.session_id}:${x.state}:${x.agent}:${x.tmux_label || ''}:${x.tmux_target || ''}:${x.pane || ''}:${x.model || ''}:${x.effort || ''}:${x.mux_kind || ''}:${x.discovered_only ? 1 : 0}:${x.subagent_count || 0}:${x.metrics?.context_used_pct ?? ''}:${x.metrics?.tps ?? ''}:${hashStr(x.last_message || '')}:${isSplit}:${subSig}`);
+        sideSigParts.push(`S:${x.session_id}:${x.state}:${x.agent}:${x.tmux_label || ''}:${x.tmux_target || ''}:${x.pane || ''}:${x.model || ''}:${x.effort || ''}:${x.mux_kind || ''}:${x.discovered_only ? 1 : 0}:${x.subagent_count || 0}:${x.metrics?.context_used_pct ?? ''}:${x.metrics?.tps ?? ''}:${x.metrics?.ttft_ms ?? ''}:${x.metrics?.avg_ttft_ms ?? ''}:${hashStr(x.last_message || '')}:${isSplit}:${subSig}`);
       }
     }
   }
@@ -2063,21 +2756,41 @@ export function patchWorkspace(W) {
           return pa - pb || a[0].localeCompare(b[0]);
         });
         const isRemote = hb.id !== 'local';
-        const rttBadge = isRemote && hStatus !== 'offline' ? buildRttPill(hRec?.rtt_ms) : null;
+        const hostCollapsed = !q && UI.collapsedHosts.has(hb.id);
+        const rttBadge = isRemote && hStatus !== 'offline' ? buildRttPill(hRec?.rtt_ms, hRec?.sync_ms) : null;
+        const hasSync = isRemote && hStatus !== 'offline' && typeof hRec?.sync_ms === 'number' && Number.isFinite(hRec.sync_ms) && hRec.sync_ms >= 0;
         const hostDotTip = [
           hName,
           hostStatusLabel(hStatus),
           isRemote && hStatus !== 'offline' ? fmtRtt(hRec?.rtt_ms) : '',
+          hasSync ? L(`同步 ${fmtRtt(hRec.sync_ms)}`, `Sync ${fmtRtt(hRec.sync_ms)}`) : '',
           hRec?.active_endpoint ? `(${hRec.active_endpoint})` : '',
         ].filter(Boolean).join(' · ');
+        const toggleHostTip = hostCollapsed
+          ? L(`展开主机 ${hName}`, `Expand host ${hName}`)
+          : L(`收起主机 ${hName}`, `Collapse host ${hName}`);
         const hostHead = h('div', { class: 'ws-host-head' },
-          h('div', { class: 'ws-host-left' },
-            h('i', { class: `dot dot-${hStatus}`, title: hostDotTip }),
-            h('span', { class: 'ws-host-name', title: `${hName} (${hb.id})` }, hName),
-            span('ws-host-id', hb.id),
-            hKind !== 'local' ? span('tag', hKind === 'ssh' ? 'SSH' : 'Peer') : null),
-          h('div', { class: 'row-nowrap', style: 'gap:4px;flex-shrink:0' },
-            rttBadge,
+          h('button', {
+            type: 'button',
+            class: 'ws-host-toggle',
+            'data-host-toggle': hb.id,
+            'aria-expanded': String(!hostCollapsed),
+            'aria-label': toggleHostTip,
+            title: toggleHostTip,
+            onclick: () => {
+              if (UI.collapsedHosts.has(hb.id)) UI.collapsedHosts.delete(hb.id);
+              else UI.collapsedHosts.add(hb.id);
+              saveCollapsedHosts();
+              APP.rerender();
+            },
+          },
+          span('ws-host-caret', hostCollapsed ? '▸' : '▾'),
+          h('i', { class: `dot dot-${hStatus}`, title: hostDotTip }),
+          h('span', { class: 'ws-host-name', title: `${hName} (${hb.id})` }, hName),
+          span('ws-host-id', hb.id),
+          hKind !== 'local' ? span('tag', hKind === 'ssh' ? 'SSH' : 'Peer') : null,
+          rttBadge),
+          h('div', { class: 'row-nowrap ws-host-acts', style: 'gap:4px;flex-shrink:0' },
             h('button', {
               type: 'button',
               class: 'ws-host-rename',
@@ -2104,7 +2817,7 @@ export function patchWorkspace(W) {
             hRec?.error ? h('div', { class: 'ws-host-err', title: hRec.error }, hRec.error) : null)
           : null;
 
-        const groupNodes = sortedGroups.map(([g, list]) => {
+        const groupNodes = hostCollapsed ? [] : sortedGroups.map(([g, list]) => {
           const cKey = hb.id === 'local' ? g : `${hb.id}:${g}`;
           const isCollapsed = !q && UI.collapsedGroups.has(cKey);
           const hasSel = list.some((s) => s.session_id === activeRootId);
@@ -2132,10 +2845,12 @@ export function patchWorkspace(W) {
             span('ws-group-cnt tabular', list.length)),
             !isCollapsed ? h('div', { class: 'ws-group-body' }, list.map((s) => sidebarSessionItem(s, splitWindowKeys))) : null);
         });
-        return h('div', { class: 'ws-host-block', 'data-host-id': hb.id },
+        return h('div', { class: `ws-host-block${hostCollapsed ? ' is-collapsed' : ''}`, 'data-host-id': hb.id },
           hostHead,
           hostStatusBanner,
-          groupNodes.length ? groupNodes : h('div', { class: 'dim', style: 'font-size:12px;padding:2px 8px' }, L('暂无活跃会话', 'No active sessions')));
+          hostCollapsed
+            ? null
+            : (groupNodes.length ? groupNodes : h('div', { class: 'dim ws-empty-host', style: 'font-size:12px;padding:2px 8px' }, L('暂无活跃会话', 'No active sessions'))));
       }));
     }
     W.sideList.scrollTop = prevSideTop;
@@ -2146,6 +2861,7 @@ export function patchWorkspace(W) {
     W.crumbEl.classList.add('ws-hidden');
     W.bodySplit.classList.add('ws-hidden');
     W.emptyMain.classList.remove('ws-hidden');
+    syncInteractivePromptBar(W, null);
     return;
   }
   W.headEl.classList.remove('ws-hidden');
@@ -2160,7 +2876,10 @@ export function patchWorkspace(W) {
   const displayTitle = s.is_subagent ? subagentDisplayName(s) : sessionLabel(s);
   const isShell = s.agent === 'shell';
   const effectiveMode = isShell ? 'raw' : UI.outputMode;
-  const headBaseSig = `${s.session_id}|${displayTitle}|${paneBadge}|${s.agent}|${muxKindOf(s)}|${meLabel}|${s.state}|${effectiveMode}|${titleTip}|${lang}`;
+  const headHostId = hostOf(s);
+  const headIsRemote = isRemoteHost(headHostId);
+  const headHostLabel = headIsRemote ? hostDisplayName(headHostId, s) : '';
+  const headBaseSig = `${s.session_id}|${displayTitle}|${paneBadge}|${s.agent}|${muxKindOf(s)}|${meLabel}|${s.state}|${effectiveMode}|${headHostLabel}|${titleTip}|${lang}`;
   const nextTelSig = telemetrySigOf(s);
   if (W.headSig !== headBaseSig) {
     W.headSig = headBaseSig;
@@ -2171,18 +2890,90 @@ export function patchWorkspace(W) {
       : h('div', { class: 'view-seg', role: 'tablist', 'aria-label': L('显示模式', 'Display mode') },
         h('button', { type: 'button', role: 'tab', class: UI.outputMode === 'reading' ? 'on' : '', onclick: () => { UI.outputMode = 'reading'; APP.rerender(); } }, L('阅读', 'Reading')),
         h('button', { type: 'button', role: 'tab', class: UI.outputMode === 'raw' ? 'on' : '', onclick: () => { UI.outputMode = 'raw'; if (s.pane) loadPreview(s.pane, { mode: pvModeOf(s.pane), silent: true }); APP.rerender(); } }, L('终端', 'Terminal')));
+    const mobMenuBtn = h('button', {
+      type: 'button',
+      class: 'ws-mob-menu-btn',
+      'aria-label': L('打开会话列表', 'Open sessions list'),
+      title: L('打开会话列表', 'Open sessions list'),
+      onclick: () => { UI.mobileSessionsOpen = !UI.mobileSessionsOpen; APP.rerender(); },
+    }, menuDrawerIcon());
+    const mobPctVal = ctxPctOf(s.metrics);
+    const mobTitleBtn = h('button', {
+      type: 'button',
+      class: 'ws-head-mob-title',
+      'aria-label': L(`切换会话：${displayTitle}`, `Switch session: ${displayTitle}`),
+      title: titleTip,
+      onclick: () => { UI.mobileSessionsOpen = true; APP.rerender(); },
+    },
+    h('span', { class: 'ws-mob-title-row' },
+      h('i', { class: `dot dot-${s.state}` }),
+      h('span', { class: 'ws-mob-title-name trunc' }, displayTitle),
+      span('ws-mob-caret', '▾')),
+    h('span', { class: 'ws-mob-sub-row' },
+      span(`ws-mob-agent a-${s.agent || 'x'}`, s.agent || '?'),
+      buildMobCtxEl(s),
+      headIsRemote ? h('span', { class: 'ws-mob-host trunc' }, headHostLabel) : null,
+      mobPctVal == null && !headIsRemote ? h('span', { class: 'trunc' }, stateText(s.state)) : null));
+    const mobOutlineBtn = h('button', {
+      type: 'button',
+      class: 'btn sm ws-outline-mob-btn ws-hidden',
+      'aria-label': L('打开提问目录', 'Open prompt outline'),
+      title: L('提问目录', 'Prompt outline'),
+      onclick: () => APP.openDrawer('outline', { sessionId: s.session_id }),
+    }, outlineListIcon(), span('ws-outline-cnt tabular', '0'));
+    W.mobOutlineBtn = mobOutlineBtn;
+    const mobModeBtn = isShell
+      ? h('button', {
+        type: 'button',
+        class: 'btn sm on ws-mob-mode-btn',
+        'aria-label': L('刷新终端视图', 'Refresh terminal view'),
+        title: L('刷新终端', 'Refresh terminal'),
+        onclick: () => { if (s.pane) loadPreview(s.pane, { mode: pvModeOf(s.pane), silent: false }); },
+      }, modeSwitchIcon(true), span(null, L('终端', 'Term')))
+      : h('button', {
+        type: 'button',
+        class: `btn sm ws-mob-mode-btn${effectiveMode === 'raw' ? ' on' : ''}`,
+        'aria-label': effectiveMode === 'reading' ? L('切换到原始终端视图', 'Switch to raw terminal view') : L('切换回阅读视图', 'Switch back to reading view'),
+        title: effectiveMode === 'reading' ? L('切换到原始终端', 'Switch to raw terminal') : L('切回阅读视图', 'Switch to reading view'),
+        onclick: () => {
+          if (UI.outputMode === 'reading') {
+            UI.outputMode = 'raw';
+            if (s.pane) loadPreview(s.pane, { mode: pvModeOf(s.pane), silent: true });
+          } else {
+            UI.outputMode = 'reading';
+          }
+          APP.rerender();
+        },
+      }, modeSwitchIcon(effectiveMode === 'reading'), span(null, effectiveMode === 'reading' ? L('终端', 'Term') : L('阅读', 'Read')));
+    const detailsBtn = h('button', {
+      type: 'button',
+      class: 'btn sm ws-head-info-btn',
+      title: L('展开右侧检查抽屉（切到终端 / 刷新 / 性能与上下文 / 元数据）', 'Open inspector drawer (terminal / refresh / metrics / metadata)'),
+      onclick: () => APP.openDrawer('session', { sessionId: s.session_id }),
+    }, span('ws-lbl-desk', L('详情', 'Details')), span('ws-lbl-mob', L('详情', 'Info')));
+    const deskPane = paneBadge ? span('tag host-pfx ws-head-desk-item', paneBadge) : null;
+    const deskAgent = agentTag(s.agent);
+    deskAgent.classList.add('ws-head-desk-item');
+    const deskMux = muxKindOf(s) === 'zellij' ? span('tag mux-zj ws-head-desk-item', 'zellij') : null;
+    const deskModel = meLabel ? span('tag mono ws-model-pill ws-head-desk-item', meLabel) : null;
+    const deskStatus = statusInd(s.state, stateText(s.state));
+    deskStatus.classList.add('ws-head-desk-item');
     W.headEl.replaceChildren(
       h('div', { class: 'ws-head-left', title: titleTip },
+        mobMenuBtn,
+        mobTitleBtn,
         h('h2', { class: 'ws-head-title' }, displayTitle),
-        paneBadge ? span('tag host-pfx', paneBadge) : null,
-        agentTag(s.agent),
-        muxKindOf(s) === 'zellij' ? span('tag mux-zj', 'zellij') : null,
-        meLabel ? span('tag mono ws-model-pill', meLabel) : null,
-        statusInd(s.state, stateText(s.state))),
+        deskPane,
+        deskAgent,
+        deskMux,
+        deskModel,
+        deskStatus),
       h('div', { class: 'ws-head-right' },
         buildTelemetryStrip(s),
+        mobOutlineBtn,
         viewToggle,
-        btn(L('详情', 'Details'), { cls: 'sm', title: L('展开右侧检查抽屉（切到终端 / 刷新 / 性能与上下文 / 元数据）', 'Open inspector drawer (terminal / refresh / metrics / metadata)'), onclick: () => APP.openDrawer('session', { sessionId: s.session_id }) })),
+        mobModeBtn,
+        detailsBtn),
     );
   } else if (W.telSig !== nextTelSig) {
     patchTelemetryStrip(s.session_id);
@@ -2209,6 +3000,7 @@ export function patchWorkspace(W) {
 
   syncOutputViewport(W.vp, s);
   syncOutlineRail(W, s, effectiveMode);
+  syncInteractivePromptBar(W, s);
 
   const C = W.comp;
   const readOnlyMsg = s.is_subagent
@@ -2230,6 +3022,7 @@ export function patchWorkspace(W) {
     b.classList.toggle('on', b.dataset.mode === effCompMode);
     b.disabled = !!readOnlyMsg;
   }
+  const isOfflineDirect = compIsRemote && compHostRec?.status === 'offline' && effCompMode === 'direct';
   if (sending && effCompMode === 'direct') {
     const rttPart = compIsRemote && typeof compHostRec?.rtt_ms === 'number' && Number.isFinite(compHostRec.rtt_ms)
       ? ` · ${fmtRtt(compHostRec.rtt_ms)}`
@@ -2238,10 +3031,11 @@ export function patchWorkspace(W) {
     C.modeHint.textContent = compIsRemote
       ? L(`正在通过 ${proto} 发送至 ${hostDisplayName(compHostId, s)}${rttPart}…`, `Sending over ${proto} to ${hostDisplayName(compHostId, s)}${rttPart}…`)
       : L('正在发送至终端…', 'Sending to terminal…');
-    C.modeHint.classList.add('is-sending-hint');
+    C.modeHint.classList.add('is-sending-hint', 'is-critical');
   } else {
     C.modeHint.classList.remove('is-sending-hint');
-    C.modeHint.textContent = readOnlyMsg || (compIsRemote && compHostRec?.status === 'offline' && effCompMode === 'direct'
+    C.modeHint.classList.toggle('is-critical', Boolean(readOnlyMsg || isOfflineDirect));
+    C.modeHint.textContent = readOnlyMsg || (isOfflineDirect
       ? L(`主机 ${hostDisplayName(compHostId, s)} 已离线 · 发送将尝试重连`, `Host ${hostDisplayName(compHostId, s)} is offline · send will attempt reconnect`)
       : (isShell
         ? L('发送终端命令或输入 · Cmd+Enter 执行', 'Send terminal command or input · Cmd+Enter to execute')
@@ -2250,6 +3044,9 @@ export function patchWorkspace(W) {
   if (effCompMode === 'direct' || readOnlyMsg) {
     C.directRow.classList.remove('ws-hidden');
     C.pipeSlot.classList.add('ws-hidden');
+    const isMob = window.innerWidth <= 768;
+    const wantRows = isMob ? 1 : 2;
+    if (C.ta.rows !== wantRows) C.ta.rows = wantRows;
     if (C.sid !== s.session_id) {
       if (C.sid) UI.drafts.set(`ws:msg:${C.sid}`, C.ta.value);
       C.sid = s.session_id;
@@ -2265,13 +3062,19 @@ export function patchWorkspace(W) {
       C.agent = s.agent;
       if (isShell) closeSlashMenu();
     }
-    const ph = readOnlyMsg || (isShell
-      ? L(`输入终端命令发送到 ${sessionLabel(s)}…（Cmd+Enter 执行）`, `Send terminal command to ${sessionLabel(s)}… (Cmd+Enter to execute)`)
-      : L(`发消息给 ${sessionLabel(s)}…（输入 / 唤出命令，Cmd+Enter 发送）`, `Message ${sessionLabel(s)}… (/ for commands, Cmd+Enter to send)`));
+    const ph = readOnlyMsg || (isMob
+      ? (isShell
+        ? L(`输入命令发送到 ${sessionLabel(s)}…`, `Send command to ${sessionLabel(s)}…`)
+        : L(`发消息给 ${sessionLabel(s)}…`, `Message ${sessionLabel(s)}…`))
+      : (isShell
+        ? L(`输入终端命令发送到 ${sessionLabel(s)}…（Cmd+Enter 执行）`, `Send terminal command to ${sessionLabel(s)}… (Cmd+Enter to execute)`)
+        : L(`发消息给 ${sessionLabel(s)}…（输入 / 唤出命令，Cmd+Enter 发送）`, `Message ${sessionLabel(s)}… (/ for commands, Cmd+Enter to send)`)));
     if (C.ta.placeholder !== ph) C.ta.placeholder = ph;
     const wantSendLabel = sending ? L('发送中…', 'Sending…') : L('发送', 'Send');
     if (C.sendBtn.textContent !== wantSendLabel) C.sendBtn.textContent = wantSendLabel;
     C.ta.disabled = !!readOnlyMsg;
+    C.slashBtn.classList.toggle('ws-hidden', isShell);
+    C.slashBtn.disabled = !!readOnlyMsg;
     C.imgBtn.disabled = !!readOnlyMsg;
     C.sendBtn.classList.remove('is-busy');
     C.sendBtn.classList.toggle('is-sending', sending);

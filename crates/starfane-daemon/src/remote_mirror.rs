@@ -24,7 +24,7 @@ use crate::core::transcript::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use starfane_proto::{AgentKind, SessionMetrics};
-use starfane_tmux::{ssh_universal_quote, SshExec, TmuxError};
+use starfane_tmux::{ssh_universal_quote, ConduitLane, SshConduitPool, SshExec, TmuxError};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -48,6 +48,8 @@ pub const MAX_DECOMPRESSED_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_AGY_HYDRATE_STEPS: usize = 20;
 /// Maximum bytes accepted per hydrated AGY step line (512 KiB).
 pub const MAX_AGY_HYDRATE_STEP_BYTES: usize = 512 * 1024;
+/// Maximum byte length of an inline hot transcript delta carried inside `compound_discover_script_v3` (64 KiB).
+pub const MAX_INLINE_DELTA_BYTES: usize = 64 * 1024;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -145,6 +147,7 @@ pub type RemoteTelemetryOutcome = (
 );
 
 type KeyLockMap = HashMap<(String, String), Arc<Mutex<()>>>;
+type AsyncKeyLockMap = HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>;
 
 /// Hub-side incremental mirror manager for remote SSH host transcripts.
 ///
@@ -154,6 +157,7 @@ type KeyLockMap = HashMap<(String, String), Arc<Mutex<()>>>;
 pub struct RemoteTranscriptMirror {
     cache_root: PathBuf,
     key_locks: Arc<Mutex<KeyLockMap>>,
+    async_key_locks: Arc<Mutex<AsyncKeyLockMap>>,
 }
 
 impl RemoteTranscriptMirror {
@@ -161,6 +165,7 @@ impl RemoteTranscriptMirror {
         Self {
             cache_root: state_dir.join("remote-cache"),
             key_locks: Arc::new(Mutex::new(HashMap::new())),
+            async_key_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -263,6 +268,197 @@ impl RemoteTranscriptMirror {
     /// Compute the deterministic local cache path for `(host_id, agent, remote_path)`.
     pub fn local_mirror_path(&self, host_id: &str, agent: AgentKind, remote_path: &str) -> PathBuf {
         self.cache_paths(host_id, agent, remote_path).local_path
+    }
+
+    /// Return the currently mirrored `(remote_ino, synced_offset)` for `(host_id, agent, remote_path)`
+    /// when a valid local mirror exists on disk (`None` if unmirrored or inconsistent).
+    pub fn cached_sync_cursor(
+        &self,
+        host_id: &str,
+        agent: AgentKind,
+        remote_path: &str,
+    ) -> Option<(u64, u64)> {
+        let paths = self.cache_paths(host_id, agent, remote_path);
+        let meta = load_valid_meta(&paths.local_path, &paths.meta_path, remote_path)?;
+        Some((meta.remote_ino, meta.synced_offset))
+    }
+
+    /// Return the latest verified remote `(ino, size, mtime_s)` from local mirror metadata,
+    /// used to seed `last_stat` on tick 1 when a newly resolved transcript wasn't in `latest_tr_stats`.
+    pub fn cached_remote_stat(
+        &self,
+        host_id: &str,
+        agent: AgentKind,
+        remote_path: &str,
+    ) -> Option<RemoteFileStat> {
+        let paths = self.cache_paths(host_id, agent, remote_path);
+        let meta = load_valid_meta(&paths.local_path, &paths.meta_path, remote_path)?;
+        (meta.remote_ino != 0).then_some(RemoteFileStat {
+            ino: meta.remote_ino,
+            size: meta.remote_size,
+            mtime_s: meta.remote_mtime_s,
+        })
+    }
+
+    /// Ingest an inline hot transcript delta (`<= 64 KiB`) piggybacked inside a discovery or
+    /// dirty-pane response with **0 extra SSH round-trips**.
+    ///
+    /// Supports both:
+    /// - Incremental append onto an existing valid mirror matching `(stat.ino, base_offset_expected)`
+    /// - Fresh small cold-seed (`base_offset_expected == 0 && delta_bytes.len() as u64 == stat.size`)
+    ///
+    /// Returns `Err` on any inode/offset/size mismatch so the caller can fall back cleanly to
+    /// [`RemoteTranscriptMirror::ensure_fresh_conduit`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingest_inline_delta(
+        &self,
+        host_id: &str,
+        remote_home: &str,
+        agent: AgentKind,
+        remote_path: &str,
+        stat: RemoteFileStat,
+        base_offset_expected: u64,
+        delta_bytes: &[u8],
+    ) -> Result<MirrorSyncResult, TmuxError> {
+        Self::validate_remote_transcript_path(remote_home, remote_path)
+            .map_err(TmuxError::InvalidRequest)?;
+        if delta_bytes.len() > MAX_INLINE_DELTA_BYTES {
+            return Err(TmuxError::Parse(format!(
+                "inline delta ({} bytes) exceeds {} byte cap",
+                delta_bytes.len(),
+                MAX_INLINE_DELTA_BYTES
+            )));
+        }
+        let delta_len = delta_bytes.len() as u64;
+        let new_synced = base_offset_expected
+            .checked_add(delta_len)
+            .ok_or_else(|| TmuxError::Parse("inline delta offset overflow".into()))?;
+        if new_synced > stat.size {
+            return Err(TmuxError::Parse(format!(
+                "inline delta end ({new_synced}) exceeds remote file size ({})",
+                stat.size
+            )));
+        }
+
+        let key_lock = self.lock_for(host_id, remote_path);
+        let _guard = lock_mutex(&key_lock);
+
+        let paths = self.cache_paths(host_id, agent, remote_path);
+        let existing_meta = load_valid_meta(&paths.local_path, &paths.meta_path, remote_path);
+
+        if let Some(meta) = existing_meta {
+            if meta.remote_ino != 0
+                && meta.remote_ino == stat.ino
+                && meta.synced_offset == base_offset_expected
+            {
+                let cur_local_len = meta.synced_offset.saturating_sub(meta.base_offset);
+                if cur_local_len.saturating_add(delta_len) > MAX_REMOTE_MIRROR_BYTES {
+                    return Err(TmuxError::Parse(
+                        "inline delta would exceed MAX_REMOTE_MIRROR_BYTES".into(),
+                    ));
+                }
+                let actual_local_len = fs::metadata(&paths.local_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if actual_local_len != cur_local_len {
+                    return Err(TmuxError::Parse(format!(
+                        "local mirror size mismatch: disk={actual_local_len}, meta={cur_local_len}"
+                    )));
+                }
+                if delta_bytes.is_empty() {
+                    let mut next_meta = meta;
+                    if next_meta.remote_mtime_s != stat.mtime_s
+                        || next_meta.remote_size != stat.size
+                    {
+                        next_meta.remote_size = stat.size;
+                        next_meta.remote_mtime_s = stat.mtime_s;
+                        save_meta(&paths.meta_path, &next_meta)?;
+                    }
+                    return Ok(MirrorSyncResult {
+                        local_path: paths.local_path,
+                        base_offset: next_meta.base_offset,
+                        synced_offset: next_meta.synced_offset,
+                        changed: false,
+                    });
+                }
+
+                let mut file =
+                    open_private_append(&paths.local_path).map_err(|e| TmuxError::Io {
+                        what: format!("append inline mirror delta {}", paths.local_path.display()),
+                        source: e,
+                    })?;
+                file.write_all(delta_bytes).map_err(|e| TmuxError::Io {
+                    what: format!("write inline mirror delta {}", paths.local_path.display()),
+                    source: e,
+                })?;
+                file.flush().map_err(|e| TmuxError::Io {
+                    what: format!("flush inline mirror delta {}", paths.local_path.display()),
+                    source: e,
+                })?;
+
+                let next_meta = MirrorMeta {
+                    remote_path: remote_path.to_string(),
+                    remote_ino: stat.ino,
+                    remote_size: stat.size.max(new_synced),
+                    remote_mtime_s: stat.mtime_s,
+                    base_offset: meta.base_offset,
+                    synced_offset: new_synced,
+                };
+                save_meta(&paths.meta_path, &next_meta)?;
+                return Ok(MirrorSyncResult {
+                    local_path: paths.local_path,
+                    base_offset: next_meta.base_offset,
+                    synced_offset: next_meta.synced_offset,
+                    changed: true,
+                });
+            }
+            if base_offset_expected != 0 {
+                return Err(TmuxError::Parse(format!(
+                    "inline delta cursor mismatch: local ino={} off={}, incoming ino={} base={base_offset_expected}",
+                    meta.remote_ino, meta.synced_offset, stat.ino
+                )));
+            }
+        }
+
+        // Small fresh/rotated cold-seed (`base_offset_expected == 0`, complete file inline).
+        if base_offset_expected == 0
+            && new_synced == stat.size
+            && stat.size <= MAX_REMOTE_MIRROR_BYTES
+        {
+            ensure_private_dir(&paths.dir).map_err(|e| TmuxError::Io {
+                what: format!("create remote cache dir {}", paths.dir.display()),
+                source: e,
+            })?;
+            if agent == AgentKind::Agy {
+                let stale_full = paths.local_path.with_file_name("transcript_full.jsonl");
+                if stale_full.exists() {
+                    let _ = fs::remove_file(&stale_full);
+                }
+            }
+            atomic_write_private(&paths.local_path, delta_bytes).map_err(|e| TmuxError::Io {
+                what: format!("write inline mirror file {}", paths.local_path.display()),
+                source: e,
+            })?;
+            let next_meta = MirrorMeta {
+                remote_path: remote_path.to_string(),
+                remote_ino: stat.ino,
+                remote_size: stat.size,
+                remote_mtime_s: stat.mtime_s,
+                base_offset: 0,
+                synced_offset: new_synced,
+            };
+            save_meta(&paths.meta_path, &next_meta)?;
+            return Ok(MirrorSyncResult {
+                local_path: paths.local_path,
+                base_offset: 0,
+                synced_offset: new_synced,
+                changed: true,
+            });
+        }
+
+        Err(TmuxError::Parse(format!(
+            "cannot ingest inline delta at base={base_offset_expected} len={delta_len} without matching mirror"
+        )))
     }
 
     /// Ensure the local Hub mirror of `remote_path` is up to date.
@@ -561,6 +757,345 @@ impl RemoteTranscriptMirror {
                     Err(e) => {
                         log::debug!(
                             "remote AGY selective hydration skipped for {remote_path}: {e}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let (mut resp, model, effort) = {
+            let mut guard = lock_mutex(cache);
+            let resp = guard
+                .get_page_or_sync(
+                    agent,
+                    &sync.local_path,
+                    effective_query,
+                    session_metrics.clone(),
+                    now_ms,
+                )
+                .unwrap_or_else(|| TranscriptResponse {
+                    source: "none".to_string(),
+                    transcript_path: None,
+                    messages: Vec::new(),
+                    has_more: false,
+                    total_messages: 0,
+                    start_seq: 0,
+                    next_before: None,
+                    metrics: session_metrics,
+                });
+            let (_, model, effort) = guard.sync_and_telemetry(agent, &sync.local_path, now_ms);
+            (resp, model, effort)
+        };
+
+        if resp.source == "transcript" {
+            resp.transcript_path = Some(remote_path.to_string());
+            resp.has_more = resp.has_more || sync.base_offset > 0;
+            if resp.has_more && resp.next_before.is_none() {
+                resp.next_before = Some(resp.start_seq);
+            }
+        }
+
+        Ok(RemotePageOutcome {
+            response: resp,
+            model,
+            effort,
+            sync,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Async persistent-conduit (`SshConduitPool`) mirror APIs (0 per-call ssh fork)
+    // -----------------------------------------------------------------------
+
+    /// Persistent-conduit equivalent of [`RemoteTranscriptMirror::ensure_fresh`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ensure_fresh_conduit(
+        &self,
+        pool: &SshConduitPool,
+        lane: ConduitLane,
+        host_id: &str,
+        remote_home: &str,
+        agent: AgentKind,
+        remote_path: &str,
+        latest_stat: Option<RemoteFileStat>,
+        need_full_history: bool,
+    ) -> Result<MirrorSyncResult, TmuxError> {
+        Self::validate_remote_transcript_path(remote_home, remote_path)
+            .map_err(TmuxError::InvalidRequest)?;
+
+        let async_lock = self.async_lock_for(host_id, remote_path);
+        let _async_guard = async_lock.lock().await;
+
+        self.ensure_fresh_conduit_locked(
+            pool,
+            lane,
+            host_id,
+            agent,
+            remote_path,
+            latest_stat,
+            need_full_history,
+        )
+        .await
+    }
+
+    /// Persistent-conduit equivalent of [`RemoteTranscriptMirror::backfill_prefix`].
+    pub async fn backfill_prefix_conduit(
+        &self,
+        pool: &SshConduitPool,
+        lane: ConduitLane,
+        host_id: &str,
+        remote_home: &str,
+        agent: AgentKind,
+        remote_path: &str,
+    ) -> Result<MirrorSyncResult, TmuxError> {
+        Self::validate_remote_transcript_path(remote_home, remote_path)
+            .map_err(TmuxError::InvalidRequest)?;
+
+        let async_lock = self.async_lock_for(host_id, remote_path);
+        let _async_guard = async_lock.lock().await;
+
+        self.backfill_prefix_conduit_locked(pool, lane, host_id, agent, remote_path)
+            .await
+    }
+
+    /// Persistent-conduit equivalent of [`RemoteTranscriptMirror::hydrate_remote_agy_steps`].
+    pub async fn hydrate_remote_agy_steps_conduit(
+        &self,
+        pool: &SshConduitPool,
+        lane: ConduitLane,
+        host_id: &str,
+        remote_home: &str,
+        remote_compact_path: &str,
+        step_indices: &[usize],
+    ) -> Result<usize, TmuxError> {
+        Self::validate_remote_transcript_path(remote_home, remote_compact_path)
+            .map_err(TmuxError::InvalidRequest)?;
+        if step_indices.is_empty() {
+            return Ok(0);
+        }
+        let Some(remote_full_path) = remote_sibling_transcript_full(remote_compact_path) else {
+            return Ok(0);
+        };
+        Self::validate_remote_transcript_path(remote_home, &remote_full_path)
+            .map_err(TmuxError::InvalidRequest)?;
+
+        let async_lock = self.async_lock_for(host_id, remote_compact_path);
+        let _async_guard = async_lock.lock().await;
+
+        let paths = self.cache_paths(host_id, AgentKind::Agy, remote_compact_path);
+        let local_full_path = paths.local_path.with_file_name("transcript_full.jsonl");
+
+        let already_present = scan_local_step_indices(&local_full_path);
+        let mut needed: Vec<usize> = Vec::new();
+        for &idx in step_indices {
+            if !already_present.contains(&(idx as u64)) && !needed.contains(&idx) {
+                needed.push(idx);
+                if needed.len() >= MAX_AGY_HYDRATE_STEPS {
+                    break;
+                }
+            }
+        }
+        if needed.is_empty() {
+            return Ok(0);
+        }
+        needed.sort_unstable();
+
+        let script = build_agy_hydrate_script(&remote_full_path, &needed);
+        let out = pool
+            .exec_bytes(lane, &script, None, pool.ssh().timeout())
+            .await?;
+        let payload = parse_hydrate_response_async(out).await?;
+        let Some(raw_lines) = payload else {
+            return Ok(0);
+        };
+
+        let key_lock = self.lock_for(host_id, remote_compact_path);
+        let _sync_guard = lock_mutex(&key_lock);
+
+        let wanted_set: HashSet<u64> = needed.iter().map(|&n| n as u64).collect();
+        let mut seen_new: HashSet<u64> = HashSet::new();
+        let mut verified_lines: Vec<Vec<u8>> = Vec::new();
+
+        for raw_line in raw_lines.split(|&b| b == b'\n') {
+            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if line.is_empty() || line.len() > MAX_AGY_HYDRATE_STEP_BYTES {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let trimmed = text.trim();
+            if !trimmed.starts_with('{') {
+                continue;
+            }
+            let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let Some(step_idx) = obj.get("step_index").and_then(Value::as_u64) else {
+                continue;
+            };
+            if wanted_set.contains(&step_idx) && seen_new.insert(step_idx) {
+                verified_lines.push(trimmed.as_bytes().to_vec());
+            }
+        }
+
+        if verified_lines.is_empty() {
+            return Ok(0);
+        }
+
+        ensure_private_dir(&paths.dir).map_err(|e| TmuxError::Io {
+            what: format!("create remote cache dir {}", paths.dir.display()),
+            source: e,
+        })?;
+        let mut file = open_private_append(&local_full_path).map_err(|e| TmuxError::Io {
+            what: format!("open sparse full transcript {}", local_full_path.display()),
+            source: e,
+        })?;
+        for line in &verified_lines {
+            file.write_all(line).map_err(|e| TmuxError::Io {
+                what: format!("append hydrated step to {}", local_full_path.display()),
+                source: e,
+            })?;
+            file.write_all(b"\n").map_err(|e| TmuxError::Io {
+                what: format!("append hydrated newline to {}", local_full_path.display()),
+                source: e,
+            })?;
+        }
+        file.flush().map_err(|e| TmuxError::Io {
+            what: format!("flush {}", local_full_path.display()),
+            source: e,
+        })?;
+
+        Ok(verified_lines.len())
+    }
+
+    /// Persistent-conduit equivalent of [`RemoteTranscriptMirror::sync_telemetry`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sync_telemetry_conduit(
+        &self,
+        pool: &SshConduitPool,
+        lane: ConduitLane,
+        cache: &Mutex<TranscriptIndexCache>,
+        host_id: &str,
+        remote_home: &str,
+        agent: AgentKind,
+        remote_path: &str,
+        latest_stat: Option<RemoteFileStat>,
+        now_ms: u64,
+    ) -> Result<RemoteTelemetryOutcome, TmuxError> {
+        let sync = self
+            .ensure_fresh_conduit(
+                pool,
+                lane,
+                host_id,
+                remote_home,
+                agent,
+                remote_path,
+                latest_stat,
+                false,
+            )
+            .await?;
+        let (metrics, model, effort) = {
+            let mut guard = lock_mutex(cache);
+            guard.sync_and_telemetry(agent, &sync.local_path, now_ms)
+        };
+        Ok((metrics, model, effort, sync))
+    }
+
+    /// Persistent-conduit equivalent of [`RemoteTranscriptMirror::read_page_and_metrics`].
+    /// Never holds `cache`'s mutex across async conduit I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn read_page_and_metrics_conduit(
+        &self,
+        pool: &SshConduitPool,
+        lane: ConduitLane,
+        cache: &Mutex<TranscriptIndexCache>,
+        host_id: &str,
+        remote_home: &str,
+        agent: AgentKind,
+        remote_path: &str,
+        latest_stat: Option<RemoteFileStat>,
+        query: TranscriptQuery,
+        session_metrics: Option<SessionMetrics>,
+        now_ms: u64,
+    ) -> Result<RemotePageOutcome, TmuxError> {
+        let mut sync = self
+            .ensure_fresh_conduit(
+                pool,
+                lane,
+                host_id,
+                remote_home,
+                agent,
+                remote_path,
+                latest_stat,
+                query.all,
+            )
+            .await?;
+
+        let effective_limit = if query.all {
+            MAX_TRANSCRIPT_LIMIT
+        } else {
+            query.limit.clamp(1, MAX_TRANSCRIPT_LIMIT)
+        };
+        let mut effective_query = query;
+
+        let reaches_start = query.all || query.before.is_some_and(|b| b <= effective_limit);
+        if sync.base_offset > 0 && reaches_start {
+            let old_total = {
+                let mut guard = lock_mutex(cache);
+                guard
+                    .total_messages_for_path(agent, &sync.local_path)
+                    .unwrap_or(0)
+            };
+            let backfilled = self
+                .backfill_prefix_conduit(pool, lane, host_id, remote_home, agent, remote_path)
+                .await?;
+            if backfilled.changed {
+                let new_total = {
+                    let mut guard = lock_mutex(cache);
+                    guard.invalidate_path(&backfilled.local_path);
+                    guard
+                        .total_messages_for_path(agent, &backfilled.local_path)
+                        .unwrap_or(old_total)
+                };
+                if let Some(b) = effective_query.before {
+                    let prefix_delta = new_total.saturating_sub(old_total);
+                    effective_query.before = Some(b.saturating_add(prefix_delta));
+                }
+            }
+            sync = backfilled;
+        }
+
+        if agent == AgentKind::Agy {
+            let missing = {
+                let mut guard = lock_mutex(cache);
+                guard.missing_agy_hydration_steps(
+                    agent,
+                    &sync.local_path,
+                    effective_query,
+                    MAX_AGY_HYDRATE_STEPS,
+                )
+            };
+            if !missing.is_empty() {
+                match self
+                    .hydrate_remote_agy_steps_conduit(
+                        pool,
+                        lane,
+                        host_id,
+                        remote_home,
+                        remote_path,
+                        &missing,
+                    )
+                    .await
+                {
+                    Ok(hydrated_count) if hydrated_count > 0 => {
+                        let mut guard = lock_mutex(cache);
+                        guard.invalidate_pages(&sync.local_path);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::debug!(
+                            "remote AGY selective hydration (conduit) skipped for {remote_path}: {e}"
                         );
                     }
                 }
@@ -934,11 +1469,376 @@ impl RemoteTranscriptMirror {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_fresh_conduit_locked(
+        &self,
+        pool: &SshConduitPool,
+        lane: ConduitLane,
+        host_id: &str,
+        agent: AgentKind,
+        remote_path: &str,
+        latest_stat: Option<RemoteFileStat>,
+        need_full_history: bool,
+    ) -> Result<MirrorSyncResult, TmuxError> {
+        let paths = self.cache_paths(host_id, agent, remote_path);
+        let existing_meta = {
+            let key_lock = self.lock_for(host_id, remote_path);
+            let _g = lock_mutex(&key_lock);
+            load_valid_meta(&paths.local_path, &paths.meta_path, remote_path)
+        };
+
+        if let (Some(stat), Some(meta)) = (latest_stat, existing_meta.as_ref()) {
+            if meta.remote_ino != 0
+                && stat.ino == meta.remote_ino
+                && stat.size == meta.synced_offset
+                && (!need_full_history || meta.base_offset == 0)
+            {
+                return Ok(MirrorSyncResult {
+                    local_path: paths.local_path,
+                    base_offset: meta.base_offset,
+                    synced_offset: meta.synced_offset,
+                    changed: false,
+                });
+            }
+        }
+
+        let mut current_meta = existing_meta;
+        let mut any_changed = false;
+        if need_full_history {
+            if let Some(ref meta) = current_meta {
+                let compatible = latest_stat.is_none_or(|s| {
+                    meta.remote_ino != 0 && s.ino == meta.remote_ino && s.size >= meta.synced_offset
+                });
+                if meta.base_offset > 0 && compatible {
+                    let bf = self
+                        .backfill_prefix_conduit_locked(pool, lane, host_id, agent, remote_path)
+                        .await?;
+                    any_changed |= bf.changed;
+                    current_meta = {
+                        let key_lock = self.lock_for(host_id, remote_path);
+                        let _g = lock_mutex(&key_lock);
+                        load_valid_meta(&paths.local_path, &paths.meta_path, remote_path)
+                    };
+                    if let Some(ref updated) = current_meta {
+                        let up_to_date = match latest_stat {
+                            Some(stat) => {
+                                updated.remote_ino != 0
+                                    && stat.ino == updated.remote_ino
+                                    && stat.size == updated.synced_offset
+                            }
+                            None => updated.remote_size == updated.synced_offset,
+                        };
+                        if up_to_date {
+                            return Ok(MirrorSyncResult {
+                                local_path: paths.local_path,
+                                base_offset: updated.base_offset,
+                                synced_offset: updated.synced_offset,
+                                changed: any_changed,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let max_chunks = ((MAX_REMOTE_MIRROR_BYTES / MAX_DELTA_CHUNK) as usize).max(1) + 2;
+        for _ in 0..max_chunks {
+            let (prev_ino, prev_off, cur_local_len) = match &current_meta {
+                Some(m) => {
+                    let local_len = m.synced_offset.saturating_sub(m.base_offset);
+                    if local_len >= MAX_REMOTE_MIRROR_BYTES {
+                        (0, 0, 0)
+                    } else {
+                        (m.remote_ino, m.synced_offset, local_len)
+                    }
+                }
+                None => (0, 0, 0),
+            };
+            let remaining_mirror_budget = MAX_REMOTE_MIRROR_BYTES
+                .saturating_sub(cur_local_len)
+                .min(MAX_DELTA_CHUNK);
+            let chunk_cap = if prev_ino == 0 {
+                MAX_DELTA_CHUNK
+            } else {
+                remaining_mirror_budget.max(1)
+            };
+
+            let script = build_ensure_fresh_script(
+                remote_path,
+                prev_ino,
+                prev_off,
+                need_full_history,
+                chunk_cap,
+            );
+            let out = pool
+                .exec_bytes(lane, &script, None, pool.ssh().timeout())
+                .await?;
+            let (hdr, raw_bytes) = parse_fetch_response_async(out).await?;
+
+            let key_lock = self.lock_for(host_id, remote_path);
+            let _sync_guard = lock_mutex(&key_lock);
+
+            if hdr.reset {
+                ensure_private_dir(&paths.dir).map_err(|e| TmuxError::Io {
+                    what: format!("create remote cache dir {}", paths.dir.display()),
+                    source: e,
+                })?;
+                if agent == AgentKind::Agy {
+                    let stale_full = paths.local_path.with_file_name("transcript_full.jsonl");
+                    if stale_full.exists() {
+                        let _ = fs::remove_file(&stale_full);
+                    }
+                }
+
+                let (clean_slice, base_offset) = if hdr.offset > 0 {
+                    align_tail_slice(&raw_bytes, hdr.offset)
+                } else {
+                    (raw_bytes.as_slice(), 0)
+                };
+                let synced_offset = hdr.offset.saturating_add(hdr.raw_len);
+                atomic_write_private(&paths.local_path, clean_slice).map_err(|e| {
+                    TmuxError::Io {
+                        what: format!("write mirror file {}", paths.local_path.display()),
+                        source: e,
+                    }
+                })?;
+
+                let next_meta = MirrorMeta {
+                    remote_path: remote_path.to_string(),
+                    remote_ino: hdr.stat.ino,
+                    remote_size: hdr.stat.size,
+                    remote_mtime_s: hdr.stat.mtime_s,
+                    base_offset,
+                    synced_offset,
+                };
+                save_meta(&paths.meta_path, &next_meta)?;
+                current_meta = Some(next_meta);
+                any_changed = true;
+            } else if hdr.raw_len == 0 {
+                let meta = current_meta.as_mut().ok_or_else(|| {
+                    TmuxError::Parse("unexpected zero-byte non-reset mirror response".into())
+                })?;
+                if meta.remote_mtime_s != hdr.stat.mtime_s || meta.remote_size != hdr.stat.size {
+                    meta.remote_size = hdr.stat.size;
+                    meta.remote_mtime_s = hdr.stat.mtime_s;
+                    save_meta(&paths.meta_path, meta)?;
+                }
+                break;
+            } else {
+                let meta = current_meta.as_ref().ok_or_else(|| {
+                    TmuxError::Parse("missing mirror meta on incremental append".into())
+                })?;
+                if hdr.offset != meta.synced_offset || hdr.stat.ino != meta.remote_ino {
+                    return Err(TmuxError::Parse(format!(
+                        "mirror delta mismatch: expected ino={} off={}, got ino={} off={}",
+                        meta.remote_ino, meta.synced_offset, hdr.stat.ino, hdr.offset
+                    )));
+                }
+                let expected_local_len = meta.synced_offset.saturating_sub(meta.base_offset);
+                let actual_local_len = fs::metadata(&paths.local_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if actual_local_len != expected_local_len {
+                    current_meta = None;
+                    continue;
+                }
+
+                let mut file =
+                    open_private_append(&paths.local_path).map_err(|e| TmuxError::Io {
+                        what: format!("append mirror file {}", paths.local_path.display()),
+                        source: e,
+                    })?;
+                file.write_all(&raw_bytes).map_err(|e| TmuxError::Io {
+                    what: format!("write mirror delta {}", paths.local_path.display()),
+                    source: e,
+                })?;
+                file.flush().map_err(|e| TmuxError::Io {
+                    what: format!("flush mirror delta {}", paths.local_path.display()),
+                    source: e,
+                })?;
+
+                let synced_offset = hdr.offset.saturating_add(hdr.raw_len);
+                let next_meta = MirrorMeta {
+                    remote_path: remote_path.to_string(),
+                    remote_ino: hdr.stat.ino,
+                    remote_size: hdr.stat.size,
+                    remote_mtime_s: hdr.stat.mtime_s,
+                    base_offset: meta.base_offset,
+                    synced_offset,
+                };
+                save_meta(&paths.meta_path, &next_meta)?;
+                current_meta = Some(next_meta);
+                any_changed = true;
+            }
+
+            let Some(ref m) = current_meta else {
+                break;
+            };
+            if m.synced_offset >= m.remote_size
+                || m.synced_offset.saturating_sub(m.base_offset) >= MAX_REMOTE_MIRROR_BYTES
+            {
+                break;
+            }
+        }
+
+        let final_meta = current_meta.ok_or_else(|| {
+            TmuxError::Parse(format!("failed to materialize mirror for {remote_path}"))
+        })?;
+        Ok(MirrorSyncResult {
+            local_path: paths.local_path,
+            base_offset: final_meta.base_offset,
+            synced_offset: final_meta.synced_offset,
+            changed: any_changed,
+        })
+    }
+
+    fn backfill_prefix_conduit_locked<'a>(
+        &'a self,
+        pool: &'a SshConduitPool,
+        lane: ConduitLane,
+        host_id: &'a str,
+        agent: AgentKind,
+        remote_path: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<MirrorSyncResult, TmuxError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let paths = self.cache_paths(host_id, agent, remote_path);
+            let meta_opt = {
+                let key_lock = self.lock_for(host_id, remote_path);
+                let _g = lock_mutex(&key_lock);
+                load_valid_meta(&paths.local_path, &paths.meta_path, remote_path)
+            };
+            let Some(meta) = meta_opt else {
+                return self
+                    .ensure_fresh_conduit_locked(
+                        pool,
+                        lane,
+                        host_id,
+                        agent,
+                        remote_path,
+                        None,
+                        true,
+                    )
+                    .await;
+            };
+            if meta.base_offset == 0 {
+                return Ok(MirrorSyncResult {
+                    local_path: paths.local_path,
+                    base_offset: 0,
+                    synced_offset: meta.synced_offset,
+                    changed: false,
+                });
+            }
+
+            let cur_local_len = meta.synced_offset.saturating_sub(meta.base_offset);
+            let budget = MAX_REMOTE_MIRROR_BYTES.saturating_sub(cur_local_len);
+            if budget == 0 {
+                return Ok(MirrorSyncResult {
+                    local_path: paths.local_path,
+                    base_offset: meta.base_offset,
+                    synced_offset: meta.synced_offset,
+                    changed: false,
+                });
+            }
+
+            let target_start = meta.base_offset.saturating_sub(budget);
+            let total_prefix_bytes = meta.base_offset.saturating_sub(target_start);
+            let mut prefix_buf: Vec<u8> = Vec::with_capacity(
+                usize::try_from(total_prefix_bytes).unwrap_or(MAX_DELTA_CHUNK as usize),
+            );
+            let mut cursor = target_start;
+            let mut latest_remote_stat = RemoteFileStat {
+                ino: meta.remote_ino,
+                size: meta.remote_size,
+                mtime_s: meta.remote_mtime_s,
+            };
+
+            while cursor < meta.base_offset {
+                let cap = (meta.base_offset - cursor).min(MAX_DELTA_CHUNK);
+                let script = build_range_fetch_script(remote_path, meta.remote_ino, cursor, cap);
+                let out = pool
+                    .exec_bytes(lane, &script, None, pool.ssh().timeout())
+                    .await?;
+                match parse_range_fetch_response_async(out).await? {
+                    (RangeFetchOutcome::Rotated(_) | RangeFetchOutcome::Truncated(_), _) => {
+                        return self
+                            .ensure_fresh_conduit_locked(
+                                pool,
+                                lane,
+                                host_id,
+                                agent,
+                                remote_path,
+                                None,
+                                true,
+                            )
+                            .await;
+                    }
+                    (RangeFetchOutcome::Header(hdr), chunk_bytes) => {
+                        if hdr.offset != cursor || hdr.raw_len != cap {
+                            return Err(TmuxError::Parse(format!(
+                                "backfill range mismatch: expected off={cursor} len={cap}, got off={} len={}",
+                                hdr.offset, hdr.raw_len
+                            )));
+                        }
+                        latest_remote_stat = hdr.stat;
+                        prefix_buf.extend_from_slice(&chunk_bytes);
+                        cursor = cursor.saturating_add(cap);
+                    }
+                }
+            }
+
+            let (prefix_slice, new_base_offset) = if target_start > 0 {
+                align_tail_slice(&prefix_buf, target_start)
+            } else {
+                (prefix_buf.as_slice(), 0)
+            };
+
+            let key_lock = self.lock_for(host_id, remote_path);
+            let _sync_guard = lock_mutex(&key_lock);
+
+            atomic_stitch_prefix_private(&paths.local_path, prefix_slice).map_err(|e| {
+                TmuxError::Io {
+                    what: format!(
+                        "stitch backfilled prefix into {}",
+                        paths.local_path.display()
+                    ),
+                    source: e,
+                }
+            })?;
+
+            let updated_meta = MirrorMeta {
+                remote_path: remote_path.to_string(),
+                remote_ino: latest_remote_stat.ino,
+                remote_size: latest_remote_stat.size,
+                remote_mtime_s: latest_remote_stat.mtime_s,
+                base_offset: new_base_offset,
+                synced_offset: meta.synced_offset,
+            };
+            save_meta(&paths.meta_path, &updated_meta)?;
+
+            Ok(MirrorSyncResult {
+                local_path: paths.local_path,
+                base_offset: updated_meta.base_offset,
+                synced_offset: updated_meta.synced_offset,
+                changed: true,
+            })
+        })
+    }
+
     fn lock_for(&self, host_id: &str, remote_path: &str) -> Arc<Mutex<()>> {
         let mut map = lock_mutex(&self.key_locks);
         let key = (host_id.to_string(), remote_path.to_string());
         map.entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn async_lock_for(&self, host_id: &str, remote_path: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = lock_mutex(&self.async_key_locks);
+        let key = (host_id.to_string(), remote_path.to_string());
+        map.entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
 
@@ -983,7 +1883,11 @@ struct CachePaths {
 
 const POSIX_SF_STAT_FN: &str = "\
 sf_stat() {
-  stat -c '%i %s %Y' \"$1\" 2>/dev/null || stat -f '%i %z %m' \"$1\" 2>/dev/null || printf '0 -1 0\\n'
+  case \"${SF_STAT_MODE:-}\" in
+    gnu) stat -c '%i %s %Y' \"$1\" 2>/dev/null || printf '0 -1 0\\n' ;;
+    bsd) stat -f '%i %z %m' \"$1\" 2>/dev/null || printf '0 -1 0\\n' ;;
+    *) stat -c '%i %s %Y' \"$1\" 2>/dev/null || stat -f '%i %z %m' \"$1\" 2>/dev/null || printf '0 -1 0\\n' ;;
+  esac
 }";
 
 fn build_ensure_fresh_script(
@@ -1228,6 +2132,60 @@ fn parse_hydrate_response(
         other => Err(TmuxError::Parse(format!(
             "unexpected AGY hydrate header: {other:?}"
         ))),
+    }
+}
+
+async fn parse_fetch_response_async(
+    out: starfane_tmux::ExecBytesOutput,
+) -> Result<(FetchHeader, Vec<u8>), TmuxError> {
+    let is_gz = split_header_and_payload(&out)
+        .ok()
+        .is_some_and(|(hdr, _)| hdr.contains(" GZ1 "));
+    if is_gz {
+        tokio::task::spawn_blocking(move || parse_fetch_response(&out))
+            .await
+            .map_err(|e| TmuxError::Io {
+                what: "mirror gzip decode join".into(),
+                source: std::io::Error::other(e.to_string()),
+            })?
+    } else {
+        parse_fetch_response(&out)
+    }
+}
+
+async fn parse_range_fetch_response_async(
+    out: starfane_tmux::ExecBytesOutput,
+) -> Result<(RangeFetchOutcome, Vec<u8>), TmuxError> {
+    let is_gz = split_header_and_payload(&out)
+        .ok()
+        .is_some_and(|(hdr, _)| hdr.contains(" GZ1 "));
+    if is_gz {
+        tokio::task::spawn_blocking(move || parse_range_fetch_response(&out))
+            .await
+            .map_err(|e| TmuxError::Io {
+                what: "mirror range gzip decode join".into(),
+                source: std::io::Error::other(e.to_string()),
+            })?
+    } else {
+        parse_range_fetch_response(&out)
+    }
+}
+
+async fn parse_hydrate_response_async(
+    out: starfane_tmux::ExecBytesOutput,
+) -> Result<Option<Vec<u8>>, TmuxError> {
+    let is_gz = split_header_and_payload(&out)
+        .ok()
+        .is_some_and(|(hdr, _)| hdr == "HDR GZ1");
+    if is_gz {
+        tokio::task::spawn_blocking(move || parse_hydrate_response(&out))
+            .await
+            .map_err(|e| TmuxError::Io {
+                what: "mirror hydrate gzip decode join".into(),
+                source: std::io::Error::other(e.to_string()),
+            })?
+    } else {
+        parse_hydrate_response(&out)
     }
 }
 
@@ -2695,5 +3653,271 @@ cat "{}"
             "expected RAW delta: {:?}",
             logs[1]
         );
+    }
+
+    #[test]
+    fn ingest_inline_delta_cold_seed_append_and_mismatch_guards() {
+        let dir = temp_test_dir("inline-delta");
+        let mirror = RemoteTranscriptMirror::new(dir.join("state"));
+        let rhome = "/home/demo";
+        let rpath = "/home/demo/.claude/projects/-home-demo-app/s1.jsonl";
+
+        let line1 = concat!(
+            r#"{"type":"user","timestamp":"2026-11-25T10:00:00Z","message":{"role":"user","content":"inline 1"}}"#,
+            "\n"
+        );
+        let line2 = concat!(
+            r#"{"type":"assistant","timestamp":"2026-11-25T10:00:02Z","message":{"id":"m1","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"inline 2"}]}}"#,
+            "\n"
+        );
+
+        // 1. Cold-seed small transcript inline (`base_offset_expected == 0`, 0 SSH calls).
+        let stat1 = RemoteFileStat {
+            ino: 42,
+            size: line1.len() as u64,
+            mtime_s: 1_760_000_001,
+        };
+        let res1 = mirror
+            .ingest_inline_delta(
+                "host-a",
+                rhome,
+                AgentKind::Claude,
+                rpath,
+                stat1,
+                0,
+                line1.as_bytes(),
+            )
+            .unwrap();
+        assert!(res1.changed);
+        assert_eq!(res1.base_offset, 0);
+        assert_eq!(res1.synced_offset, line1.len() as u64);
+        assert_eq!(
+            mirror.cached_sync_cursor("host-a", AgentKind::Claude, rpath),
+            Some((42, line1.len() as u64))
+        );
+
+        // 2. Incremental append matching `(ino, synced_offset)`.
+        let stat2 = RemoteFileStat {
+            ino: 42,
+            size: (line1.len() + line2.len()) as u64,
+            mtime_s: 1_760_000_005,
+        };
+        let res2 = mirror
+            .ingest_inline_delta(
+                "host-a",
+                rhome,
+                AgentKind::Claude,
+                rpath,
+                stat2,
+                line1.len() as u64,
+                line2.as_bytes(),
+            )
+            .unwrap();
+        assert!(res2.changed);
+        assert_eq!(res2.synced_offset, (line1.len() + line2.len()) as u64);
+        assert_eq!(
+            fs::read_to_string(&res2.local_path).unwrap(),
+            format!("{line1}{line2}")
+        );
+
+        // 3. Mismatched inode or base offset is rejected cleanly (never corrupts local file).
+        assert!(mirror
+            .ingest_inline_delta(
+                "host-a",
+                rhome,
+                AgentKind::Claude,
+                rpath,
+                RemoteFileStat {
+                    ino: 99,
+                    size: stat2.size + 4,
+                    mtime_s: 1_760_000_006,
+                },
+                stat2.size,
+                b"abcd",
+            )
+            .is_err());
+        assert!(mirror
+            .ingest_inline_delta(
+                "host-a",
+                rhome,
+                AgentKind::Claude,
+                rpath,
+                RemoteFileStat {
+                    ino: 42,
+                    size: stat2.size + 4,
+                    mtime_s: 1_760_000_006,
+                },
+                stat2.size + 1,
+                b"abc",
+            )
+            .is_err());
+
+        // 4. Rejects oversized inline delta (> 64 KiB) and traversal paths.
+        let giant = vec![b'x'; MAX_INLINE_DELTA_BYTES + 1];
+        assert!(mirror
+            .ingest_inline_delta(
+                "host-a",
+                rhome,
+                AgentKind::Claude,
+                rpath,
+                RemoteFileStat {
+                    ino: 42,
+                    size: stat2.size + giant.len() as u64,
+                    mtime_s: 1_760_000_007,
+                },
+                stat2.size,
+                &giant,
+            )
+            .is_err());
+        assert!(mirror
+            .ingest_inline_delta(
+                "host-a",
+                rhome,
+                AgentKind::Claude,
+                "/home/demo/.claude/projects/../../etc/passwd",
+                stat1,
+                0,
+                b"bad",
+            )
+            .is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn conduit_mirror_reuses_single_ssh_spawn_across_sync_delta_and_backfill() {
+        let dir = temp_test_dir("conduit-mirror");
+        let state_dir = dir.join("state");
+        let remote_home = dir.join("remote_home");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(remote_home.join(".claude/projects/-home-u-demo")).unwrap();
+        let calls_log = dir.join("conduit_spawns.log");
+        let fake_ssh = dir.join("fake-ssh");
+        write_executable(
+            &fake_ssh,
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "-O" ] && [ "$2" = "exit" ]; then exit 0; fi
+printf 'SPAWN\n' >> "{log}"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then shift; break; fi
+  shift
+done
+export HOME="{rhome}"
+exec /bin/sh -c "$1"
+"#,
+                log = calls_log.display(),
+                rhome = remote_home.display(),
+            ),
+        );
+        let ssh = SshExec::new("demo@conduit-test", dir.join("cm.sock"))
+            .with_ssh_bin(Some(fake_ssh.to_string_lossy().into_owned()))
+            .with_timeout(Duration::from_secs(10));
+        let pool = SshConduitPool::new(ssh);
+        let mirror = RemoteTranscriptMirror::new(state_dir);
+        let cache = Mutex::new(TranscriptIndexCache::default());
+
+        let tr_path = remote_home.join(".claude/projects/-home-u-demo/conduit-s1.jsonl");
+        let pad = "a".repeat(2048);
+        let mut body = String::new();
+        for i in 0..1200 {
+            body.push_str(&format!(
+                "{{\"type\":\"user\",\"timestamp\":\"2026-11-25T09:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"turn-{i} {pad}\"}}}}\n"
+            ));
+        }
+        assert!(body.len() as u64 > INITIAL_TAIL_WINDOW);
+        fs::write(&tr_path, &body).unwrap();
+        let rhome = remote_home.to_string_lossy().into_owned();
+        let rpath = tr_path.to_string_lossy().into_owned();
+
+        // 1. Cold tail window over persistent conduit (1 spawn).
+        let p1 = mirror
+            .read_page_and_metrics_conduit(
+                &pool,
+                ConduitLane::Interactive,
+                &cache,
+                "h-conduit",
+                &rhome,
+                AgentKind::Claude,
+                &rpath,
+                None,
+                TranscriptQuery::tail(20),
+                None,
+                1000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p1.response.source, "transcript");
+        assert!(p1.sync.base_offset > 0);
+        assert!(p1.response.has_more);
+        assert_eq!(
+            fs::read_to_string(&calls_log).unwrap().lines().count(),
+            1,
+            "conduit should spawn ssh once"
+        );
+
+        // 2. Append delta and re-read via the SAME persistent conduit (still 1 ssh spawn!).
+        let extra_line = "{\"type\":\"assistant\",\"timestamp\":\"2026-11-25T09:01:00Z\",\"message\":{\"id\":\"m-end\",\"role\":\"assistant\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"conduit delta ok\"}]}}\n";
+        {
+            let mut f = OpenOptions::new().append(true).open(&tr_path).unwrap();
+            f.write_all(extra_line.as_bytes()).unwrap();
+        }
+        let p2 = mirror
+            .read_page_and_metrics_conduit(
+                &pool,
+                ConduitLane::Interactive,
+                &cache,
+                "h-conduit",
+                &rhome,
+                AgentKind::Claude,
+                &rpath,
+                None,
+                TranscriptQuery::tail(5),
+                None,
+                2000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p2.response.messages.last().unwrap().text,
+            "conduit delta ok"
+        );
+        assert_eq!(
+            fs::read_to_string(&calls_log).unwrap().lines().count(),
+            1,
+            "delta fetch must reuse existing conduit without spawning ssh"
+        );
+
+        // 3. Full history backfill (`all=true`) over the SAME persistent conduit (still 1 ssh spawn!).
+        let p3 = mirror
+            .read_page_and_metrics_conduit(
+                &pool,
+                ConduitLane::Interactive,
+                &cache,
+                "h-conduit",
+                &rhome,
+                AgentKind::Claude,
+                &rpath,
+                None,
+                TranscriptQuery {
+                    limit: 5000,
+                    before: None,
+                    all: true,
+                },
+                None,
+                3000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p3.sync.base_offset, 0);
+        assert!(p3.response.messages[0].text.starts_with("turn-0 "));
+        assert_eq!(
+            fs::read_to_string(&calls_log).unwrap().lines().count(),
+            1,
+            "prefix backfill must reuse existing conduit without spawning ssh"
+        );
+
+        pool.reset().await;
+        let _ = fs::remove_dir_all(&dir);
     }
 }

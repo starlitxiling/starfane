@@ -51,6 +51,23 @@ export function loadCollapsedGroups() {
   }
 }
 
+const COLLAPSED_HOSTS_KEY = 'starfane_collapsed_hosts';
+
+export function loadCollapsedHosts() {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_HOSTS_KEY);
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+export function saveCollapsedHosts() {
+  try {
+    localStorage.setItem(COLLAPSED_HOSTS_KEY, JSON.stringify([...UI.collapsedHosts]));
+  } catch { /* ignore */ }
+}
+
 export function saveCollapsedGroups() {
   try {
     localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...UI.collapsedGroups]));
@@ -71,9 +88,11 @@ export const S = {
   conn: 'connecting',
   healthFails: 0,
   version: '',
+  uiHash: '',
   uptimeMs: null,
   lastSeq: 0,
   lastLoad: 0,
+  lastSseAt: 0,
   loaded: false,
   loadError: null,
   authEnabled: true,
@@ -101,6 +120,7 @@ export const S = {
   handoffs: new Map(),
   previews: new Map(),
   transcripts: new Map(),
+  liveTails: new Map(),
   activity: [],
   muteUntil: Number(localStorage.getItem('starfane_mute_until') || 0),
   channelMutes: {},
@@ -128,6 +148,8 @@ export const UI = {
   parsePreviews: {},
   drafts: new Map(),
   attachments: new Map(),
+  optimisticTurns: new Map(),
+  forceScrollBottomSid: null,
   busy: new Set(),
   open: new Set(),
   trLimit: new Map(),
@@ -138,8 +160,10 @@ export const UI = {
   termGlyphMode: loadGlyphMode(),
   slash: { open: false, start: 0, end: 0, query: '', items: [], idx: 0 },
   collapsedGroups: loadCollapsedGroups(),
+  collapsedHosts: loadCollapsedHosts(),
   groupsInited: !!localStorage.getItem(GROUPS_INIT_KEY),
   outlineCollapsed: localStorage.getItem(OUTLINE_COLLAPSED_KEY) === '1',
+  mobileSessionsOpen: false,
   jumpLockUntil: 0,
   muteMenu: false,
   muteTarget: 'all',
@@ -166,6 +190,8 @@ export const APP = {
   updateOutputClock: () => {},
   patchTelemetryStrip: () => {},
   compactTranscript: () => {},
+  collectUserPrompts: () => [],
+  jumpToPrompt: () => {},
   loadAll: async () => {},
   syncStateSilent: async () => {},
   loadSessionOutput: () => {},
@@ -199,8 +225,155 @@ export const pvKeyOf = (pane, mode = pvModeOf(pane)) => `${pane}:${mode}`;
 
 export const MAX_CACHED_TRANSCRIPTS = 12;
 export const MAX_CACHED_PREVIEWS = 12;
+export const MAX_CACHED_LIVE_TAILS = 24;
 export const COMPACT_TRANSCRIPT_THRESHOLD = 120;
+export const OPTIMISTIC_EXPIRE_MS = 45000;
 const HEAVY_PREVIEW_CHAR_LIMIT = 512 * 1024;
+
+export function setLiveTailEntry(sessionId, text, updatedMs = Date.now()) {
+  if (!sessionId || typeof text !== 'string') return;
+  S.liveTails.delete(sessionId);
+  S.liveTails.set(sessionId, { text, hash: hashStr(text), updatedMs });
+  const activeSid = UI.selSession;
+  while (S.liveTails.size > MAX_CACHED_LIVE_TAILS) {
+    let victim = null;
+    for (const sid of S.liveTails.keys()) {
+      if (sid !== sessionId && sid !== activeSid) { victim = sid; break; }
+    }
+    if (!victim) break;
+    S.liveTails.delete(victim);
+  }
+}
+
+export function normalizeTurnText(str) {
+  return String(str || '').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim();
+}
+
+function isSyntheticUserPrompt(norm) {
+  return (
+    norm.startsWith('[后台任务')
+    || norm.startsWith('[Swarm 通知]')
+    || /^\[来自 [^\]]+ 消息\]/.test(norm)
+    || norm.startsWith('Task id "')
+  );
+}
+
+function stripAttachTokens(norm) {
+  return norm.replace(/\[(?:图片|Image|粘贴|Paste)\s+#\d+\]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function optimisticMatchesMessage(item, msg, absSeq) {
+  if (!item || !msg || msg.role !== 'user') return false;
+  if (absSeq < (Number.isFinite(item.anchor_total) ? item.anchor_total : 0)) return false;
+  const mNorm = normalizeTurnText(msg.text);
+  if (isSyntheticUserPrompt(mNorm)) return false;
+  const itemNorm = normalizeTurnText(item.text);
+  if (itemNorm) {
+    if (mNorm === itemNorm) return true;
+    if (mNorm.includes(itemNorm) || itemNorm.includes(mNorm)) return true;
+    const plain = stripAttachTokens(itemNorm);
+    if (plain.length >= 4 && mNorm.includes(plain)) return true;
+  }
+  const atts = Array.isArray(item.attachments) ? item.attachments : [];
+  if (atts.length) {
+    for (let i = 0; i < atts.length; i++) {
+      const a = atts[i];
+      if (a.path && mNorm.includes(String(a.path).trim())) return true;
+      if (a.content) {
+        const snippet = normalizeTurnText(a.content).slice(0, 32);
+        if (snippet.length >= 8 && mNorm.includes(snippet)) return true;
+      }
+    }
+    const plain = stripAttachTokens(itemNorm);
+    if (!plain && mNorm) return true;
+  }
+  if (item.status === 'sent' && typeof msg.ts_ms === 'number' && Number.isFinite(msg.ts_ms) && msg.ts_ms >= (item.created_ms || 0) - 5000) {
+    return true;
+  }
+  return false;
+}
+
+export function addOptimisticTurn(sid, entry) {
+  if (!sid || !entry || !entry.nonce) return null;
+  const list = UI.optimisticTurns.get(sid) || [];
+  list.push(entry);
+  UI.optimisticTurns.set(sid, list);
+  return entry;
+}
+
+export function updateOptimisticTurnStatus(sid, nonce, status) {
+  if (!sid || !nonce) return false;
+  const list = UI.optimisticTurns.get(sid);
+  if (!list || !list.length) return false;
+  const item = list.find((x) => x.nonce === nonce);
+  if (!item || item.status === status) return false;
+  item.status = status;
+  return true;
+}
+
+export function removeOptimisticTurn(sid, nonce) {
+  if (!sid || !nonce) return null;
+  const list = UI.optimisticTurns.get(sid);
+  if (!list || !list.length) return null;
+  const idx = list.findIndex((x) => x.nonce === nonce);
+  if (idx < 0) return null;
+  const [removed] = list.splice(idx, 1);
+  if (removed?._expireTimer) {
+    clearTimeout(removed._expireTimer);
+    removed._expireTimer = 0;
+  }
+  if (!list.length) UI.optimisticTurns.delete(sid);
+  return removed;
+}
+
+export function hasOptimisticTurn(sid, nonce) {
+  const list = sid ? UI.optimisticTurns.get(sid) : null;
+  if (!list || !list.length) return false;
+  return nonce ? list.some((x) => x.nonce === nonce) : true;
+}
+
+export function reconcileOptimisticTurns(sid, tr = S.transcripts.get(sid)) {
+  if (!sid) return false;
+  const list = UI.optimisticTurns.get(sid);
+  if (!list || !list.length) return false;
+  const now = Date.now();
+  const hasMsgs = tr?.state === 'ok' && tr.source === 'transcript' && Array.isArray(tr.messages) && tr.messages.length > 0;
+  const startSeq = hasMsgs && Number.isFinite(tr.startSeq) ? tr.startSeq : 0;
+  const consumedSeqs = new Set();
+  const kept = [];
+  let changed = false;
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
+    if (item.status === 'sent' && (now - (item.created_ms || 0)) >= OPTIMISTIC_EXPIRE_MS) {
+      if (item._expireTimer) { clearTimeout(item._expireTimer); item._expireTimer = 0; }
+      changed = true;
+      continue;
+    }
+    let matched = false;
+    if (hasMsgs) {
+      for (let j = 0; j < tr.messages.length; j++) {
+        const absSeq = startSeq + j;
+        if (consumedSeqs.has(absSeq)) continue;
+        if (optimisticMatchesMessage(item, tr.messages[j], absSeq)) {
+          consumedSeqs.add(absSeq);
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (matched) {
+      if (item._expireTimer) { clearTimeout(item._expireTimer); item._expireTimer = 0; }
+      changed = true;
+      continue;
+    }
+    kept.push(item);
+  }
+  if (changed) {
+    if (kept.length) UI.optimisticTurns.set(sid, kept);
+    else UI.optimisticTurns.delete(sid);
+  }
+  return changed;
+}
 
 export function hashStr(str) {
   let h = 2166136261;
@@ -222,7 +395,7 @@ export function hashMessage(msg) {
   if (typeof msg._h === 'string' && msg._h) return msg._h;
   const tools = Array.isArray(msg.tools) && msg.tools.length ? msg.tools.join(',') : '';
   const txt = String(msg.text || '');
-  const h = hashStr(`${msg.role || ''}|${msg.kind || ''}|${msg.ts_ms || 0}|${tools}|${txt.length}|${txt}`);
+  const h = hashStr(`${msg.role || ''}|${msg.kind || ''}|${msg.ts_ms || 0}|${msg.delegation || ''}|${tools}|${txt.length}|${txt}`);
   try {
     Object.defineProperty(msg, '_h', { value: h, configurable: true, enumerable: false });
   } catch {
@@ -771,6 +944,14 @@ export function migrateSessionSelection(oldId, newId) {
   const dkNew = `ws:msg:${newId}`;
   if (UI.drafts.has(dkOld) && !UI.drafts.has(dkNew)) UI.drafts.set(dkNew, UI.drafts.get(dkOld));
   if (UI.attachments.has(oldId) && !UI.attachments.has(newId)) UI.attachments.set(newId, UI.attachments.get(oldId));
+  if (UI.optimisticTurns.has(oldId) && !UI.optimisticTurns.has(newId)) {
+    UI.optimisticTurns.set(newId, UI.optimisticTurns.get(oldId));
+    UI.optimisticTurns.delete(oldId);
+  }
+  if (S.liveTails.has(oldId) && !S.liveTails.has(newId)) {
+    S.liveTails.set(newId, S.liveTails.get(oldId));
+    S.liveTails.delete(oldId);
+  }
   if (UI.wsShell?.comp?.sid === oldId) {
     UI.wsShell.comp.sid = newId;
     UI.wsShell.comp.ta.dataset.draft = dkNew;

@@ -103,13 +103,37 @@ pub fn is_user_watching(
     }
 }
 
-/// Detect whether terminal screen text (visible screen capture, tail capture, or a single cursor
-/// line) displays an interactive folder/workspace trust confirmation prompt for `agent`.
+/// True when the bottom-most lines of a multi-line capture show active TUI chat chrome
+/// (normal conversation prompt/footer), suppressing false positives when normal chat
+/// merely quotes trust/MCP/update prompt text higher up in the scrollback.
 ///
-/// Returns a clear human-readable reason (e.g. `"codex waiting for folder trust approval"`) when
-/// a trust dialog is active, or `None` otherwise. In multi-line captures, active TUI chat chrome
-/// (`? for shortcuts`, `esc to interrupt`, `context left`, `Ask Codex to do anything`) suppresses
-/// false positives when a normal conversation merely mentions trust-prompt text.
+/// Restricted to the bottom 5 non-empty lines so stale chat chrome left above a newly
+/// launched startup modal (e.g. exiting an old CLI and immediately restarting it in the
+/// same tmux pane) never suppresses detection of the active modal at the bottom.
+fn has_bottom_active_chat_chrome(non_empty: &[&str]) -> bool {
+    if non_empty.len() <= 1 {
+        return false;
+    }
+    let bottom = &non_empty[non_empty.len().saturating_sub(5)..];
+    bottom.iter().any(|l| {
+        let ll = l.to_ascii_lowercase();
+        ll.contains("? for shortcuts")
+            || ll.contains("esc to interrupt")
+            || ll.contains("ctrl+c to interrupt")
+            || ll.contains("context left")
+            || ll.contains("ask codex to do anything")
+            || ll.contains("shift+tab to cycle")
+    })
+}
+
+/// Detect whether terminal screen text (visible screen capture, tail capture, or a single cursor
+/// line) displays an interactive folder/workspace trust or Claude project MCP server confirmation
+/// prompt for `agent`.
+///
+/// Returns a clear human-readable reason (e.g. `"codex waiting for folder trust approval"` or
+/// `"claude waiting for mcp server approval"`) when a confirmation dialog is active, or `None`
+/// otherwise. In multi-line captures, active TUI chat chrome at the bottom of the screen
+/// suppresses false positives when a normal conversation merely mentions prompt text.
 pub fn detect_folder_trust_prompt(agent: AgentKind, text: &str) -> Option<&'static str> {
     if agent == AgentKind::Shell || text.trim().is_empty() {
         return None;
@@ -125,13 +149,7 @@ pub fn detect_folder_trust_prompt(agent: AgentKind, text: &str) -> Option<&'stat
     let single_line = non_empty.len() == 1;
     let lower = text.to_ascii_lowercase();
 
-    if !single_line
-        && (lower.contains("? for shortcuts")
-            || lower.contains("esc to interrupt")
-            || lower.contains("ctrl+c to interrupt")
-            || lower.contains("context left")
-            || lower.contains("ask codex to do anything"))
-    {
+    if has_bottom_active_chat_chrome(&non_empty) {
         return None;
     }
 
@@ -176,7 +194,7 @@ pub fn detect_folder_trust_prompt(agent: AgentKind, text: &str) -> Option<&'stat
             let has_context = lower.contains("accessing workspace")
                 || lower.contains("claude code'll be able to read, edit, and execute files here")
                 || lower.contains("enter to confirm");
-            let hit = if single_line {
+            let trust_hit = if single_line {
                 has_question
                     || lower.contains("yes, i trust this folder")
                     || (non_empty[0].starts_with('❯')
@@ -185,7 +203,36 @@ pub fn detect_folder_trust_prompt(agent: AgentKind, text: &str) -> Option<&'stat
                 (has_question && (has_action || has_context))
                     || (lower.contains("yes, i trust this folder") && has_context)
             };
-            hit.then_some("claude waiting for folder trust approval")
+            if trust_hit {
+                return Some("claude waiting for folder trust approval");
+            }
+
+            let has_mcp_header = lower.contains("new mcp server found in this project")
+                || lower.contains("new mcp servers found in this project");
+            let has_mcp_action = lower.contains("continue without using this mcp server")
+                || lower.contains("continue without using these mcp servers")
+                || lower.contains("use this and all future mcp servers")
+                || lower.contains("use these and all future mcp servers")
+                || non_empty.iter().any(|l| {
+                    let ll = l.to_ascii_lowercase();
+                    ll.starts_with('❯')
+                        && (ll.contains("use this mcp server")
+                            || ll.contains("use these mcp servers")
+                            || ll.contains("continue without using this mcp")
+                            || ll.contains("continue without using these mcp"))
+                });
+            let has_mcp_context = lower.contains("enter to confirm")
+                || lower.contains("esc to cancel")
+                || lower.contains("mcp servers may execute code")
+                || lower.contains("use this mcp server")
+                || lower.contains("use these mcp servers");
+            let mcp_hit = if single_line {
+                has_mcp_header || has_mcp_action
+            } else {
+                (has_mcp_header && (has_mcp_action || has_mcp_context))
+                    || (has_mcp_action && has_mcp_context)
+            };
+            mcp_hit.then_some("claude waiting for mcp server approval")
         }
         AgentKind::Agy => {
             let has_question = lower.contains("do you trust the contents of this project?")
@@ -234,13 +281,7 @@ pub fn detect_codex_update_prompt(agent: AgentKind, text: &str) -> Option<&'stat
     let single_line = non_empty.len() == 1;
     let lower = text.to_ascii_lowercase();
 
-    if !single_line
-        && (lower.contains("? for shortcuts")
-            || lower.contains("esc to interrupt")
-            || lower.contains("ctrl+c to interrupt")
-            || lower.contains("context left")
-            || lower.contains("ask codex to do anything"))
-    {
+    if has_bottom_active_chat_chrome(&non_empty) {
         return None;
     }
 

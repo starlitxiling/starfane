@@ -235,10 +235,18 @@ fn state_snapshot_and_sse_roundtrip() {
             context_used_pct: Some(60.0),
             tps: Some(64.5),
             ttft_ms: Some(1_200),
+            avg_ttft_ms: Some(1_200),
             last_output_tokens: Some(645),
             last_duration_ms: Some(10_000),
             total_input_tokens: Some(300_000),
             total_output_tokens: Some(4_200),
+            recent_turns: vec![TurnMetricSample {
+                ts_ms: 1234,
+                ttft_ms: Some(1_200),
+                tps: Some(64.5),
+                output_tokens: Some(645),
+                duration_ms: Some(10_000),
+            }],
             source: "transcript".into(),
             updated_ms: 1234,
         }),
@@ -269,6 +277,28 @@ fn state_snapshot_and_sse_roundtrip() {
     let frame = ev.to_sse_frame().unwrap();
     assert!(frame.starts_with("id: 10\nevent: session\ndata: {"));
     assert!(frame.ends_with("\n\n"));
+
+    let out_ev = DaemonEvent::Output {
+        seq: 11,
+        session_id: SessionId::new("mac-xiling:tmux-%39"),
+        start_seq: Some(25),
+        total_messages: Some(26),
+        appended_messages: vec![json!({"role": "assistant", "text": "hello"})],
+        live_tail: Some("tail".into()),
+        metrics: None,
+        dirty: false,
+    };
+    let out_frame = out_ev.to_sse_frame().unwrap();
+    assert!(out_frame.starts_with("id: 11\nevent: output\ndata: {"));
+    let parsed_out: DaemonEvent = serde_json::from_str(
+        out_frame
+            .lines()
+            .nth(2)
+            .unwrap()
+            .trim_start_matches("data: "),
+    )
+    .unwrap();
+    assert_eq!(parsed_out, out_ev);
 }
 
 #[test]
@@ -333,4 +363,55 @@ fn id_generation_prefixes() {
     let parsed = PipelineId::new(p.clone());
     assert!(parsed.as_str().starts_with("P-"));
     assert!(id::timestamp_ms(&p).is_some());
+}
+
+#[test]
+fn session_metrics_legacy_json_and_recent_turns_roundtrip() {
+    // Legacy JSON missing `avg_ttft_ms` and `recent_turns` must deserialize cleanly,
+    // and serialize without emitting empty `avg_ttft_ms` / `recent_turns` fields.
+    let legacy_json = json!({
+        "context_used_tokens": 50_000,
+        "context_window_tokens": 200_000,
+        "context_used_pct": 25.0,
+        "tps": 72.3,
+        "ttft_ms": 950,
+        "source": "transcript",
+        "updated_ms": 1_700_000_000_000u64
+    });
+    let legacy: SessionMetrics = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy.avg_ttft_ms, None);
+    assert!(legacy.recent_turns.is_empty());
+    let ser_legacy = serde_json::to_value(&legacy).unwrap();
+    assert!(ser_legacy.get("avg_ttft_ms").is_none());
+    assert!(ser_legacy.get("recent_turns").is_none());
+
+    // Populated `avg_ttft_ms` and `recent_turns` roundtrip losslessly.
+    let populated = SessionMetrics {
+        avg_ttft_ms: Some(1_150),
+        recent_turns: vec![
+            TurnMetricSample {
+                ts_ms: 1_700_000_001_000,
+                ttft_ms: Some(950),
+                tps: Some(80.5),
+                output_tokens: Some(322),
+                duration_ms: Some(4_000),
+            },
+            TurnMetricSample {
+                ts_ms: 1_700_000_005_000,
+                ttft_ms: Some(1_350),
+                tps: None,
+                output_tokens: Some(45),
+                duration_ms: None,
+            },
+        ],
+        source: "agy_db".into(),
+        ..legacy
+    };
+    let ser = serde_json::to_value(&populated).unwrap();
+    assert_eq!(ser["avg_ttft_ms"], 1_150);
+    assert_eq!(ser["recent_turns"].as_array().unwrap().len(), 2);
+    assert!(ser["recent_turns"][1].get("tps").is_none());
+    assert!(ser["recent_turns"][1].get("duration_ms").is_none());
+    let back: SessionMetrics = serde_json::from_value(ser).unwrap();
+    assert_eq!(back, populated);
 }

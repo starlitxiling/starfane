@@ -7,49 +7,55 @@
 use crate::config::{NodeConfig, NodeKindConfig, NotifyOwnership, TeamConfig};
 use crate::core::discover::{legacy_session_id, next_sequential_window_name};
 use crate::core::metrics::{
-    encode_claude_project_dir, epoch_i64_to_ms, extract_agy_effort_from_model,
-    extract_codex_status_title, is_post_birth_timestamp, merge_metrics,
-    parse_lsof_agy_presence_all, parse_ps_etime_secs, parse_status_line_metrics,
+    agy_step_timings_to_metrics, encode_claude_project_dir, epoch_i64_to_ms,
+    extract_agy_effort_from_model, extract_codex_status_title,
+    extract_session_id_from_transcript_path, is_post_birth_timestamp, merge_metrics,
+    parse_agy_step_timing_tsv, parse_codex_status_line_model_effort, parse_lsof_agy_presence_all,
+    parse_ps_etime_secs, parse_status_line_metrics, AgyStepTiming,
 };
 use crate::core::transcript::{
-    parse_iso8601_ms, TranscriptIndexCache, TranscriptQuery, TranscriptResponse,
+    parse_iso8601_ms, TranscriptIndexCache, TranscriptMessage, TranscriptQuery, TranscriptResponse,
+    TranscriptWatermark,
 };
-use crate::core::uploads::{detect_image_magic, MAX_IMAGE_BYTES};
+use crate::core::uploads::{decode_base64, detect_image_magic, MAX_IMAGE_BYTES};
 use crate::core::util::sanitize_line;
 use crate::notice::BoxFuture;
+use crate::peer_client::{
+    PeerHttpError, PeerKeepAlivePool, PeerSseEndpoint, PeerSseSignal, PeerSseSubscriber,
+    SshLoopbackTunnel,
+};
 use crate::remote_mirror::{
     parse_codex_default_effort_toml, parse_sf_stat_line, RemoteFileStat, RemoteTranscriptMirror,
+    MAX_INLINE_DELTA_BYTES,
 };
 use serde::Serialize;
 use serde_json::Value;
 use starfane_proto::{
-    id, AgentKind, ApiError, Confidence, DeliveryLevel, DeliveryReport, DeliveryStatus, Effort,
-    ErrorCode, EventDetail, EventId, EventKind, GateCheck, GateReport, HostId, HostKind,
-    HostRecord, HostStatus, NormalizedEvent, PaneId, PaneResolution, SessionId, SessionMetrics,
-    SessionRecord, SessionState, LOCAL_HOST_ID, PROTO_VERSION,
+    id, AgentKind, ApiError, Confidence, DaemonEvent, DeliveryLevel, DeliveryReport,
+    DeliveryStatus, Effort, ErrorCode, EventDetail, EventId, EventKind, GateCheck, GateReport,
+    HostId, HostKind, HostRecord, HostStatus, NormalizedEvent, PaneId, PaneResolution, SessionId,
+    SessionMetrics, SessionRecord, SessionState, LOCAL_HOST_ID, PROTO_VERSION,
 };
 use starfane_tmux::{
     adaptive_paste_settle_ms, cap_page_bytes, classify_panes_with_git_lookup,
     detect_blocking_startup_prompt, detect_codex_update_prompt, detect_folder_trust_prompt,
     is_paste_stuck_in_prompt, parse_panes, parse_zellij_pane_id, qualify_host_pane,
-    qualify_host_session, shell_single_quote, trim_and_cap_tail, validate_interactive_text,
-    CaptureRequest, ClientInfo, DiscoverOptions, DiscoveredPane, ExecTransport, FocusOutcome,
-    GateConfig, PaneInfo, PanePreview, PaneStatus, SshExec, TerminalMux, Tmux, TmuxError,
-    ZellijMux, MAX_CAPTURE_BYTES, MAX_CAPTURE_LINES, MAX_FULL_CAPTURE_BYTES,
-    MAX_FULL_CAPTURE_LINES,
+    qualify_host_session, shell_single_quote, trim_and_cap_tail, validate_interactive_key,
+    validate_interactive_text, CaptureRequest, ClientInfo, ConduitLane, DiscoverOptions,
+    DiscoveredPane, ExecTransport, FocusOutcome, GateConfig, PaneInfo, PanePreview, PaneStatus,
+    SshConduitPool, SshExec, TerminalMux, Tmux, TmuxError, ZellijMux, MAX_CAPTURE_BYTES,
+    MAX_CAPTURE_LINES, MAX_FULL_CAPTURE_BYTES, MAX_FULL_CAPTURE_LINES,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
 
-const PEER_HTTP_TIMEOUT: Duration = Duration::from_secs(6);
-const MAX_PEER_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 const SSH_SPLIT_MARKER: &str = "__SF_SSH_PS_SPLIT__";
 
 const SEC_META: &str = "__SF_SEC_META__";
@@ -58,6 +64,7 @@ const SEC_PS: &str = "__SF_SEC_PS__";
 const SEC_TAILS: &str = "__SF_SEC_TAILS__";
 const SEC_RESOLVE: &str = "__SF_SEC_RESOLVE__";
 const SEC_TR_STATS: &str = "__SF_SEC_TR_STATS__";
+const SEC_HOT_DELTAS: &str = "__SF_SEC_HOT_DELTAS__";
 
 const PF_META: &str = "__SF_PF_META__";
 const PF_WINDOWS: &str = "__SF_PF_WINDOWS__";
@@ -68,11 +75,21 @@ const SSH_BG_MAX_CONCURRENT: usize = 4;
 const SSH_INTERACTIVE_MAX_CONCURRENT: usize = 1;
 const LEGACY_STABLE_TICKS: u32 = 3;
 const LEGACY_SPAWN_GRACE_MS: u64 = 15_000;
-const TAIL_CACHE_MAX_TICKS: u8 = 2;
 const CLAUDE_PID_START_MAX_SKEW_MS: u64 = 120_000;
 const RECENT_CLOSE_TOMBSTONE_MS: u64 = 5_000;
 const MAX_STAGED_CACHE_ENTRIES: usize = 256;
 const RTT_UNSET: u64 = u64::MAX;
+const SSH_PING_INTERVAL_MS: u64 = 15_000;
+const SSH_PING_TIMEOUT: Duration = Duration::from_secs(3);
+const SSH_STAGE_CONDUIT_MAX_BYTES: usize = 64 * 1024;
+const SSH_HOT_CURSOR_MAX: usize = 6;
+const SSH_WARM_TOP_N: usize = 8;
+const SSH_INLINE_OUTPUT_MAX_BYTES: usize = 32 * 1024;
+const SSH_INLINE_OUTPUT_MAX_TURNS: usize = 32;
+const WATCH_DEBOUNCE_MS: u64 = 75;
+const WATCH_DIGEST_ACTIVE_MS: u64 = 1_000;
+const WATCH_DIGEST_IDLE_MS: u64 = 3_000;
+const WATCH_MAX_LINE_KEEP_BYTES: usize = 4 * 1024;
 
 /// Remote non-interactive `$PATH` bootstrap prepended to SSH POSIX `/bin/sh` scripts so
 /// user-installed `claude`, `codex`, `agy`, and `tmux` binaries are found even when login
@@ -83,10 +100,31 @@ done
 export PATH
 "#;
 
-/// Portable POSIX `stat` wrapper emitting `<inode> <size_bytes> <mtime_epoch_sec>` on both
-/// GNU/Linux (`stat -c`) and macOS/BSD (`stat -f`).
-const REMOTE_SF_STAT_FN: &str = r#"sf_stat() {
-  stat -c '%i %s %Y' "$1" 2>/dev/null || stat -f '%i %z %m' "$1" 2>/dev/null || printf '0 -1 0\n'
+/// Portable POSIX `stat` wrapper honoring `SF_STAT_MODE` (`bsd` / `gnu`) detected once by
+/// `PersistentSshConduit` (falling back cleanly to auto-detect on one-shot `SshExec`).
+const REMOTE_SF_STAT_FN: &str = r#"if [ -z "${SF_STAT_MODE:-}" ]; then
+  if stat -c '%s' / >/dev/null 2>&1; then SF_STAT_MODE=gnu
+  elif stat -f '%z' / >/dev/null 2>&1; then SF_STAT_MODE=bsd
+  else SF_STAT_MODE=unknown; fi
+fi
+sf_stat() {
+  case "$SF_STAT_MODE" in
+    gnu) stat -c '%i %s %Y' "$1" 2>/dev/null || printf '0 -1 0\n' ;;
+    bsd) stat -f '%i %z %m' "$1" 2>/dev/null || printf '0 -1 0\n' ;;
+    *) stat -c '%i %s %Y' "$1" 2>/dev/null || stat -f '%i %z %m' "$1" 2>/dev/null || printf '0 -1 0\n' ;;
+  esac
+}
+sf_batch_stat() {
+  [ "$#" -gt 0 ] || return 0
+  case "$SF_STAT_MODE" in
+    bsd) stat -f '%i %z %m %N' "$@" 2>/dev/null || true ;;
+    gnu) stat -c '%i %s %Y %n' "$@" 2>/dev/null || true ;;
+    *)
+      for _sp in "$@"; do
+        printf '%s %s\n' "$(sf_stat "$_sp")" "$_sp"
+      done
+      ;;
+  esac
 }
 "#;
 
@@ -281,6 +319,17 @@ impl LocalMuxPool {
         }
     }
 
+    pub fn send_key(&self, pane: &PaneId, key: &str) -> Result<(), TmuxError> {
+        if Self::is_zellij_pane(pane) {
+            let zj = self.zellij.as_ref().ok_or_else(|| {
+                TmuxError::InvalidRequest("zellij mux is not enabled or unavailable".into())
+            })?;
+            zj.send_key(pane, key)
+        } else {
+            self.tmux.send_key(pane, key)
+        }
+    }
+
     pub fn focus_pane(&self, pane: &PaneId) -> Result<FocusOutcome, TmuxError> {
         if Self::is_zellij_pane(pane) {
             let zj = self.zellij.as_ref().ok_or_else(|| {
@@ -324,12 +373,26 @@ impl LocalMuxPool {
 // Multi-host NodeProvider abstraction & HostCircuitBreaker
 // ---------------------------------------------------------------------------
 
+/// Asynchronous push signal emitted by a remote host's push watcher (`tmux -C` on SSH or
+/// `/api/events` SSE subscriber on Peer) to wake `Core`'s per-host supervisor immediately.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum HostPushSignal {
+    DirtyPanes(Vec<PaneId>),
+    FullSync,
+    PeerSnapshot(Box<NodeSnapshot>),
+    PeerEvent(DaemonEvent),
+    Reconnect,
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeSnapshot {
     pub host: HostRecord,
     pub sessions: Vec<SessionRecord>,
     /// Heuristic events produced during SSH discovery (`TurnComplete`, `NeedsPermission`, `NeedsInput`).
     pub events: Vec<NormalizedEvent>,
+    /// Incremental `DaemonEvent::Output` payloads emitted when remote transcripts or live tails advance.
+    pub output_deltas: Vec<DaemonEvent>,
 }
 
 /// Request payload for spawning an interactive coding-agent session on a remote host.
@@ -511,9 +574,30 @@ pub trait NodeProvider: Send + Sync {
 
     fn rtt_ms(&self) -> Option<u64>;
 
+    fn sync_ms(&self) -> Option<u64> {
+        None
+    }
+
     fn next_retry_ms(&self) -> Option<u64>;
 
     fn circuit_status(&self) -> HostStatus;
+
+    fn sync_dirty_panes<'a>(
+        &'a self,
+        display_name: &'a str,
+        dirty_panes: &'a [PaneId],
+        claimed_external_ids: &'a HashSet<String>,
+    ) -> BoxFuture<'a, Result<NodeSnapshot, String>> {
+        let _ = dirty_panes;
+        self.sync_with_claimed(display_name, claimed_external_ids)
+    }
+
+    fn spawn_push_watcher(
+        &self,
+        _tx: tokio::sync::mpsc::UnboundedSender<HostPushSignal>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        None
+    }
 
     fn capture_pane<'a>(
         &'a self,
@@ -546,6 +630,20 @@ pub trait NodeProvider: Send + Sync {
         remote_session: &'a SessionId,
         local_pane: &'a PaneId,
     ) -> BoxFuture<'a, Result<serde_json::Value, ApiError>>;
+
+    fn send_key<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        let _ = (remote_session, local_pane, key);
+        Box::pin(async {
+            Err(ApiError::bad_request(
+                "remote host does not support interactive keys",
+            ))
+        })
+    }
 }
 
 pub fn build_remote_providers(
@@ -578,7 +676,9 @@ pub fn build_remote_providers_with_transcript_cache(
                 shared_mirror.clone(),
                 transcript_index.clone(),
             )),
-            NodeKindConfig::Peer => Arc::new(PeerDaemonNodeProvider::new(cfg)),
+            NodeKindConfig::Peer => {
+                Arc::new(PeerDaemonNodeProvider::with_state_dir(cfg, state_dir))
+            }
         };
         map.insert(host_id, provider);
     }
@@ -596,7 +696,7 @@ struct SshTailCacheEntry {
     cursor_y: u32,
     in_mode: bool,
     current_command: String,
-    ticks_cached: u8,
+    agent_pid: Option<u32>,
     tail: String,
 }
 
@@ -628,6 +728,9 @@ struct ResolvedRemoteTranscript {
     path: String,
     external_id: Option<String>,
     authoritative: bool,
+    /// Non-`None` when bound via Codex live bottom status-bar title (`extract_codex_status_title`).
+    /// Used to detect interactive `/resume` thread switches or `/new` blank prompts on later ticks.
+    title_hint: Option<String>,
     last_stat: Option<RemoteFileStat>,
     metrics: Option<SessionMetrics>,
     model: Option<String>,
@@ -657,7 +760,9 @@ struct RemoteCodexThreadRow {
     rollout_path: String,
     cwd: String,
     name: Option<String>,
+    #[allow(dead_code)]
     created_at: i64,
+    #[allow(dead_code)]
     updated_at: i64,
 }
 
@@ -692,8 +797,13 @@ struct RemoteAgyChildRow {
 #[derive(Debug, Default)]
 struct SshDiscoveryState {
     remote_home: Option<String>,
+    /// Monotonic discovery tick counter used to stagger active-pane verification captures.
+    discover_tick: u64,
     /// OS process birth timestamps strictly in the **Remote Host Clock Domain** (`remote_now_ms - etime`).
     pid_birth_remote_ms: HashMap<u32, u64>,
+    /// Cached AGY presence locks keyed by live remote `pid -> (birth_remote_s, lock_uuids)` so
+    /// macOS `lsof -p` runs once per AGY process lifetime (invalidated on PID death or birth skew).
+    resolved_agy_locks: HashMap<u32, (u64, Vec<String>)>,
     pane_agent_pid: HashMap<PaneId, u32>,
     pane_agent: HashMap<PaneId, AgentKind>,
     pane_first_seen_remote_ms: HashMap<PaneId, u64>,
@@ -714,6 +824,19 @@ struct SshDiscoveryState {
     recently_closed_panes: HashMap<PaneId, u64>,
     /// Latest stat map from `__SF_SEC_TR_STATS__`.
     latest_tr_stats: HashMap<String, RemoteFileStat>,
+    /// Latest complete session snapshot for fast targeted `sync_dirty_panes` patching.
+    last_sessions: Vec<SessionRecord>,
+    /// Last emitted transcript watermark per qualified session id (for `DaemonEvent::Output` deltas).
+    last_emitted_watermarks: HashMap<SessionId, TranscriptWatermark>,
+    /// Last emitted live-tail content hash per local pane id (for `DaemonEvent::Output` `live_tail` updates).
+    last_emitted_tail_hash: HashMap<PaneId, u64>,
+}
+
+fn pane_numeric_id(pane: &PaneId) -> u64 {
+    pane.as_str()
+        .strip_prefix('%')
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 impl SshDiscoveryState {
@@ -726,16 +849,63 @@ impl SshDiscoveryState {
         self.tail_cache.remove(local_pane);
         self.pane_watch.remove(local_pane);
         self.resolved_by_pane.remove(local_pane);
+        self.last_emitted_tail_hash.remove(local_pane);
         let leg = legacy_session_id(local_pane);
         self.session_lookup.remove(&leg);
+        let pane_suffix = format!(":{}", local_pane.as_str());
+        let leg_suffix = format!(":{}", leg.as_str());
+        let mut evicted_sids: HashSet<SessionId> = HashSet::new();
+        for s in &self.last_sessions {
+            if s.pane
+                .as_ref()
+                .is_some_and(|p| p.as_str().ends_with(&pane_suffix))
+                || s.session_id == leg
+                || s.session_id.as_str().ends_with(&leg_suffix)
+            {
+                evicted_sids.insert(s.session_id.clone());
+            }
+        }
+        for s in &self.last_sessions {
+            if s.parent_session_id
+                .as_ref()
+                .is_some_and(|p| evicted_sids.contains(p))
+            {
+                evicted_sids.insert(s.session_id.clone());
+            }
+        }
+        self.last_emitted_watermarks.retain(|sid, _| {
+            !evicted_sids.contains(sid) && sid != &leg && !sid.as_str().ends_with(&leg_suffix)
+        });
+        self.last_sessions
+            .retain(|s| !evicted_sids.contains(&s.session_id));
         self.recently_closed_panes
             .insert(local_pane.clone(), now_hub_ms);
     }
 
-    fn cached_tail_fingerprints(&self) -> Vec<String> {
+    /// Return pane tail fingerprints that may skip `tmux capture-pane` on this tick:
+    /// - `Idle` / `Ended` panes with unchanged `(history_size, cursor_x, cursor_y, in_mode, cmd, agent_pid)`
+    ///   never suffer a synchronized `TAIL_CACHE_MAX_TICKS` expiry cliff (**0 captures when idle**).
+    /// - Active (`Working`/`Starting`/`Needs*`) panes stagger verification via
+    ///   `(pane_num + discover_tick) % 4 == 0` so at most 1/4 verify on any given tick.
+    fn cached_tail_fingerprints(&self, tick: u64) -> Vec<String> {
         self.tail_cache
             .iter()
-            .filter(|(_, e)| e.ticks_cached < TAIL_CACHE_MAX_TICKS)
+            .filter(|(pane, entry)| {
+                // If agent_pid changed since cache entry, never treat as cached.
+                if self.pane_agent_pid.get(*pane).copied() != entry.agent_pid {
+                    return false;
+                }
+                let is_active = self.pane_watch.get(*pane).is_some_and(|w| {
+                    matches!(
+                        w.state,
+                        SessionState::Working
+                            | SessionState::Starting
+                            | SessionState::NeedsPermission
+                            | SessionState::NeedsInput
+                    )
+                });
+                !(is_active && (pane_numeric_id(pane).wrapping_add(tick)) % 4 == 0)
+            })
             .map(|(pane, e)| {
                 format!(
                     "{}|{}|{}|{}|{}|{}",
@@ -748,6 +918,94 @@ impl SshDiscoveryState {
                 )
             })
             .collect()
+    }
+
+    /// Already-resolved live AGY `(pid, birth_remote_s)` pairs so `lsof -p` runs once per AGY PID.
+    fn resolved_agy_pid_births(&self) -> Vec<(u32, u64)> {
+        let mut out: Vec<(u32, u64)> = self
+            .resolved_agy_locks
+            .iter()
+            .filter(|(_, (_, locks))| !locks.is_empty())
+            .map(|(&pid, &(birth_s, _))| (pid, birth_s))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Panes that should still be tail-captured even if `include_shell_panes == false`
+    /// (e.g. freshly spawned panes within startup grace).
+    fn force_capture_panes(&self, now_hub_ms: u64) -> Vec<String> {
+        self.spawned_panes
+            .iter()
+            .filter(|(_, m)| now_hub_ms.saturating_sub(m.hub_spawned_at_ms) < LEGACY_SPAWN_GRACE_MS)
+            .map(|(p, _)| p.as_str().to_string())
+            .collect()
+    }
+
+    /// Select up to `SSH_HOT_CURSOR_MAX` (6) active/`Working` sessions' `(remote_path, ino, synced_offset)`
+    /// for inline `<= 64 KiB` hot delta delivery inside `compound_discover_script_v3`.
+    fn hot_transcript_cursors(
+        &self,
+        host_id: &HostId,
+        mirror: &RemoteTranscriptMirror,
+    ) -> Vec<(String, u64, u64)> {
+        let mut ranked: Vec<(u8, u64, String, u64, u64)> = Vec::new();
+        for (pane, res) in &self.resolved_by_pane {
+            let Some(&agent) = self.pane_agent.get(pane) else {
+                continue;
+            };
+            if agent.is_shell() {
+                continue;
+            }
+            let Some((ino, synced_off)) =
+                mirror.cached_sync_cursor(host_id.as_str(), agent, &res.path)
+            else {
+                continue;
+            };
+            if ino == 0 {
+                continue;
+            }
+            let (priority, last_ms) = match self.pane_watch.get(pane) {
+                Some(w) if w.state == SessionState::Working => (3, w.last_event_ms),
+                Some(w)
+                    if matches!(
+                        w.state,
+                        SessionState::Starting
+                            | SessionState::NeedsPermission
+                            | SessionState::NeedsInput
+                    ) =>
+                {
+                    (2, w.last_event_ms)
+                }
+                Some(w) => (1, w.last_event_ms),
+                None => (0, 0),
+            };
+            ranked.push((priority, last_ms, res.path.clone(), ino, synced_off));
+        }
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let mut seen = HashSet::new();
+        let mut out = Vec::with_capacity(SSH_HOT_CURSOR_MAX);
+        for (_, _, path, ino, off) in ranked {
+            if seen.insert(path.clone()) {
+                out.push((path, ino, off));
+                if out.len() >= SSH_HOT_CURSOR_MAX {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn has_active_session(&self) -> bool {
+        self.pane_watch.values().any(|w| {
+            matches!(
+                w.state,
+                SessionState::Working
+                    | SessionState::Starting
+                    | SessionState::NeedsPermission
+                    | SessionState::NeedsInput
+            )
+        })
     }
 
     fn known_transcript_paths(&self) -> Vec<String> {
@@ -795,7 +1053,16 @@ impl StagedFileCache {
     }
 }
 
-/// Parsed structured output of `compound_discover_script_v2`.
+/// Inline `<= 64 KiB` transcript delta piggybacked inside `compound_discover_script_v3` or
+/// `sync_dirty_panes` (`__SF_HOT_DELTA__`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineHotDelta {
+    pub stat: RemoteFileStat,
+    pub base_offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// Parsed structured output of `compound_discover_script_v2` / `compound_discover_script_v3`.
 #[derive(Debug, Default)]
 pub struct ParsedSshDiscoveryV2 {
     pub remote_now_ms: u64,
@@ -815,6 +1082,7 @@ pub struct ParsedSshDiscoveryV2 {
     codex_threads: Option<Vec<RemoteCodexThreadRow>>,
     codex_rollouts: Vec<RemoteCodexRolloutCandidate>,
     pub tr_stats: HashMap<String, RemoteFileStat>,
+    pub hot_deltas: HashMap<String, InlineHotDelta>,
 }
 
 /// Parse `LC_ALL=C ps -eo pid=,ppid=,etime=,args=` into:
@@ -1008,14 +1276,85 @@ pub fn parse_ssh_compound_v2_output(
     // Parse `__SF_SEC_RESOLVE__`.
     parse_resolve_section(resolve_sec, &mut out);
 
+    // Optional `__SF_SEC_HOT_DELTAS__` section (emitted by `compound_discover_script_v3`).
+    let (real_tr_stats_sec, hot_deltas_sec) =
+        match split_marker_line_last(tr_stats_sec, SEC_HOT_DELTAS) {
+            Some((stats_part, deltas_part)) => (stats_part, deltas_part),
+            None => (tr_stats_sec, ""),
+        };
+
     // Parse `__SF_SEC_TR_STATS__`.
-    for line in tr_stats_sec.lines() {
+    for line in real_tr_stats_sec.lines() {
         if let Some((stat, path)) = parse_stat_and_path(line) {
             out.tr_stats.insert(path, stat);
         }
     }
 
+    // Parse `__SF_SEC_HOT_DELTAS__` (`__SF_HOT_DELTA__ <ino> <size> <mtime_s> <base_off> <delta_len> <path>\n<b64>`).
+    parse_hot_deltas_section(hot_deltas_sec, &mut out.hot_deltas);
+
     Ok(out)
+}
+
+/// Alias entry point for parsing `compound_discover_script_v3` output (superset of v2).
+pub fn parse_ssh_compound_v3_output(
+    stdout: &str,
+    fallback_now_ms: u64,
+) -> Result<ParsedSshDiscoveryV2, String> {
+    parse_ssh_compound_v2_output(stdout, fallback_now_ms)
+}
+
+fn parse_hot_deltas_section(sec: &str, out: &mut HashMap<String, InlineHotDelta>) {
+    let lines: Vec<&str> = sec.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(rest) = line.strip_prefix("__SF_HOT_DELTA__ ") {
+            let b64_line = lines.get(i + 1).copied().unwrap_or("").trim();
+            i += 2;
+            let trimmed = rest.trim();
+            let mut cols = trimmed.split_whitespace();
+            let (Some(ino_s), Some(size_s), Some(mt_s), Some(off_s), Some(dlen_s)) = (
+                cols.next(),
+                cols.next(),
+                cols.next(),
+                cols.next(),
+                cols.next(),
+            ) else {
+                continue;
+            };
+            let path = after_n_tokens(trimmed, 5).trim();
+            if path.is_empty() {
+                continue;
+            }
+            let (Ok(ino), Ok(size), Ok(mtime_s), Ok(base_offset), Ok(delta_len)) = (
+                ino_s.parse::<u64>(),
+                size_s.parse::<u64>(),
+                mt_s.parse::<i64>(),
+                off_s.parse::<u64>(),
+                dlen_s.parse::<usize>(),
+            ) else {
+                continue;
+            };
+            if delta_len == 0 || delta_len > MAX_INLINE_DELTA_BYTES {
+                continue;
+            }
+            if let Ok(bytes) = decode_base64(b64_line) {
+                if bytes.len() == delta_len {
+                    out.insert(
+                        path.to_string(),
+                        InlineHotDelta {
+                            stat: RemoteFileStat { ino, size, mtime_s },
+                            base_offset,
+                            bytes,
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
 }
 
 fn parse_resolve_section(sec: &str, out: &mut ParsedSshDiscoveryV2) {
@@ -1476,7 +1815,7 @@ fn apply_ssh_pane_tail_watch(
 struct SshReconcileResult {
     sessions: Vec<SessionRecord>,
     events: Vec<NormalizedEvent>,
-    need_mirror: Vec<(PaneId, AgentKind, String, RemoteFileStat)>,
+    need_mirror: Vec<(PaneId, AgentKind, String, Option<RemoteFileStat>)>,
 }
 
 /// Reconcile a parsed `compound_discover_script_v2` snapshot against `SshDiscoveryState`
@@ -1521,6 +1860,35 @@ fn reconcile_ssh_discovery_v2(
         .retain(|pid, _| parsed.live_remote_pids.contains(pid));
     for (pid, birth_ms) in parsed.pid_birth_remote_ms {
         state.pid_birth_remote_ms.entry(pid).or_insert(birth_ms);
+    }
+
+    // Prune dead or recycled AGY PID lock cache entries and merge newly discovered locks.
+    state.resolved_agy_locks.retain(|pid, (birth_s, _)| {
+        if !parsed.live_remote_pids.contains(pid) {
+            return false;
+        }
+        state.pid_birth_remote_ms.get(pid).is_none_or(|&b_ms| {
+            let cur_s = b_ms / 1_000;
+            cur_s.abs_diff(*birth_s) <= 5
+        })
+    });
+    for (pid, cids) in &parsed.agy_locks_by_pid {
+        let birth_s = state
+            .pid_birth_remote_ms
+            .get(pid)
+            .copied()
+            .unwrap_or(remote_now_ms)
+            / 1_000;
+        let entry = state
+            .resolved_agy_locks
+            .entry(*pid)
+            .or_insert_with(|| (birth_s, Vec::new()));
+        entry.0 = birth_s;
+        for c in cids {
+            if !entry.1.iter().any(|x| x == c) {
+                entry.1.push(c.clone());
+            }
+        }
     }
 
     // Expire old close tombstones.
@@ -1595,6 +1963,8 @@ fn reconcile_ssh_discovery_v2(
             state.tail_cache.remove(&dp.pane_id);
             state.pane_watch.remove(&dp.pane_id);
             state.spawned_panes.remove(&dp.pane_id);
+            let qsid = qualify_host_session(host_id, &legacy_session_id(&dp.pane_id));
+            state.last_emitted_watermarks.remove(&qsid);
             state
                 .pane_first_seen_remote_ms
                 .insert(dp.pane_id.clone(), remote_now_ms);
@@ -1629,7 +1999,7 @@ fn reconcile_ssh_discovery_v2(
             .pane_birth_remote_ms
             .insert(dp.pane_id.clone(), eff_birth);
 
-        // Update fingerprint tail cache from newly captured tails or increment cache age.
+        // Update fingerprint tail cache from newly captured tails.
         if let Some(fresh_tail) = parsed.captured_tails.get(&dp.pane_id) {
             state.tail_cache.insert(
                 dp.pane_id.clone(),
@@ -1639,18 +2009,31 @@ fn reconcile_ssh_discovery_v2(
                     cursor_y: dp.cursor_y,
                     in_mode: dp.pane_in_mode,
                     current_command: dp.pane_current_command.clone(),
-                    ticks_cached: 0,
+                    agent_pid: eff_pid,
                     tail: fresh_tail.clone(),
                 },
             );
-        } else if let Some(entry) = state.tail_cache.get_mut(&dp.pane_id) {
-            if entry.history_size == dp.history_size
-                && entry.cursor_x == dp.cursor_x
-                && entry.cursor_y == dp.cursor_y
-                && entry.in_mode == dp.pane_in_mode
-                && entry.current_command == dp.pane_current_command
-            {
-                entry.ticks_cached = entry.ticks_cached.saturating_add(1);
+        }
+    }
+
+    // Dynamic invalidation for Codex status-bar title bindings: if a non-CLI-resume Codex pane's
+    // live bottom status bar changed to a different thread title (`/resume`) or became blank
+    // (`/new`), drop its old title binding cleanly before building `sibling_claimed`.
+    for dp in &discovered {
+        if dp.pane_dead || dp.agent != AgentKind::Codex || dp.codex_resume_id.is_some() {
+            continue;
+        }
+        let prev_title = state
+            .resolved_by_pane
+            .get(&dp.pane_id)
+            .and_then(|r| r.title_hint.as_deref());
+        let Some(prev_title) = prev_title else {
+            continue;
+        };
+        if let Some(tail_entry) = state.tail_cache.get(&dp.pane_id) {
+            let cur_title = extract_codex_status_title(&tail_entry.tail);
+            if cur_title.as_deref() != Some(prev_title) {
+                state.resolved_by_pane.remove(&dp.pane_id);
             }
         }
     }
@@ -1675,6 +2058,17 @@ fn reconcile_ssh_discovery_v2(
         ex.extend(newly_claimed.iter().cloned());
         ex
     };
+    let live_excluded_for_pane =
+        |pane: &PaneId, newly_claimed: &HashSet<String>| -> HashSet<String> {
+            let mut ex = HashSet::new();
+            for (owner, eid) in &sibling_claimed {
+                if owner != pane {
+                    ex.insert(eid.clone());
+                }
+            }
+            ex.extend(newly_claimed.iter().cloned());
+            ex
+        };
 
     // Pass 1: Authoritative resolution across all 3 agents (Claude PID file, AGY presence lock, Codex resume UUID).
     let mut newly_claimed_ids: HashSet<String> = HashSet::new();
@@ -1708,7 +2102,7 @@ fn reconcile_ssh_discovery_v2(
                     &exclude,
                 ) {
                     newly_claimed_ids.insert(sid.clone());
-                    upsert_resolved_transcript(state, &dp.pane_id, path, Some(sid), true);
+                    upsert_resolved_transcript(state, &dp.pane_id, path, Some(sid), true, None);
                 }
             }
             AgentKind::Codex => {
@@ -1739,6 +2133,7 @@ fn reconcile_ssh_discovery_v2(
                             path,
                             Some(resume_id.to_string()),
                             true,
+                            None,
                         );
                     } else {
                         unmatched_codex.push(dp);
@@ -1749,9 +2144,15 @@ fn reconcile_ssh_discovery_v2(
             }
             AgentKind::Agy => {
                 let mut found_lock: Option<String> = None;
-                // Prefer known `nesting_depth = 0` root conversations over child locks.
+                // Prefer known `nesting_depth = 0` root conversations over child locks
+                // (consulting both fresh locks and PID-birth-cached locks).
                 for pid in &pids {
-                    if let Some(cids) = parsed.agy_locks_by_pid.get(pid) {
+                    let locks_opt = parsed
+                        .agy_locks_by_pid
+                        .get(pid)
+                        .map(Vec::as_slice)
+                        .or_else(|| state.resolved_agy_locks.get(pid).map(|(_, v)| v.as_slice()));
+                    if let Some(cids) = locks_opt {
                         if let Some(root_cid) =
                             cids.iter().find(|c| agy_root_id_set.contains(c.as_str()))
                         {
@@ -1762,7 +2163,14 @@ fn reconcile_ssh_discovery_v2(
                 }
                 if found_lock.is_none() {
                     for pid in &pids {
-                        if let Some(cids) = parsed.agy_locks_by_pid.get(pid) {
+                        let locks_opt = parsed
+                            .agy_locks_by_pid
+                            .get(pid)
+                            .map(Vec::as_slice)
+                            .or_else(|| {
+                                state.resolved_agy_locks.get(pid).map(|(_, v)| v.as_slice())
+                            });
+                        if let Some(cids) = locks_opt {
                             if let Some(first) = cids.first() {
                                 found_lock = Some(first.clone());
                                 break;
@@ -1775,7 +2183,14 @@ fn reconcile_ssh_discovery_v2(
                     if let Some(path) =
                         resolve_remote_agy_path(&remote_home, &conv_id, &state.latest_tr_stats)
                     {
-                        upsert_resolved_transcript(state, &dp.pane_id, path, Some(conv_id), true);
+                        upsert_resolved_transcript(
+                            state,
+                            &dp.pane_id,
+                            path,
+                            Some(conv_id),
+                            true,
+                            None,
+                        );
                     }
                 } else {
                     unmatched_agy.push(dp);
@@ -1785,15 +2200,67 @@ fn reconcile_ssh_discovery_v2(
         }
     }
 
-    // Pass 2: Strict non-authoritative matching for unlocked Codex & AGY panes
+    // Pass 1b: Explicit Codex status-bar title matching (`extract_codex_status_title(tail) == Some(hint)`).
+    // Does NOT require `unique_in_cwd` or `created_at/updated_at >= birth_ms`, so multiple Codex panes
+    // sharing a CWD (including blank siblings) AND interactive TUI `/resume` threads resolve cleanly.
+    // Strictly enforces: matching `cwd`, unique live `(cwd, title)` across panes, `!live_claimed`, and
+    // unambiguous single hit in `state_5.sqlite`. Treated as authoritative while live tail shows that title.
+    let mut codex_title_counts: HashMap<(String, String), usize> = HashMap::new();
+    for dp in &unmatched_codex {
+        let tail = state
+            .tail_cache
+            .get(&dp.pane_id)
+            .map(|e| e.tail.as_str())
+            .unwrap_or("");
+        if let Some(title) = extract_codex_status_title(tail) {
+            *codex_title_counts
+                .entry((dp.cwd.trim_end_matches('/').to_string(), title))
+                .or_insert(0) += 1;
+        }
+    }
+    let mut titleless_codex: Vec<&DiscoveredPane> = Vec::new();
+    for dp in &unmatched_codex {
+        let tail = state
+            .tail_cache
+            .get(&dp.pane_id)
+            .map(|e| e.tail.as_str())
+            .unwrap_or("");
+        if let Some(title) = extract_codex_status_title(tail) {
+            let unique_title = codex_title_counts
+                .get(&(dp.cwd.trim_end_matches('/').to_string(), title.clone()))
+                .copied()
+                .unwrap_or(0)
+                == 1;
+            if unique_title {
+                let live_exclude = live_excluded_for_pane(&dp.pane_id, &newly_claimed_ids);
+                if let Some((cid, path)) =
+                    match_remote_codex_sqlite(&state.codex_threads, &dp.cwd, tail, &live_exclude)
+                {
+                    newly_claimed_ids.insert(cid.clone());
+                    upsert_resolved_transcript(
+                        state,
+                        &dp.pane_id,
+                        path,
+                        Some(cid),
+                        true,
+                        Some(title),
+                    );
+                    continue;
+                }
+            }
+        }
+        titleless_codex.push(dp);
+    }
+
+    // Pass 2: Strict non-authoritative title-less CWD fallback for unlocked Codex & AGY panes
     // (`unique_in_cwd && !claimed && post_birth && unambiguous`).
     let mut codex_cwd_counts: HashMap<String, usize> = HashMap::new();
-    for dp in &unmatched_codex {
+    for dp in &titleless_codex {
         *codex_cwd_counts
             .entry(dp.cwd.trim_end_matches('/').to_string())
             .or_insert(0) += 1;
     }
-    for dp in &unmatched_codex {
+    for dp in &titleless_codex {
         let unique = codex_cwd_counts
             .get(dp.cwd.trim_end_matches('/'))
             .copied()
@@ -1807,27 +2274,11 @@ fn reconcile_ssh_discovery_v2(
             .copied()
             .unwrap_or(remote_now_ms);
         let exclude = excluded_for_pane(&dp.pane_id, &newly_claimed_ids);
-        let tail = state
-            .tail_cache
-            .get(&dp.pane_id)
-            .map(|e| e.tail.as_str())
-            .unwrap_or("");
-
-        // Try sqlite3 threads match (by status title + cwd + post-birth), then zero-sqlite3 rollout header fallback.
-        let matched = match_remote_codex_sqlite(
-            &state.codex_threads,
-            &state.latest_tr_stats,
-            &dp.cwd,
-            tail,
-            &exclude,
-            birth_ms,
-        )
-        .or_else(|| {
+        if let Some((cid, path)) =
             match_remote_codex_rollout_fallback(&parsed.codex_rollouts, &dp.cwd, &exclude, birth_ms)
-        });
-        if let Some((cid, path)) = matched {
+        {
             newly_claimed_ids.insert(cid.clone());
-            upsert_resolved_transcript(state, &dp.pane_id, path, Some(cid), false);
+            upsert_resolved_transcript(state, &dp.pane_id, path, Some(cid), false, None);
         }
     }
 
@@ -1860,7 +2311,7 @@ fn reconcile_ssh_discovery_v2(
             birth_ms,
         ) {
             newly_claimed_ids.insert(cid.clone());
-            upsert_resolved_transcript(state, &dp.pane_id, path, Some(cid), false);
+            upsert_resolved_transcript(state, &dp.pane_id, path, Some(cid), false, None);
         }
     }
 
@@ -1904,7 +2355,7 @@ fn reconcile_ssh_discovery_v2(
     // list of transcripts whose remote `(ino, size)` changed and need Hub mirror delta sync.
     let mut sessions = Vec::with_capacity(discovered.len());
     let mut events = Vec::new();
-    let mut need_mirror: Vec<(PaneId, AgentKind, String, RemoteFileStat)> = Vec::new();
+    let mut need_mirror: Vec<(PaneId, AgentKind, String, Option<RemoteFileStat>)> = Vec::new();
     let mut discovered_pane_ids: HashSet<PaneId> = HashSet::new();
     state.session_lookup.clear();
 
@@ -1921,36 +2372,52 @@ fn reconcile_ssh_discovery_v2(
             .as_deref()
             .and_then(|p| state.latest_tr_stats.get(p).copied());
 
-        if let (Some(r), Some(st)) = (resolved.as_ref(), tr_stat) {
-            if r.last_stat
-                .is_none_or(|prev| prev.ino != st.ino || prev.size != st.size)
-            {
-                need_mirror.push((dp.pane_id.clone(), dp.agent, r.path.clone(), st));
+        if let Some(r) = resolved.as_ref() {
+            let needs_sync = match tr_stat {
+                Some(st) => r.last_stat.is_none_or(|prev| {
+                    prev.ino != st.ino || prev.size != st.size || prev.mtime_s != st.mtime_s
+                }),
+                // Newly resolved transcript not yet in `latest_tr_stats` (e.g. a resumed thread
+                // ranked below the top-30 SQLite rows): mirror immediately on tick 1!
+                None => r.last_stat.is_none(),
+            };
+            if needs_sync {
+                need_mirror.push((dp.pane_id.clone(), dp.agent, r.path.clone(), tr_stat));
             }
         }
-
-        // Model & effort precedence: verified transcript > CLI args > spawn metadata > AGY model suffix.
-        let model = resolved
-            .as_ref()
-            .and_then(|r| r.model.clone())
-            .or_else(|| dp.model.clone())
-            .or_else(|| spawned_meta.as_ref().and_then(|m| m.model.clone()));
-        let effort = resolved
-            .as_ref()
-            .and_then(|r| r.effort.clone())
-            .or_else(|| dp.effort.clone())
-            .or_else(|| spawned_meta.as_ref().and_then(|m| m.effort.clone()))
-            .or_else(|| {
-                (dp.agent == AgentKind::Agy)
-                    .then(|| model.as_deref().and_then(extract_agy_effort_from_model))
-                    .flatten()
-            });
 
         let tail_opt = state
             .tail_cache
             .get(&dp.pane_id)
             .map(|e| e.tail.as_str())
             .map(str::to_string);
+        let (st_model, st_effort) = if dp.agent == AgentKind::Codex {
+            tail_opt
+                .as_deref()
+                .map(parse_codex_status_line_model_effort)
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+
+        // Model & effort precedence: verified transcript > CLI args > spawn metadata > Codex status bar > AGY model suffix.
+        let model = resolved
+            .as_ref()
+            .and_then(|r| r.model.clone())
+            .or_else(|| dp.model.clone())
+            .or_else(|| spawned_meta.as_ref().and_then(|m| m.model.clone()))
+            .or(st_model);
+        let effort = resolved
+            .as_ref()
+            .and_then(|r| r.effort.clone())
+            .or_else(|| dp.effort.clone())
+            .or_else(|| spawned_meta.as_ref().and_then(|m| m.effort.clone()))
+            .or(st_effort)
+            .or_else(|| {
+                (dp.agent == AgentKind::Agy)
+                    .then(|| model.as_deref().and_then(extract_agy_effort_from_model))
+                    .flatten()
+            });
 
         // Heuristic state transitions from captured/cached tail.
         let init_state = if dp.pane_dead {
@@ -2194,12 +2661,16 @@ fn upsert_resolved_transcript(
     path: String,
     external_id: Option<String>,
     authoritative: bool,
+    title_hint: Option<String>,
 ) {
     match state.resolved_by_pane.get_mut(pane) {
         Some(existing) if existing.path == path => {
             existing.authoritative |= authoritative;
             if existing.external_id.is_none() {
                 existing.external_id = external_id;
+            }
+            if title_hint.is_some() {
+                existing.title_hint = title_hint;
             }
         }
         _ => {
@@ -2209,6 +2680,7 @@ fn upsert_resolved_transcript(
                     path,
                     external_id,
                     authoritative,
+                    title_hint,
                     last_stat: None,
                     metrics: None,
                     model: None,
@@ -2296,11 +2768,9 @@ fn resolve_remote_agy_path(
 
 fn match_remote_codex_sqlite(
     rows: &[RemoteCodexThreadRow],
-    tr_stats: &HashMap<String, RemoteFileStat>,
     cwd: &str,
     tail: &str,
     claimed_ids: &HashSet<String>,
-    min_birth_remote_ms: u64,
 ) -> Option<(String, String)> {
     let hint = extract_codex_status_title(tail)?;
     let hint_clean = hint.trim_end_matches(['…', '.']).trim();
@@ -2308,17 +2778,13 @@ fn match_remote_codex_sqlite(
         return None;
     }
     let check_row = |r: &RemoteCodexThreadRow| -> Option<(String, String)> {
-        if claimed_ids.contains(r.id.trim()) || !same_remote_dir(&r.cwd, cwd) {
-            return None;
-        }
-        let stat = tr_stats.get(&r.rollout_path);
-        let updated_ms = epoch_i64_to_ms(r.updated_at)
-            .or_else(|| stat.and_then(|s| epoch_i64_to_ms(s.mtime_s)))?;
-        if !is_post_birth_timestamp(updated_ms, min_birth_remote_ms) {
-            return None;
-        }
-        let created_ms = epoch_i64_to_ms(r.created_at)?;
-        if !is_post_birth_timestamp(created_ms, min_birth_remote_ms) {
+        let id = r.id.trim();
+        let path = r.rollout_path.trim();
+        if id.is_empty()
+            || path.is_empty()
+            || claimed_ids.contains(id)
+            || !same_remote_dir(&r.cwd, cwd)
+        {
             return None;
         }
         Some((r.id.clone(), r.rollout_path.clone()))
@@ -2458,9 +2924,11 @@ pub struct SshMuxNodeProvider {
     last_display_name: Mutex<String>,
     ownership: NotifyOwnership,
     include_shell_panes: bool,
+    push_watch: bool,
     #[allow(dead_code)]
     tmux: Tmux,
     transport: Arc<SshExec>,
+    conduit_pool: Arc<SshConduitPool>,
     tmux_bin: String,
     tmux_socket: Option<String>,
     claude_bin: String,
@@ -2468,13 +2936,58 @@ pub struct SshMuxNodeProvider {
     agy_bin: String,
     mirror: Arc<RemoteTranscriptMirror>,
     transcript_index: Arc<Mutex<TranscriptIndexCache>>,
-    /// Bounds background SSH channels (`sync`, `capture_pane`, `fetch_transcript`, `list_tmux_sessions`).
+    /// Bounds background SSH channels and >64 KiB one-shot `stage_input_files` uploads.
     io_sem: Arc<Semaphore>,
-    /// Dedicated interactive SSH channel (`dispatch_interactive`, `spawn_session`, `stage_input_files`, `focus_pane`, `close_pane`, `probe_now`).
+    /// Dedicated interactive SSH lane guard (`dispatch_interactive`, `spawn_session`, `focus_pane`, `close_pane`, `probe_now`).
     interactive_sem: Arc<Semaphore>,
-    circuit: Mutex<HostCircuitBreaker>,
-    discovery: Mutex<SshDiscoveryState>,
+    circuit: Arc<Mutex<HostCircuitBreaker>>,
+    discovery: Arc<Mutex<SshDiscoveryState>>,
     staged_cache: Mutex<StagedFileCache>,
+    last_sync_ms: AtomicU64,
+    last_ping_ms: AtomicU64,
+    warm_in_flight: Arc<AtomicBool>,
+}
+
+fn is_retryable_conduit_err(err: &TmuxError) -> bool {
+    match err {
+        TmuxError::Parse(msg) => msg.contains("unexpected EOF"),
+        TmuxError::Io { source, .. } => matches!(
+            source.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+        ),
+        TmuxError::Command {
+            code: Some(255),
+            stderr,
+            ..
+        } => {
+            let lower = stderr.to_ascii_lowercase();
+            lower.contains("broken pipe")
+                || lower.contains("controlsocket")
+                || lower.contains("control socket")
+                || lower.contains("mux_client")
+                || lower.contains("unexpected eof")
+        }
+        _ => false,
+    }
+}
+
+/// Adaptive fast-ack settle & post-check timing for `SshMuxNodeProvider::dispatch_interactive`.
+///
+/// Short single-line prompts (`<= 160` chars, no `\n`) use a fast `30 ms` paste settle and
+/// `50 ms` post-check (cutting LAN dispatch from ~600 ms to ~90 ms), while longer or multi-line
+/// prompts retain full adaptive paste-burst settling (`120 ms` post-check + stuck-paste retry).
+pub(crate) fn fast_ssh_dispatch_timings(configured_settle_ms: u64, text: &str) -> (u64, u64) {
+    let is_short_single_line = !text.contains('\n') && text.chars().count() <= 160;
+    if configured_settle_ms == 0 {
+        return (0, 50);
+    }
+    if is_short_single_line {
+        (configured_settle_ms.min(30), 50)
+    } else {
+        (adaptive_paste_settle_ms(configured_settle_ms, text), 120)
+    }
 }
 
 impl SshMuxNodeProvider {
@@ -2505,13 +3018,13 @@ impl SshMuxNodeProvider {
         let ssh_dir = state_dir.join("ssh-cm");
         let control_path =
             ssh_dir.join(format!("cm-{}.sock", sanitize_sock_name(host_id.as_str())));
-        let transport = Arc::new(
-            SshExec::new(cfg.ssh_target.trim(), control_path)
-                .with_ssh_bin(cfg.ssh_bin_override())
-                .with_connect_timeout_secs(cfg.effective_connect_timeout_secs())
-                .with_compression(cfg.compression)
-                .with_extra_args(cfg.ssh_args.clone()),
-        );
+        let ssh_exec = SshExec::new(cfg.ssh_target.trim(), control_path)
+            .with_ssh_bin(cfg.ssh_bin_override())
+            .with_connect_timeout_secs(cfg.effective_connect_timeout_secs())
+            .with_compression(cfg.compression)
+            .with_extra_args(cfg.ssh_args.clone());
+        let conduit_pool = Arc::new(SshConduitPool::new(ssh_exec.clone()));
+        let transport = Arc::new(ssh_exec);
         let tmux_bin = if cfg.tmux_bin.trim().is_empty() {
             "tmux".to_string()
         } else {
@@ -2527,14 +3040,16 @@ impl SshMuxNodeProvider {
             transport.clone(),
         );
         Self {
-            circuit: Mutex::new(HostCircuitBreaker::new(host_id.as_str())),
+            circuit: Arc::new(Mutex::new(HostCircuitBreaker::new(host_id.as_str()))),
             host_id,
             last_display_name: Mutex::new(display.clone()),
             default_display_name: display,
             ownership: cfg.effective_ownership(),
             include_shell_panes: cfg.include_shell_panes,
+            push_watch: cfg.push_watch,
             tmux,
             transport,
+            conduit_pool,
             tmux_bin,
             tmux_socket,
             claude_bin: cfg.agent_bin(AgentKind::Claude),
@@ -2544,9 +3059,78 @@ impl SshMuxNodeProvider {
             transcript_index,
             io_sem: Arc::new(Semaphore::new(SSH_BG_MAX_CONCURRENT)),
             interactive_sem: Arc::new(Semaphore::new(SSH_INTERACTIVE_MAX_CONCURRENT)),
-            discovery: Mutex::new(SshDiscoveryState::default()),
+            discovery: Arc::new(Mutex::new(SshDiscoveryState::default())),
             staged_cache: Mutex::new(StagedFileCache::default()),
+            last_sync_ms: AtomicU64::new(RTT_UNSET),
+            last_ping_ms: AtomicU64::new(0),
+            warm_in_flight: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn conduit_pool(&self) -> &Arc<SshConduitPool> {
+        &self.conduit_pool
+    }
+
+    async fn exec_conduit_idempotent(
+        &self,
+        lane: ConduitLane,
+        script: &str,
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+    ) -> Result<starfane_tmux::ExecBytesOutput, TmuxError> {
+        match self
+            .conduit_pool
+            .exec_bytes(lane, script, stdin, timeout)
+            .await
+        {
+            Ok(out) => Ok(out),
+            Err(err) if is_retryable_conduit_err(&err) => {
+                self.conduit_pool
+                    .exec_bytes(lane, script, stdin, timeout)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn maybe_refresh_rtt(&self, force: bool) {
+        let now_ms = id::now_ms();
+        if !force && self.transport.rtt_ms().is_some() {
+            let last = self.last_ping_ms.load(Ordering::Acquire);
+            if now_ms.saturating_sub(last) < SSH_PING_INTERVAL_MS {
+                return;
+            }
+        }
+        match self.conduit_pool.ping(SSH_PING_TIMEOUT).await {
+            Ok(_) => {
+                self.last_ping_ms.store(id::now_ms(), Ordering::Release);
+            }
+            Err(e) => {
+                log::debug!("ssh {} conduit ping skipped/failed: {e}", self.host_id);
+            }
+        }
+    }
+
+    fn extra_agent_bin_names(&self) -> String {
+        let mut names = Vec::new();
+        for raw in [&self.claude_bin, &self.codex_bin, &self.agy_bin] {
+            let base = Path::new(raw)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(raw)
+                .trim()
+                .to_ascii_lowercase();
+            if !base.is_empty()
+                && !matches!(base.as_str(), "claude" | "codex" | "agy" | "sh")
+                && base
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+                && !names.contains(&base)
+            {
+                names.push(base);
+            }
+        }
+        names.join(" ")
     }
 
     fn tmux_cmd_prefix(&self) -> String {
@@ -2569,21 +3153,49 @@ impl SshMuxNodeProvider {
         }
     }
 
-    /// Build the single-RTT POSIX `/bin/sh -s` compound discovery script (`compound_discover_script_v2`)
-    /// emitting all 6 deterministic sections:
-    /// `__SF_SEC_META__`, `__SF_SEC_PANES__`, `__SF_SEC_PS__`, `__SF_SEC_TAILS__`,
-    /// `__SF_SEC_RESOLVE__`, `__SF_SEC_TR_STATS__`.
-    fn compound_discover_script_v2(
+    /// Build the ultra-lean single-RTT POSIX `/bin/sh` v3 compound discovery script
+    /// (`360ms / 322KB -> ~35–55ms / <6KB`):
+    /// 1. Single-pass wrap-safe fixed-point `awk` process-tree filter seeded with tmux pane PIDs
+    ///    (handling OS PID wrap-around where `child_pid < parent_pid`), emitting ONLY pane
+    ///    descendants + agent processes plus `AGENT_PANES`, `AGY_PIDS`, and `CX_RESUMES`.
+    /// 2. Skips `tmux capture-pane` for non-agent shell panes when `include_shell_panes == false`,
+    ///    and skips unchanged cached panes with zero synchronized `TAIL_CACHE_MAX_TICKS` cliff.
+    /// 3. Single batched OS-native `stat` (`SF_STAT_MODE`: `stat -f` on BSD/macOS, `stat -c` on GNU).
+    /// 4. Skips macOS `lsof -p` for already-resolved `(pid, birth_s)` AGY processes.
+    /// 5. Appends inline `<= 64 KiB` hot transcript deltas (`__SF_HOT_DELTA__`) for up to 3 active
+    ///    sessions in `__SF_SEC_HOT_DELTAS__` (0 extra SSH round-trips during live streaming).
+    #[allow(clippy::too_many_arguments)]
+    fn compound_discover_script_v3(
         &self,
         cached_tail_fps: &[String],
         prev_agy_db_sig: Option<&str>,
         prev_codex_db_sig: Option<&str>,
         known_tr_paths: &[String],
+        resolved_agy_pids: &[(u32, u64)],
+        force_capture_panes: &[String],
+        hot_cursors: &[(String, u64, u64)],
     ) -> String {
         let tmux_cmd = self.tmux_cmd_prefix();
         let pane_fmt = shell_single_quote(starfane_tmux::PANE_FORMAT);
         let prev_agy = shell_single_quote(prev_agy_db_sig.unwrap_or(""));
         let prev_cx = shell_single_quote(prev_codex_db_sig.unwrap_or(""));
+        let include_shells_flag = if self.include_shell_panes { "1" } else { "0" };
+        let extra_bins_q = shell_single_quote(&self.extra_agent_bin_names());
+
+        let skip_agy_str = resolved_agy_pids
+            .iter()
+            .map(|(pid, birth_s)| format!("{pid}:{birth_s}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let skip_agy_q = shell_single_quote(&skip_agy_str);
+
+        let force_panes_str = force_capture_panes
+            .iter()
+            .filter(|p| p.starts_with('%') && p[1..].bytes().all(|b| b.is_ascii_digit()))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let force_panes_q = shell_single_quote(&force_panes_str);
 
         let mut fp_cases = String::new();
         for fp in cached_tail_fps {
@@ -2597,9 +3209,26 @@ impl SshMuxNodeProvider {
             }
         }
 
+        let mut hot_delta_lines = String::new();
+        for (path, ino, off) in hot_cursors.iter().take(SSH_HOT_CURSOR_MAX) {
+            if !path.contains('\n') && !path.contains('\r') {
+                hot_delta_lines.push_str(&format!(
+                    "sf_hot_delta {} {} {}\n",
+                    shell_single_quote(path),
+                    ino,
+                    off
+                ));
+            }
+        }
+
         format!(
             r#"{bootstrap}{sf_stat}
+SF_TAB=$(printf '\t')
 SF_US=$(printf '\037')
+SF_INCLUDE_SHELLS={include_shells}
+SF_FORCE_PANES={force_panes}
+SF_SKIP_AGY={skip_agy}
+SF_EXTRA_BINS={extra_bins}
 SF_TR_PATHS=""
 sf_add_tr_stat() {{
   [ -n "$1" ] || return 0
@@ -2622,26 +3251,221 @@ sf_tail_cached() {{
 {fp_cases}    *) return 1 ;;
   esac
 }}
+sf_hot_delta() {{
+  _hp="$1"; _hino="$2"; _hoff="$3"
+  [ -f "$_hp" ] && [ ! -L "$_hp" ] || return 0
+  set -- $(sf_stat "$_hp")
+  _cino="$1"; _csz="$2"; _cmt="$3"
+  [ -n "$_csz" ] && [ "$_csz" -ge 0 ] 2>/dev/null || return 0
+  if [ "$_hino" -ne 0 ] && [ "$_cino" -ne "$_hino" ]; then return 0; fi
+  _dlen=$((_csz - _hoff))
+  if [ "$_dlen" -gt 0 ] && [ "$_dlen" -le {max_inline} ]; then
+    _b64=$(tail -c +"$((_hoff + 1))" "$_hp" 2>/dev/null | head -c "$_dlen" | base64 2>/dev/null | tr -d '\r\n')
+    if [ -n "$_b64" ]; then
+      printf '__SF_HOT_DELTA__ %s %s %s %s %s %s\n%s\n' "$_cino" "$_csz" "$_cmt" "$_hoff" "$_dlen" "$_hp" "$_b64"
+    fi
+  fi
+}}
 
+REMOTE_NOW_S=$(date +%s)
 printf '{sec_meta}\n'
-printf 'REMOTE_NOW_S=%s\n' "$(date +%s)"
+printf 'REMOTE_NOW_S=%s\n' "$REMOTE_NOW_S"
 printf 'REMOTE_HOME=%s\n' "$HOME"
 
 printf '\n{sec_panes}\n'
 PANES_OUT=$({tmux} list-panes -a -F {pane_fmt} 2>/dev/null || true)
 [ -n "$PANES_OUT" ] && printf '%s\n' "$PANES_OUT"
 
+_agent_panes=""
+_agy_pids=""
+_cx_resumes=""
+AWK_OUT=$(
+  {{
+    [ -n "$PANES_OUT" ] && printf '%s\n' "$PANES_OUT"
+    printf '__SF_AWK_PS__\n'
+    LC_ALL=C ps -eo pid=,ppid=,etime=,args= 2>/dev/null || true
+  }} | LC_ALL=C awk -v NOW_S="$REMOTE_NOW_S" -v SKIP_AGY="$SF_SKIP_AGY" -v EXTRA_BINS="$SF_EXTRA_BINS" '
+  function etime_secs(s,    d, parts, n, rest) {{
+    d = 0
+    rest = s
+    if (index(rest, "-") > 0) {{
+      n = split(rest, parts, "-")
+      d = parts[1] + 0
+      rest = parts[2]
+    }}
+    n = split(rest, parts, ":")
+    if (n == 2) return d * 86400 + (parts[1] + 0) * 60 + (parts[2] + 0)
+    if (n == 3) return d * 86400 + (parts[1] + 0) * 3600 + (parts[2] + 0) * 60 + (parts[3] + 0)
+    return -1
+  }}
+  BEGIN {{
+    mode = 0
+    ns = split(SKIP_AGY, sa, /[ \t]+/)
+    for (i = 1; i <= ns; i++) {{
+      if (split(sa[i], kv, ":") == 2) {{
+        sp = kv[1] + 0
+        if (sp > 0) {{
+          has_skip_agy[sp] = 1
+          skip_agy_birth[sp] = kv[2] + 0
+        }}
+      }}
+    }}
+    ne = split(EXTRA_BINS, eb, /[ \t]+/)
+    for (i = 1; i <= ne; i++) {{
+      if (eb[i] != "") extra_bin[tolower(eb[i])] = 1
+    }}
+  }}
+  $0 == "__SF_AWK_PS__" {{ mode = 1; next }}
+  mode == 0 {{
+    if ($0 == "") next
+    n = split($0, f, "\t")
+    if (n < 7) n = split($0, f, "\037")
+    if (n < 7) {{
+      s = $0
+      gsub(/\\037/, "\t", s)
+      n = split(s, f, "\t")
+    }}
+    if (n >= 7 && substr(f[1], 1, 1) == "%") {{
+      pid = f[6] + 0
+      if (pid > 0) {{
+        pane_root[pid] = f[1]
+        pane_cmd[f[1]] = f[7]
+        in_tree[pid] = 1
+        owner[pid] = f[1]
+      }}
+    }}
+    next
+  }}
+  {{
+    line = $0
+    sub(/^[ \t]+/, "", line)
+    if (line == "") next
+    p = $1 + 0
+    pp = $2 + 0
+    if (p <= 0) next
+    pids[++cnt] = p
+    ppid[p] = pp
+    etime_raw[p] = $3
+    cmd[p] = $4
+    raw[p] = line
+  }}
+  END {{
+    changed = 1
+    while (changed) {{
+      changed = 0
+      for (i = 1; i <= cnt; i++) {{
+        p = pids[i]
+        if (!in_tree[p] && in_tree[ppid[p]]) {{
+          in_tree[p] = 1
+          owner[p] = owner[ppid[p]]
+          changed = 1
+        }}
+      }}
+    }}
+    for (i = 1; i <= cnt; i++) {{
+      p = pids[i]
+      line = raw[p]
+      b = cmd[p]
+      sub(/^.*\//, "", b)
+      bl = tolower(b)
+      ll = tolower(line)
+      is_agent = 0
+      is_agy = 0
+      if (bl != "starfane" && bl != "baton" && index(ll, "starfane mcp") == 0 && index(ll, "baton mcp") == 0) {{
+        if (bl == "claude" || bl == "codex" || bl == "agy" || (bl in extra_bin) || bl ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) {{
+          is_agent = 1
+          if (bl == "agy") is_agy = 1
+        }} else if (bl == "node" || bl == "sh" || bl == "bash" || bl == "zsh" || bl == "dash" || bl == "python" || bl == "python3" || bl == "bun" || bl == "deno") {{
+          if (ll ~ /(^|[ \t\/])claude([ \t]|$)/ || ll ~ /(^|[ \t\/])codex([ \t]|$)/) {{
+            is_agent = 1
+          }}
+          if (ll ~ /(^|[ \t\/])agy([ \t]|$)/) {{
+            is_agent = 1
+            is_agy = 1
+          }}
+        }}
+      }}
+      if (in_tree[p] || is_agent) {{
+        print "PS\t" line
+      }}
+      if (in_tree[p] && is_agent && owner[p] != "") {{
+        agent_panes[owner[p]] = 1
+      }}
+      if (is_agy) {{
+        skip = 0
+        if (has_skip_agy[p] && NOW_S > 0) {{
+          es = etime_secs(etime_raw[p])
+          if (es >= 0) {{
+            est_b = NOW_S - es
+            diff = est_b - skip_agy_birth[p]
+            if (diff < 0) diff = -diff
+            if (diff <= 5) skip = 1
+          }}
+        }}
+        if (!skip) agy_pids[p] = 1
+      }}
+      if (index(line, "codex") > 0 && index(line, "resume ") > 0) {{
+        nt = split(line, toks, /[ \t]+/)
+        for (k = 1; k < nt; k++) {{
+          if (toks[k] == "resume") {{
+            u = toks[k + 1]
+            gsub(/["\047]/, "", u)
+            if (length(u) >= 16 && u ~ /^[0-9A-Fa-f-]+$/) {{
+              cx_res[u] = 1
+            }}
+          }}
+        }}
+      }}
+    }}
+    for (rpid in pane_root) {{
+      pid_str = pane_root[rpid]
+      pc = tolower(pane_cmd[pid_str])
+      sub(/^.*\//, "", pc)
+      if (pc == "claude" || pc == "codex" || pc == "agy" || (pc in extra_bin) || pc ~ /^[0-9]+\.[0-9]+\.[0-9]+$/) {{
+        agent_panes[pid_str] = 1
+      }}
+    }}
+    ap = ""
+    for (pid_str in agent_panes) ap = (ap == "" ? pid_str : ap " " pid_str)
+    print "AGENT_PANES\t" ap
+    ag = ""
+    for (p in agy_pids) ag = (ag == "" ? p : ag " " p)
+    print "AGY_PIDS\t" ag
+    cx = ""
+    for (u in cx_res) cx = (cx == "" ? u : cx " " u)
+    print "CX_RESUMES\t" cx
+  }}
+  '
+)
+
 printf '\n{sec_ps}\n'
-PS_OUT=$(LC_ALL=C ps -eo pid=,ppid=,etime=,args= 2>/dev/null || true)
-[ -n "$PS_OUT" ] && printf '%s\n' "$PS_OUT"
+if [ -n "$AWK_OUT" ]; then
+  while IFS="$SF_TAB" read -r _tag _rest; do
+    case "$_tag" in
+      PS) printf '%s\n' "$_rest" ;;
+      AGENT_PANES) _agent_panes="$_rest" ;;
+      AGY_PIDS) _agy_pids="$_rest" ;;
+      CX_RESUMES) _cx_resumes="$_rest" ;;
+    esac
+  done <<__SF_AWK_EOF__
+$AWK_OUT
+__SF_AWK_EOF__
+fi
 
 printf '\n{sec_tails}\n'
 if [ -n "$PANES_OUT" ]; then
+  _want_panes=" $_agent_panes $SF_FORCE_PANES "
   PANES_US=$(printf '%s\n' "$PANES_OUT" | LC_ALL=C tr '\t' '\037')
   while IFS="$SF_US" read -r _p_id _s_n _w_i _w_x _p_x _p_p _p_cmd _p_cwd _p_a _w_a _s_a _p_mode _p_dead _p_syn _p_alt _p_cx _p_cy _p_wn _p_sg _p_hs _p_ph; do
     case "$_p_id" in %*) ;; *) continue ;; esac
     [ "$_p_dead" = "1" ] && continue
     [ "$_p_mode" = "1" ] && continue
+    if [ "$SF_INCLUDE_SHELLS" = "0" ]; then
+      case "$_want_panes" in
+        *" $_p_id "*) ;;
+        *) continue ;;
+      esac
+    fi
     _fp="${{_p_id}}|${{_p_hs}}|${{_p_cx}}|${{_p_cy}}|${{_p_mode}}|${{_p_cmd}}"
     if sf_tail_cached "$_fp"; then
       continue
@@ -2677,59 +3501,7 @@ if [ -d "$HOME/.claude/sessions" ]; then
   done
 fi
 
-# 2. AGY: Linux /proc/$pid/fd fast-path (macOS lsof fallback) + optional sqlite3 conversation_summaries
-_agy_pids=""
-_cx_resumes=""
-if [ -n "$PS_OUT" ]; then
-  set -f
-  while IFS= read -r _pl; do
-    set -- $_pl
-    _ps_pid=$1
-    _cmd_tok=$4
-    _cmd_base=${{_cmd_tok##*/}}
-    case "$_cmd_base" in
-      starfane|baton) ;;
-      agy)
-        case "$_ps_pid" in ''|*[!0-9]*) ;; *) _agy_pids="$_agy_pids $_ps_pid" ;; esac
-        ;;
-      sh|bash|zsh|dash|node|python|python3)
-        case "$_pl" in
-          *"/agy "*|*"/agy"|*" agy "*|*" agy")
-            case "$_pl" in
-              *"starfane mcp"*|*"baton mcp"*) ;;
-              *) case "$_ps_pid" in ''|*[!0-9]*) ;; *) _agy_pids="$_agy_pids $_ps_pid" ;; esac ;;
-            esac
-            ;;
-        esac
-        ;;
-    esac
-    case "$_pl" in
-      *"codex"*"resume "*)
-        _seen_res=0
-        for _tok in $_pl; do
-          if [ "$_seen_res" = "1" ]; then
-            _u=$(printf '%s' "$_tok" | tr -d "\"'")
-            case "$_u" in
-              *[!0-9a-fA-F-]*|'') ;;
-              *)
-                if [ "${{#_u}}" -ge 16 ]; then
-                  _cx_resumes="$_cx_resumes $_u"
-                fi
-                ;;
-            esac
-            _seen_res=0
-          elif [ "$_tok" = "resume" ]; then
-            _seen_res=1
-          fi
-        done
-        ;;
-    esac
-  done <<__SF_PS_EOF__
-$PS_OUT
-__SF_PS_EOF__
-  set +f
-fi
-
+# 2. AGY: Linux /proc/$pid/fd fast-path (macOS lsof fallback, skipped for already-resolved PIDs) + optional sqlite3
 if [ -n "$_agy_pids" ]; then
   if [ -d /proc ]; then
     for _ap in $_agy_pids; do
@@ -2834,8 +3606,8 @@ if [ -f "$_cx_db" ] && [ ! -L "$_cx_db" ] && command -v sqlite3 >/dev/null 2>&1;
   printf 'CODEX_DB_SIG %s\n' "$_cx_sig"
   _cx_used_sql=1
   if [ "$_cx_sig" != {prev_cx} ]; then
-    _cx_sql="SELECT id, COALESCE(rollout_path,''), COALESCE(cwd,''), REPLACE(REPLACE(COALESCE(name,''),char(10),' '),char(13),' '), COALESCE(created_at,0), COALESCE(updated_at,0) FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != '' ORDER BY COALESCE(archived,0) ASC, updated_at DESC LIMIT 200;"
-    _cx_rows=$(sqlite3 -readonly -separator "$SF_US" "$_cx_db" "$_cx_sql" 2>/dev/null || true)
+    _cx_sql="SELECT id, COALESCE(rollout_path,''), COALESCE(cwd,''), REPLACE(REPLACE(COALESCE(name,''),char(10),' '),char(13),' '), COALESCE(created_at,0), COALESCE(updated_at,0) FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != '' ORDER BY COALESCE(archived,0) ASC, updated_at DESC LIMIT 500;"
+    _cx_rows=$(sqlite3 -readonly -separator "$SF_US" "$_cx_db" "$_cx_sql" 2>/dev/null || sqlite3 -separator "$SF_US" "file:${{_cx_db}}?immutable=1" "$_cx_sql" 2>/dev/null || true)
     printf 'CODEX_DB_BEGIN\n%s\nCODEX_DB_END\n' "$_cx_rows"
     _ccnt=0
     while IFS="$SF_US" read -r _cid _crp _crest; do
@@ -2878,28 +3650,119 @@ fi
 {known_tr_lines}
 printf '\n{sec_tr_stats}\n'
 if [ -n "$SF_TR_PATHS" ]; then
+  _valid_tr=""
   while IFS= read -r _tp; do
-    [ -f "$_tp" ] && [ ! -L "$_tp" ] || continue
-    printf '%s %s\n' "$(sf_stat "$_tp")" "$_tp"
+    [ -n "$_tp" ] && [ -f "$_tp" ] && [ ! -L "$_tp" ] || continue
+    if [ -z "$_valid_tr" ]; then
+      _valid_tr="$_tp"
+    else
+      _valid_tr="$_valid_tr
+$_tp"
+    fi
   done <<__SF_TR_EOF__
 $SF_TR_PATHS
 __SF_TR_EOF__
+  if [ -n "$_valid_tr" ]; then
+    _old_ifs="$IFS"
+    IFS='
+'
+    set -f
+    set -- $_valid_tr
+    set +f
+    IFS="$_old_ifs"
+    sf_batch_stat "$@"
+  fi
 fi
-"#,
+
+printf '\n{sec_hot_deltas}\n'
+{hot_delta_lines}"#,
             bootstrap = REMOTE_PATH_BOOTSTRAP,
             sf_stat = REMOTE_SF_STAT_FN,
+            include_shells = include_shells_flag,
+            force_panes = force_panes_q,
+            skip_agy = skip_agy_q,
+            extra_bins = extra_bins_q,
             fp_cases = fp_cases,
+            max_inline = MAX_INLINE_DELTA_BYTES,
             sec_meta = SEC_META,
             sec_panes = SEC_PANES,
             sec_ps = SEC_PS,
             sec_tails = SEC_TAILS,
             sec_resolve = SEC_RESOLVE,
             sec_tr_stats = SEC_TR_STATS,
+            sec_hot_deltas = SEC_HOT_DELTAS,
             tmux = tmux_cmd,
             pane_fmt = pane_fmt,
             prev_agy = prev_agy,
             prev_cx = prev_cx,
             known_tr_lines = known_tr_lines,
+            hot_delta_lines = hot_delta_lines,
+        )
+    }
+
+    /// Build the targeted ~18ms single-RTT script for `sync_dirty_panes`:
+    /// captures ONLY the specified dirty panes' metadata + 20-line tails + optional inline `<= 64 KiB`
+    /// hot transcript deltas (skipping full `ps`/`sqlite3`/`lsof`).
+    fn build_dirty_panes_script(&self, targets: &[DirtyPaneTarget]) -> String {
+        let tmux_cmd = self.tmux_cmd_prefix();
+        let mut pane_cmds = String::new();
+        let mut delta_cmds = String::new();
+        for target in targets {
+            let pq = shell_single_quote(target.pane.as_str());
+            pane_cmds.push_str(&format!(
+                r##"P={pq}
+M=$({tmux} display-message -p -t "$P" "#{{pane_dead}}${{SF_TAB}}#{{pane_in_mode}}${{SF_TAB}}#{{history_size}}${{SF_TAB}}#{{cursor_x}}${{SF_TAB}}#{{cursor_y}}${{SF_TAB}}#{{pane_current_command}}" 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$M" ]; then
+  printf '__SF_DIRTY_MISSING__ %s\n' "$P"
+else
+  printf '__SF_DIRTY_META__ %s\t%s\n' "$P" "$M"
+  printf '__SF_TAIL_BEGIN__ %s\n' "$P"
+  {tmux} capture-pane -p -t "$P" -S -20 2>/dev/null || true
+  printf '\n__SF_TAIL_END__ %s\n' "$P"
+fi
+"##,
+                pq = pq,
+                tmux = tmux_cmd,
+            ));
+            if let Some(ref hot) = target.hot {
+                if !hot.path.contains('\n') && !hot.path.contains('\r') {
+                    delta_cmds.push_str(&format!(
+                        "sf_hot_delta {} {} {}\n",
+                        shell_single_quote(&hot.path),
+                        hot.ino,
+                        hot.offset
+                    ));
+                }
+            }
+        }
+        format!(
+            r#"{bootstrap}{sf_stat}
+SF_TAB=$(printf '\t')
+sf_hot_delta() {{
+  _hp="$1"; _hino="$2"; _hoff="$3"
+  [ -f "$_hp" ] && [ ! -L "$_hp" ] || return 0
+  set -- $(sf_stat "$_hp")
+  _cino="$1"; _csz="$2"; _cmt="$3"
+  [ -n "$_csz" ] && [ "$_csz" -ge 0 ] 2>/dev/null || return 0
+  printf '__SF_DIRTY_STAT__ %s %s %s %s\n' "$_cino" "$_csz" "$_cmt" "$_hp"
+  if [ "$_hino" -ne 0 ] && [ "$_cino" -ne "$_hino" ]; then return 0; fi
+  _dlen=$((_csz - _hoff))
+  if [ "$_dlen" -gt 0 ] && [ "$_dlen" -le {max_inline} ]; then
+    _b64=$(tail -c +"$((_hoff + 1))" "$_hp" 2>/dev/null | head -c "$_dlen" | base64 2>/dev/null | tr -d '\r\n')
+    if [ -n "$_b64" ]; then
+      printf '__SF_HOT_DELTA__ %s %s %s %s %s %s\n%s\n' "$_cino" "$_csz" "$_cmt" "$_hoff" "$_dlen" "$_hp" "$_b64"
+    fi
+  fi
+}}
+{pane_cmds}
+printf '\n{sec_hot_deltas}\n'
+{delta_cmds}"#,
+            bootstrap = REMOTE_PATH_BOOTSTRAP,
+            sf_stat = REMOTE_SF_STAT_FN,
+            max_inline = MAX_INLINE_DELTA_BYTES,
+            pane_cmds = pane_cmds,
+            sec_hot_deltas = SEC_HOT_DELTAS,
+            delta_cmds = delta_cmds,
         )
     }
 
@@ -3137,6 +4000,7 @@ printf '__SF_CAP_BODY__\n'
         local_pane: &PaneId,
         agent: Option<AgentKind>,
         effective_settle_ms: u64,
+        post_check_ms: u64,
     ) -> String {
         let tmux_cmd = self.tmux_cmd_prefix();
         let pane_q = shell_single_quote(local_pane.as_str());
@@ -3146,6 +4010,14 @@ printf '__SF_CAP_BODY__\n'
             format!(
                 "sleep {:.3} 2>/dev/null || sleep 1",
                 effective_settle_ms as f64 / 1000.0
+            )
+        };
+        let post_sleep_cmd = if post_check_ms == 0 {
+            "true".to_string()
+        } else {
+            format!(
+                "sleep {:.3} </dev/null 2>/dev/null || true",
+                post_check_ms as f64 / 1000.0
             )
         };
         let modal_block_snippet = match agent {
@@ -3253,7 +4125,7 @@ if ! {tmux} send-keys -t "$PANE" C-m </dev/null ; then
   printf 'STATUS:ENTER_ERR\n'
   exit 0
 fi
-sleep 0.22 </dev/null 2>/dev/null || true
+{post_sleep_cmd}
 POST_META=$({tmux} display-message -p -t "$PANE" "#{{pane_dead}}${{SF_TAB}}#{{pane_in_mode}}${{SF_TAB}}#{{cursor_y}}" </dev/null 2>/dev/null || printf 'MISSING')
 POST=$({tmux} capture-pane -p -t "$PANE" </dev/null 2>/dev/null || true)
 printf 'STATUS:OK:%s:%s\nPOST_META:%s\n__SF_PRE__\n%s\n__SF_PRE_END__\n__SF_POST__\n%s\n__SF_POST_END__\n' "$EXITED_COPY" "$P_CMD" "$POST_META" "$PRE" "$POST"
@@ -3263,6 +4135,7 @@ printf 'STATUS:OK:%s:%s\nPOST_META:%s\n__SF_PRE__\n%s\n__SF_PRE_END__\n__SF_POST
             tmux = tmux_cmd,
             modal_block = modal_block_snippet,
             settle_cmd = settle_cmd,
+            post_sleep_cmd = post_sleep_cmd,
         )
     }
 
@@ -3330,37 +4203,78 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                 .map_err(|_| "ssh semaphore closed".to_string())?
         };
 
-        let (cached_fps, prev_agy_sig, prev_cx_sig, known_tr_paths) = {
-            let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+        // Pure transport RTT measurement:
+        // - Cold connect / explicit probe: ping FIRST on `lane_interactive` (warms ControlMaster
+        //   without concurrent race and populates `rtt_ms`).
+        // - Warm periodic 15s refresh: run concurrently with discovery below (0ms added latency).
+        let is_cold_or_probe = bypass_backoff || self.transport.rtt_ms().is_none();
+        let periodic_ping_due = !is_cold_or_probe
+            && now_before.saturating_sub(self.last_ping_ms.load(Ordering::Acquire))
+                >= SSH_PING_INTERVAL_MS;
+        if is_cold_or_probe {
+            self.maybe_refresh_rtt(true).await;
+        }
+
+        let sync_started = Instant::now();
+        let (
+            tick,
+            cached_fps,
+            prev_agy_sig,
+            prev_cx_sig,
+            known_tr_paths,
+            resolved_agy_pids,
+            force_panes,
+            hot_cursors,
+        ) = {
+            let mut ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+            ds.discover_tick = ds.discover_tick.saturating_add(1);
+            let tick = ds.discover_tick;
             (
-                ds.cached_tail_fingerprints(),
+                tick,
+                ds.cached_tail_fingerprints(tick),
                 ds.agy_db_sig.clone(),
                 ds.codex_db_sig.clone(),
                 ds.known_transcript_paths(),
+                ds.resolved_agy_pid_births(),
+                ds.force_capture_panes(now_before),
+                ds.hot_transcript_cursors(&self.host_id, &self.mirror),
             )
         };
 
-        let script = self.compound_discover_script_v2(
+        let script = self.compound_discover_script_v3(
             &cached_fps,
             prev_agy_sig.as_deref(),
             prev_cx_sig.as_deref(),
             &known_tr_paths,
+            &resolved_agy_pids,
+            &force_panes,
+            &hot_cursors,
         );
-        let transport = self.transport.clone();
-        let host_id = self.host_id.clone();
-
-        let exec_res = tokio::task::spawn_blocking(move || transport.run_idempotent_shell(&script))
-            .await
-            .map_err(|e| format!("ssh task join: {e}"));
+        let lane = if bypass_backoff {
+            ConduitLane::Interactive
+        } else {
+            ConduitLane::Background
+        };
+        let timeout = self.transport.timeout();
+        let exec_res = if periodic_ping_due {
+            let (res, _) = tokio::join!(
+                self.exec_conduit_idempotent(lane, &script, None, timeout),
+                self.maybe_refresh_rtt(false),
+            );
+            res
+        } else {
+            self.exec_conduit_idempotent(lane, &script, None, timeout)
+                .await
+        };
 
         let now_hub = id::now_ms();
         let out = match exec_res {
-            Ok(Ok(o)) if o.success => o,
-            Ok(Ok(o)) => {
+            Ok(o) if o.success() => o.into_utf8_lossy(),
+            Ok(o) => {
                 let msg = format!(
                     "ssh {} failed (exit {:?}): {}",
-                    host_id,
-                    o.code,
+                    self.host_id,
+                    o.exit_code,
                     o.stderr.trim()
                 );
                 self.circuit
@@ -3369,15 +4283,8 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                     .record_failure(now_hub, msg.clone());
                 return Err(msg);
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 let msg = e.to_string();
-                self.circuit
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .record_failure(now_hub, msg.clone());
-                return Err(msg);
-            }
-            Err(msg) => {
                 self.circuit
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -3386,7 +4293,7 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
             }
         };
 
-        let parsed = match parse_ssh_compound_v2_output(&out.stdout, now_hub) {
+        let mut parsed = match parse_ssh_compound_v3_output(&out.stdout, now_hub) {
             Ok(p) => p,
             Err(msg) => {
                 self.circuit
@@ -3396,13 +4303,14 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                 return Err(msg);
             }
         };
+        let hot_deltas = std::mem::take(&mut parsed.hot_deltas);
 
         self.circuit
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .record_success();
 
-        let (mut sessions, events, need_mirror, remote_home) = {
+        let (mut sessions, events, need_mirror, remote_home, tail_map) = {
             let mut ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
             let rec = reconcile_ssh_discovery_v2(
                 &mut ds,
@@ -3414,56 +4322,187 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                 now_hub,
             );
             let rh = ds.remote_home.clone().unwrap_or_default();
-            (rec.sessions, rec.events, rec.need_mirror, rh)
+            let tails: HashMap<PaneId, String> = ds
+                .tail_cache
+                .iter()
+                .map(|(p, e)| (p.clone(), e.tail.clone()))
+                .collect();
+            (rec.sessions, rec.events, rec.need_mirror, rh, tails)
         };
 
-        // Incrementally mirror active transcripts whose `(ino, size)` grew and compute
-        // `SessionMetrics`, `model`, and `effort` via `TranscriptIndexCache`.
+        let mut output_deltas: Vec<DaemonEvent> = Vec::new();
+        let mut emitted_sids: HashSet<SessionId> = HashSet::new();
+
+        // Step 1: Ingest inline `<= 64 KiB` hot deltas (0 extra SSH round-trips!) and fall back
+        // to persistent conduit mirroring (`ConduitLane::Background`) for any remaining updates.
         if !need_mirror.is_empty() && !remote_home.is_empty() {
-            let mirror = self.mirror.clone();
-            let tr_cache = self.transcript_index.clone();
-            let ssh = self.transport.clone();
-            let hid = self.host_id.clone();
-            let rh = remote_home.clone();
-            let synced_telemetry = tokio::task::spawn_blocking(move || {
-                let mut out = Vec::with_capacity(need_mirror.len());
-                for (pane, agent, remote_path, stat) in need_mirror {
-                    if RemoteTranscriptMirror::validate_remote_transcript_path(&rh, &remote_path)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    match mirror.sync_telemetry(
-                        &ssh,
-                        &tr_cache,
-                        hid.as_str(),
-                        &rh,
-                        agent,
-                        &remote_path,
-                        Some(stat),
-                        now_hub,
-                    ) {
-                        Ok((metrics, model, effort, _sync)) => {
-                            out.push((pane, agent, remote_path, stat, metrics, model, effort));
-                        }
-                        Err(e) => {
-                            log::debug!(
-                                "ssh {} background transcript mirror failed for {}: {e}",
-                                hid,
-                                remote_path
-                            );
+            let mut remaining_mirror = Vec::new();
+            let mut inline_synced = Vec::new();
+
+            for (pane, agent, remote_path, stat_opt) in need_mirror {
+                if RemoteTranscriptMirror::validate_remote_transcript_path(
+                    &remote_home,
+                    &remote_path,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                if let (Some(stat), Some(hd)) = (stat_opt, hot_deltas.get(&remote_path)) {
+                    if hd.stat.ino == stat.ino && hd.stat.size == stat.size {
+                        match self.mirror.ingest_inline_delta(
+                            self.host_id.as_str(),
+                            &remote_home,
+                            agent,
+                            &remote_path,
+                            hd.stat,
+                            hd.base_offset,
+                            &hd.bytes,
+                        ) {
+                            Ok(sync_res) => {
+                                let (metrics, model, effort) = {
+                                    let mut guard = self
+                                        .transcript_index
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner());
+                                    guard.sync_and_telemetry(agent, &sync_res.local_path, now_hub)
+                                };
+                                inline_synced.push((
+                                    pane,
+                                    agent,
+                                    remote_path,
+                                    Some(stat),
+                                    sync_res.local_path,
+                                    metrics,
+                                    model,
+                                    effort,
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                log::debug!(
+                                    "ssh {} inline delta fallback for {}: {e}",
+                                    self.host_id,
+                                    remote_path
+                                );
+                            }
                         }
                     }
                 }
-                out
-            })
-            .await
-            .unwrap_or_default();
+                remaining_mirror.push((pane, agent, remote_path, stat_opt));
+            }
 
-            if !synced_telemetry.is_empty() {
+            // Cap synchronous per-sync cold/delta mirror pulls at top-8 active sessions;
+            // older dormant sessions still mirror on-demand via `fetch_transcript`.
+            if remaining_mirror.len() > SSH_WARM_TOP_N {
+                let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+                remaining_mirror.sort_by(|a, b| {
+                    let rank = |p: &PaneId| -> (u8, u64) {
+                        match ds.pane_watch.get(p) {
+                            Some(w) if w.state == SessionState::Working => (2, w.last_event_ms),
+                            Some(w) => (1, w.last_event_ms),
+                            None => (0, 0),
+                        }
+                    };
+                    rank(&b.0).cmp(&rank(&a.0))
+                });
+                remaining_mirror.truncate(SSH_WARM_TOP_N);
+            }
+
+            let mut conduit_synced = Vec::with_capacity(remaining_mirror.len());
+            for (pane, agent, remote_path, stat_opt) in remaining_mirror {
+                match self
+                    .mirror
+                    .sync_telemetry_conduit(
+                        &self.conduit_pool,
+                        lane,
+                        &self.transcript_index,
+                        self.host_id.as_str(),
+                        &remote_home,
+                        agent,
+                        &remote_path,
+                        stat_opt,
+                        now_hub,
+                    )
+                    .await
+                {
+                    Ok((metrics, model, effort, sync_res)) => {
+                        let resolved_stat = stat_opt.or_else(|| {
+                            self.mirror.cached_remote_stat(
+                                self.host_id.as_str(),
+                                agent,
+                                &remote_path,
+                            )
+                        });
+                        conduit_synced.push((
+                            pane,
+                            agent,
+                            remote_path,
+                            resolved_stat,
+                            sync_res.local_path,
+                            metrics,
+                            model,
+                            effort,
+                        ));
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "ssh {} conduit transcript mirror failed for {}: {e}",
+                            self.host_id,
+                            remote_path
+                        );
+                    }
+                }
+            }
+
+            inline_synced.extend(conduit_synced);
+            if !inline_synced.is_empty() {
+                let cached_models: HashMap<PaneId, String> = {
+                    let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+                    ds.resolved_by_pane
+                        .iter()
+                        .filter_map(|(p, r)| r.model.as_ref().map(|m| (p.clone(), m.clone())))
+                        .collect()
+                };
+                for (pane, agent, remote_path, _, _, tr_metrics, tr_model, _) in &mut inline_synced
+                {
+                    if *agent != AgentKind::Agy {
+                        continue;
+                    }
+                    let Some(conv_id) = extract_session_id_from_transcript_path(
+                        AgentKind::Agy,
+                        Path::new(remote_path),
+                    ) else {
+                        continue;
+                    };
+                    let timings = self
+                        .fetch_remote_agy_step_timings(lane, &remote_home, &conv_id)
+                        .await;
+                    if !timings.is_empty() {
+                        let model_hint = tr_model
+                            .as_deref()
+                            .or_else(|| cached_models.get(pane).map(String::as_str));
+                        if let Some(enriched) = agy_step_timings_to_metrics(
+                            &timings,
+                            model_hint,
+                            tr_metrics.clone(),
+                            now_hub,
+                        ) {
+                            *tr_metrics = Some(enriched);
+                        }
+                    }
+                }
                 let mut ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
-                for (pane, agent, remote_path, stat, tr_metrics, tr_model, tr_effort) in
-                    synced_telemetry
+                for (
+                    pane,
+                    agent,
+                    remote_path,
+                    stat_opt,
+                    local_path,
+                    tr_metrics,
+                    tr_model,
+                    tr_effort,
+                ) in inline_synced
                 {
                     let valid_model = tr_model
                         .as_deref()
@@ -3483,9 +4522,14 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                             })
                             .flatten()
                     });
+                    if let Some(st) = stat_opt {
+                        ds.latest_tr_stats.insert(remote_path.clone(), st);
+                    }
                     if let Some(entry) = ds.resolved_by_pane.get_mut(&pane) {
                         if entry.path == remote_path {
-                            entry.last_stat = Some(stat);
+                            if let Some(st) = stat_opt {
+                                entry.last_stat = Some(st);
+                            }
                             entry.metrics = tr_metrics.clone();
                             if valid_model.is_some() {
                                 entry.model = valid_model.clone();
@@ -3497,6 +4541,7 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                     }
                     let local_sid = legacy_session_id(&pane);
                     let qualified_sid = qualify_host_session(&self.host_id, &local_sid);
+                    let mut final_metrics = tr_metrics.clone();
                     if let Some(rec) = sessions.iter_mut().find(|s| s.session_id == qualified_sid) {
                         if let Some(ref m) = valid_model {
                             rec.model = Some(m.clone());
@@ -3512,15 +4557,87 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                         let merged = merge_metrics(tr_metrics.clone(), st_metrics);
                         if merged.is_some() {
                             rec.metrics = merged.clone();
+                            final_metrics = merged;
                         }
                         if let Some(lk) = ds.session_lookup.get_mut(&local_sid) {
-                            lk.latest_stat = Some(stat);
+                            if let Some(st) = stat_opt {
+                                lk.latest_stat = Some(st);
+                            }
                             lk.metrics = rec.metrics.clone();
                         }
+                    }
+                    let live_tail = tail_map.get(&pane).cloned();
+                    if let Some(ev) = self.build_transcript_output_delta(
+                        &mut ds,
+                        &qualified_sid,
+                        agent,
+                        &local_path,
+                        tick > 1,
+                        live_tail,
+                        final_metrics,
+                        now_hub,
+                    ) {
+                        emitted_sids.insert(qualified_sid);
+                        output_deltas.push(ev);
                     }
                 }
             }
         }
+
+        // Emit `live_tail` `DaemonEvent::Output` for active panes whose terminal tail changed
+        // without already emitting a transcript delta above.
+        {
+            let mut ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+            for rec in &sessions {
+                if rec.is_subagent || rec.state == SessionState::Ended {
+                    continue;
+                }
+                if emitted_sids.contains(&rec.session_id) {
+                    continue;
+                }
+                let Some(local_pane) = rec.pane.as_ref().map(|p| {
+                    let (_, raw) = starfane_tmux::split_host_prefix(p.as_str());
+                    PaneId::new(raw)
+                }) else {
+                    continue;
+                };
+                let Some(tail) = tail_map.get(&local_pane) else {
+                    continue;
+                };
+                let h = hash_tail(tail);
+                let prev_h = ds.last_emitted_tail_hash.insert(local_pane, h);
+                if tick > 1 && prev_h.is_some_and(|ph| ph != h) {
+                    output_deltas.push(DaemonEvent::Output {
+                        seq: 0,
+                        session_id: rec.session_id.clone(),
+                        start_seq: None,
+                        total_messages: None,
+                        appended_messages: Vec::new(),
+                        live_tail: Some(tail.clone()),
+                        metrics: rec.metrics.clone(),
+                        dirty: false,
+                    });
+                }
+            }
+            let live_sids: HashSet<&SessionId> = sessions
+                .iter()
+                .filter(|s| s.state != SessionState::Ended)
+                .map(|s| &s.session_id)
+                .collect();
+            ds.last_emitted_watermarks
+                .retain(|sid, _| live_sids.contains(sid));
+            ds.last_sessions = sessions.clone();
+        }
+
+        // Proactively pre-warm Hub RAM `TranscriptIndexCache` (`tail(60)`) for top 8 active
+        // transcripts in the background so first click in browser hits RAM in <1ms.
+        self.spawn_warm_top_transcripts(&sessions, &remote_home, now_hub);
+
+        let elapsed_sync_ms = sync_started
+            .elapsed()
+            .as_millis()
+            .min((RTT_UNSET - 1) as u128) as u64;
+        self.last_sync_ms.store(elapsed_sync_ms, Ordering::Release);
 
         let count = sessions
             .iter()
@@ -3537,11 +4654,1400 @@ printf 'POST_META:%s\n__SF_POST__\n%s\n__SF_POST_END__\n' "$POST_META" "$POST"
                 error: None,
                 session_count: count,
                 rtt_ms: self.transport.rtt_ms(),
+                sync_ms: Some(elapsed_sync_ms),
                 next_retry_ms: None,
             },
             sessions,
             events,
+            output_deltas,
         })
+    }
+
+    async fn fetch_remote_agy_step_timings(
+        &self,
+        lane: ConduitLane,
+        remote_home: &str,
+        conv_id: &str,
+    ) -> Vec<AgyStepTiming> {
+        let rh = remote_home.trim_end_matches('/');
+        if rh.is_empty()
+            || conv_id.is_empty()
+            || conv_id.contains('/')
+            || conv_id.contains("..")
+            || !conv_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Vec::new();
+        }
+        let db_path = format!("{rh}/.gemini/antigravity-cli/conversations/{conv_id}.db");
+        let db_q = shell_single_quote(&db_path);
+        let script = format!(
+            r#"{bootstrap}_db={db_q}
+if [ -f "$_db" ] && [ ! -L "$_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+  _tab=$(printf '\t')
+  _sql='SELECT idx, hex(metadata) FROM steps WHERE step_type=15 AND status=3 AND metadata IS NOT NULL ORDER BY idx DESC LIMIT 20;'
+  sqlite3 -readonly -separator "$_tab" "$_db" "$_sql" 2>/dev/null || sqlite3 -separator "$_tab" "file:${{_db}}?immutable=1" "$_sql" 2>/dev/null || true
+fi
+"#,
+            bootstrap = REMOTE_PATH_BOOTSTRAP,
+            db_q = db_q,
+        );
+        let Ok(out) = self
+            .exec_conduit_idempotent(lane, &script, None, self.transport.timeout())
+            .await
+        else {
+            return Vec::new();
+        };
+        if !out.success() {
+            return Vec::new();
+        }
+        let stdout = out.into_utf8_lossy().stdout;
+        parse_agy_step_timing_tsv(&stdout)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_transcript_output_delta(
+        &self,
+        ds: &mut SshDiscoveryState,
+        qualified_sid: &SessionId,
+        agent: AgentKind,
+        local_path: &Path,
+        allow_emit: bool,
+        live_tail: Option<String>,
+        metrics: Option<SessionMetrics>,
+        now_ms: u64,
+    ) -> Option<DaemonEvent> {
+        let mut cache = self
+            .transcript_index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let wm = cache.watermark_for_path(agent, local_path)?;
+        let prev_opt = ds.last_emitted_watermarks.insert(qualified_sid.clone(), wm);
+        if !allow_emit {
+            return None;
+        }
+        let prev = prev_opt.unwrap_or_default();
+
+        let (start_from, count) = if wm.total_messages > prev.total_messages {
+            let prev_last_mutated = prev.total_messages > 0
+                && (prev.has_pending_tools
+                    || cache.turn_hash_at_for_path(agent, local_path, prev.total_messages - 1)
+                        != Some(prev.last_turn_hash));
+            let sf = if prev_last_mutated {
+                prev.total_messages - 1
+            } else {
+                prev.total_messages
+            };
+            (sf, wm.total_messages - sf)
+        } else if wm.total_messages == prev.total_messages
+            && wm.total_messages > 0
+            && (wm.last_turn_hash != prev.last_turn_hash
+                || wm.has_pending_tools != prev.has_pending_tools)
+        {
+            (wm.total_messages - 1, 1)
+        } else if wm.total_messages < prev.total_messages {
+            return Some(DaemonEvent::Output {
+                seq: 0,
+                session_id: qualified_sid.clone(),
+                start_seq: None,
+                total_messages: Some(wm.total_messages),
+                appended_messages: Vec::new(),
+                live_tail,
+                metrics,
+                dirty: true,
+            });
+        } else {
+            return None;
+        };
+
+        if count <= SSH_INLINE_OUTPUT_MAX_TURNS {
+            if let Some(resp) = cache.get_page_or_sync(
+                agent,
+                local_path,
+                TranscriptQuery::tail(count),
+                metrics.clone(),
+                now_ms,
+            ) {
+                if resp.start_seq == start_from {
+                    if let Some(values) = Self::serialize_inline_output_messages(
+                        &resp.messages,
+                        SSH_INLINE_OUTPUT_MAX_BYTES,
+                    ) {
+                        return Some(DaemonEvent::Output {
+                            seq: 0,
+                            session_id: qualified_sid.clone(),
+                            start_seq: Some(resp.start_seq),
+                            total_messages: Some(wm.total_messages),
+                            appended_messages: values,
+                            live_tail,
+                            metrics,
+                            dirty: false,
+                        });
+                    }
+                }
+            }
+        }
+        Some(DaemonEvent::Output {
+            seq: 0,
+            session_id: qualified_sid.clone(),
+            start_seq: Some(start_from),
+            total_messages: Some(wm.total_messages),
+            appended_messages: Vec::new(),
+            live_tail,
+            metrics,
+            dirty: true,
+        })
+    }
+
+    fn serialize_inline_output_messages(
+        messages: &[TranscriptMessage],
+        max_bytes: usize,
+    ) -> Option<Vec<serde_json::Value>> {
+        if messages.is_empty() {
+            return None;
+        }
+        let mut values = Vec::with_capacity(messages.len());
+        let mut total_bytes = 0usize;
+        for m in messages {
+            let v = serde_json::to_value(m).ok()?;
+            total_bytes = total_bytes.saturating_add(v.to_string().len());
+            if total_bytes > max_bytes {
+                return None;
+            }
+            values.push(v);
+        }
+        (!values.is_empty()).then_some(values)
+    }
+
+    fn spawn_warm_top_transcripts(
+        &self,
+        sessions: &[SessionRecord],
+        remote_home: &str,
+        now_ms: u64,
+    ) {
+        if remote_home.is_empty()
+            || self
+                .warm_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let mut candidates: Vec<(u8, u64, AgentKind, String, Option<RemoteFileStat>)> = {
+            let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+            sessions
+                .iter()
+                .filter(|s| !s.is_subagent && s.state != SessionState::Ended && !s.agent.is_shell())
+                .filter_map(|s| {
+                    let path = s.transcript_path.as_ref()?.clone();
+                    let stat = ds.latest_tr_stats.get(&path).copied();
+                    let prio = match s.state {
+                        SessionState::Working => 3,
+                        SessionState::Starting
+                        | SessionState::NeedsPermission
+                        | SessionState::NeedsInput => 2,
+                        _ => 1,
+                    };
+                    Some((prio, s.last_event_ms, s.agent, path, stat))
+                })
+                .collect()
+        };
+        if candidates.is_empty() {
+            self.warm_in_flight.store(false, Ordering::Release);
+            return;
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        candidates.truncate(SSH_WARM_TOP_N);
+
+        let pool = self.conduit_pool.clone();
+        let mirror = self.mirror.clone();
+        let tr_cache = self.transcript_index.clone();
+        let host_id = self.host_id.clone();
+        let rhome = remote_home.to_string();
+        let flag = self.warm_in_flight.clone();
+
+        tokio::spawn(async move {
+            for (_, _, agent, remote_path, stat) in candidates {
+                if RemoteTranscriptMirror::validate_remote_transcript_path(&rhome, &remote_path)
+                    .is_err()
+                {
+                    continue;
+                }
+                if let Ok(sync_res) = mirror
+                    .ensure_fresh_conduit(
+                        &pool,
+                        ConduitLane::Background,
+                        host_id.as_str(),
+                        &rhome,
+                        agent,
+                        &remote_path,
+                        stat,
+                        false,
+                    )
+                    .await
+                {
+                    let mut guard = tr_cache.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = guard.get_page_or_sync(
+                        agent,
+                        &sync_res.local_path,
+                        TranscriptQuery::tail(60),
+                        None,
+                        now_ms,
+                    );
+                }
+            }
+            flag.store(false, Ordering::Release);
+        });
+    }
+
+    /// Fast targeted sync (~18ms single-RTT on `ConduitLane::Interactive`) for dirty panes signaled
+    /// by `SshTmuxControlWatcher`, skipping full `ps`/`sqlite3`/`lsof` unless pane topology changed.
+    async fn run_sync_dirty_panes_inner(
+        &self,
+        display_name: &str,
+        dirty_panes: &[PaneId],
+        claimed_external_ids: &HashSet<String>,
+    ) -> Result<NodeSnapshot, String> {
+        if dirty_panes.is_empty() {
+            return self
+                .run_sync_inner(display_name, claimed_external_ids, false)
+                .await;
+        }
+
+        let (remote_home, has_baseline, unknown_pane, targets, cached_sessions) = {
+            let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+            let rh = ds.remote_home.clone().unwrap_or_default();
+            let has_base = !rh.is_empty() && !ds.last_sessions.is_empty();
+            let mut seen = HashSet::new();
+            let mut unknown = false;
+            let mut tgts: Vec<DirtyPaneTarget> = Vec::new();
+            for p in dirty_panes {
+                if validate_tmux_pane_id(p).is_err() || !seen.insert(p.clone()) {
+                    continue;
+                }
+                let Some(&agent) = ds.pane_agent.get(p) else {
+                    // Unknown pane -> topology may have changed, trigger full sync!
+                    unknown = true;
+                    break;
+                };
+                if agent.is_shell() && !self.include_shell_panes {
+                    continue;
+                }
+                let hot = ds.resolved_by_pane.get(p).map(|res| {
+                    let (ino, offset) = self
+                        .mirror
+                        .cached_sync_cursor(self.host_id.as_str(), agent, &res.path)
+                        .unwrap_or((0, 0));
+                    HotCursorSpec {
+                        path: res.path.clone(),
+                        ino,
+                        offset,
+                    }
+                });
+                tgts.push(DirtyPaneTarget {
+                    pane: p.clone(),
+                    agent,
+                    hot,
+                });
+            }
+            let cached = if !unknown && has_base && tgts.is_empty() {
+                Some(ds.last_sessions.clone())
+            } else {
+                None
+            };
+            (rh, has_base, unknown, tgts, cached)
+        };
+
+        if unknown_pane || !has_baseline {
+            return self
+                .run_sync_inner(display_name, claimed_external_ids, false)
+                .await;
+        }
+        if targets.is_empty() {
+            let sessions = cached_sessions.unwrap_or_default();
+            let count = sessions
+                .iter()
+                .filter(|s| !s.is_subagent && s.state != SessionState::Ended)
+                .count();
+            return Ok(NodeSnapshot {
+                host: HostRecord {
+                    id: self.host_id.clone(),
+                    display_name: display_name.to_string(),
+                    kind: HostKind::Ssh,
+                    status: HostStatus::Online,
+                    active_endpoint: Some(self.transport.target().to_string()),
+                    last_seen_ms: Some(id::now_ms()),
+                    error: None,
+                    session_count: count,
+                    rtt_ms: self.transport.rtt_ms(),
+                    sync_ms: self.sync_ms(),
+                    next_retry_ms: None,
+                },
+                sessions,
+                events: Vec::new(),
+                output_deltas: Vec::new(),
+            });
+        }
+
+        let script = self.build_dirty_panes_script(&targets);
+        let started = Instant::now();
+        let out = match self
+            .exec_conduit_idempotent(
+                ConduitLane::Interactive,
+                &script,
+                None,
+                self.transport.timeout(),
+            )
+            .await
+        {
+            Ok(o) if o.success() => o.into_utf8_lossy(),
+            Ok(o) => {
+                let msg = format!(
+                    "ssh {} dirty sync failed (exit {:?}): {}",
+                    self.host_id,
+                    o.exit_code,
+                    o.stderr.trim()
+                );
+                self.circuit
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record_failure(id::now_ms(), msg.clone());
+                return Err(msg);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.circuit
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record_failure(id::now_ms(), msg.clone());
+                return Err(msg);
+            }
+        };
+
+        let parsed = parse_dirty_panes_output(&out.stdout);
+        // If any dirty pane disappeared, died, switched foreground command, or is a Codex pane
+        // whose live status-bar thread title changed (`/resume` or `/new`), fall back to full sync.
+        let need_full_fallback = !parsed.missing_panes.is_empty() || {
+            let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+            let meta_changed = parsed.pane_metas.iter().any(|(pane, meta)| {
+                meta.dead
+                    || ds
+                        .tail_cache
+                        .get(pane)
+                        .is_some_and(|e| e.current_command != meta.current_command)
+            });
+            let codex_title_changed = targets.iter().any(|t| {
+                if t.agent != AgentKind::Codex {
+                    return false;
+                }
+                let Some(new_tail) = parsed.captured_tails.get(&t.pane) else {
+                    return false;
+                };
+                let new_title = extract_codex_status_title(new_tail);
+                let prev_title = ds
+                    .resolved_by_pane
+                    .get(&t.pane)
+                    .and_then(|r| r.title_hint.as_deref())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        ds.tail_cache
+                            .get(&t.pane)
+                            .and_then(|e| extract_codex_status_title(&e.tail))
+                    });
+                new_title != prev_title
+                    || (new_title.is_some() && !ds.resolved_by_pane.contains_key(&t.pane))
+            });
+            meta_changed || codex_title_changed
+        };
+        if need_full_fallback {
+            return self
+                .run_sync_inner(display_name, claimed_external_ids, false)
+                .await;
+        }
+
+        let now_hub = id::now_ms();
+        self.circuit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_success();
+
+        // Ingest inline hot deltas or fall back to conduit delta pull for >64 KiB updates.
+        let mut mirror_updates: Vec<DirtyMirrorUpdate> = Vec::new();
+        for target in &targets {
+            let pane = &target.pane;
+            let agent = target.agent;
+            let Some(ref hot) = target.hot else {
+                continue;
+            };
+            let remote_path = &hot.path;
+            let Some(&stat) = parsed.tr_stats.get(remote_path) else {
+                continue;
+            };
+            let prev_stat = {
+                let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+                ds.resolved_by_pane.get(pane).and_then(|r| r.last_stat)
+            };
+            if prev_stat.is_some_and(|ps| {
+                ps.ino == stat.ino && ps.size == stat.size && ps.mtime_s == stat.mtime_s
+            }) {
+                continue;
+            }
+            if RemoteTranscriptMirror::validate_remote_transcript_path(&remote_home, remote_path)
+                .is_err()
+            {
+                continue;
+            }
+            if let Some(hd) = parsed.hot_deltas.get(remote_path) {
+                if hd.stat.ino == stat.ino && hd.stat.size == stat.size {
+                    if let Ok(sync_res) = self.mirror.ingest_inline_delta(
+                        self.host_id.as_str(),
+                        &remote_home,
+                        agent,
+                        remote_path,
+                        hd.stat,
+                        hd.base_offset,
+                        &hd.bytes,
+                    ) {
+                        let (metrics, model, effort) = {
+                            let mut guard = self
+                                .transcript_index
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            guard.sync_and_telemetry(agent, &sync_res.local_path, now_hub)
+                        };
+                        mirror_updates.push(DirtyMirrorUpdate {
+                            pane: pane.clone(),
+                            agent,
+                            remote_path: remote_path.clone(),
+                            stat,
+                            local_path: sync_res.local_path,
+                            metrics,
+                            model,
+                            effort,
+                        });
+                        continue;
+                    }
+                }
+            }
+            if let Ok((metrics, model, effort, sync_res)) = self
+                .mirror
+                .sync_telemetry_conduit(
+                    &self.conduit_pool,
+                    ConduitLane::Interactive,
+                    &self.transcript_index,
+                    self.host_id.as_str(),
+                    &remote_home,
+                    agent,
+                    remote_path,
+                    Some(stat),
+                    now_hub,
+                )
+                .await
+            {
+                mirror_updates.push(DirtyMirrorUpdate {
+                    pane: pane.clone(),
+                    agent,
+                    remote_path: remote_path.clone(),
+                    stat,
+                    local_path: sync_res.local_path,
+                    metrics,
+                    model,
+                    effort,
+                });
+            }
+        }
+
+        if !mirror_updates.is_empty() && !remote_home.is_empty() {
+            let cached_models: HashMap<PaneId, String> = {
+                let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+                ds.resolved_by_pane
+                    .iter()
+                    .filter_map(|(p, r)| r.model.as_ref().map(|m| (p.clone(), m.clone())))
+                    .collect()
+            };
+            for upd in &mut mirror_updates {
+                if upd.agent != AgentKind::Agy {
+                    continue;
+                }
+                let Some(conv_id) = extract_session_id_from_transcript_path(
+                    AgentKind::Agy,
+                    Path::new(&upd.remote_path),
+                ) else {
+                    continue;
+                };
+                let timings = self
+                    .fetch_remote_agy_step_timings(ConduitLane::Interactive, &remote_home, &conv_id)
+                    .await;
+                if !timings.is_empty() {
+                    let model_hint = upd
+                        .model
+                        .as_deref()
+                        .or_else(|| cached_models.get(&upd.pane).map(String::as_str));
+                    if let Some(enriched) = agy_step_timings_to_metrics(
+                        &timings,
+                        model_hint,
+                        upd.metrics.clone(),
+                        now_hub,
+                    ) {
+                        upd.metrics = Some(enriched);
+                    }
+                }
+            }
+        }
+
+        let mut events = Vec::new();
+        let mut output_deltas = Vec::new();
+        let mut emitted_sids = HashSet::new();
+
+        let sessions = {
+            let mut ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+            let mut sessions = ds.last_sessions.clone();
+            for (path, stat) in &parsed.tr_stats {
+                ds.latest_tr_stats.insert(path.clone(), *stat);
+            }
+
+            // Apply updated pane tails & heuristic state watch.
+            for target in &targets {
+                let pane = &target.pane;
+                let agent = target.agent;
+                let local_sid = legacy_session_id(pane);
+                let qualified_sid = qualify_host_session(&self.host_id, &local_sid);
+                let qualified_pane = qualify_host_pane(&self.host_id, pane);
+                let agent_pid = ds.pane_agent_pid.get(pane).copied();
+                if let (Some(meta), Some(tail)) =
+                    (parsed.pane_metas.get(pane), parsed.captured_tails.get(pane))
+                {
+                    ds.tail_cache.insert(
+                        pane.clone(),
+                        SshTailCacheEntry {
+                            history_size: meta.history_size,
+                            cursor_x: meta.cursor_x,
+                            cursor_y: meta.cursor_y,
+                            in_mode: meta.in_mode,
+                            current_command: meta.current_command.clone(),
+                            agent_pid,
+                            tail: tail.clone(),
+                        },
+                    );
+                    if let Some(rec) = sessions.iter_mut().find(|s| s.session_id == qualified_sid) {
+                        let (st, st_since, last_ev_ms, last_err, hev) = apply_ssh_pane_tail_watch(
+                            &mut ds.pane_watch,
+                            pane,
+                            &qualified_sid,
+                            &qualified_pane,
+                            agent,
+                            rec.cwd.as_deref(),
+                            rec.model.as_deref(),
+                            tail,
+                            rec.state,
+                            now_hub,
+                        );
+                        rec.state = st;
+                        rec.state_since_ms = st_since;
+                        rec.last_event_ms = last_ev_ms;
+                        rec.last_error = last_err;
+                        if let Some(ev) = hev {
+                            events.push(ev);
+                        }
+                        if let Some(st_m) = parse_status_line_metrics(agent, tail, now_hub) {
+                            let tr_m = ds
+                                .resolved_by_pane
+                                .get(pane)
+                                .and_then(|r| r.metrics.clone());
+                            rec.metrics = merge_metrics(tr_m, Some(st_m));
+                        }
+                        if agent == AgentKind::Codex
+                            && (rec.model.is_none() || rec.effort.is_none())
+                        {
+                            let (st_model, st_effort) = parse_codex_status_line_model_effort(tail);
+                            if rec.model.is_none() {
+                                rec.model = st_model;
+                            }
+                            if rec.effort.is_none() {
+                                rec.effort = st_effort;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Apply transcript delta updates & emit `DaemonEvent::Output`.
+            for DirtyMirrorUpdate {
+                pane,
+                agent,
+                remote_path,
+                stat,
+                local_path,
+                metrics: tr_metrics,
+                model: tr_model,
+                effort: tr_effort,
+            } in mirror_updates
+            {
+                let valid_model = tr_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| {
+                        !s.is_empty()
+                            && *s != "<synthetic>"
+                            && !(agent == AgentKind::Agy && *s == "gemini-flash-worker-agy")
+                    })
+                    .map(str::to_string);
+                let valid_effort = tr_effort.or_else(|| {
+                    (agent == AgentKind::Agy)
+                        .then(|| {
+                            valid_model
+                                .as_deref()
+                                .and_then(extract_agy_effort_from_model)
+                        })
+                        .flatten()
+                });
+                if let Some(entry) = ds.resolved_by_pane.get_mut(&pane) {
+                    if entry.path == remote_path {
+                        entry.last_stat = Some(stat);
+                        entry.metrics = tr_metrics.clone();
+                        if valid_model.is_some() {
+                            entry.model = valid_model.clone();
+                        }
+                        if valid_effort.is_some() {
+                            entry.effort = valid_effort.clone();
+                        }
+                    }
+                }
+                let local_sid = legacy_session_id(&pane);
+                let qualified_sid = qualify_host_session(&self.host_id, &local_sid);
+                let mut final_metrics = tr_metrics.clone();
+                if let Some(rec) = sessions.iter_mut().find(|s| s.session_id == qualified_sid) {
+                    if let Some(ref m) = valid_model {
+                        rec.model = Some(m.clone());
+                    }
+                    if let Some(ref e) = valid_effort {
+                        rec.effort = Some(e.clone());
+                    }
+                    let st_metrics = rec
+                        .metrics
+                        .as_ref()
+                        .filter(|m| m.source == "status_line")
+                        .cloned();
+                    let merged = merge_metrics(tr_metrics.clone(), st_metrics);
+                    if merged.is_some() {
+                        rec.metrics = merged.clone();
+                        final_metrics = merged;
+                    }
+                    if let Some(lk) = ds.session_lookup.get_mut(&local_sid) {
+                        lk.latest_stat = Some(stat);
+                        lk.metrics = rec.metrics.clone();
+                    }
+                }
+                let live_tail = parsed.captured_tails.get(&pane).cloned();
+                if let Some(ev) = self.build_transcript_output_delta(
+                    &mut ds,
+                    &qualified_sid,
+                    agent,
+                    &local_path,
+                    true,
+                    live_tail,
+                    final_metrics,
+                    now_hub,
+                ) {
+                    emitted_sids.insert(qualified_sid);
+                    output_deltas.push(ev);
+                }
+            }
+
+            // Emit `live_tail` `DaemonEvent::Output` for dirty panes whose tail changed.
+            for target in &targets {
+                let pane = &target.pane;
+                let qualified_sid = qualify_host_session(&self.host_id, &legacy_session_id(pane));
+                if emitted_sids.contains(&qualified_sid) {
+                    continue;
+                }
+                let Some(tail) = parsed.captured_tails.get(pane) else {
+                    continue;
+                };
+                let h = hash_tail(tail);
+                let prev_h = ds.last_emitted_tail_hash.insert(pane.clone(), h);
+                if prev_h.is_none_or(|ph| ph != h) {
+                    let metrics = sessions
+                        .iter()
+                        .find(|s| s.session_id == qualified_sid)
+                        .and_then(|s| s.metrics.clone());
+                    output_deltas.push(DaemonEvent::Output {
+                        seq: 0,
+                        session_id: qualified_sid,
+                        start_seq: None,
+                        total_messages: None,
+                        appended_messages: Vec::new(),
+                        live_tail: Some(tail.clone()),
+                        metrics,
+                        dirty: false,
+                    });
+                }
+            }
+
+            ds.last_sessions = sessions.clone();
+            sessions
+        };
+
+        let elapsed_ms = started.elapsed().as_millis().min((RTT_UNSET - 1) as u128) as u64;
+        self.last_sync_ms.store(elapsed_ms, Ordering::Release);
+        let count = sessions
+            .iter()
+            .filter(|s| !s.is_subagent && s.state != SessionState::Ended)
+            .count();
+        Ok(NodeSnapshot {
+            host: HostRecord {
+                id: self.host_id.clone(),
+                display_name: display_name.to_string(),
+                kind: HostKind::Ssh,
+                status: HostStatus::Online,
+                active_endpoint: Some(self.transport.target().to_string()),
+                last_seen_ms: Some(now_hub),
+                error: None,
+                session_count: count,
+                rtt_ms: self.transport.rtt_ms(),
+                sync_ms: Some(elapsed_ms),
+                next_retry_ms: None,
+            },
+            sessions,
+            events,
+            output_deltas,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HotCursorSpec {
+    path: String,
+    ino: u64,
+    offset: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DirtyPaneTarget {
+    pane: PaneId,
+    agent: AgentKind,
+    hot: Option<HotCursorSpec>,
+}
+
+struct DirtyMirrorUpdate {
+    pane: PaneId,
+    agent: AgentKind,
+    remote_path: String,
+    stat: RemoteFileStat,
+    local_path: PathBuf,
+    metrics: Option<SessionMetrics>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DirtyPaneMeta {
+    dead: bool,
+    in_mode: bool,
+    history_size: u32,
+    cursor_x: u32,
+    cursor_y: u32,
+    current_command: String,
+}
+
+#[derive(Debug, Default)]
+struct ParsedDirtyPanes {
+    missing_panes: Vec<PaneId>,
+    pane_metas: HashMap<PaneId, DirtyPaneMeta>,
+    captured_tails: HashMap<PaneId, String>,
+    tr_stats: HashMap<String, RemoteFileStat>,
+    hot_deltas: HashMap<String, InlineHotDelta>,
+}
+
+fn parse_dirty_panes_output(stdout: &str) -> ParsedDirtyPanes {
+    let clean = stdout.replace("\r\n", "\n");
+    let (panes_part, deltas_part) = match split_marker_line_last(&clean, SEC_HOT_DELTAS) {
+        Some((p, d)) => (p, d),
+        None => (clean.as_str(), ""),
+    };
+    let mut out = ParsedDirtyPanes::default();
+    let mut cur_pane: Option<PaneId> = None;
+    let mut cur_buf = String::new();
+    for line in panes_part.lines() {
+        if let Some(pid_raw) = line.strip_prefix("__SF_DIRTY_MISSING__ ") {
+            out.missing_panes.push(PaneId::new(pid_raw.trim()));
+        } else if let Some(rest) = line.strip_prefix("__SF_DIRTY_META__ ") {
+            let fields = starfane_tmux::split_tmux_fields(rest);
+            if fields.len() >= 7 {
+                let pane = PaneId::new(fields[0].trim());
+                out.pane_metas.insert(
+                    pane,
+                    DirtyPaneMeta {
+                        dead: fields[1].trim() == "1",
+                        in_mode: fields[2].trim() == "1",
+                        history_size: fields[3].trim().parse::<u32>().unwrap_or(0),
+                        cursor_x: fields[4].trim().parse::<u32>().unwrap_or(0),
+                        cursor_y: fields[5].trim().parse::<u32>().unwrap_or(0),
+                        current_command: fields[6].trim().to_string(),
+                    },
+                );
+            }
+        } else if let Some(pid_raw) = line.strip_prefix("__SF_TAIL_BEGIN__ ") {
+            cur_pane = Some(PaneId::new(pid_raw.trim()));
+            cur_buf.clear();
+        } else if let Some(pid_raw) = line.strip_prefix("__SF_TAIL_END__ ") {
+            if let Some(p) = cur_pane.take() {
+                if p.as_str() == pid_raw.trim() {
+                    out.captured_tails
+                        .insert(p, trim_and_cap_tail(&cur_buf, 20, MAX_CAPTURE_BYTES));
+                }
+            }
+            cur_buf.clear();
+        } else if cur_pane.is_some() {
+            if !cur_buf.is_empty() {
+                cur_buf.push('\n');
+            }
+            cur_buf.push_str(line);
+        }
+    }
+    for line in deltas_part.lines() {
+        if let Some(rest) = line.strip_prefix("__SF_DIRTY_STAT__ ") {
+            if let Some((stat, path)) = parse_stat_and_path(rest) {
+                out.tr_stats.insert(path, stat);
+            }
+        }
+    }
+    parse_hot_deltas_section(deltas_part, &mut out.hot_deltas);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Zero-Install `SshTmuxControlWatcher` (`tmux -C` + Multi-Session Digest)
+// ---------------------------------------------------------------------------
+
+/// Parsed control-mode notification/framing line from `tmux -C`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxControlEvent {
+    Output(PaneId),
+    ExtendedOutput(PaneId),
+    Pause(PaneId),
+    Continue(PaneId),
+    TopologyChanged { pane: Option<PaneId> },
+    Begin { cmd_num: u64 },
+    End { cmd_num: u64 },
+    Error { cmd_num: u64 },
+    Exit(String),
+}
+
+/// Parse a single line emitted by `tmux -C` control mode.
+pub fn parse_tmux_control_line(line: &str) -> Option<TmuxControlEvent> {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    if !trimmed.starts_with('%') {
+        return None;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let tag = parts.next()?;
+    let parse_pane_tok = |tok: Option<&str>| -> Option<PaneId> {
+        let s = tok?;
+        if s.len() > 1 && s.starts_with('%') && s[1..].bytes().all(|b| b.is_ascii_digit()) {
+            Some(PaneId::new(s))
+        } else {
+            None
+        }
+    };
+    match tag {
+        "%output" => Some(TmuxControlEvent::Output(parse_pane_tok(parts.next())?)),
+        "%extended-output" => Some(TmuxControlEvent::ExtendedOutput(parse_pane_tok(
+            parts.next(),
+        )?)),
+        "%pause" => Some(TmuxControlEvent::Pause(parse_pane_tok(parts.next())?)),
+        "%continue" => Some(TmuxControlEvent::Continue(parse_pane_tok(parts.next())?)),
+        "%pane-mode-changed" => Some(TmuxControlEvent::TopologyChanged {
+            pane: parse_pane_tok(parts.next()),
+        }),
+        "%window-add"
+        | "%window-close"
+        | "%window-renamed"
+        | "%unlinked-window-add"
+        | "%unlinked-window-close"
+        | "%unlinked-window-renamed"
+        | "%layout-change"
+        | "%sessions-changed"
+        | "%session-changed"
+        | "%session-renamed" => Some(TmuxControlEvent::TopologyChanged { pane: None }),
+        "%begin" => {
+            let _ts = parts.next();
+            let cmd_num = parts
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            Some(TmuxControlEvent::Begin { cmd_num })
+        }
+        "%end" => {
+            let _ts = parts.next();
+            let cmd_num = parts
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            Some(TmuxControlEvent::End { cmd_num })
+        }
+        "%error" => {
+            let _ts = parts.next();
+            let cmd_num = parts
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            Some(TmuxControlEvent::Error { cmd_num })
+        }
+        "%exit" => {
+            let reason = trimmed
+                .strip_prefix("%exit")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            Some(TmuxControlEvent::Exit(reason))
+        }
+        _ => None,
+    }
+}
+
+/// Compact per-pane state digest emitted by zero-fork in-control `tmux list-panes -a -F`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneDigest {
+    pub pane_id: PaneId,
+    pub history_size: u32,
+    pub cursor_x: u32,
+    pub cursor_y: u32,
+    pub in_mode: bool,
+    pub dead: bool,
+    pub current_command: String,
+}
+
+/// Parse one pipe-delimited line from `list-panes -a -F '#{pane_id}|#{history_size}|#{cursor_x}|#{cursor_y}|#{pane_in_mode}|#{pane_dead}|#{pane_current_command}'`.
+pub fn parse_pane_digest_line(line: &str) -> Option<PaneDigest> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('%') {
+        return None;
+    }
+    let mut parts = trimmed.splitn(7, '|');
+    let pane_raw = parts.next()?;
+    if pane_raw.len() <= 1 || !pane_raw[1..].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let history_size = parts.next()?.parse::<u32>().ok()?;
+    let cursor_x = parts.next()?.parse::<u32>().ok()?;
+    let cursor_y = parts.next()?.parse::<u32>().ok()?;
+    let in_mode = parts.next()? == "1";
+    let dead = parts.next()? == "1";
+    let current_command = parts.next()?.to_string();
+    Some(PaneDigest {
+        pane_id: PaneId::new(pane_raw),
+        history_size,
+        cursor_x,
+        cursor_y,
+        in_mode,
+        dead,
+        current_command,
+    })
+}
+
+/// Result of comparing two consecutive multi-session `list-panes -a` digests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DigestDiff {
+    pub topology_changed: bool,
+    pub dirty_panes: Vec<PaneId>,
+}
+
+/// Compare `cur` against `prev`, classifying added/removed/dead/command-changed panes as
+/// `topology_changed` (`FullSync`) and cursor/history/mode changes as targeted `dirty_panes`.
+pub fn diff_pane_digests(prev: &HashMap<PaneId, PaneDigest>, cur: &[PaneDigest]) -> DigestDiff {
+    let mut diff = DigestDiff::default();
+    if prev.is_empty() {
+        return diff;
+    }
+    let mut seen = HashSet::with_capacity(cur.len());
+    for d in cur {
+        seen.insert(&d.pane_id);
+        match prev.get(&d.pane_id) {
+            None => {
+                diff.topology_changed = true;
+            }
+            Some(old) => {
+                if old.dead != d.dead || old.current_command != d.current_command {
+                    diff.topology_changed = true;
+                } else if old.history_size != d.history_size
+                    || old.cursor_x != d.cursor_x
+                    || old.cursor_y != d.cursor_y
+                    || old.in_mode != d.in_mode
+                {
+                    diff.dirty_panes.push(d.pane_id.clone());
+                }
+            }
+        }
+    }
+    if prev.keys().any(|k| !seen.contains(k)) {
+        diff.topology_changed = true;
+    }
+    diff
+}
+
+/// Read up to `max_keep` bytes of the next `\n`-terminated line and drain any trailing bytes
+/// beyond `max_keep` without allocating unbounded memory (defends against giant `%output` floods).
+async fn read_control_line_prefix<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_keep: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::with_capacity(256);
+    let mut saw_any = false;
+    loop {
+        let avail = reader.fill_buf().await?;
+        if avail.is_empty() {
+            return if saw_any {
+                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            } else {
+                Ok(None)
+            };
+        }
+        saw_any = true;
+        if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            let keep = max_keep.saturating_sub(buf.len()).min(pos);
+            if keep > 0 {
+                buf.extend_from_slice(&avail[..keep]);
+            }
+            reader.consume(take);
+            if buf.ends_with(b"\r") {
+                buf.pop();
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        let n = avail.len();
+        let keep = max_keep.saturating_sub(buf.len()).min(n);
+        if keep > 0 {
+            buf.extend_from_slice(&avail[..keep]);
+        }
+        reader.consume(n);
+    }
+}
+
+struct SshTmuxControlWatcher {
+    host_id: HostId,
+    ssh: Arc<SshExec>,
+    tmux_cmd: String,
+    include_shell_panes: bool,
+    circuit: Arc<Mutex<HostCircuitBreaker>>,
+    discovery: Arc<Mutex<SshDiscoveryState>>,
+}
+
+impl SshTmuxControlWatcher {
+    fn pane_is_interesting(&self, pane: &PaneId) -> bool {
+        if self.include_shell_panes {
+            return true;
+        }
+        let ds = self.discovery.lock().unwrap_or_else(|p| p.into_inner());
+        if ds.pane_agent.is_empty() {
+            return true;
+        }
+        ds.pane_agent
+            .get(pane)
+            .is_some_and(|agent| !agent.is_shell())
+    }
+
+    fn digest_interval(&self) -> Duration {
+        let active = self
+            .discovery
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .has_active_session();
+        if active {
+            Duration::from_millis(WATCH_DIGEST_ACTIVE_MS)
+        } else {
+            Duration::from_millis(WATCH_DIGEST_IDLE_MS)
+        }
+    }
+
+    async fn run(self, tx: tokio::sync::mpsc::UnboundedSender<HostPushSignal>) {
+        const BACKOFF_SECS: &[u64] = &[1, 2, 5, 15];
+        let mut backoff_idx = 0usize;
+        let mut ever_connected = false;
+
+        while !tx.is_closed() {
+            // Respect open offline circuit breaker instead of hammering unreachable hosts.
+            let wait_offline = {
+                let cb = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+                if cb.status() == HostStatus::Offline {
+                    let now = id::now_ms();
+                    cb.active_backoff_until(now).map(|until| {
+                        Duration::from_millis(until.saturating_sub(now).clamp(500, 15_000))
+                    })
+                } else {
+                    None
+                }
+            };
+            if let Some(dur) = wait_offline {
+                tokio::select! {
+                    _ = tokio::time::sleep(dur) => continue,
+                    _ = tx.closed() => return,
+                }
+            }
+
+            let session_start = Instant::now();
+            let connected = self.run_once(&tx, ever_connected).await;
+            if tx.is_closed() {
+                return;
+            }
+            if connected {
+                ever_connected = true;
+                if session_start.elapsed() >= Duration::from_secs(10) {
+                    backoff_idx = 0;
+                }
+            }
+            let delay = Duration::from_secs(BACKOFF_SECS.get(backoff_idx).copied().unwrap_or(15));
+            if backoff_idx + 1 < BACKOFF_SECS.len() {
+                backoff_idx += 1;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = tx.closed() => return,
+            }
+        }
+    }
+
+    async fn run_once(
+        &self,
+        tx: &tokio::sync::mpsc::UnboundedSender<HostPushSignal>,
+        was_connected: bool,
+    ) -> bool {
+        let watch_script = format!(
+            "{bootstrap}SESS=$({tmux} list-sessions -F '#{{session_name}}' 2>/dev/null | head -n 1)\n\
+             [ -n \"$SESS\" ] || exit 75\n\
+             exec {tmux} -C attach-session -t \"=$SESS\"\n",
+            bootstrap = REMOTE_PATH_BOOTSTRAP,
+            tmux = self.tmux_cmd,
+        );
+        let mut args = self.ssh.build_ssh_base_args();
+        args.push("-T".to_string());
+        args.push(self.ssh.target().to_string());
+        args.push("--".to_string());
+        args.push(format!(
+            "/bin/sh -c {}",
+            starfane_tmux::ssh_universal_quote(&watch_script)
+        ));
+
+        let mut cmd = tokio::process::Command::new(self.ssh.ssh_bin());
+        cmd.args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        let Ok(mut child) = cmd.spawn() else {
+            return false;
+        };
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill().await;
+            return false;
+        };
+        let mut reader = BufReader::with_capacity(16 * 1024, stdout);
+
+        let mut handshake_done = false;
+        let mut sent_pause_fallback = false;
+        let mut flow_cmd_in_flight = false;
+        let mut digest_in_flight = false;
+        let mut digest_collecting = false;
+        let mut digest_rows: Vec<PaneDigest> = Vec::new();
+        let mut prev_digests: HashMap<PaneId, PaneDigest> = HashMap::new();
+
+        let mut pending_dirty: HashSet<PaneId> = HashSet::new();
+        let mut paused_panes: HashSet<PaneId> = HashSet::new();
+        let mut pending_full_sync = false;
+        let mut debounce_deadline: Option<tokio::time::Instant> = None;
+        let mut next_digest_at = tokio::time::Instant::now() + self.digest_interval();
+
+        let digest_cmd = "list-panes -a -F '#{pane_id}|#{history_size}|#{cursor_x}|#{cursor_y}|#{pane_in_mode}|#{pane_dead}|#{pane_current_command}'\n";
+
+        loop {
+            let debounce_fut = async {
+                match debounce_deadline {
+                    Some(dl) => tokio::time::sleep_until(dl).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = tx.closed() => {
+                    let _ = child.kill().await;
+                    return handshake_done;
+                }
+                _ = debounce_fut => {
+                    debounce_deadline = None;
+                    if pending_full_sync {
+                        pending_full_sync = false;
+                        pending_dirty.clear();
+                        if tx.send(HostPushSignal::FullSync).is_err() {
+                            let _ = child.kill().await;
+                            return handshake_done;
+                        }
+                    } else if !pending_dirty.is_empty() {
+                        let dirty: Vec<PaneId> = pending_dirty.drain().collect();
+                        if tx.send(HostPushSignal::DirtyPanes(dirty)).is_err() {
+                            let _ = child.kill().await;
+                            return handshake_done;
+                        }
+                    }
+                    if !paused_panes.is_empty() {
+                        for pane in paused_panes.drain() {
+                            let resume = format!("refresh-client -A {}:continue\n", pane.as_str());
+                            let _ = stdin.write_all(resume.as_bytes()).await;
+                        }
+                        let _ = stdin.flush().await;
+                    }
+                }
+                _ = tokio::time::sleep_until(next_digest_at), if handshake_done => {
+                    next_digest_at = tokio::time::Instant::now() + self.digest_interval();
+                    if !digest_in_flight && !flow_cmd_in_flight {
+                        if stdin.write_all(digest_cmd.as_bytes()).await.is_err()
+                            || stdin.flush().await.is_err()
+                        {
+                            break;
+                        }
+                        digest_in_flight = true;
+                        digest_rows.clear();
+                    }
+                }
+                line_res = read_control_line_prefix(&mut reader, WATCH_MAX_LINE_KEEP_BYTES) => {
+                    let Ok(Some(line)) = line_res else {
+                        break;
+                    };
+                    if let Some(ev) = parse_tmux_control_line(&line) {
+                        match ev {
+                            TmuxControlEvent::Begin { .. } => {
+                                if digest_in_flight {
+                                    digest_collecting = true;
+                                    digest_rows.clear();
+                                }
+                            }
+                            TmuxControlEvent::End { .. } => {
+                                if !handshake_done {
+                                    handshake_done = true;
+                                    if was_connected {
+                                        let _ = tx.send(HostPushSignal::Reconnect);
+                                    }
+                                    // Enable tmux >= 3.2 flow-control backpressure + ignore-size.
+                                    if stdin
+                                        .write_all(b"refresh-client -f pause-after=2,ignore-size\n")
+                                        .await
+                                        .is_ok()
+                                    {
+                                        let _ = stdin.flush().await;
+                                        flow_cmd_in_flight = true;
+                                    }
+                                } else if flow_cmd_in_flight {
+                                    flow_cmd_in_flight = false;
+                                } else if digest_in_flight {
+                                    digest_in_flight = false;
+                                    digest_collecting = false;
+                                    let diff = diff_pane_digests(&prev_digests, &digest_rows);
+                                    prev_digests = digest_rows
+                                        .drain(..)
+                                        .map(|d| (d.pane_id.clone(), d))
+                                        .collect();
+                                    if diff.topology_changed {
+                                        pending_full_sync = true;
+                                        debounce_deadline.get_or_insert_with(|| {
+                                            tokio::time::Instant::now()
+                                                + Duration::from_millis(WATCH_DEBOUNCE_MS)
+                                        });
+                                    } else {
+                                        let mut any = false;
+                                        for pane in diff.dirty_panes {
+                                            if self.pane_is_interesting(&pane) {
+                                                pending_dirty.insert(pane);
+                                                any = true;
+                                            }
+                                        }
+                                        if any {
+                                            debounce_deadline.get_or_insert_with(|| {
+                                                tokio::time::Instant::now()
+                                                    + Duration::from_millis(WATCH_DEBOUNCE_MS)
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            TmuxControlEvent::Error { .. } => {
+                                if flow_cmd_in_flight {
+                                    flow_cmd_in_flight = false;
+                                    if !sent_pause_fallback {
+                                        sent_pause_fallback = true;
+                                        if stdin
+                                            .write_all(b"refresh-client -f pause-after=2\n")
+                                            .await
+                                            .is_ok()
+                                        {
+                                            let _ = stdin.flush().await;
+                                            flow_cmd_in_flight = true;
+                                        }
+                                    }
+                                } else if digest_in_flight {
+                                    digest_in_flight = false;
+                                    digest_collecting = false;
+                                    digest_rows.clear();
+                                }
+                            }
+                            TmuxControlEvent::Output(pane)
+                            | TmuxControlEvent::ExtendedOutput(pane) => {
+                                if self.pane_is_interesting(&pane) {
+                                    pending_dirty.insert(pane);
+                                    debounce_deadline.get_or_insert_with(|| {
+                                        tokio::time::Instant::now()
+                                            + Duration::from_millis(WATCH_DEBOUNCE_MS)
+                                    });
+                                }
+                            }
+                            TmuxControlEvent::Pause(pane) => {
+                                paused_panes.insert(pane.clone());
+                                if self.pane_is_interesting(&pane) {
+                                    pending_dirty.insert(pane);
+                                }
+                                debounce_deadline.get_or_insert_with(|| {
+                                    tokio::time::Instant::now()
+                                        + Duration::from_millis(WATCH_DEBOUNCE_MS)
+                                });
+                            }
+                            TmuxControlEvent::Continue(_) => {}
+                            TmuxControlEvent::TopologyChanged { pane } => {
+                                if let Some(p) = pane {
+                                    if self.pane_is_interesting(&p) {
+                                        pending_dirty.insert(p);
+                                        debounce_deadline.get_or_insert_with(|| {
+                                            tokio::time::Instant::now()
+                                                + Duration::from_millis(WATCH_DEBOUNCE_MS)
+                                        });
+                                    }
+                                } else {
+                                    pending_full_sync = true;
+                                    debounce_deadline.get_or_insert_with(|| {
+                                        tokio::time::Instant::now()
+                                            + Duration::from_millis(WATCH_DEBOUNCE_MS)
+                                    });
+                                }
+                            }
+                            TmuxControlEvent::Exit(_) => break,
+                        }
+                    } else if digest_collecting {
+                        if let Some(d) = parse_pane_digest_line(&line) {
+                            digest_rows.push(d);
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_millis(200), child.wait()).await;
+        if handshake_done {
+            log::debug!(
+                "ssh {} tmux -C control stream ended; will reconnect",
+                self.host_id
+            );
+        }
+        handshake_done
     }
 }
 
@@ -4126,6 +6632,38 @@ impl NodeProvider for SshMuxNodeProvider {
         })
     }
 
+    fn sync_dirty_panes<'a>(
+        &'a self,
+        display_name: &'a str,
+        dirty_panes: &'a [PaneId],
+        claimed_external_ids: &'a HashSet<String>,
+    ) -> BoxFuture<'a, Result<NodeSnapshot, String>> {
+        Box::pin(async move {
+            self.run_sync_dirty_panes_inner(display_name, dirty_panes, claimed_external_ids)
+                .await
+        })
+    }
+
+    fn spawn_push_watcher(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<HostPushSignal>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.push_watch {
+            return None;
+        }
+        let watcher = SshTmuxControlWatcher {
+            host_id: self.host_id.clone(),
+            ssh: self.transport.clone(),
+            tmux_cmd: self.tmux_cmd_prefix(),
+            include_shell_panes: self.include_shell_panes,
+            circuit: self.circuit.clone(),
+            discovery: self.discovery.clone(),
+        };
+        Some(tokio::spawn(async move {
+            watcher.run(tx).await;
+        }))
+    }
+
     fn list_tmux_sessions(&self) -> BoxFuture<'_, Result<Vec<String>, ApiError>> {
         Box::pin(async move {
             {
@@ -4143,17 +6681,22 @@ impl NodeProvider for SshMuxNodeProvider {
                 bootstrap = REMOTE_PATH_BOOTSTRAP,
                 tmux = self.tmux_cmd_prefix(),
             );
-            let transport = self.transport.clone();
-            let out = tokio::task::spawn_blocking(move || transport.run_idempotent_shell(&script))
+            let out = self
+                .exec_conduit_idempotent(
+                    ConduitLane::Interactive,
+                    &script,
+                    None,
+                    self.transport.timeout(),
+                )
                 .await
-                .map_err(|e| ApiError::internal(format!("ssh list_tmux_sessions join: {e}")))?
                 .map_err(|e| {
                     self.circuit
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .record_failure(id::now_ms(), e.to_string());
                     ApiError::new(ErrorCode::Unavailable, format!("ssh list_sessions: {e}"))
-                })?;
+                })?
+                .into_utf8_lossy();
             if !out.success {
                 let msg = format!(
                     "ssh {} list-sessions failed (exit {:?}): {}",
@@ -4234,20 +6777,24 @@ impl NodeProvider for SshMuxNodeProvider {
                 .await
                 .map_err(|_| ApiError::internal("ssh interactive semaphore closed"))?;
 
-            // RTT 1: Read-only remote preflight probe (expands remote $HOME, verifies cwd & binary,
-            // lists windows in target tmux session, fetches capped team.toml + codex/agy config).
+            // RTT 1: Read-only remote preflight probe over persistent `ConduitLane::Interactive`.
             let pf_script = self.build_spawn_preflight_script(req.agent, &raw_cwd, &target_session);
-            let t1 = self.transport.clone();
-            let pf_out = tokio::task::spawn_blocking(move || t1.run_idempotent_shell(&pf_script))
+            let pf_out = self
+                .exec_conduit_idempotent(
+                    ConduitLane::Interactive,
+                    &pf_script,
+                    None,
+                    self.transport.timeout(),
+                )
                 .await
-                .map_err(|e| ApiError::internal(format!("ssh spawn preflight join: {e}")))?
                 .map_err(|e| {
                     self.circuit
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .record_failure(id::now_ms(), e.to_string());
                     ApiError::new(ErrorCode::Unavailable, format!("ssh spawn preflight: {e}"))
-                })?;
+                })?
+                .into_utf8_lossy();
             if !pf_out.success {
                 let msg = format!(
                     "ssh {} spawn preflight failed (exit {:?}): {}",
@@ -4359,20 +6906,26 @@ impl NodeProvider for SshMuxNodeProvider {
                         .flatten()
                 });
 
-            // RTT 2: Atomic remote tmux spawn (NON-idempotent `run_shell`, never retried).
+            // RTT 2: Atomic remote tmux spawn (NON-idempotent `exec_bytes`, NEVER auto-retried).
             let spawn_script =
                 self.build_atomic_spawn_script(&target_session, &win_label, &pf.lex_cwd, &argv);
-            let t2 = self.transport.clone();
-            let sp_out = tokio::task::spawn_blocking(move || t2.run_shell(&spawn_script))
+            let sp_out = self
+                .conduit_pool
+                .exec_bytes(
+                    ConduitLane::Interactive,
+                    &spawn_script,
+                    None,
+                    self.transport.timeout(),
+                )
                 .await
-                .map_err(|e| ApiError::internal(format!("ssh atomic spawn join: {e}")))?
                 .map_err(|e| {
                     self.circuit
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .record_failure(id::now_ms(), e.to_string());
                     ApiError::new(ErrorCode::Unavailable, format!("ssh spawn: {e}"))
-                })?;
+                })?
+                .into_utf8_lossy();
             if !sp_out.success {
                 let msg = format!(
                     "ssh {} spawn failed (exit {:?}): {}",
@@ -4451,6 +7004,11 @@ impl NodeProvider for SshMuxNodeProvider {
             let qualified_pane = qualify_host_pane(&self.host_id, &local_pane);
             let qualified_sid =
                 qualify_host_session(&self.host_id, &legacy_session_id(&local_pane));
+            self.discovery
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .last_emitted_watermarks
+                .insert(qualified_sid.clone(), TranscriptWatermark::default());
             let session = SessionRecord {
                 session_id: qualified_sid.clone(),
                 agent: req.agent,
@@ -4542,12 +7100,6 @@ impl NodeProvider for SshMuxNodeProvider {
                     continue;
                 }
 
-                let _permit = self
-                    .interactive_sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| ApiError::internal("ssh interactive semaphore closed"))?;
                 let expected_len = bytes.len();
                 let max_plus_one = MAX_IMAGE_BYTES + 1;
                 let script = format!(
@@ -4576,20 +7128,52 @@ printf 'STAGED:%s\n' "$DST"
                     expected_len = expected_len,
                     max_bytes = MAX_IMAGE_BYTES,
                 );
-                let transport = self.transport.clone();
-                let timeout = transport.timeout().max(Duration::from_secs(15));
-                let out = tokio::task::spawn_blocking(move || {
-                    transport.run_shell_bytes(&script, Some(&bytes), timeout)
-                })
-                .await
-                .map_err(|e| ApiError::internal(format!("ssh stage file join: {e}")))?
-                .map_err(|e| {
-                    self.circuit
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .record_failure(id::now_ms(), e.to_string());
-                    ApiError::new(ErrorCode::Unavailable, format!("ssh stage file: {e}"))
-                })?;
+                let timeout = self.transport.timeout().max(Duration::from_secs(15));
+                // Small pastes (<= 64 KiB) ride the persistent interactive conduit (0 ssh fork);
+                // large binary uploads (> 64 KiB, e.g. 5 MB screenshots) use one-shot `SshExec`
+                // under `io_sem` so they never head-of-line block `lane_interactive`.
+                let out = if bytes.len() <= SSH_STAGE_CONDUIT_MAX_BYTES {
+                    let _permit = self
+                        .interactive_sem
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ApiError::internal("ssh interactive semaphore closed"))?;
+                    self.exec_conduit_idempotent(
+                        ConduitLane::Interactive,
+                        &script,
+                        Some(&bytes),
+                        timeout,
+                    )
+                    .await
+                    .map_err(|e| {
+                        self.circuit
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .record_failure(id::now_ms(), e.to_string());
+                        ApiError::new(ErrorCode::Unavailable, format!("ssh stage file: {e}"))
+                    })?
+                } else {
+                    let _permit = self
+                        .io_sem
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| ApiError::internal("ssh semaphore closed"))?;
+                    let transport = self.transport.clone();
+                    tokio::task::spawn_blocking(move || {
+                        transport.run_shell_bytes(&script, Some(&bytes), timeout)
+                    })
+                    .await
+                    .map_err(|e| ApiError::internal(format!("ssh stage file join: {e}")))?
+                    .map_err(|e| {
+                        self.circuit
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .record_failure(id::now_ms(), e.to_string());
+                        ApiError::new(ErrorCode::Unavailable, format!("ssh stage file: {e}"))
+                    })?
+                };
                 if !out.success() {
                     let msg = format!(
                         "ssh {} stage file failed (exit {:?}): {}",
@@ -4667,6 +7251,11 @@ printf 'STAGED:%s\n' "$DST"
         self.transport.rtt_ms()
     }
 
+    fn sync_ms(&self) -> Option<u64> {
+        let v = self.last_sync_ms.load(Ordering::Acquire);
+        (v != RTT_UNSET).then_some(v)
+    }
+
     fn next_retry_ms(&self) -> Option<u64> {
         self.circuit
             .lock()
@@ -4699,17 +7288,22 @@ printf 'STAGED:%s\n' "$DST"
                 .await
                 .map_err(|_| ApiError::internal("ssh semaphore closed"))?;
             let script = self.build_capture_pane_script(local_pane, req);
-            let transport = self.transport.clone();
-            let out = tokio::task::spawn_blocking(move || transport.run_idempotent_shell(&script))
+            let out = self
+                .exec_conduit_idempotent(
+                    ConduitLane::Interactive,
+                    &script,
+                    None,
+                    self.transport.timeout(),
+                )
                 .await
-                .map_err(|e| ApiError::internal(format!("ssh capture task: {e}")))?
                 .map_err(|e| {
                     self.circuit
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .record_failure(id::now_ms(), e.to_string());
                     ApiError::new(ErrorCode::Unavailable, format!("ssh capture: {e}"))
-                })?;
+                })?
+                .into_utf8_lossy();
             if !out.success {
                 let msg = format!(
                     "ssh {} capture failed (exit {:?}): {}",
@@ -4789,31 +7383,22 @@ printf 'STAGED:%s\n' "$DST"
                 .await
                 .map_err(|_| ApiError::internal("ssh semaphore closed"))?;
 
-            let mirror = self.mirror.clone();
-            let tr_cache = self.transcript_index.clone();
-            let ssh = self.transport.clone();
-            let hid = self.host_id.clone();
-            let remote_path = info.remote_path.clone();
-            let agent = info.agent;
-            let latest_stat = info.latest_stat;
-            let cached_metrics = info.metrics.clone();
-
-            let page_res = tokio::task::spawn_blocking(move || {
-                mirror.read_page_and_metrics(
-                    &ssh,
-                    &tr_cache,
-                    hid.as_str(),
+            let page_res = self
+                .mirror
+                .read_page_and_metrics_conduit(
+                    &self.conduit_pool,
+                    ConduitLane::Interactive,
+                    &self.transcript_index,
+                    self.host_id.as_str(),
                     &remote_home,
-                    agent,
-                    &remote_path,
-                    latest_stat,
+                    info.agent,
+                    &info.remote_path,
+                    info.latest_stat,
                     query,
-                    cached_metrics,
+                    info.metrics.clone(),
                     now_ms,
                 )
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("ssh fetch_transcript join: {e}")))?;
+                .await;
 
             match page_res {
                 Ok(outcome) => {
@@ -4876,7 +7461,8 @@ printf 'STAGED:%s\n' "$DST"
                 .pane_agent
                 .get(local_pane)
                 .copied();
-            let effective_settle = adaptive_paste_settle_ms(settle_ms, &clean_text);
+            let (effective_settle, post_check_ms) =
+                fast_ssh_dispatch_timings(settle_ms, &clean_text);
 
             let _permit = self
                 .interactive_sem
@@ -4886,23 +7472,31 @@ printf 'STAGED:%s\n' "$DST"
                 .map_err(|_| ApiError::internal("ssh interactive semaphore closed"))?;
 
             // RTT 1: Single compound gate + copy-mode cancel + pre-screen modal guard +
-            // bracketed paste + adaptive settle + C-m + post-capture (NEVER auto-retried on exit 255).
-            let script = self.build_dispatch_script(local_pane, known_agent, effective_settle);
-            let transport = self.transport.clone();
-            let payload = clean_text.as_bytes().to_vec();
-            let timeout = transport.timeout().max(Duration::from_secs(12));
-            let out = tokio::task::spawn_blocking(move || {
-                transport.run_shell_bytes(&script, Some(&payload), timeout)
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("ssh dispatch join: {e}")))?
-            .map_err(|e| {
-                self.circuit
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .record_failure(id::now_ms(), e.to_string());
-                ApiError::new(ErrorCode::Unavailable, format!("ssh dispatch: {e}"))
-            })?;
+            // bracketed paste + fast-ack settle + C-m + fast post-capture over persistent
+            // `ConduitLane::Interactive` (NEVER auto-retried on exit 255 / transport failure).
+            let script = self.build_dispatch_script(
+                local_pane,
+                known_agent,
+                effective_settle,
+                post_check_ms,
+            );
+            let timeout = self.transport.timeout().max(Duration::from_secs(12));
+            let out = self
+                .conduit_pool
+                .exec_bytes(
+                    ConduitLane::Interactive,
+                    &script,
+                    Some(clean_text.as_bytes()),
+                    timeout,
+                )
+                .await
+                .map_err(|e| {
+                    self.circuit
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .record_failure(id::now_ms(), e.to_string());
+                    ApiError::new(ErrorCode::Unavailable, format!("ssh dispatch: {e}"))
+                })?;
 
             if !out.success() {
                 let msg = format!(
@@ -5046,24 +7640,27 @@ printf 'STAGED:%s\n' "$DST"
                         let mut retried = false;
                         if stuck {
                             const RETRY_SCHEDULE: [(&str, &str); 2] =
-                                [("0.25", "0.26"), ("0.35", "0.28")];
+                                [("0.20", "0.22"), ("0.30", "0.24")];
                             for (settle_s, observe_s) in RETRY_SCHEDULE {
                                 retried = true;
                                 let r_script =
                                     self.build_enter_retry_script(local_pane, settle_s, observe_s);
-                                let tr = self.transport.clone();
-                                let r_out =
-                                    tokio::task::spawn_blocking(move || tr.run_shell(&r_script))
-                                        .await
-                                        .map_err(|e| {
-                                            ApiError::internal(format!("ssh retry join: {e}"))
-                                        })?
-                                        .map_err(|e| {
-                                            ApiError::new(
-                                                ErrorCode::Unavailable,
-                                                format!("ssh C-m retry: {e}"),
-                                            )
-                                        })?;
+                                let r_out = self
+                                    .conduit_pool
+                                    .exec_bytes(
+                                        ConduitLane::Interactive,
+                                        &r_script,
+                                        None,
+                                        self.transport.timeout(),
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        ApiError::new(
+                                            ErrorCode::Unavailable,
+                                            format!("ssh C-m retry: {e}"),
+                                        )
+                                    })?
+                                    .into_utf8_lossy();
                                 if !r_out.success {
                                     break;
                                 }
@@ -5206,11 +7803,16 @@ printf '%s\n' "$META"
                 pane_q = pane_q,
                 tmux = tmux_cmd,
             );
-            let transport = self.transport.clone();
-            let out = tokio::task::spawn_blocking(move || transport.run_shell(&script))
+            let out = self
+                .exec_conduit_idempotent(
+                    ConduitLane::Interactive,
+                    &script,
+                    None,
+                    self.transport.timeout(),
+                )
                 .await
-                .map_err(|e| ApiError::internal(format!("ssh focus task: {e}")))?
-                .map_err(|e| ApiError::new(ErrorCode::Unavailable, format!("ssh focus: {e}")))?;
+                .map_err(|e| ApiError::new(ErrorCode::Unavailable, format!("ssh focus: {e}")))?
+                .into_utf8_lossy();
             if !out.success {
                 let err = out.stderr.trim();
                 let lower = err.to_ascii_lowercase();
@@ -5282,17 +7884,23 @@ printf '%s\n' "$META"
                 tmux = self.tmux_cmd_prefix(),
                 pane = shell_single_quote(local_pane.as_str()),
             );
-            let transport = self.transport.clone();
-            let out = tokio::task::spawn_blocking(move || transport.run_shell(&script))
+            let out = self
+                .conduit_pool
+                .exec_bytes(
+                    ConduitLane::Interactive,
+                    &script,
+                    None,
+                    self.transport.timeout(),
+                )
                 .await
-                .map_err(|e| ApiError::internal(format!("ssh close task: {e}")))?
                 .map_err(|e| {
                     self.circuit
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .record_failure(id::now_ms(), e.to_string());
                     ApiError::new(ErrorCode::Unavailable, format!("ssh close: {e}"))
-                })?;
+                })?
+                .into_utf8_lossy();
 
             if !out.success {
                 let stderr = out.stderr.trim();
@@ -5332,6 +7940,170 @@ printf '%s\n' "$META"
             }))
         })
     }
+
+    fn send_key<'a>(
+        &'a self,
+        _remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        Box::pin(async move {
+            validate_tmux_pane_id(local_pane)?;
+            let tmux_key =
+                validate_interactive_key(key).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+            let _permit = self
+                .interactive_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| ApiError::internal("ssh interactive semaphore closed"))?;
+
+            let tmux_cmd = self.tmux_cmd_prefix();
+            let pane_q = shell_single_quote(local_pane.as_str());
+            let send_args = if tmux_key.len() == 1 {
+                format!("-l {}", shell_single_quote(tmux_key))
+            } else {
+                shell_single_quote(tmux_key)
+            };
+            // Single ~15ms RTT over persistent `ConduitLane::Interactive` (NEVER auto-retried
+            // on exit 255 / transport failure so a keystroke is never double-sent).
+            let script = format!(
+                r##"{bootstrap}
+SF_TAB=$(printf '\t')
+SF_US=$(printf '\037')
+PANE={pane_q}
+META=$({tmux} display-message -p -t "$PANE" "#{{pane_dead}}${{SF_TAB}}#{{pane_in_mode}}${{SF_TAB}}#{{pane_mode}}" </dev/null 2>&1)
+if [ $? -ne 0 ]; then
+  printf 'STATUS:MISSING:%s\n' "$META"
+  exit 0
+fi
+META_US=$(printf '%s\n' "$META" | LC_ALL=C tr '\t' '\037')
+IFS="$SF_US" read -r P_DEAD P_INMODE P_MODE <<__SF_KM_EOF__
+$META_US
+__SF_KM_EOF__
+if [ "$P_DEAD" = "1" ]; then
+  printf 'STATUS:DEAD\n'
+  exit 0
+fi
+if [ "$P_INMODE" = "1" ]; then
+  case "$P_MODE" in
+    ""|"copy-mode"|"view-mode")
+      {tmux} send-keys -t "$PANE" -X cancel </dev/null 2>/dev/null || true
+      sleep 0.03 </dev/null 2>/dev/null || true
+      P_INMODE=$({tmux} display-message -p -t "$PANE" '#{{pane_in_mode}}' </dev/null 2>/dev/null || printf '1')
+      if [ "$P_INMODE" = "1" ]; then
+        printf 'STATUS:MODE:%s\n' "$P_MODE"
+        exit 0
+      fi
+      ;;
+    *)
+      printf 'STATUS:MODE:%s\n' "$P_MODE"
+      exit 0
+      ;;
+  esac
+fi
+SEND_ERR=$({tmux} send-keys -t "$PANE" {send_args} </dev/null 2>&1)
+if [ $? -ne 0 ]; then
+  printf 'STATUS:ERR:%s\n' "$SEND_ERR"
+  exit 0
+fi
+printf 'STATUS:OK\n'
+"##,
+                bootstrap = REMOTE_PATH_BOOTSTRAP,
+                pane_q = pane_q,
+                tmux = tmux_cmd,
+                send_args = send_args,
+            );
+
+            let out = self
+                .conduit_pool
+                .exec_bytes(
+                    ConduitLane::Interactive,
+                    &script,
+                    None,
+                    self.transport.timeout(),
+                )
+                .await
+                .map_err(|e| {
+                    self.circuit
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .record_failure(id::now_ms(), e.to_string());
+                    ApiError::new(ErrorCode::Unavailable, format!("ssh send_key: {e}"))
+                })?
+                .into_utf8_lossy();
+
+            if !out.success {
+                let msg = format!(
+                    "ssh {} send_key failed (exit {:?}): {}",
+                    self.host_id,
+                    out.code,
+                    out.stderr.trim()
+                );
+                if out.code == Some(255) {
+                    self.circuit
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .record_failure(id::now_ms(), msg.clone());
+                }
+                return Err(ApiError::new(ErrorCode::Unavailable, msg));
+            }
+
+            self.circuit
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_success();
+
+            let status_line = out
+                .stdout
+                .lines()
+                .find(|l| l.starts_with("STATUS:"))
+                .unwrap_or("");
+            if status_line == "STATUS:OK" {
+                Ok(())
+            } else if let Some(msg) = status_line.strip_prefix("STATUS:MISSING:") {
+                Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!(
+                        "ssh {} pane {} not found: {}",
+                        self.host_id,
+                        local_pane,
+                        msg.trim()
+                    ),
+                ))
+            } else if status_line == "STATUS:DEAD" {
+                Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("ssh {} pane {} is dead", self.host_id, local_pane),
+                ))
+            } else if let Some(mode) = status_line.strip_prefix("STATUS:MODE:") {
+                Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!(
+                        "ssh {} pane {} is in mode {}",
+                        self.host_id,
+                        local_pane,
+                        mode.trim()
+                    ),
+                ))
+            } else if let Some(msg) = status_line.strip_prefix("STATUS:ERR:") {
+                Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("ssh {} send-keys failed: {}", self.host_id, msg.trim()),
+                ))
+            } else {
+                Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!(
+                        "ssh {} unexpected send_key output: {:?}",
+                        self.host_id,
+                        out.stdout.trim()
+                    ),
+                ))
+            }
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5343,16 +8115,24 @@ pub struct PeerDaemonNodeProvider {
     default_display_name: String,
     last_display_name: Mutex<String>,
     ownership: NotifyOwnership,
+    push_watch: bool,
     endpoints: Vec<String>,
     token: Option<String>,
     active_endpoint_idx: Mutex<usize>,
-    rtt_ewma_ms: AtomicU64,
-    circuit: Mutex<HostCircuitBreaker>,
+    pool: Arc<PeerKeepAlivePool>,
+    tunnel: Option<Arc<SshLoopbackTunnel>>,
+    last_sync_ms: AtomicU64,
+    circuit: Arc<Mutex<HostCircuitBreaker>>,
     staged_cache: Mutex<StagedFileCache>,
 }
 
 impl PeerDaemonNodeProvider {
     pub fn new(cfg: &NodeConfig) -> Self {
+        let fallback_state = std::env::temp_dir().join("starfane-peer-state");
+        Self::with_state_dir(cfg, &fallback_state)
+    }
+
+    pub fn with_state_dir(cfg: &NodeConfig, state_dir: &Path) -> Self {
         let host_id = HostId::new(cfg.id.trim());
         let display = cfg
             .display_name
@@ -5377,42 +8157,43 @@ impl PeerDaemonNodeProvider {
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty())
             .collect();
+        let tunnel = {
+            let ssh_target = cfg.ssh_target.trim();
+            if ssh_target.is_empty() {
+                None
+            } else {
+                let ssh_dir = state_dir.join("ssh-cm");
+                let control_path = ssh_dir.join(format!(
+                    "cm-peer-{}.sock",
+                    sanitize_sock_name(host_id.as_str())
+                ));
+                let ssh_exec = SshExec::new(ssh_target, control_path)
+                    .with_ssh_bin(cfg.ssh_bin_override())
+                    .with_connect_timeout_secs(cfg.effective_connect_timeout_secs())
+                    .with_compression(cfg.compression)
+                    .with_extra_args(cfg.ssh_args.clone());
+                Some(Arc::new(SshLoopbackTunnel::new(ssh_exec)))
+            }
+        };
         Self {
-            circuit: Mutex::new(HostCircuitBreaker::new(host_id.as_str())),
+            circuit: Arc::new(Mutex::new(HostCircuitBreaker::new(host_id.as_str()))),
             host_id,
             last_display_name: Mutex::new(display.clone()),
             default_display_name: display,
             ownership: cfg.effective_ownership(),
+            push_watch: cfg.push_watch,
             endpoints,
             token,
             active_endpoint_idx: Mutex::new(0),
-            rtt_ewma_ms: AtomicU64::new(RTT_UNSET),
+            pool: Arc::new(PeerKeepAlivePool::new()),
+            tunnel,
+            last_sync_ms: AtomicU64::new(RTT_UNSET),
             staged_cache: Mutex::new(StagedFileCache::default()),
         }
     }
 
-    fn record_rtt(&self, elapsed: Duration) {
-        let sample = elapsed.as_millis().min((RTT_UNSET - 1) as u128) as u64;
-        let mut prev = self.rtt_ewma_ms.load(Ordering::Acquire);
-        loop {
-            let next = if prev == RTT_UNSET {
-                sample
-            } else {
-                prev.saturating_mul(3)
-                    .saturating_add(sample)
-                    .saturating_add(2)
-                    / 4
-            };
-            match self.rtt_ewma_ms.compare_exchange_weak(
-                prev,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(cur) => prev = cur,
-            }
-        }
+    pub fn keep_alive_pool(&self) -> &Arc<PeerKeepAlivePool> {
+        &self.pool
     }
 
     fn ordered_candidates(&self) -> Vec<(usize, String)> {
@@ -5432,7 +8213,8 @@ impl PeerDaemonNodeProvider {
             .collect()
     }
 
-    /// Execute an HTTP request across multi-candidate outbound endpoints with sticky failover.
+    /// Execute an HTTP request across optional SSH loopback tunnel + multi-candidate outbound
+    /// endpoints via `PeerKeepAlivePool` with sticky failover.
     /// Transport errors and 5xx responses fail over to the next candidate; authoritative 4xx
     /// application responses (400/404/409/422) from a live peer are returned immediately.
     async fn request_json(
@@ -5441,36 +8223,125 @@ impl PeerDaemonNodeProvider {
         path_and_query: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<(String, serde_json::Value), PeerHttpError> {
-        let candidates = self.ordered_candidates();
-        if candidates.is_empty() {
-            return Err(PeerHttpError::Transport(
-                "no peer endpoints configured".into(),
-            ));
+        struct PeerCandidate {
+            idx: Option<usize>,
+            base: String,
+            host_override: Option<String>,
+            token: Option<String>,
         }
-        let mut last_err = PeerHttpError::Transport("no peer endpoints tried".into());
-        for (idx, base) in candidates {
+        let mut candidates: Vec<PeerCandidate> = Vec::new();
+        let mut last_err = PeerHttpError::Transport("no peer endpoints configured".into());
+
+        if let Some(ref tun) = self.tunnel {
+            match tun.ensure_endpoint().await {
+                Ok(ep) => {
+                    let tok = self.token.clone().or(ep.token);
+                    candidates.push(PeerCandidate {
+                        idx: None,
+                        base: ep.local_endpoint,
+                        host_override: Some(ep.host_header),
+                        token: tok,
+                    });
+                }
+                Err(e) => {
+                    last_err = e.with_prefix("ssh-tunnel");
+                }
+            }
+        }
+        for (idx, base) in self.ordered_candidates() {
+            candidates.push(PeerCandidate {
+                idx: Some(idx),
+                base,
+                host_override: None,
+                token: self.token.clone(),
+            });
+        }
+        if candidates.is_empty() {
+            return Err(last_err);
+        }
+
+        let is_idempotent =
+            method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+        for PeerCandidate {
+            idx: idx_opt,
+            base,
+            host_override,
+            token: tok,
+        } in candidates
+        {
             let url = format!("{base}{path_and_query}");
             let started = Instant::now();
-            match http_request_json(method, &url, self.token.as_deref(), body).await {
+            let res = self
+                .pool
+                .request_json_with_host(
+                    method,
+                    &url,
+                    host_override.as_deref(),
+                    tok.as_deref(),
+                    body,
+                )
+                .await;
+            match res {
                 Ok(val) => {
-                    self.record_rtt(started.elapsed());
-                    *self
-                        .active_endpoint_idx
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = idx;
+                    let sample = started.elapsed().as_millis().min((RTT_UNSET - 1) as u128) as u64;
+                    self.pool.record_rtt_sample(sample);
+                    if let Some(idx) = idx_opt {
+                        *self
+                            .active_endpoint_idx
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = idx;
+                    }
                     return Ok((base, val));
                 }
                 Err(PeerHttpError::Http { status, body })
                     if matches!(status, 400 | 404 | 409 | 422) =>
                 {
-                    self.record_rtt(started.elapsed());
-                    *self
-                        .active_endpoint_idx
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = idx;
+                    let sample = started.elapsed().as_millis().min((RTT_UNSET - 1) as u128) as u64;
+                    self.pool.record_rtt_sample(sample);
+                    if let Some(idx) = idx_opt {
+                        *self
+                            .active_endpoint_idx
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = idx;
+                    }
                     return Err(PeerHttpError::Http { status, body });
                 }
                 Err(e) => {
+                    // If the active SSH loopback tunnel transport broke on an idempotent call,
+                    // bounce the tunnel once and retry before failing over.
+                    if idx_opt.is_none()
+                        && is_idempotent
+                        && matches!(e, PeerHttpError::Transport(_))
+                    {
+                        if let Some(ref tun) = self.tunnel {
+                            self.pool.clear_idle();
+                            if let Ok(fresh_ep) = tun.reconnect().await {
+                                let fresh_tok = self.token.clone().or(fresh_ep.token);
+                                let fresh_url =
+                                    format!("{}{path_and_query}", fresh_ep.local_endpoint);
+                                let retry_start = Instant::now();
+                                if let Ok(val) = self
+                                    .pool
+                                    .request_json_with_host(
+                                        method,
+                                        &fresh_url,
+                                        Some(&fresh_ep.host_header),
+                                        fresh_tok.as_deref(),
+                                        body,
+                                    )
+                                    .await
+                                {
+                                    let sample = retry_start
+                                        .elapsed()
+                                        .as_millis()
+                                        .min((RTT_UNSET - 1) as u128)
+                                        as u64;
+                                    self.pool.record_rtt_sample(sample);
+                                    return Ok((fresh_ep.local_endpoint, val));
+                                }
+                            }
+                        }
+                    }
                     last_err = e.with_prefix(&base);
                 }
             }
@@ -5499,6 +8370,7 @@ impl PeerDaemonNodeProvider {
             }
         }
 
+        let sync_started = Instant::now();
         let (active_ep, env) = match self.request_json("GET", "/api/state", None).await {
             Ok(v) => v,
             Err(e) => {
@@ -5547,6 +8419,11 @@ impl PeerDaemonNodeProvider {
             s.host_display_name = Some(display_name.to_string());
             qualified.push(s);
         }
+        let elapsed_sync_ms = sync_started
+            .elapsed()
+            .as_millis()
+            .min((RTT_UNSET - 1) as u128) as u64;
+        self.last_sync_ms.store(elapsed_sync_ms, Ordering::Release);
         let now = id::now_ms();
         let count = qualified
             .iter()
@@ -5562,11 +8439,13 @@ impl PeerDaemonNodeProvider {
                 last_seen_ms: Some(now),
                 error: None,
                 session_count: count,
-                rtt_ms: self.rtt_ms(),
+                rtt_ms: self.pool.rtt_ms(),
+                sync_ms: Some(elapsed_sync_ms),
                 next_retry_ms: None,
             },
             sessions: qualified,
             events: Vec::new(),
+            output_deltas: Vec::new(),
         })
     }
 }
@@ -5853,7 +8732,11 @@ impl NodeProvider for PeerDaemonNodeProvider {
     }
 
     fn rtt_ms(&self) -> Option<u64> {
-        let v = self.rtt_ewma_ms.load(Ordering::Acquire);
+        self.pool.rtt_ms()
+    }
+
+    fn sync_ms(&self) -> Option<u64> {
+        let v = self.last_sync_ms.load(Ordering::Acquire);
         (v != RTT_UNSET).then_some(v)
     }
 
@@ -5869,6 +8752,154 @@ impl NodeProvider for PeerDaemonNodeProvider {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .status()
+    }
+
+    fn spawn_push_watcher(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<HostPushSignal>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.push_watch || (self.endpoints.is_empty() && self.tunnel.is_none()) {
+            return None;
+        }
+        let host_id = self.host_id.clone();
+        let static_endpoints = self.endpoints.clone();
+        let cfg_token = self.token.clone();
+        let tunnel = self.tunnel.clone();
+        let circuit = self.circuit.clone();
+        let pool = self.pool.clone();
+
+        Some(tokio::spawn(async move {
+            const TUNNEL_BACKOFF_SECS: &[u64] = &[1, 2, 5, 15];
+            let mut tun_backoff_idx = 0usize;
+            let mut last_event_id: Option<String> = None;
+
+            while !tx.is_closed() {
+                let mut sse_endpoints: Vec<PeerSseEndpoint> = Vec::new();
+                let mut using_tunnel = false;
+                if let Some(ref tun) = tunnel {
+                    match tun.ensure_endpoint().await {
+                        Ok(ep) => {
+                            tun_backoff_idx = 0;
+                            using_tunnel = true;
+                            let tok = cfg_token.clone().or(ep.token);
+                            sse_endpoints.push(
+                                PeerSseEndpoint::new(ep.local_endpoint, tok)
+                                    .with_host_override(Some(ep.host_header)),
+                            );
+                        }
+                        Err(e) => {
+                            log::debug!("peer {host_id} SSH tunnel bootstrap pending: {e}");
+                        }
+                    }
+                }
+                for base in &static_endpoints {
+                    sse_endpoints.push(PeerSseEndpoint::new(base.clone(), cfg_token.clone()));
+                }
+                if sse_endpoints.is_empty() {
+                    let delay = Duration::from_secs(
+                        TUNNEL_BACKOFF_SECS
+                            .get(tun_backoff_idx)
+                            .copied()
+                            .unwrap_or(15),
+                    );
+                    if tun_backoff_idx + 1 < TUNNEL_BACKOFF_SECS.len() {
+                        tun_backoff_idx += 1;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => continue,
+                        _ = tx.closed() => return,
+                    }
+                }
+
+                let subscriber = PeerSseSubscriber::with_endpoints(sse_endpoints)
+                    .with_initial_last_event_id(last_event_id.clone());
+                let sub_ref = subscriber.clone();
+                let (sig_tx, mut sig_rx) = tokio::sync::mpsc::unbounded_channel();
+                let runner = subscriber.spawn_signals(sig_tx);
+
+                let mut consecutive_disconnects = 0u32;
+                let mut need_tunnel_bounce = false;
+                while let Some(sig) = tokio::select! {
+                    s = sig_rx.recv() => s,
+                    _ = tx.closed() => None,
+                } {
+                    match sig {
+                        PeerSseSignal::Connected { reconnected, .. } => {
+                            consecutive_disconnects = 0;
+                            circuit
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .record_success();
+                            let push = if reconnected {
+                                HostPushSignal::Reconnect
+                            } else {
+                                HostPushSignal::FullSync
+                            };
+                            if tx.send(push).is_err() {
+                                break;
+                            }
+                        }
+                        PeerSseSignal::Frame(frame) => {
+                            if let Some(ref fid) = frame.id {
+                                last_event_id = Some(fid.clone());
+                            }
+                            if frame.is_ping() {
+                                continue;
+                            }
+                            if frame.is_resync() {
+                                if tx.send(HostPushSignal::FullSync).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            match frame.parse_daemon_event() {
+                                Ok(ev) => {
+                                    // Filter out federated (non-local) sessions on the peer to prevent loops.
+                                    if let DaemonEvent::Session { ref session, .. } = ev {
+                                        if !session.is_local_host() {
+                                            continue;
+                                        }
+                                    }
+                                    if tx.send(HostPushSignal::PeerEvent(ev)).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::debug!(
+                                        "peer {host_id} ignored unparsed SSE frame event={:?}: {e}",
+                                        frame.event
+                                    );
+                                }
+                            }
+                        }
+                        PeerSseSignal::Disconnected { error, .. } => {
+                            consecutive_disconnects = consecutive_disconnects.saturating_add(1);
+                            log::debug!(
+                                "peer {host_id} SSE disconnected (#{consecutive_disconnects}): {error}"
+                            );
+                            if using_tunnel && consecutive_disconnects >= 2 {
+                                need_tunnel_bounce = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(lid) = sub_ref.last_event_id() {
+                    last_event_id = Some(lid);
+                }
+                runner.abort();
+                if tx.is_closed() {
+                    return;
+                }
+                if need_tunnel_bounce {
+                    if let Some(ref tun) = tunnel {
+                        pool.clear_idle();
+                        let _ = tun.reconnect().await;
+                    }
+                }
+            }
+        }))
     }
 
     fn capture_pane<'a>(
@@ -6003,184 +9034,34 @@ impl NodeProvider for PeerDaemonNodeProvider {
             Ok(env.get("data").cloned().unwrap_or(env))
         })
     }
+
+    fn send_key<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        _local_pane: &'a PaneId,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        let encoded_sid = pct_encode(remote_session.as_str());
+        let path = format!("/api/sessions/{encoded_sid}/key");
+        let key_owned = key.to_string();
+        Box::pin(async move {
+            validate_interactive_key(&key_owned)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            let body = serde_json::json!({ "key": key_owned });
+            let _ = self
+                .request_json("POST", &path, Some(&body))
+                .await
+                .map_err(|e| e.into_api_error("peer send_key failed"))?;
+            Ok(())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Minimal Zero-Dependency Async HTTP/1.1 Client (http:// via Tokio TcpStream; https:// via curl)
+// Utility helpers (chunked test parser, Base64, socket-name & URL encoding)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-enum PeerHttpError {
-    Transport(String),
-    Http { status: u16, body: String },
-}
-
-impl PeerHttpError {
-    fn with_prefix(self, base: &str) -> Self {
-        match self {
-            PeerHttpError::Transport(m) => PeerHttpError::Transport(format!("{base}: {m}")),
-            PeerHttpError::Http { status, body } => PeerHttpError::Http {
-                status,
-                body: format!("{base}: {body}"),
-            },
-        }
-    }
-
-    fn into_api_error(self, ctx: &str) -> ApiError {
-        match self {
-            PeerHttpError::Transport(m) => {
-                ApiError::new(ErrorCode::Unavailable, format!("{ctx}: {m}"))
-            }
-            PeerHttpError::Http { status, body } => {
-                let msg = format!("{ctx}: HTTP {status}: {body}");
-                let code = match status {
-                    400 => ErrorCode::BadRequest,
-                    404 => ErrorCode::NotFound,
-                    409 => ErrorCode::Conflict,
-                    422 => ErrorCode::GateRejected,
-                    503 => ErrorCode::Unavailable,
-                    _ => ErrorCode::Internal,
-                };
-                ApiError::new(code, msg)
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for PeerHttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PeerHttpError::Transport(m) => f.write_str(m),
-            PeerHttpError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
-        }
-    }
-}
-
-async fn http_request_json(
-    method: &str,
-    url: &str,
-    token: Option<&str>,
-    body: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, PeerHttpError> {
-    if let Some(rest) = url.strip_prefix("http://") {
-        tokio::time::timeout(
-            PEER_HTTP_TIMEOUT,
-            http1_plain_json(method, rest, token, body),
-        )
-        .await
-        .map_err(|_| {
-            PeerHttpError::Transport(format!("timeout after {}s", PEER_HTTP_TIMEOUT.as_secs()))
-        })?
-    } else if url.starts_with("https://") {
-        curl_http_json(method, url, token, body).await
-    } else {
-        Err(PeerHttpError::Transport(format!(
-            "unsupported peer endpoint scheme: {url}"
-        )))
-    }
-}
-
-async fn http1_plain_json(
-    method: &str,
-    without_scheme: &str,
-    token: Option<&str>,
-    body: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, PeerHttpError> {
-    let (host_port, path) = match without_scheme.find('/') {
-        Some(idx) => (&without_scheme[..idx], &without_scheme[idx..]),
-        None => (without_scheme, "/"),
-    };
-    let connect_addr = if host_port.starts_with('[') {
-        if host_port.contains("]:") {
-            host_port.to_string()
-        } else {
-            format!("{host_port}:80")
-        }
-    } else if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("{host_port}:80")
-    };
-
-    let mut stream = TcpStream::connect(&connect_addr)
-        .await
-        .map_err(|e| PeerHttpError::Transport(format!("connect {connect_addr}: {e}")))?;
-
-    let body_bytes = match body {
-        Some(v) => serde_json::to_vec(v)
-            .map_err(|e| PeerHttpError::Transport(format!("encode body: {e}")))?,
-        None => Vec::new(),
-    };
-
-    let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\nAccept: application/json\r\n"
-    );
-    if let Some(tok) = token {
-        if tok.contains(['\r', '\n']) {
-            return Err(PeerHttpError::Transport(
-                "invalid newline in bearer token".into(),
-            ));
-        }
-        req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
-    }
-    if body.is_some() {
-        req.push_str("Content-Type: application/json\r\n");
-        req.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
-        req.push_str(&format!("Origin: http://{host_port}\r\n"));
-    }
-    req.push_str("\r\n");
-
-    let mut wire = req.into_bytes();
-    wire.extend_from_slice(&body_bytes);
-    stream
-        .write_all(&wire)
-        .await
-        .map_err(|e| PeerHttpError::Transport(format!("write request: {e}")))?;
-
-    let mut raw = Vec::new();
-    stream
-        .take(MAX_PEER_RESPONSE_BYTES + 1)
-        .read_to_end(&mut raw)
-        .await
-        .map_err(|e| PeerHttpError::Transport(format!("read response: {e}")))?;
-    if (raw.len() as u64) > MAX_PEER_RESPONSE_BYTES {
-        return Err(PeerHttpError::Transport(format!(
-            "peer response exceeded {} MiB limit",
-            MAX_PEER_RESPONSE_BYTES / (1024 * 1024)
-        )));
-    }
-
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| PeerHttpError::Transport("malformed HTTP response".to_string()))?;
-    let head = String::from_utf8_lossy(&raw[..split]);
-    let status_code = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse::<u16>().ok())
-        .unwrap_or(0);
-    let is_chunked = head.lines().any(|l| {
-        l.to_ascii_lowercase().starts_with("transfer-encoding:")
-            && l.to_ascii_lowercase().contains("chunked")
-    });
-    let body_slice = &raw[split + 4..];
-    let decoded = if is_chunked {
-        decode_chunked(body_slice).map_err(PeerHttpError::Transport)?
-    } else {
-        body_slice.to_vec()
-    };
-    if !(200..300).contains(&status_code) {
-        return Err(PeerHttpError::Http {
-            status: status_code,
-            body: String::from_utf8_lossy(&decoded).trim().to_string(),
-        });
-    }
-    serde_json::from_slice(&decoded)
-        .map_err(|e| PeerHttpError::Transport(format!("parse JSON: {e}")))
-}
-
+#[cfg(test)]
 fn decode_chunked(mut src: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut saw_terminator = false;
@@ -6208,99 +9089,6 @@ fn decode_chunked(mut src: &[u8]) -> Result<Vec<u8>, String> {
         return Err("incomplete chunked response (missing 0 terminator)".into());
     }
     Ok(out)
-}
-
-fn curl_escape_config_val(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
-async fn curl_http_json(
-    method: &str,
-    url: &str,
-    token: Option<&str>,
-    body: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, PeerHttpError> {
-    if url.contains(['\r', '\n']) {
-        return Err(PeerHttpError::Transport(
-            "invalid newline in peer URL".into(),
-        ));
-    }
-    if token.is_some_and(|t| t.contains(['\r', '\n'])) {
-        return Err(PeerHttpError::Transport(
-            "invalid newline in peer token".into(),
-        ));
-    }
-    let mut cfg_stdin = format!("url = \"{}\"\n", curl_escape_config_val(url));
-    if let Some(tok) = token {
-        cfg_stdin.push_str(&format!(
-            "header = \"Authorization: Bearer {}\"\n",
-            curl_escape_config_val(tok)
-        ));
-    }
-    if let Some(val) = body {
-        let body_str = serde_json::to_string(val)
-            .map_err(|e| PeerHttpError::Transport(format!("encode body: {e}")))?;
-        if let Some(rest) = url.strip_prefix("https://") {
-            let host_port = rest.split('/').next().unwrap_or("");
-            if !host_port.is_empty() {
-                cfg_stdin.push_str(&format!(
-                    "header = \"Origin: https://{}\"\n",
-                    curl_escape_config_val(host_port)
-                ));
-            }
-        }
-        cfg_stdin.push_str("header = \"Content-Type: application/json\"\n");
-        cfg_stdin.push_str(&format!(
-            "data-raw = \"{}\"\n",
-            curl_escape_config_val(&body_str)
-        ));
-    }
-    let mut cmd = tokio::process::Command::new("curl");
-    cmd.args([
-        "-sS",
-        "--max-time",
-        "6",
-        "-X",
-        method,
-        "-w",
-        "\n%{http_code}",
-        "-K",
-        "-",
-    ]);
-    let mut child = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| PeerHttpError::Transport(format!("spawn curl: {e}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(cfg_stdin.as_bytes()).await;
-    }
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| PeerHttpError::Transport(format!("wait curl: {e}")))?;
-    if !out.status.success() {
-        return Err(PeerHttpError::Transport(format!(
-            "curl failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let full = String::from_utf8_lossy(&out.stdout);
-    let (body_part, code_part) = full.rsplit_once('\n').unwrap_or(("", full.as_ref()));
-    let status = code_part.trim().parse::<u16>().unwrap_or(0);
-    if !(200..300).contains(&status) {
-        return Err(PeerHttpError::Http {
-            status,
-            body: body_part.trim().to_string(),
-        });
-    }
-    serde_json::from_str(body_part)
-        .map_err(|e| PeerHttpError::Transport(format!("parse curl JSON: {e}")))
 }
 
 fn encode_base64(input: &[u8]) -> String {
@@ -6373,6 +9161,7 @@ pub fn split_session_host(sid: &str, known_hosts: &HashSet<HostId>) -> Option<(H
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     fn pane_row(pane_id: &str, pid: u32, cmd: &str, cwd: &str) -> String {
@@ -6690,6 +9479,173 @@ CODEX_ROLLOUT 56 900 {remote_now_s} /home/u/.codex/sessions/2025/10/09/rollout-n
         assert!(
             sessions2.iter().all(|s| s.transcript_path.is_none()),
             "sibling unlocked Codex panes in same cwd must not hijack each other's rollout"
+        );
+    }
+
+    #[test]
+    fn remote_codex_multi_pane_same_cwd_resume_title_match_blank_isolation_and_new_clear() {
+        let host = HostId::new("mac-xiling");
+        let mut ds = SshDiscoveryState::default();
+        let remote_now_s = 1_795_620_000u64;
+        let hub_now_ms = remote_now_s * 1_000;
+
+        // Reproduces live `mac-xiling`:
+        // - `%20` (blank) & `%21` (resumed Nov 10 thread) share `/Users/xiling/Work/chatgpt-register`
+        // - `%33` (resumed Oct 24 thread, NOT in `tr_stats`!) & `%34` (resumed Nov 8 thread) & `%37` (blank)
+        //   all share `/Users/xiling/Work/Einsia`
+        // - `%31` is Claude stuck on project MCP confirmation prompt (`NeedsPermission`)
+        let p20 = pane_row("%20", 1001, "codex", "/Users/xiling/Work/chatgpt-register");
+        let p21 = pane_row("%21", 1002, "codex", "/Users/xiling/Work/chatgpt-register");
+        let p33 = pane_row("%33", 1003, "codex", "/Users/xiling/Work/Einsia");
+        let p34 = pane_row("%34", 1004, "codex", "/Users/xiling/Work/Einsia");
+        let p37 = pane_row("%37", 1005, "codex", "/Users/xiling/Work/Einsia");
+        let p31 = pane_row(
+            "%31",
+            1006,
+            "claude",
+            "/Users/xiling/Work/openkernelchallenge",
+        );
+
+        let us = '\x1f';
+        let raw_t1 = format!(
+            "{SEC_META}\nREMOTE_NOW_S={remote_now_s}\nREMOTE_HOME=/Users/xiling\n\
+\n{SEC_PANES}\n{p20}\n{p21}\n{p33}\n{p34}\n{p37}\n{p31}\n\
+\n{SEC_PS}\n\
+ 1001 1 00:10 codex\n\
+ 1002 1 00:10 codex\n\
+ 1003 1 00:10 codex\n\
+ 1004 1 00:10 codex\n\
+ 1005 1 00:10 codex\n\
+ 1006 1 00:10 claude --allow-dangerously-skip-permissions\n\
+\n{SEC_TAILS}\n\
+__SF_TAIL_BEGIN__ %20\n› Ask Codex to do anything\n  GPT-6.1-Sol low · ~/Work/chatgpt-register\n  ← for agents · ? for shortcuts\n__SF_TAIL_END__ %20\n\
+__SF_TAIL_BEGIN__ %21\n› Ask Codex to do anything\n  GPT-6.1-Sol high · ~/Work/chatgpt-register · 新增 zjc API 并按本地样式打包\n  ← for agents · ? for shortcuts\n__SF_TAIL_END__ %21\n\
+__SF_TAIL_BEGIN__ %33\n› Ask Codex to do anything\n  GPT-6.1-Sol medium · ~/Work/Einsia · 测试该出口访问网站是否需要代理\n  ← for agents · ? for shortcuts\n__SF_TAIL_END__ %33\n\
+__SF_TAIL_BEGIN__ %34\n› Ask Codex to do anything\n  GPT-6.1-Sol high · ~/Work/Einsia · 只读查看 vm2api+magpie 项目及连接方式\n  ← for agents · ? for shortcuts\n__SF_TAIL_END__ %34\n\
+__SF_TAIL_BEGIN__ %37\n› Ask Codex to do anything\n  GPT-6.1-Sol low · ~/Work/Einsia\n  ← for agents · ? for shortcuts\n__SF_TAIL_END__ %37\n\
+__SF_TAIL_BEGIN__ %31\n  New MCP server found in this project: ida-pro\n  Use this and all future MCP servers in this project\n  ❯ Continue without using this MCP server\n  Enter to confirm · Esc to cancel\n__SF_TAIL_END__ %31\n\
+\n{SEC_RESOLVE}\n\
+CODEX_DB_SIG 1:1:1|0:0:0\n\
+CODEX_DB_BEGIN\n\
+01a1c31c{us}/Users/xiling/.codex/sessions/2026/11/10/r-21.jsonl{us}/Users/xiling/Work/chatgpt-register{us}新增 zjc API 并按本地样式打包{us}1794300000{us}1795550000\n\
+01a1bb5d{us}/Users/xiling/.codex/sessions/2026/11/08/r-34.jsonl{us}/Users/xiling/Work/Einsia{us}只读查看 vm2api+magpie 项目及连接方式{us}1794100000{us}1795200000\n\
+01a16c82{us}/Users/xiling/.codex/sessions/2026/10/24/r-33.jsonl{us}/Users/xiling/Work/Einsia{us}测试该出口访问网站是否需要代理{us}1792800000{us}1794900000\n\
+CODEX_DB_END\n\
+\n{SEC_TR_STATS}\n\
+101 2970000 1795550000 /Users/xiling/.codex/sessions/2026/11/10/r-21.jsonl\n\
+102 20100000 1795200000 /Users/xiling/.codex/sessions/2026/11/08/r-34.jsonl\n"
+        );
+        // Note: `%33` (`r-33.jsonl`) is deliberately OMITTED from `SEC_TR_STATS` to prove tick-1
+        // mirror scheduling works even for older resumed threads below top-30 SQLite rows!
+        let parsed1 = parse_ssh_compound_v2_output(&raw_t1, hub_now_ms).unwrap();
+        let res1 = reconcile_ssh_discovery_v2(
+            &mut ds,
+            &host,
+            "mac-xiling",
+            parsed1,
+            false,
+            &HashSet::new(),
+            hub_now_ms,
+        );
+        let find_s = |res: &SshReconcileResult, pane: &str| -> SessionRecord {
+            res.sessions
+                .iter()
+                .find(|s| s.session_id.as_str() == format!("mac-xiling:tmux-{pane}"))
+                .unwrap()
+                .clone()
+        };
+
+        let s20 = find_s(&res1, "%20");
+        assert_eq!(s20.transcript_path, None);
+        assert_eq!(s20.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(s20.effort.as_deref(), Some("low"));
+
+        let s21 = find_s(&res1, "%21");
+        assert_eq!(
+            s21.transcript_path.as_deref(),
+            Some("/Users/xiling/.codex/sessions/2026/11/10/r-21.jsonl")
+        );
+        assert_eq!(s21.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(s21.effort.as_deref(), Some("high"));
+
+        let s33 = find_s(&res1, "%33");
+        assert_eq!(
+            s33.transcript_path.as_deref(),
+            Some("/Users/xiling/.codex/sessions/2026/10/24/r-33.jsonl")
+        );
+        assert_eq!(s33.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(s33.effort.as_deref(), Some("medium"));
+        // Tick-1 mirror scheduled even though `r-33.jsonl` was absent from `SEC_TR_STATS`!
+        assert!(
+            res1.need_mirror
+                .iter()
+                .any(|(p, _, path, st)| p.as_str() == "%33"
+                    && path.ends_with("r-33.jsonl")
+                    && st.is_none()),
+            "expected tick-1 mirror entry with stat=None for %33: {:?}",
+            res1.need_mirror
+        );
+
+        let s34 = find_s(&res1, "%34");
+        assert_eq!(
+            s34.transcript_path.as_deref(),
+            Some("/Users/xiling/.codex/sessions/2026/11/08/r-34.jsonl")
+        );
+        assert_eq!(s34.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(s34.effort.as_deref(), Some("high"));
+
+        let s37 = find_s(&res1, "%37");
+        assert_eq!(s37.transcript_path, None);
+        assert_eq!(s37.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(s37.effort.as_deref(), Some("low"));
+
+        let s31 = find_s(&res1, "%31");
+        assert_eq!(s31.state, SessionState::NeedsPermission);
+
+        // Tick 2: user runs `/new` inside `%21` (status bar becomes blank `GPT-6.1-Sol low · ~/Work/chatgpt-register`)
+        // -> stale title binding is dropped cleanly, while `%33` & `%34` stay authoritatively bound!
+        let raw_t2 = format!(
+            "{SEC_META}\nREMOTE_NOW_S={}\nREMOTE_HOME=/Users/xiling\n\
+\n{SEC_PANES}\n{p20}\n{p21}\n{p33}\n{p34}\n{p37}\n{p31}\n\
+\n{SEC_PS}\n\
+ 1001 1 00:20 codex\n\
+ 1002 1 00:20 codex\n\
+ 1003 1 00:20 codex\n\
+ 1004 1 00:20 codex\n\
+ 1005 1 00:20 codex\n\
+ 1006 1 00:20 claude --allow-dangerously-skip-permissions\n\
+\n{SEC_TAILS}\n\
+__SF_TAIL_BEGIN__ %21\n› Ask Codex to do anything\n  GPT-6.1-Sol low · ~/Work/chatgpt-register\n  ← for agents · ? for shortcuts\n__SF_TAIL_END__ %21\n\
+\n{SEC_RESOLVE}\n\
+CODEX_DB_SIG 1:1:1|0:0:0\n\
+\n{SEC_TR_STATS}\n\
+102 20100000 1795200000 /Users/xiling/.codex/sessions/2026/11/08/r-34.jsonl\n",
+            remote_now_s + 10
+        );
+        let parsed2 = parse_ssh_compound_v2_output(&raw_t2, hub_now_ms + 10_000).unwrap();
+        let res2 = reconcile_ssh_discovery_v2(
+            &mut ds,
+            &host,
+            "mac-xiling",
+            parsed2,
+            false,
+            &HashSet::new(),
+            hub_now_ms + 10_000,
+        );
+        let s21_after = find_s(&res2, "%21");
+        assert_eq!(
+            s21_after.transcript_path, None,
+            "switching %21 to blank /new prompt must clear stale title binding"
+        );
+        assert_eq!(s21_after.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(s21_after.effort.as_deref(), Some("low"));
+        assert_eq!(
+            find_s(&res2, "%34").transcript_path.as_deref(),
+            Some("/Users/xiling/.codex/sessions/2026/11/08/r-34.jsonl")
+        );
+        assert_eq!(
+            find_s(&res2, "%33").transcript_path.as_deref(),
+            Some("/Users/xiling/.codex/sessions/2026/10/24/r-33.jsonl")
         );
     }
 
@@ -7362,5 +10318,792 @@ CLAUDE_SESS 9001 13 100 {remote_now_s}\n\
             "PID restart in same pane must scrub stale transcript"
         );
         assert_eq!(res_restarted.sessions[0].model.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn compound_v3_wrap_safe_awk_batched_stat_shell_skip_and_inline_hot_delta() {
+        // 1. Test `parse_ssh_compound_v3_output` with inline `__SF_HOT_DELTA__` payload.
+        let delta_text = concat!(
+            r#"{"type":"assistant","timestamp":"2026-11-25T11:00:00Z","message":{"id":"m9","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"inline v3 streaming reply"}]}}"#,
+            "\n"
+        );
+        let delta_b64 = encode_base64(delta_text.as_bytes());
+        let p_cl = pane_row("%1", 50000, "zsh", "/home/u/repo");
+        let raw_v3 = format!(
+            "{SEC_META}\nREMOTE_NOW_S=1760000100\nREMOTE_HOME=/home/u\n\
+\n{SEC_PANES}\n{p_cl}\n\
+\n{SEC_PS}\n50000 1 01:00 -zsh\n120 50000 00:10 claude --model opus\n\
+\n{SEC_TAILS}\n__SF_TAIL_BEGIN__ %1\nWorking...\n__SF_TAIL_END__ %1\n\
+\n{SEC_RESOLVE}\n\
+\n{SEC_TR_STATS}\n101 {} 1760000100 /home/u/.claude/projects/-home-u-repo/s1.jsonl\n\
+\n{SEC_HOT_DELTAS}\n__SF_HOT_DELTA__ 101 {} 1760000100 500 {} /home/u/.claude/projects/-home-u-repo/s1.jsonl\n{delta_b64}\n",
+            500 + delta_text.len(),
+            500 + delta_text.len(),
+            delta_text.len(),
+        );
+        let parsed = parse_ssh_compound_v3_output(&raw_v3, 1_760_000_100_000).unwrap();
+        let hd = parsed
+            .hot_deltas
+            .get("/home/u/.claude/projects/-home-u-repo/s1.jsonl")
+            .expect("inline hot delta parsed");
+        assert_eq!(hd.stat.ino, 101);
+        assert_eq!(hd.base_offset, 500);
+        assert_eq!(hd.bytes, delta_text.as_bytes());
+
+        // 2. Execute the actual generated `compound_discover_script_v3` with synthetic `tmux` and
+        //    `ps` shims to verify:
+        //    - Wrap-safe fixed-point `awk` catches child PID `120 < parent PID 50000` (and grandchild `42 < 120`)
+        //    - Unrelated background processes (PID 90001) are filtered out of `__SF_SEC_PS__`
+        //    - Pure-shell pane `%2` (`zsh`) is NOT captured when `include_shell_panes == false`
+        //    - Already-resolved AGY PID `3003` (within birth skew tolerance) is skipped from `AGY_PIDS`
+        //    - Single batched OS-native `stat` emits stats for files including spaces in path
+        //    - Inline hot delta emits exact base64 bytes for `0 < size - offset <= 65536`
+        let root = std::env::temp_dir().join(format!("sf-v3-script-{}", id::new_id("T")));
+        let rhome = root.join("home");
+        let shim_bin = root.join("bin");
+        std::fs::create_dir_all(&shim_bin).unwrap();
+        let tr_dir = rhome.join(".claude/projects/-home-u-my repo");
+        std::fs::create_dir_all(&tr_dir).unwrap();
+        let tr_file = tr_dir.join("hot-s1.jsonl");
+        let prefix = "line0-existing\n";
+        let appended = "line1-hot-delta\n";
+        std::fs::write(&tr_file, format!("{prefix}{appended}")).unwrap();
+
+        #[cfg(unix)]
+        let tr_ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&tr_file).unwrap().ino()
+        };
+        #[cfg(not(unix))]
+        let tr_ino = 0u64;
+
+        let cap_log = root.join("captures.log");
+        let pane1 = pane_row("%1", 50000, "zsh", "/home/u/repo");
+        let pane2 = pane_row("%2", 60000, "zsh", "/home/u/shell");
+        let fake_tmux = shim_bin.join("fake-tmux");
+        std::fs::write(
+            &fake_tmux,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "list-panes" ]; then
+  printf '%s\n%s\n' '{pane1}' '{pane2}'
+  exit 0
+fi
+if [ "$1" = "capture-pane" ]; then
+  printf '%s\n' "$*" >> "{cap_log}"
+  printf 'captured-tail-for-%s\n' "$3"
+  exit 0
+fi
+exit 0
+"#,
+                cap_log = cap_log.display(),
+            ),
+        )
+        .unwrap();
+        let fake_ps = shim_bin.join("ps");
+        std::fs::write(
+            &fake_ps,
+            r#"#!/bin/sh
+cat <<'EOF'
+   42   120 00:05 claude --model opus
+  120 50000 00:10 bash -c claude
+50000     1 01:00 -zsh
+60000     1 02:00 -zsh
+ 3003     1 00:30 /usr/local/bin/agy --model gemini-4-neon-high
+ 3004     1 00:02 /usr/local/bin/agy --model gemini-4-neon-high
+90001     1 10:00 /usr/sbin/unrelated-system-daemon --noise
+EOF
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&fake_ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let cfg = NodeConfig {
+            id: "v3-box".into(),
+            kind: NodeKindConfig::Ssh,
+            enabled: true,
+            ssh_target: "demo@v3-box".into(),
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+            include_shell_panes: false,
+            ..NodeConfig::default()
+        };
+        let provider = SshMuxNodeProvider::new(&cfg, &root.join("ssh-cm"));
+        let now_s = id::now_ms() / 1_000;
+        let script = provider.compound_discover_script_v3(
+            &[],
+            None,
+            None,
+            &[tr_file.to_string_lossy().into_owned()],
+            &[(3003, now_s.saturating_sub(30))],
+            &[],
+            &[(
+                tr_file.to_string_lossy().into_owned(),
+                tr_ino,
+                prefix.len() as u64,
+            )],
+        );
+
+        let cur_path = std::env::var("PATH").unwrap_or_default();
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", &rhome)
+            .env("PATH", format!("{}:{cur_path}", shim_bin.display()))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "v3 script failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let res = parse_ssh_compound_v3_output(&stdout, id::now_ms()).unwrap();
+
+        // Wrap-safe fixed-point awk included wrapped child 120 and grandchild 42, excluded noise 90001!
+        assert!(
+            res.live_remote_pids.contains(&42),
+            "wrapped grandchild PID 42 (< 120 < 50000) must be included"
+        );
+        assert!(res.live_remote_pids.contains(&120));
+        assert!(res.live_remote_pids.contains(&50000));
+        assert!(
+            !res.live_remote_pids.contains(&90001),
+            "unrelated system daemon 90001 must be filtered out"
+        );
+
+        // Agent pane %1 WAS captured; pure-shell pane %2 was SKIPPED (`include_shell_panes == false`)!
+        assert!(res.captured_tails.contains_key(&PaneId::new("%1")));
+        assert!(
+            !res.captured_tails.contains_key(&PaneId::new("%2")),
+            "pure-shell pane %2 must be skipped when include_shell_panes == false"
+        );
+
+        // Batched stat handled path with spaces!
+        let tr_key = tr_file.to_string_lossy().into_owned();
+        let tr_st = res
+            .tr_stats
+            .get(&tr_key)
+            .expect("batched stat must include path with spaces");
+        assert_eq!(tr_st.size, (prefix.len() + appended.len()) as u64);
+
+        // Inline hot delta returned ONLY the appended suffix bytes!
+        let delta = res
+            .hot_deltas
+            .get(&tr_key)
+            .expect("inline hot delta emitted for active cursor");
+        assert_eq!(delta.base_offset, prefix.len() as u64);
+        assert_eq!(delta.bytes, appended.as_bytes());
+
+        // Staggered active verification + zero Idle expiry cliff in `cached_tail_fingerprints`.
+        let mut ds = SshDiscoveryState::default();
+        ds.pane_agent_pid.insert(PaneId::new("%1"), 42);
+        ds.pane_agent_pid.insert(PaneId::new("%4"), 43);
+        ds.tail_cache.insert(
+            PaneId::new("%1"),
+            SshTailCacheEntry {
+                history_size: 100,
+                cursor_x: 2,
+                cursor_y: 10,
+                in_mode: false,
+                current_command: "claude".into(),
+                agent_pid: Some(42),
+                tail: "idle".into(),
+            },
+        );
+        ds.tail_cache.insert(
+            PaneId::new("%4"),
+            SshTailCacheEntry {
+                history_size: 200,
+                cursor_x: 5,
+                cursor_y: 12,
+                in_mode: false,
+                current_command: "codex".into(),
+                agent_pid: Some(43),
+                tail: "working".into(),
+            },
+        );
+        ds.pane_watch.insert(
+            PaneId::new("%1"),
+            SshPaneWatch {
+                last_hash: 1,
+                stable_ticks: 10,
+                state: SessionState::Idle,
+                state_since_ms: 0,
+                last_event_ms: 0,
+                last_error: None,
+            },
+        );
+        ds.pane_watch.insert(
+            PaneId::new("%4"),
+            SshPaneWatch {
+                last_hash: 2,
+                stable_ticks: 0,
+                state: SessionState::Working,
+                state_since_ms: 0,
+                last_event_ms: 0,
+                last_error: None,
+            },
+        );
+        // Idle pane %1 stays cached across ALL 8 ticks (no synchronized 3-tick cliff!).
+        // Working pane %4 skips cache only when `(4 + tick) % 4 == 0` (ticks 0 and 4).
+        for tick in 0..8u64 {
+            let fps = ds.cached_tail_fingerprints(tick);
+            assert!(
+                fps.iter().any(|f| f.starts_with("%1|")),
+                "idle pane %1 must stay cached on tick {tick}"
+            );
+            let p4_cached = fps.iter().any(|f| f.starts_with("%4|"));
+            assert_eq!(
+                p4_cached,
+                (4 + tick) % 4 != 0,
+                "working pane %4 staggered verification mismatch on tick {tick}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tmux_control_watcher_parses_output_pause_and_multi_session_digest() {
+        assert_eq!(
+            parse_tmux_control_line("%output %12 hello\\015\\012"),
+            Some(TmuxControlEvent::Output(PaneId::new("%12")))
+        );
+        assert_eq!(
+            parse_tmux_control_line("%extended-output %7 0 : some output"),
+            Some(TmuxControlEvent::ExtendedOutput(PaneId::new("%7")))
+        );
+        assert_eq!(
+            parse_tmux_control_line("%pause %9"),
+            Some(TmuxControlEvent::Pause(PaneId::new("%9")))
+        );
+        assert_eq!(
+            parse_tmux_control_line("%continue %9"),
+            Some(TmuxControlEvent::Continue(PaneId::new("%9")))
+        );
+        assert_eq!(
+            parse_tmux_control_line("%pane-mode-changed %3"),
+            Some(TmuxControlEvent::TopologyChanged {
+                pane: Some(PaneId::new("%3"))
+            })
+        );
+        assert_eq!(
+            parse_tmux_control_line("%sessions-changed"),
+            Some(TmuxControlEvent::TopologyChanged { pane: None })
+        );
+        assert_eq!(
+            parse_tmux_control_line("%window-add @4"),
+            Some(TmuxControlEvent::TopologyChanged { pane: None })
+        );
+        assert_eq!(
+            parse_tmux_control_line("%begin 1760000000 42 1"),
+            Some(TmuxControlEvent::Begin { cmd_num: 42 })
+        );
+        assert_eq!(
+            parse_tmux_control_line("%end 1760000000 42 1"),
+            Some(TmuxControlEvent::End { cmd_num: 42 })
+        );
+        assert_eq!(
+            parse_tmux_control_line("%error 1760000000 43 1"),
+            Some(TmuxControlEvent::Error { cmd_num: 43 })
+        );
+        assert_eq!(
+            parse_tmux_control_line("%exit client detached"),
+            Some(TmuxControlEvent::Exit("client detached".into()))
+        );
+        assert_eq!(parse_tmux_control_line("regular digest line"), None);
+
+        // Multi-session digest parser + diff logic.
+        let d1 = parse_pane_digest_line("%1|500|4|20|0|0|claude").unwrap();
+        let d2 = parse_pane_digest_line("%2|120|0|10|0|0|codex").unwrap();
+        let mut prev = HashMap::new();
+        prev.insert(d1.pane_id.clone(), d1.clone());
+        prev.insert(d2.pane_id.clone(), d2.clone());
+
+        // Cursor/history change on %2 -> targeted DirtyPanes([%2]), topology_changed == false.
+        let mut d2_moved = d2.clone();
+        d2_moved.history_size = 505;
+        let diff1 = diff_pane_digests(&prev, &[d1.clone(), d2_moved]);
+        assert!(!diff1.topology_changed);
+        assert_eq!(diff1.dirty_panes, vec![PaneId::new("%2")]);
+
+        // Foreground command change on %1 -> topology_changed == true (triggers FullSync).
+        let mut d1_cmd = d1.clone();
+        d1_cmd.current_command = "zsh".into();
+        let diff2 = diff_pane_digests(&prev, &[d1_cmd, d2.clone()]);
+        assert!(diff2.topology_changed);
+
+        // New pane %3 added -> topology_changed == true.
+        let d3 = parse_pane_digest_line("%3|0|0|0|0|0|agy").unwrap();
+        let diff3 = diff_pane_digests(&prev, &[d1, d2, d3]);
+        assert!(diff3.topology_changed);
+    }
+
+    #[test]
+    fn fast_ssh_dispatch_timings_short_single_line_vs_multiline() {
+        // Short single-line prompt uses fast 30ms settle + 50ms post-check!
+        assert_eq!(fast_ssh_dispatch_timings(250, "run cargo test"), (30, 50));
+        assert_eq!(fast_ssh_dispatch_timings(20, "hi"), (20, 50));
+        assert_eq!(fast_ssh_dispatch_timings(0, "hi"), (0, 50));
+
+        // Multi-line or >160-char prompt retains adaptive paste-burst settling + 120ms post-check.
+        let (ml_settle, ml_post) = fast_ssh_dispatch_timings(250, "line 1\nline 2");
+        assert!(ml_settle >= 400, "expected >=400ms settle, got {ml_settle}");
+        assert_eq!(ml_post, 120);
+
+        let long_line = "a".repeat(220);
+        let (long_settle, long_post) = fast_ssh_dispatch_timings(250, &long_line);
+        assert!(long_settle >= 250);
+        assert_eq!(long_post, 120);
+    }
+
+    #[tokio::test]
+    async fn peer_provider_push_watcher_streams_sse_events_and_filters_federated_loops() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let local_out = DaemonEvent::Output {
+                seq: 11,
+                session_id: SessionId::new("tmux-%5"),
+                start_seq: Some(2),
+                total_messages: Some(3),
+                appended_messages: vec![
+                    serde_json::json!({"role": "assistant", "text": "fast push"}),
+                ],
+                live_tail: None,
+                metrics: None,
+                dirty: false,
+            };
+            let foreign_sess = DaemonEvent::Session {
+                seq: 12,
+                session: SessionRecord {
+                    session_id: SessionId::new("other-host:tmux-%9"),
+                    agent: AgentKind::Claude,
+                    pane: Some(PaneId::new("other-host:%9")),
+                    pane_resolution: PaneResolution::Env,
+                    cwd: None,
+                    git_root: None,
+                    model: None,
+                    effort: None,
+                    state: SessionState::Idle,
+                    state_since_ms: 0,
+                    last_event_id: None,
+                    last_event_ms: 0,
+                    last_message: None,
+                    last_error: None,
+                    parent_session_id: None,
+                    is_subagent: false,
+                    subagent_count: 0,
+                    active_subagents: 0,
+                    stage: None,
+                    unread_inbox: 0,
+                    confidence: Confidence::Exact,
+                    tmux_target: None,
+                    tmux_label: None,
+                    discovered_only: false,
+                    transcript_path: None,
+                    metrics: None,
+                    host_id: Some(HostId::new("other-host")),
+                    host_display_name: None,
+                    mux_kind: None,
+                },
+            };
+            let frames = format!(
+                "{}{}",
+                local_out.to_sse_frame().unwrap(),
+                foreign_sess.to_sse_frame().unwrap()
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n{frames}"
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let cfg = NodeConfig {
+            id: "peer-push".into(),
+            kind: NodeKindConfig::Peer,
+            enabled: true,
+            push_watch: true,
+            endpoints: vec![format!("http://{addr}")],
+            ..NodeConfig::default()
+        };
+        let provider = PeerDaemonNodeProvider::new(&cfg);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = provider
+            .spawn_push_watcher(tx)
+            .expect("peer push_watch=true must spawn watcher");
+
+        // 1. First signal: initial FullSync on SSE connect.
+        let sig1 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(sig1, HostPushSignal::FullSync), "{sig1:?}");
+
+        // 2. Second signal: local DaemonEvent::Output pushed directly!
+        let sig2 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match sig2 {
+            HostPushSignal::PeerEvent(DaemonEvent::Output {
+                session_id,
+                total_messages,
+                ..
+            }) => {
+                assert_eq!(session_id.as_str(), "tmux-%5");
+                assert_eq!(total_messages, Some(3));
+            }
+            other => panic!("expected PeerEvent(Output), got {other:?}"),
+        }
+
+        // 3. Foreign-host session event must NOT be forwarded (loop prevention!).
+        let no_foreign = tokio::time::timeout(Duration::from_millis(120), rx.recv()).await;
+        assert!(
+            no_foreign.is_err(),
+            "federated foreign-host session must be filtered out, got {no_foreign:?}"
+        );
+
+        drop(rx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn ssh_build_transcript_output_delta_handles_watermark_mutations_shrink_and_caps() {
+        let dir = std::env::temp_dir().join(format!("starfane-ssh-wm-{}", id::new_id("T")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tr_cache = Arc::new(Mutex::new(TranscriptIndexCache::default()));
+        let provider = SshMuxNodeProvider::with_shared_caches(
+            &NodeConfig {
+                id: "ssh-wm".into(),
+                kind: NodeKindConfig::Ssh,
+                enabled: true,
+                ssh_target: "dev@example".into(),
+                ..NodeConfig::default()
+            },
+            &dir,
+            Arc::new(RemoteTranscriptMirror::new(dir.clone())),
+            tr_cache,
+        );
+        let mut ds = SshDiscoveryState::default();
+        let qsid = SessionId::new("ssh-wm:tmux-%1");
+
+        // 1. AGY trailing pending_tools -> final PLANNER_RESPONSE (N -> N) + late hydration
+        let agy_dir = dir.join("agy");
+        std::fs::create_dir_all(&agy_dir).unwrap();
+        let agy_compact = agy_dir.join("transcript.jsonl");
+        let agy_full = agy_dir.join("transcript_full.jsonl");
+        let u1 = r#"{"step_index":0,"type":"USER_INPUT","created_at":"2026-11-26T00:00:00Z","content":"test"}"#;
+        let p_tools = r#"{"step_index":1,"type":"PLANNER_RESPONSE","created_at":"2026-11-26T00:00:01Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"ls"}}]}"#;
+        std::fs::write(&agy_compact, format!("{u1}\n{p_tools}\n")).unwrap();
+
+        // Baseline seed with allow_emit = false -> None
+        assert!(provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid,
+                AgentKind::Agy,
+                &agy_compact,
+                false,
+                None,
+                None,
+                1_000,
+            )
+            .is_none());
+
+        let p_final_trunc = r#"{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-11-26T00:00:02Z","content":"Truncated... <truncated 50 chars>","truncated_fields":["content"]}"#;
+        std::fs::write(&agy_compact, format!("{u1}\n{p_tools}\n{p_final_trunc}\n")).unwrap();
+        let ev1 = provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid,
+                AgentKind::Agy,
+                &agy_compact,
+                true,
+                None,
+                None,
+                2_000,
+            )
+            .expect("expected SSH Output on pending_tools -> final");
+        match ev1 {
+            DaemonEvent::Output {
+                start_seq,
+                total_messages,
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert_eq!(start_seq, Some(1));
+                assert_eq!(total_messages, Some(2));
+                assert!(!dirty);
+                assert_eq!(
+                    appended_messages[0]["text"],
+                    "Truncated... <truncated 50 chars>"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Late transcript_full.jsonl hydration emits overlap tail(1).
+        let p_final_full = r#"{"step_index":2,"type":"PLANNER_RESPONSE","created_at":"2026-11-26T00:00:02Z","content":"Hydrated final output"}"#;
+        std::fs::write(&agy_full, format!("{p_final_full}\n")).unwrap();
+        let ev2 = provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid,
+                AgentKind::Agy,
+                &agy_compact,
+                true,
+                None,
+                None,
+                3_000,
+            )
+            .expect("expected SSH Output on late hydration");
+        match ev2 {
+            DaemonEvent::Output {
+                start_seq,
+                total_messages,
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert_eq!(start_seq, Some(1));
+                assert_eq!(total_messages, Some(2));
+                assert!(!dirty);
+                assert_eq!(appended_messages[0]["text"], "Hydrated final output");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 2. Growth where previous last turn had pending_tools overlaps by 1 (start_seq = old_total - 1).
+        let agy_growth = dir.join("agy-growth.jsonl");
+        let p_tools2 = r#"{"step_index":3,"type":"PLANNER_RESPONSE","created_at":"2026-11-26T00:00:03Z","tool_calls":[{"name":"read_file","args":{"Path":"x"}}]}"#;
+        std::fs::write(&agy_growth, format!("{u1}\n{p_tools2}\n")).unwrap();
+        let qsid_g = SessionId::new("ssh-wm:tmux-%3");
+        assert!(provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid_g,
+                AgentKind::Agy,
+                &agy_growth,
+                false,
+                None,
+                None,
+                3_500,
+            )
+            .is_none());
+        let u2 = r#"{"step_index":4,"type":"USER_INPUT","created_at":"2026-11-26T00:00:04Z","content":"next"}"#;
+        let p_final2 = r#"{"step_index":5,"type":"PLANNER_RESPONSE","created_at":"2026-11-26T00:00:05Z","content":"done"}"#;
+        std::fs::write(&agy_growth, format!("{u1}\n{p_tools2}\n{u2}\n{p_final2}\n")).unwrap();
+        let ev_g = provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid_g,
+                AgentKind::Agy,
+                &agy_growth,
+                true,
+                None,
+                None,
+                3_600,
+            )
+            .expect("expected SSH growth overlap");
+        match ev_g {
+            DaemonEvent::Output {
+                start_seq,
+                total_messages,
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert_eq!(start_seq, Some(1));
+                assert_eq!(total_messages, Some(3));
+                assert!(!dirty);
+                assert_eq!(appended_messages.len(), 2);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // 3. Claude same-msg_id append (2 -> 2), >32 KiB dirty, and shrink (3 -> 1) -> dirty=true.
+        let c_path = dir.join("claude.jsonl");
+        let cu = r#"{"type":"user","timestamp":"2026-11-26T00:00:00Z","message":{"content":"go"}}"#;
+        let ca1 = r#"{"type":"assistant","timestamp":"2026-11-26T00:00:01Z","message":{"id":"cm1","stop_reason":null,"content":[{"type":"text","text":"step 1"}]}}"#;
+        std::fs::write(&c_path, format!("{cu}\n{ca1}\n")).unwrap();
+        let qsid_c = SessionId::new("ssh-wm:tmux-%2");
+        assert!(provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid_c,
+                AgentKind::Claude,
+                &c_path,
+                false,
+                None,
+                None,
+                4_000,
+            )
+            .is_none());
+
+        let ca2 = r#"{"type":"assistant","timestamp":"2026-11-26T00:00:02Z","message":{"id":"cm1","stop_reason":"end_turn","content":[{"type":"text","text":"step 2"}]}}"#;
+        std::fs::write(&c_path, format!("{cu}\n{ca1}\n{ca2}\n")).unwrap();
+        let ev_c = provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid_c,
+                AgentKind::Claude,
+                &c_path,
+                true,
+                None,
+                None,
+                5_000,
+            )
+            .expect("expected SSH Output on same-msg_id append");
+        match ev_c {
+            DaemonEvent::Output {
+                start_seq,
+                total_messages,
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert_eq!(start_seq, Some(1));
+                assert_eq!(total_messages, Some(2));
+                assert!(!dirty);
+                assert_eq!(appended_messages[0]["text"], "step 1\n\nstep 2");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Oversized > 32 KiB growth -> dirty = true
+        let big = "b".repeat(40 * 1024);
+        let ca_big = serde_json::json!({
+            "type": "assistant",
+            "timestamp": "2026-11-26T00:00:03Z",
+            "message": {
+                "id": "cm2",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": big}]
+            }
+        })
+        .to_string();
+        std::fs::write(&c_path, format!("{cu}\n{ca1}\n{ca2}\n{ca_big}\n")).unwrap();
+        let ev_big = provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid_c,
+                AgentKind::Claude,
+                &c_path,
+                true,
+                None,
+                None,
+                6_000,
+            )
+            .expect("expected dirty delta on >32KiB turn");
+        match ev_big {
+            DaemonEvent::Output {
+                total_messages,
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert_eq!(total_messages, Some(3));
+                assert!(appended_messages.is_empty());
+                assert!(dirty);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Shrink 3 -> 1 -> dirty = true
+        std::fs::write(&c_path, format!("{cu}\n")).unwrap();
+        let ev_shrink = provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid_c,
+                AgentKind::Claude,
+                &c_path,
+                true,
+                None,
+                None,
+                7_000,
+            )
+            .expect("expected dirty delta on shrink");
+        match ev_shrink {
+            DaemonEvent::Output {
+                start_seq,
+                total_messages,
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert_eq!(start_seq, None);
+                assert_eq!(total_messages, Some(1));
+                assert!(appended_messages.is_empty());
+                assert!(dirty);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // > SSH_INLINE_OUTPUT_MAX_TURNS (32) growth -> dirty = true
+        let mut many_lines = format!("{cu}\n");
+        for idx in 0..35 {
+            many_lines.push_str(&format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"2026-11-26T00:01:{:02}Z\",\"message\":{{\"id\":\"many_{idx}\",\"stop_reason\":\"end_turn\",\"content\":[{{\"type\":\"text\",\"text\":\"turn {idx}\"}}]}}}} \n",
+                idx % 60
+            ));
+        }
+        std::fs::write(&c_path, many_lines).unwrap();
+        let ev_many = provider
+            .build_transcript_output_delta(
+                &mut ds,
+                &qsid_c,
+                AgentKind::Claude,
+                &c_path,
+                true,
+                None,
+                None,
+                8_000,
+            )
+            .expect("expected dirty delta on >32 turn jump");
+        match ev_many {
+            DaemonEvent::Output {
+                start_seq,
+                total_messages,
+                appended_messages,
+                dirty,
+                ..
+            } => {
+                assert_eq!(start_seq, Some(1));
+                assert_eq!(total_messages, Some(36));
+                assert!(appended_messages.is_empty());
+                assert!(dirty);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Verify dirty panes script stats hot.path even when hot.ino == 0 (first-time dirty mirror).
+        let script = provider.build_dirty_panes_script(&[DirtyPaneTarget {
+            pane: PaneId::new("%1"),
+            agent: AgentKind::Claude,
+            hot: Some(HotCursorSpec {
+                path: "/home/dev/.claude/projects/p/s.jsonl".into(),
+                ino: 0,
+                offset: 0,
+            }),
+        }]);
+        assert!(script.contains("sf_hot_delta '/home/dev/.claude/projects/p/s.jsonl' 0 0"));
+        assert!(script.contains("printf '__SF_DIRTY_STAT__ %s %s %s %s\\n'"));
+        assert!(script.contains(
+            "if [ \"$_hino\" -ne 0 ] && [ \"$_cino\" -ne \"$_hino\" ]; then return 0; fi"
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

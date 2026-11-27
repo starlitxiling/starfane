@@ -15,7 +15,7 @@ export const AGENT_DISPLAY = { claude: 'Claude', codex: 'Codex', agy: 'AGY', she
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const DEPTHS = ['D0', 'D1', 'D2', 'D3'];
 export const SEVERITIES = ['blocker', 'major', 'minor', 'nit'];
-export const SSE_TYPES = ['event', 'session', 'host', 'pipeline', 'artifact', 'review', 'delivery', 'attention', 'notifiers', 'resync'];
+export const SSE_TYPES = ['event', 'session', 'host', 'output', 'pipeline', 'artifact', 'review', 'delivery', 'attention', 'notifiers', 'resync', 'ping'];
 export const NOTIFIER_KINDS = ['feishu', 'telegram', 'discord', 'slack', 'wecom', 'qq', 'webhook', 'macos'];
 export function notifierKindLabel(kind) {
   return {

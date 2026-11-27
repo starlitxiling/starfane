@@ -4,9 +4,9 @@
 
 use crate::api::{AttentionItem, DeliveryReport, DispatchTarget};
 use crate::event::NormalizedEvent;
-use crate::id::{ArtifactId, PipelineId, ReviewId};
+use crate::id::{ArtifactId, PipelineId, ReviewId, SessionId};
 use crate::pipeline::{ArtifactKind, PipelineSpec};
-use crate::session::{HostRecord, SessionRecord};
+use crate::session::{HostRecord, SessionMetrics, SessionRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -57,6 +57,22 @@ pub enum DaemonEvent {
         #[serde(default)]
         channel_mutes: BTreeMap<String, u64>,
     },
+    Output {
+        seq: u64,
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_seq: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_messages: Option<usize>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        appended_messages: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_tail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metrics: Option<SessionMetrics>,
+        #[serde(default)]
+        dirty: bool,
+    },
 }
 
 impl DaemonEvent {
@@ -70,7 +86,8 @@ impl DaemonEvent {
             | DaemonEvent::Delivery { seq, .. }
             | DaemonEvent::Attention { seq, .. }
             | DaemonEvent::Host { seq, .. }
-            | DaemonEvent::Notifiers { seq, .. } => *seq,
+            | DaemonEvent::Notifiers { seq, .. }
+            | DaemonEvent::Output { seq, .. } => *seq,
         }
     }
 
@@ -86,6 +103,7 @@ impl DaemonEvent {
             DaemonEvent::Attention { .. } => "attention",
             DaemonEvent::Host { .. } => "host",
             DaemonEvent::Notifiers { .. } => "notifiers",
+            DaemonEvent::Output { .. } => "output",
         }
     }
 
@@ -135,5 +153,63 @@ mod tests {
         let nback: DaemonEvent =
             serde_json::from_str(nf.lines().nth(2).unwrap().trim_start_matches("data: ")).unwrap();
         assert_eq!(nback, ne);
+
+        let oe = DaemonEvent::Output {
+            seq: 44,
+            session_id: SessionId::new("mac-xiling:tmux-%39"),
+            start_seq: Some(25),
+            total_messages: Some(26),
+            appended_messages: vec![serde_json::json!({"role": "assistant", "text": "ok"})],
+            live_tail: Some("thinking...".into()),
+            metrics: Some(SessionMetrics {
+                context_used_tokens: Some(12_000),
+                context_window_tokens: Some(200_000),
+                context_used_pct: Some(6.0),
+                tps: Some(42.5),
+                ttft_ms: None,
+                avg_ttft_ms: None,
+                last_output_tokens: Some(40),
+                last_duration_ms: Some(900),
+                total_input_tokens: None,
+                total_output_tokens: None,
+                recent_turns: Vec::new(),
+                source: "transcript".into(),
+                updated_ms: 1_700_000_000_000,
+            }),
+            dirty: false,
+        };
+        let of = oe.to_sse_frame().unwrap();
+        assert!(of.starts_with("id: 44\nevent: output\ndata: "));
+        let ojson: serde_json::Value =
+            serde_json::from_str(of.lines().nth(2).unwrap().trim_start_matches("data: ")).unwrap();
+        assert_eq!(ojson["type"], "output");
+        assert_eq!(ojson["session_id"], "mac-xiling:tmux-%39");
+        assert_eq!(ojson["start_seq"], 25);
+        assert_eq!(ojson["total_messages"], 26);
+        assert_eq!(ojson["dirty"], false);
+        let oback: DaemonEvent = serde_json::from_value(ojson).unwrap();
+        assert_eq!(oback, oe);
+
+        let dirty_only = DaemonEvent::Output {
+            seq: 45,
+            session_id: SessionId::new("mac-xiling:tmux-%39"),
+            start_seq: None,
+            total_messages: None,
+            appended_messages: Vec::new(),
+            live_tail: None,
+            metrics: None,
+            dirty: true,
+        };
+        let df = dirty_only.to_sse_frame().unwrap();
+        let djson: serde_json::Value =
+            serde_json::from_str(df.lines().nth(2).unwrap().trim_start_matches("data: ")).unwrap();
+        assert!(djson.get("start_seq").is_none());
+        assert!(djson.get("total_messages").is_none());
+        assert!(djson.get("appended_messages").is_none());
+        assert!(djson.get("live_tail").is_none());
+        assert!(djson.get("metrics").is_none());
+        assert_eq!(djson["dirty"], true);
+        let dback: DaemonEvent = serde_json::from_value(djson).unwrap();
+        assert_eq!(dback, dirty_only);
     }
 }

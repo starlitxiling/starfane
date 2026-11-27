@@ -288,6 +288,141 @@ const TUI_CHROME_RE = /(?:^\s*\?\s*for shortcuts\b|shift\+tab to cycle|esc to in
 const EMPTY_PROMPT_RE = /^\s*[❯›>]\s*$/;
 const WORKED_FOR_RE = /^\s*(?:Worked for\s+\S+\s*[•·]|[✻✳✶✢·*]\s+[A-Z][a-z]+\s+for\s+\d)/i;
 
+// Interactive TUI menu cursor detection (prevents Claude/Codex/AGY approval & picker menus
+// from being misparsed as fake `你 #N` user bubbles in Reading view).
+const TUI_MENU_OPTION_RE = /^(?:\d+\.\s+)?(?:continue without using th(?:is|ese) mcp\b|use th(?:is|ese) mcp servers?\b|use th(?:is|ese) and all future\b|yes,\s*i trust this (?:folder|workspace|project|directory)\b|yes,\s*proceed\b|yes,\s*continue\b|yes,\s*don'?t ask again\b|yes,\s*allow\b|no,\s*exit\b|no,\s*cancel\b|no,\s*skip\b|no,\s*and tell\b|trust and continue\b|back to agent command center\b|allow once\b|allow always\b|allow for this session\b|always allow\b|update now\b|skip until next version\b)/i;
+const TUI_MENU_HEADER_RE = /(?:new mcp servers? found\b|mcp servers? may execute code|trust this (?:folder|workspace|project|directory)|do you trust the (?:files|contents) (?:in|of) this|is this a project you created or one you trust|quick safety check|folder access\b|update available\b|do you want to (?:proceed|continue|run|allow|make this edit|create|delete|overwrite)|would you like to (?:proceed|continue|allow)|select an option\b|choose an option\b|accessing workspace:)/i;
+const TUI_MENU_FOOTER_RE = /(?:enter to confirm|esc to cancel|enter(?: to)? continue|esc(?: to)? (?:skip|back|cancel)|↑\/↓\s*(?:to\s*)?navigate|up\/down\s*(?:to\s*)?navigate|press enter\b|space to (?:select|toggle)|tab to amend)/i;
+const TUI_MENU_BOUNDARY_RE = /^\s*(?:⏺|❯\s+\S|›\s+\S)/;
+const TUI_PEER_EXCLUDE_RE = /^\s*(?:[•●▪⏺⎿❯›>#\-*]|```)/;
+
+function unboxLine(line) {
+  const s = String(line || '');
+  const m = s.match(/^\s*│\s?(.*?)\s?│\s*$/);
+  return m ? m[1] : s;
+}
+
+export function isTuiMenuSelectionLine(lines, idx, rawOptionText = null) {
+  if (!Array.isArray(lines) || idx < 0 || idx >= lines.length) return false;
+  const rawLine = unboxLine(lines[idx]);
+  const cursorMatch = rawLine.match(/^(\s*)[❯›]\s+(.+)$/);
+  const opt = String(rawOptionText ?? cursorMatch?.[2] ?? '').trim();
+  if (!opt) return false;
+
+  // 1. Direct known TUI menu option text.
+  if (TUI_MENU_OPTION_RE.test(opt)) return true;
+
+  // 2. Scan up (<= 6 lines) for a TUI menu header, stopping at prior turn / footer boundaries.
+  const minUp = Math.max(0, idx - 6);
+  for (let j = idx - 1; j >= minUp; j--) {
+    const u = unboxLine(lines[j]).trim();
+    if (!u || PURE_BOX_RE.test(u)) continue;
+    if (TUI_MENU_FOOTER_RE.test(u) || TUI_MENU_BOUNDARY_RE.test(u) || WORKED_FOR_RE.test(u)) break;
+    if (TUI_MENU_HEADER_RE.test(u)) {
+      // Guard conversational "Do you want to proceed ..." followed by a long prose user reply.
+      if (/(?:do you want to|would you like to)/i.test(u) && opt.length > 120) continue;
+      return true;
+    }
+  }
+
+  // 3. Scan down (<= 6 lines) for a TUI menu footer, stopping at next turn / assistant marker.
+  const maxDown = Math.min(lines.length - 1, idx + 6);
+  for (let j = idx + 1; j <= maxDown; j++) {
+    const u = unboxLine(lines[j]).trim();
+    if (!u || PURE_BOX_RE.test(u)) continue;
+    if (TUI_MENU_BOUNDARY_RE.test(u) || WORKED_FOR_RE.test(u)) break;
+    if (TUI_MENU_FOOTER_RE.test(u)) return true;
+  }
+
+  // 4. Adjacent numbered options (e.g. `› 1. ...` with `  2. ...` below, or `❯ 2. ...` with `  1. ...` above).
+  const numMatch = opt.match(/^(\d+)\.\s+\S+/);
+  if (numMatch) {
+    const n = Number(numMatch[1]);
+    if (n >= 1 && n <= 9) {
+      for (const dir of [-1, 1]) {
+        for (let step = 1; step <= 3; step++) {
+          const j = idx + dir * step;
+          if (j < 0 || j >= lines.length) break;
+          const u = unboxLine(lines[j]).trim();
+          if (!u || PURE_BOX_RE.test(u)) continue;
+          if (TUI_MENU_BOUNDARY_RE.test(u) || WORKED_FOR_RE.test(u)) break;
+          const peerNum = u.match(/^(\d+)\.\s+\S+/);
+          if (peerNum) {
+            const pn = Number(peerNum[1]);
+            if (pn === n + dir || pn === n - 1 || pn === n + 1) return true;
+          }
+        }
+      }
+    }
+  }
+
+  // 5. Indented peer option line directly adjacent (idx - 1 or idx + 1), guarded against wrapped user prose.
+  if (cursorMatch && opt.length <= 65 && !/[.!?。！？]$/.test(opt)) {
+    const cursorIndent = cursorMatch[1].length;
+    const isPeerOption = (j, below) => {
+      if (j < 0 || j >= lines.length) return false;
+      const rawPeer = unboxLine(lines[j]);
+      const peerTrim = rawPeer.trim();
+      if (!peerTrim || peerTrim.length < 2 || peerTrim.length > 72) return false;
+      if (PURE_BOX_RE.test(peerTrim) || TUI_CHROME_RE.test(peerTrim) || WORKED_FOR_RE.test(peerTrim)) return false;
+      if (TUI_PEER_EXCLUDE_RE.test(rawPeer)) return false;
+      if (/[.!?。！？:：]$/.test(peerTrim)) return false;
+      const peerIndent = rawPeer.match(/^(\s*)/)[1].length;
+      const aligned = peerIndent === cursorIndent + 2 || (cursorIndent >= 1 && peerIndent === cursorIndent);
+      if (!aligned) return false;
+      if (below && cursorIndent === 0 && (opt.length > 50 || !/^[A-Z0-9\u4e00-\u9fff]/.test(peerTrim))) return false;
+      return true;
+    };
+    if (isPeerOption(idx - 1, false) || isPeerOption(idx + 1, true)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Extract a concise, ANSI-clean menu snippet from cached terminal output for the interactive
+ * approval card (`renderInteractivePromptBar`), preserving relative option alignment.
+ */
+export function extractInteractiveMenuSnippet(rawText, maxLines = 6) {
+  if (!rawText) return '';
+  const cleaned = formatTerminalText(rawText);
+  const rawLines = cleaned.split('\n');
+  const kept = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const u = unboxLine(rawLines[i]).replace(/\s+$/, '');
+    const t = u.trim();
+    if (!t || PURE_BOX_RE.test(t) || EMPTY_PROMPT_RE.test(t) || TUI_CHROME_RE.test(t) || WORKED_FOR_RE.test(t)) {
+      continue;
+    }
+    kept.push(u);
+  }
+  if (!kept.length) return '';
+  const tail = kept.slice(-12);
+  let cursorPos = -1;
+  for (let i = tail.length - 1; i >= 0; i--) {
+    if (/^\s*[❯›>]\s+\S+/.test(tail[i])) {
+      cursorPos = i;
+      break;
+    }
+  }
+  let slice;
+  if (cursorPos >= 0) {
+    let start = Math.max(0, cursorPos - 3);
+    let end = Math.min(tail.length, start + maxLines);
+    if (end - start < maxLines) start = Math.max(0, end - maxLines);
+    slice = tail.slice(start, end);
+  } else {
+    slice = tail.slice(-maxLines);
+  }
+  let minIndent = Infinity;
+  for (let i = 0; i < slice.length; i++) {
+    const ind = slice[i].match(/^(\s*)/)[1].length;
+    if (ind < minIndent) minIndent = ind;
+  }
+  if (!Number.isFinite(minIndent)) minIndent = 0;
+  return slice.map((l) => l.slice(minIndent)).join('\n').trim();
+}
+
 export function cleanTerminalToMarkdown(raw, _agent) {
   const cleaned = formatTerminalText(raw);
   const lines = cleaned.split('\n').map((l) => l.replace(/\s+$/, ''));
@@ -299,8 +434,8 @@ export function cleanTerminalToMarkdown(raw, _agent) {
   }
   const out = [];
   let inFence = false;
-  for (const orig of lines) {
-    let l = orig;
+  for (let i = 0; i < lines.length; i++) {
+    let l = lines[i];
     const boxWrap = l.match(/^\s*│\s?(.*?)\s?│\s*$/);
     if (boxWrap) l = boxWrap[1];
     if (/^\s*```/.test(l)) {
@@ -329,9 +464,13 @@ export function cleanTerminalToMarkdown(raw, _agent) {
     if (sub) { out.push(`> ${sub[1]}`); continue; }
     const hd = l.match(/^\s{1,4}(#{1,4}\s+.*)$/);
     if (hd) { out.push(hd[1]); continue; }
-    const usr = l.match(/^\s*[❯›]\s+(.+)$/);
-    if (usr && !/^Ask Codex to do anything$/i.test(usr[1].trim())) {
-      out.push('', L(`> **用户输入**：${usr[1].trim()}`, `> **User input**: ${usr[1].trim()}`), '');
+    const usr = l.match(/^\s*([❯›])\s+(.+)$/);
+    if (usr && !/^Ask Codex to do anything$/i.test(usr[2].trim())) {
+      if (isTuiMenuSelectionLine(lines, i, usr[2])) {
+        out.push(`${usr[1]} ${usr[2].trim()}`);
+      } else {
+        out.push('', L(`> **用户输入**：${usr[2].trim()}`, `> **User input**: ${usr[2].trim()}`), '');
+      }
       continue;
     }
     out.push(l);
@@ -354,9 +493,10 @@ export function parseTerminalTurns(raw, agent) {
     if (md) turns.push({ role: 'assistant', text: md });
     buf = [];
   };
-  for (const l of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
     const pm = l.match(/^\s*[❯›]\s+(.+)$/);
-    if (pm && !/^Ask Codex to do anything$/i.test(pm[1].trim())) {
+    if (pm && !/^Ask Codex to do anything$/i.test(pm[1].trim()) && !isTuiMenuSelectionLine(lines, i, pm[1])) {
       flushAsst();
       turns.push({ role: 'user', text: pm[1].trim() });
     } else {

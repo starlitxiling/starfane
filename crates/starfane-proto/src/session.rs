@@ -39,8 +39,12 @@ pub struct HostRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub session_count: usize,
+    /// Pure network/transport round-trip latency in milliseconds (never discovery/dispatch wall-clock).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u64>,
+    /// Last discovery/sync wall-clock duration in milliseconds (diagnostics only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_retry_ms: Option<u64>,
 }
@@ -127,6 +131,19 @@ pub struct StageRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnMetricSample {
+    pub ts_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tps: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMetrics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_used_tokens: Option<u64>,
@@ -136,9 +153,12 @@ pub struct SessionMetrics {
     pub context_used_pct: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tps: Option<f32>,
-    /// Time to first token (ms), when available from proxy/request logs (e.g. `cc_switch`).
+    /// Time to first token (ms), when available from native step/transcript telemetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
+    /// Rolling average TTFT (ms) over `recent_turns` with valid `ttft_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_ttft_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,7 +167,10 @@ pub struct SessionMetrics {
     pub total_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_output_tokens: Option<u64>,
-    /// Data source: `"cc_switch"`, `"transcript"`, `"status_line"`, or `"none"`.
+    /// Recent per-turn TTFT / TPS samples in chronological order (capped at 20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_turns: Vec<TurnMetricSample>,
+    /// Data source: `"agy_db"`, `"transcript"`, `"status_line"`, or `"none"`.
     pub source: String,
     pub updated_ms: u64,
 }
@@ -303,18 +326,22 @@ mod tests {
         });
         let legacy: HostRecord = serde_json::from_value(legacy_json).unwrap();
         assert_eq!(legacy.rtt_ms, None);
+        assert_eq!(legacy.sync_ms, None);
         assert_eq!(legacy.next_retry_ms, None);
         let ser_legacy = serde_json::to_value(&legacy).unwrap();
         assert!(ser_legacy.get("rtt_ms").is_none());
+        assert!(ser_legacy.get("sync_ms").is_none());
         assert!(ser_legacy.get("next_retry_ms").is_none());
 
         let with_net = HostRecord {
             rtt_ms: Some(142),
+            sync_ms: Some(48),
             next_retry_ms: Some(1_700_000_015_000),
             ..legacy
         };
         let ser = serde_json::to_value(&with_net).unwrap();
         assert_eq!(ser["rtt_ms"], 142);
+        assert_eq!(ser["sync_ms"], 48);
         assert_eq!(ser["next_retry_ms"], 1_700_000_015_000u64);
         let back: HostRecord = serde_json::from_value(ser).unwrap();
         assert_eq!(back, with_net);

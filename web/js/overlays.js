@@ -33,6 +33,8 @@ import {
   statusInd,
   toast,
   tpsOf,
+  ttftOf,
+  ttftTone,
 } from './dom.js';
 import {
   act,
@@ -92,17 +94,32 @@ import {
 import { formatTerminalText, renderChunkedTerminal } from './terminal.js';
 import { dropReasons, effSev, focusBtn, g2Of, g3Of, sevTagCls } from './views.js';
 
-function rttPill(rttMs) {
+function rttPill(rttMs, syncMs = null) {
   if (!isFin(rttMs) || rttMs < 0) return null;
   const label = fmtRtt(rttMs);
   if (!label) return null;
+  const hasSync = isFin(syncMs) && syncMs >= 0;
+  const title = hasSync
+    ? L(`网络延迟 ${Math.round(rttMs)}ms · 同步耗时 ${Math.round(syncMs)}ms`, `Network RTT ${Math.round(rttMs)}ms · Sync ${Math.round(syncMs)}ms`)
+    : L(`往返延迟 ${label}`, `Round-trip latency ${label}`);
   return h('span', {
     class: `tag mono rtt-pill rtt-${rttTone(rttMs)}`,
-    title: L(`往返延迟 ${label}`, `Round-trip latency ${label}`),
+    title,
   }, label);
 }
 
+function syncPill(syncMs) {
+  if (!isFin(syncMs) || syncMs < 0) return null;
+  const label = fmtRtt(syncMs);
+  if (!label) return null;
+  return h('span', {
+    class: 'tag mono sync-pill',
+    title: L(`远端同步耗时 ${Math.round(syncMs)}ms`, `Remote discovery sync ${Math.round(syncMs)}ms`),
+  }, L(`同步 ${label}`, `Sync ${label}`));
+}
+
 export function openDrawer(kind, params) {
+  UI.mobileSessionsOpen = false;
   UI.drawer = { kind, ...params };
   if (kind === 'session' && params.sessionId) loadHandoffs(params.sessionId);
   if (kind === 'terminal' && params.pane) loadPreview(params.pane, { mode: UI.drawerPvLines, silent: false });
@@ -115,6 +132,7 @@ export function closeDrawer() {
 }
 
 export function openSpawnModal() {
+  UI.mobileSessionsOpen = false;
   const curHost = hostOf(currentSession());
   const defaultHost = S.hosts.size > 1 && S.hosts.has(curHost) ? curHost : 'local';
   UI.drafts.set('sp:host', defaultHost);
@@ -241,6 +259,12 @@ export function renderDrawer() {
     title = p ? L(`流程元数据 · ${p.id}`, `Pipeline Metadata · ${p.id}`) : L('流程元数据', 'Pipeline Metadata');
     sub = p ? p.goal : '';
     body = p ? drawerPipeline(p) : emptyState(L('未找到流程', 'Pipeline Not Found'));
+  } else if (d.kind === 'outline') {
+    const s = S.sessions.get(d.sessionId) || currentSession();
+    const prompts = s ? APP.collectUserPrompts(s) : [];
+    title = L(`提问目录（${prompts.length}）`, `Prompt Outline (${prompts.length})`);
+    sub = s ? sessionLabel(s) : '';
+    body = s ? drawerOutline(s, prompts) : emptyState(L('会话不存在', 'Session Not Found'), L('该会话可能已被清理。', 'This session may have been cleaned up.'));
   } else if (d.kind === 'paste') {
     const list = UI.attachments.get(d.sessionId) || [];
     const att = list.find((x) => x.id === d.attachmentId);
@@ -252,21 +276,90 @@ export function renderDrawer() {
   root.replaceChildren(
     h('div', { class: 'drawer-backdrop', onclick: closeDrawer }),
     h('aside', { class: 'drawer-panel', role: 'dialog', 'aria-label': title },
+      h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
       h('div', { class: 'drawer-head' },
         h('div', { class: 'grow' }, h('h3', null, title), sub ? h('div', { class: 'muted mono', style: 'font-size:12px;margin-top:2px' }, sub) : null),
         btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeDrawer })),
       h('div', { class: 'drawer-body' }, body)));
 }
 
+function drawerOutline(s, prompts) {
+  if (!prompts.length) {
+    return emptyState(
+      L('暂无提问记录', 'No Prompts Yet'),
+      L('当前会话尚未检测到用户提问记录。', 'No user prompts detected in this session yet.'),
+    );
+  }
+  const fk = `pjump:${s.session_id}`;
+  const listEl = h('div', { class: 'outline-drawer-list' });
+  const activeIdx = UI.wsShell?.rail?._activeIdx || String(prompts[prompts.length - 1].idx);
+  const renderList = () => {
+    const q = draft(fk).trim().toLowerCase();
+    const filtered = q
+      ? prompts.filter((p) => p.text.toLowerCase().includes(q) || `#${p.idx}`.includes(q))
+      : prompts;
+    if (!filtered.length) {
+      listEl.replaceChildren(h('div', { class: 'muted', style: 'padding:16px;text-align:center;font-size:13px' }, L('无匹配提问', 'No matching prompts')));
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < filtered.length; i++) {
+      const p = filtered[i];
+      const idxStr = String(p.idx);
+      const isCur = idxStr === activeIdx;
+      frag.appendChild(h('button', {
+        type: 'button',
+        class: `outline-item outline-drawer-item${isCur ? ' active' : ''}`,
+        'data-turn-idx': idxStr,
+        onclick: () => {
+          closeDrawer();
+          APP.jumpToPrompt(p.idx);
+        },
+      },
+      h('div', { class: 'outline-item-top' },
+        span('outline-item-idx', `#${p.idx}`),
+        p.ts_ms ? span('tabular', clock(p.ts_ms)) : null),
+      h('div', { class: 'outline-item-text' }, p.text)));
+    }
+    listEl.replaceChildren(frag);
+  };
+  const filterInp = prompts.length > 6 ? (() => {
+    const inp = field(fk, {
+      class: 'inp',
+      type: 'search',
+      placeholder: L('过滤提问…', 'Filter prompts…'),
+      'aria-label': L('过滤提问', 'Filter prompts'),
+      autocomplete: 'off',
+    });
+    inp.addEventListener('input', renderList);
+    return inp;
+  })() : null;
+  renderList();
+  return h('div', { class: 'stack-sm' }, filterInp, listEl);
+}
+
 function drawerMetricsCard(m) {
   const pctVal = ctxPctOf(m);
   const tpsVal = tpsOf(m);
+  const ttftVal = ttftOf(m);
+  const avgTtftVal = isFin(m?.avg_ttft_ms) && m.avg_ttft_ms > 0 ? m.avg_ttft_ms : null;
+  const turns = Array.isArray(m?.recent_turns) ? m.recent_turns : [];
+  const validCnt = turns.filter((t) => isFin(t?.ttft_ms) && t.ttft_ms > 0).length;
   const hasUsed = isFin(m?.context_used_tokens);
   const hasWin = isFin(m?.context_window_tokens) && m.context_window_tokens > 0;
   let ctxVal = '—';
   if (hasUsed && hasWin && pctVal != null) ctxVal = `${fmtTokens(m.context_used_tokens)} / ${fmtTokens(m.context_window_tokens)} (${Math.round(pctVal)}%)`;
   else if (pctVal != null) ctxVal = `${Math.round(pctVal)}%`;
   else if (hasUsed) ctxVal = fmtTokens(m.context_used_tokens);
+  const latestTtftTone = ttftVal != null ? ttftTone(ttftVal) : 'ok';
+  const latestTtftCls = latestTtftTone === 'fast' ? ' ttft-fast' : latestTtftTone === 'slow' ? ' ttft-slow' : '';
+  const avgTtftTone = avgTtftVal != null ? ttftTone(avgTtftVal) : 'ok';
+  const avgTtftCls = avgTtftTone === 'fast' ? ' ttft-fast' : avgTtftTone === 'slow' ? ' ttft-slow' : '';
+  const avgTtftText = avgTtftVal != null
+    ? (validCnt > 0
+      ? L(`${fmtMs(avgTtftVal)} (${validCnt} 次)`, `${fmtMs(avgTtftVal)} (${validCnt} ${validCnt === 1 ? 'turn' : 'turns'})`)
+      : fmtMs(avgTtftVal))
+    : '—';
   const lastTurn = isFin(m?.last_output_tokens) || isFin(m?.last_duration_ms)
     ? `${isFin(m?.last_output_tokens) ? `${fmtTokens(m.last_output_tokens)} tokens` : '—'} · ${isFin(m?.last_duration_ms) ? fmtMs(m.last_duration_ms) : '—'}`
     : '—';
@@ -276,16 +369,45 @@ function drawerMetricsCard(m) {
   const srcLine = m?.source && m.source !== 'none'
     ? `${metricsSrcLabel(m.source)}${m.updated_ms ? ` · ${clock(m.updated_ms)}` : ''}`
     : L('暂无遥测数据', 'No telemetry data yet');
+  const turnHistoryEl = turns.length > 0
+    ? h('div', { class: 'turn-metrics-wrap' },
+      h('div', { class: 'turn-metrics-head' },
+        L(`每次首字与速度记录（最近 ${turns.length} 次）`, `Per-turn TTFT & speed (last ${turns.length})`)),
+      h('div', { class: 'turn-metrics-scroll' },
+        h('table', { class: 'turn-metrics-table' },
+          h('thead', null,
+            h('tr', null,
+              h('th', null, L('时间', 'Time')),
+              h('th', null, L('首字', 'TTFT')),
+              h('th', null, L('速度', 'Speed')),
+              h('th', null, L('输出 / 耗时', 'Output / Duration')))),
+          h('tbody', null,
+            [...turns].reverse().map((t) => {
+              const hasTtft = isFin(t?.ttft_ms) && t.ttft_ms > 0;
+              const tone = hasTtft ? ttftTone(t.ttft_ms) : 'ok';
+              const ttftCls = tone === 'fast' ? 'ttft-fast' : tone === 'slow' ? 'ttft-slow' : '';
+              const hasTps = isFin(t?.tps) && t.tps > 0;
+              const outText = isFin(t?.output_tokens) ? fmtTokens(t.output_tokens) : '—';
+              const durText = isFin(t?.duration_ms) && t.duration_ms > 0 ? fmtMs(t.duration_ms) : '—';
+              return h('tr', null,
+                h('td', { class: 'muted' }, t?.ts_ms ? clock(t.ts_ms) : '—'),
+                h('td', { class: ttftCls || null }, hasTtft ? fmtMs(t.ttft_ms) : '—'),
+                h('td', null, hasTps ? `${t.tps.toFixed(1)} tok/s` : '—'),
+                h('td', { class: 'muted' }, `${outText} / ${durText}`));
+            })))))
+    : null;
   return h('div', { class: 'metrics-card' },
     h('div', { class: 'sec-h', style: 'margin:0' }, L('性能与上下文', 'Performance & Context')),
     kvGrid([
       [L('上下文占用', 'Context usage'), h('span', { class: 'row tabular' }, ctxVal, pctVal != null ? ctxBar(pctVal, false) : null)],
       [L('生成速度 (TPS)', 'Generation speed (TPS)'), span('tabular', tpsVal != null ? `${tpsVal.toFixed(1)} tok/s` : '—')],
-      [L('首字延迟 (TTFT)', 'Time to first token (TTFT)'), span('tabular', isFin(m?.ttft_ms) ? fmtMs(m.ttft_ms) : '—')],
+      [L('最近首字延迟 (TTFT)', 'Latest TTFT'), span(`tabular${latestTtftCls}`, ttftVal != null ? fmtMs(ttftVal) : '—')],
+      [L('平均首字延迟', 'Average TTFT'), span(`tabular${avgTtftCls}`, avgTtftText)],
       [L('最近回合', 'Last turn'), span('tabular', lastTurn)],
       [L('累计用量', 'Cumulative tokens'), span('tabular', totals)],
       [L('数据来源', 'Telemetry source'), span('tabular muted', srcLine)],
-    ]));
+    ]),
+    turnHistoryEl);
 }
 
 function drawerSession(s) {
@@ -306,7 +428,7 @@ function drawerSession(s) {
       s.pane ? focusBtn(s.session_id, 'sm') : null,
       (s.state === 'error' || s.state === 'needs_permission' || s.state === 'needs_input' || s.last_error)
         ? btn(L('清除异常状态', 'Clear error state'), { cls: 'sm danger', busyKey: `ack:${s.session_id}`, onclick: () => APP.ackSessionError(s) }) : null,
-      btn(L('手动刷新', 'Refresh'), { cls: 'sm', onclick: () => { loadSessionOutput(s, { silent: false, forcePreview: true }); toast(L('已刷新会话输出', 'Session output refreshed')); } }),
+      btn(L('手动刷新', 'Refresh'), { cls: 'sm', onclick: () => { loadSessionOutput(s, { silent: false, forcePreview: true, force: true }); toast(L('已刷新会话输出', 'Session output refreshed')); } }),
       s.pane ? btn(L('完整终端日志', 'Full Terminal Log'), { cls: 'ghost sm', onclick: () => openDrawer('terminal', { pane: s.pane, title: sessionLabel(s) }) }) : null,
       closable ? btn(isSplit ? L('关闭窗格', 'Close pane') : L('关闭窗口', 'Close window'), {
         cls: 'ghost sm danger',
@@ -316,7 +438,7 @@ function drawerSession(s) {
         onclick: () => openCloseSessionModal(s.session_id),
       }) : null,
       h('label', { class: 'row muted', style: 'cursor:pointer;font-size:12.5px;margin-left:auto' },
-        h('input', { type: 'checkbox', checked: UI.autoRefreshPreview, onchange: (e) => { UI.autoRefreshPreview = e.target.checked; APP.rerender(); } }), remote ? L('自动刷新', 'Auto-refresh') : L('3s 自动刷新', '3s auto-refresh'))),
+        h('input', { type: 'checkbox', checked: UI.autoRefreshPreview, onchange: (e) => { UI.autoRefreshPreview = e.target.checked; APP.rerender(); } }), L('自动刷新', 'Auto-refresh'))),
     hUnhealthy ? h('div', { class: `callout ${hStatus === 'offline' ? 'err' : 'warn'} drawer-host-banner` },
       h('div', { class: 'stack-xs grow', style: 'min-width:0' },
         h('div', { class: 'row', style: 'gap:6px' },
@@ -337,7 +459,8 @@ function drawerSession(s) {
         h('code', null, hid),
         remote ? span('tag', hKind === 'ssh' ? 'SSH' : 'Peer') : null,
         remote ? span(`tag ${hStatus === 'online' ? 'soft-green' : hStatus === 'offline' ? 'soft-red' : 'soft-amber'}`, hostStatusLabel(hStatus)) : null,
-        remote && hStatus !== 'offline' ? rttPill(hRec?.rtt_ms) : null,
+        remote && hStatus !== 'offline' ? rttPill(hRec?.rtt_ms, hRec?.sync_ms) : null,
+        remote && hStatus !== 'offline' ? syncPill(hRec?.sync_ms) : null,
         hUnhealthy ? btn(L('重连', 'Retry'), { cls: 'xs', busyKey: `probe-host:${hid}`, onclick: () => probeHostApi(hid) }) : null)],
       [L('复用器', 'Multiplexer'), span(muxKindOf(s) === 'zellij' ? 'tag mux-zj' : 'tag', muxKindOf(s))],
       [L('会话 ID', 'Session ID'), h('code', null, s.session_id)],
@@ -524,12 +647,14 @@ function closeSessionModalBody() {
   const sid = UI.closeSessionId;
   const s = sid ? S.sessions.get(sid) : null;
   if (!s || !canCloseSessionWindow(s)) {
-    return h('div', { class: 'stack' },
+    return h('div', { class: 'modal-shell' },
+      h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
       h('div', { class: 'modal-head' },
         h('h3', null, L('关闭窗口', 'Close Window')),
         btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
-      h('p', { class: 'muted' }, L('该会话已结束或当前无法关闭。', 'This session has already ended or can no longer be closed.')),
-      h('div', { class: 'row', style: 'justify-content:flex-end' },
+      h('div', { class: 'modal-body stack' },
+        h('p', { class: 'muted' }, L('该会话已结束或当前无法关闭。', 'This session has already ended or can no longer be closed.'))),
+      h('div', { class: 'modal-foot' },
         btn(L('知道了', 'Close'), { cls: 'primary', onclick: closeModal })));
   }
   const siblings = siblingSplitPanesOf(s);
@@ -547,45 +672,47 @@ function closeSessionModalBody() {
     .join(', ')
     + (siblings.length > 3 ? ` +${siblings.length - 3}` : '');
 
-  return h('div', { class: 'stack' },
+  return h('div', { class: 'modal-shell' },
+    h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
     h('div', { class: 'modal-head' },
       h('h3', null, title),
       btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
-    h('div', { class: 'close-target-card' },
-      h('div', { class: 'close-target-head' },
-        h('div', { class: 'row', style: 'gap:7px' },
-          h('i', { class: `dot dot-${s.state}`, title: stateText(s.state) }),
-          agentTag(s.agent),
-          h('span', { class: 'close-target-name' }, label)),
-        statusInd(s.state, stateText(s.state))),
-      h('div', { class: 'close-target-meta' },
-        span('muted', `${L('主机', 'Host')}: ${hostDisplayName(hid, s)}`),
-        s.tmux_target ? [span('dim', '·'), h('code', null, s.tmux_target)] : null,
-        paneBadge ? [span('dim', '·'), h('code', null, paneBadge)] : null)),
-    isSplit
-      ? h('div', { class: 'close-split-note' },
-        h('span', null, L(
-          `此操作将终止并仅关闭当前窗格；同一 tmux 窗口内的其余 ${siblings.length} 个分屏窗格将保持运行、不受影响。`,
-          `This will terminate and close only this pane. The other ${siblings.length} sibling split ${siblings.length === 1 ? 'pane' : 'panes'} in the same tmux window will remain untouched.`,
-        )),
-        siblingPreview ? h('span', { class: 'close-split-list' }, `${siblings.length === 1 ? L('保留的分屏：', 'Untouched split pane: ') : L('保留的分屏：', 'Untouched split panes: ')}${siblingPreview}`) : null)
-      : h('p', { class: 'muted', style: 'font-size:13.5px;line-height:1.6' },
-        mux === 'zellij'
-          ? L(
-            '此操作将终止该会话中的进程并关闭对应的 Zellij 窗格，其他标签页与窗口不受影响。',
-            'This will terminate the running process and close the Zellij pane. Other tabs and windows remain untouched.',
-          )
-          : L(
-            '此操作将终止该会话中的进程并关闭对应的 tmux 窗口，所属 tmux 会话中的其他窗口不受影响。',
-            'This will terminate the running process and close the tmux window. Other windows in the tmux session remain untouched.',
+    h('div', { class: 'modal-body stack' },
+      h('div', { class: 'close-target-card' },
+        h('div', { class: 'close-target-head' },
+          h('div', { class: 'row', style: 'gap:7px' },
+            h('i', { class: `dot dot-${s.state}`, title: stateText(s.state) }),
+            agentTag(s.agent),
+            h('span', { class: 'close-target-name' }, label)),
+          statusInd(s.state, stateText(s.state))),
+        h('div', { class: 'close-target-meta' },
+          span('muted', `${L('主机', 'Host')}: ${hostDisplayName(hid, s)}`),
+          s.tmux_target ? [span('dim', '·'), h('code', null, s.tmux_target)] : null,
+          paneBadge ? [span('dim', '·'), h('code', null, paneBadge)] : null)),
+      isSplit
+        ? h('div', { class: 'close-split-note' },
+          h('span', null, L(
+            `此操作将终止并仅关闭当前窗格；同一 tmux 窗口内的其余 ${siblings.length} 个分屏窗格将保持运行、不受影响。`,
+            `This will terminate and close only this pane. The other ${siblings.length} sibling split ${siblings.length === 1 ? 'pane' : 'panes'} in the same tmux window will remain untouched.`,
           )),
-    s.state === 'working'
-      ? h('div', { class: 'callout warn' }, L(
-        '该会话当前正在运行中，关闭会中断正在执行的任务。',
-        'This session is currently working; closing it will interrupt the active run.',
-      ))
-      : null,
-    h('div', { class: 'row', style: 'justify-content:flex-end' },
+          siblingPreview ? h('span', { class: 'close-split-list' }, `${siblings.length === 1 ? L('保留的分屏：', 'Untouched split pane: ') : L('保留的分屏：', 'Untouched split panes: ')}${siblingPreview}`) : null)
+        : h('p', { class: 'muted', style: 'font-size:13.5px;line-height:1.6' },
+          mux === 'zellij'
+            ? L(
+              '此操作将终止该会话中的进程并关闭对应的 Zellij 窗格，其他标签页与窗口不受影响。',
+              'This will terminate the running process and close the Zellij pane. Other tabs and windows remain untouched.',
+            )
+            : L(
+              '此操作将终止该会话中的进程并关闭对应的 tmux 窗口，所属 tmux 会话中的其他窗口不受影响。',
+              'This will terminate the running process and close the tmux window. Other windows in the tmux session remain untouched.',
+            )),
+      s.state === 'working'
+        ? h('div', { class: 'callout warn' }, L(
+          '该会话当前正在运行中，关闭会中断正在执行的任务。',
+          'This session is currently working; closing it will interrupt the active run.',
+        ))
+        : null),
+    h('div', { class: 'modal-foot' },
       btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
       btn(confirmLabel, {
         cls: 'danger-primary',
@@ -608,16 +735,18 @@ function renameHostModalBody() {
     autocomplete: 'off',
   }, curName);
   inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); submit(); } });
-  return h('div', { class: 'stack' },
+  return h('div', { class: 'modal-shell' },
+    h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
     h('div', { class: 'modal-head' }, h('h3', null, L('重命名主机', 'Rename Host')), btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
-    h('p', { class: 'muted' },
-      L('仅修改显示名称，不可变主机 ID ', 'Only the display name changes; immutable host ID '),
-      h('code', null, hostId),
-      L(' 与面板前缀 ', ' and pane prefix '),
-      h('code', null, `${hostId}:%...`),
-      L(' 保持稳定。', ' stay unchanged.')),
-    h('div', null, h('label', { class: 'lbl' }, L('主机显示名称', 'Host display name')), inp),
-    h('div', { class: 'row', style: 'justify-content:flex-end' },
+    h('div', { class: 'modal-body stack' },
+      h('p', { class: 'muted' },
+        L('仅修改显示名称，不可变主机 ID ', 'Only the display name changes; immutable host ID '),
+        h('code', null, hostId),
+        L(' 与面板前缀 ', ' and pane prefix '),
+        h('code', null, `${hostId}:%...`),
+        L(' 保持稳定。', ' stay unchanged.')),
+      h('div', null, h('label', { class: 'lbl' }, L('主机显示名称', 'Host display name')), inp)),
+    h('div', { class: 'modal-foot' },
       btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
       btn(L('保存名称', 'Save Name'), { cls: 'primary', busyKey: `rename-host:${hostId}`, onclick: submit })));
 }
@@ -729,10 +858,14 @@ function spawnModalBody() {
       const st = hr.status || 'online';
       const selected = targetHost === hr.id;
       const rttLabel = hr.id !== 'local' && st !== 'offline' ? fmtRtt(hr.rtt_ms) : '';
+      const syncLabel = hr.id !== 'local' && st !== 'offline' && isFin(hr.sync_ms) && hr.sync_ms >= 0
+        ? L(`同步 ${fmtRtt(hr.sync_ms)}`, `Sync ${fmtRtt(hr.sync_ms)}`)
+        : '';
       const tip = [
         `${hostDisplayName(hr.id)} (${hr.id})`,
         hostStatusLabel(st),
         rttLabel,
+        syncLabel,
       ].filter(Boolean).join(' · ');
       return h('button', {
         type: 'button',
@@ -792,39 +925,41 @@ function spawnModalBody() {
   const sessPlaceholder = loadingSessions
     ? L('正在获取远端 tmux 会话…', 'Loading remote tmux sessions…')
     : L('默认 agent-session（自动创建）', 'Default: agent-session (auto-created)');
-  return h('div', { class: 'stack' },
+  return h('div', { class: 'modal-shell' },
+    h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
     h('div', { class: 'modal-head' }, h('h3', null, L('新建交互会话', 'New Interactive Session')), btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
-    h('datalist', { id: dlId }, projects.map((p) => h('option', { value: p }))),
-    h('datalist', { id: sessDlId }, sessionCandidates.map((s) => h('option', { value: s }))),
-    hostSelector,
-    h('div', null,
-      h('label', { class: 'lbl' }, L('选择 Agent', 'Agent')),
-      h('div', { class: 'chips' }, AGENTS.map((a) => h('button', {
-        type: 'button',
-        class: `chip${agent === a ? ' on' : ''}`,
-        onclick: () => {
-          UI.drafts.set('sp:agent', a);
-          hydrateSpawnAgent(a);
-          const nextModel = UI.drafts.get(`sp:modelSel:${a}`);
-          const nextEff = UI.drafts.get(`sp:effort:${a}`);
-          persistCurrent(a, nextModel, nextEff);
-          APP.rerender();
-        },
-      }, a)))),
-    h('div', { class: 'opt-grid' },
-      h('div', { class: 'stack-xs' }, h('label', { class: 'lbl', style: 'margin:0' }, L('模型', 'Model')), modelSelect, customModelInp),
-      h('div', { class: 'stack-xs' }, h('label', { class: 'lbl', style: 'margin:0' }, L('思考强度', 'Effort')), effortSelect)),
-    h('div', null,
-      h('label', { class: 'lbl' }, dirLabel),
-      field('sp:dir', { class: 'inp mono', list: dlId, placeholder: dirPlaceholder, autocomplete: 'off' }, curDir)),
-    h('div', { class: 'opt-grid' },
-      h('div', null, h('label', { class: 'lbl' }, L('tmux 会话（Session，选填）', 'tmux Session (optional)')),
-        field('sp:session', { class: 'inp mono', list: sessDlId, placeholder: sessPlaceholder, autocomplete: 'off' })),
-      h('div', null, h('label', { class: 'lbl' }, L('tmux 窗口名（Window，选填）', 'tmux Window (optional)')),
-        field('sp:name', { class: 'inp mono', placeholder: L(`留空顺延命名（如 ${agent}-1）`, `Auto-numbered if blank (e.g. ${agent}-1)`), autocomplete: 'off' }))),
-    h('div', null, h('label', { class: 'lbl' }, L('首条消息（选填）', 'Initial prompt (optional)')),
-      field('sp:prompt', { tag: 'textarea', rows: 2, class: 'inp', placeholder: L('留空则仅打开干净的交互式会话…', 'Leave blank to open a fresh interactive session…') })),
-    h('div', { class: 'row', style: 'justify-content:flex-end' },
+    h('div', { class: 'modal-body stack' },
+      h('datalist', { id: dlId }, projects.map((p) => h('option', { value: p }))),
+      h('datalist', { id: sessDlId }, sessionCandidates.map((s) => h('option', { value: s }))),
+      hostSelector,
+      h('div', null,
+        h('label', { class: 'lbl' }, L('选择 Agent', 'Agent')),
+        h('div', { class: 'chips' }, AGENTS.map((a) => h('button', {
+          type: 'button',
+          class: `chip${agent === a ? ' on' : ''}`,
+          onclick: () => {
+            UI.drafts.set('sp:agent', a);
+            hydrateSpawnAgent(a);
+            const nextModel = UI.drafts.get(`sp:modelSel:${a}`);
+            const nextEff = UI.drafts.get(`sp:effort:${a}`);
+            persistCurrent(a, nextModel, nextEff);
+            APP.rerender();
+          },
+        }, a)))),
+      h('div', { class: 'opt-grid' },
+        h('div', { class: 'stack-xs' }, h('label', { class: 'lbl', style: 'margin:0' }, L('模型', 'Model')), modelSelect, customModelInp),
+        h('div', { class: 'stack-xs' }, h('label', { class: 'lbl', style: 'margin:0' }, L('思考强度', 'Effort')), effortSelect)),
+      h('div', null,
+        h('label', { class: 'lbl' }, dirLabel),
+        field('sp:dir', { class: 'inp mono', list: dlId, placeholder: dirPlaceholder, autocomplete: 'off' }, curDir)),
+      h('div', { class: 'opt-grid' },
+        h('div', null, h('label', { class: 'lbl' }, L('tmux 会话（Session，选填）', 'tmux Session (optional)')),
+          field('sp:session', { class: 'inp mono', list: sessDlId, placeholder: sessPlaceholder, autocomplete: 'off' })),
+        h('div', null, h('label', { class: 'lbl' }, L('tmux 窗口名（Window，选填）', 'tmux Window (optional)')),
+          field('sp:name', { class: 'inp mono', placeholder: L(`留空顺延命名（如 ${agent}-1）`, `Auto-numbered if blank (e.g. ${agent}-1)`), autocomplete: 'off' }))),
+      h('div', null, h('label', { class: 'lbl' }, L('首条消息（选填）', 'Initial prompt (optional)')),
+        field('sp:prompt', { tag: 'textarea', rows: 2, class: 'inp', placeholder: L('留空则仅打开干净的交互式会话…', 'Leave blank to open a fresh interactive session…') }))),
+    h('div', { class: 'modal-foot' },
       btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
       btn(L('新建交互会话', 'Create Session'), {
         cls: 'primary',
@@ -849,7 +984,7 @@ function pipelineModalBody(pb) {
     const goal = draft(goalKey).trim();
     const utt = draft(bindKey).trim();
     const proj = draft(projKey, curDir).trim();
-    const combined = [goal, utt].filter(Boolean).join('；');
+    const combined = [goal, utt].filter(Boolean).join(L('；', '; '));
     if (!combined) throw new Error(isDebug ? L('请描述故障现象', 'Please describe the symptom') : L('请描述需求目标', 'Please describe the feature goal'));
     const parsed = pv?.data && pv.text === utt ? pv.data : null;
     let p = isDebug
@@ -864,17 +999,19 @@ function pipelineModalBody(pb) {
     APP.go('pipelines', p.id);
     return p;
   }, (p) => L(`${p.id} 已创建`, `${p.id} created`));
-  return h('div', { class: 'stack' },
+  return h('div', { class: 'modal-shell' },
+    h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
     h('div', { class: 'modal-head' }, h('h3', null, isDebug ? L('发起两速查错', 'New Two-Speed Debug') : L('发起新功能协作', 'New Feature Pipeline')), btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
-    h('div', null, h('label', { class: 'lbl' }, isDebug ? L('故障现象 / 报错描述', 'Symptom / Error description') : L('需求目标', 'Feature Goal')),
-      field(goalKey, { tag: 'textarea', rows: 3, class: 'inp', placeholder: isDebug ? L('例如：POST /login 偶发 500', 'e.g. POST /login intermittently returns 500') : L('例如：给设置页增加导出 CSV 能力', 'e.g. Add CSV export to Settings page') })),
-    h('div', null, h('label', { class: 'lbl' }, L('模型绑定话术（选填，留空用默认配置）', 'Model routing instructions (optional, uses defaults if empty)')), bindInp),
-    pv?.data ? h('div', { class: 'row' }, span('muted', L('解析预览：', 'Parsed bindings: ')), ...PLAYBOOK_STAGES[pb].map((k) => span('tag', `${stageName(k)}: ${shorthand(pv.data.resolved?.[k])}`))) : null,
-    h('div', null, h('label', { class: 'lbl' }, L('项目目录（选填）', 'Project directory (optional)')), field(projKey, { class: 'inp mono', placeholder: L('留空自动使用当前会话目录', 'Defaults to current session cwd') }, curDir)),
-    h('label', { class: 'row muted', style: 'font-size:13px;cursor:pointer' },
-      h('input', { type: 'checkbox', checked: UI.autoConfirm, onchange: (e) => { UI.autoConfirm = e.target.checked; APP.schedule(); } }),
-      L('自动确认绑定并立即启动首阶段', 'Auto-confirm bindings and start first stage immediately')),
-    h('div', { class: 'row', style: 'justify-content:flex-end' },
+    h('div', { class: 'modal-body stack' },
+      h('div', null, h('label', { class: 'lbl' }, isDebug ? L('故障现象 / 报错描述', 'Symptom / Error description') : L('需求目标', 'Feature Goal')),
+        field(goalKey, { tag: 'textarea', rows: 3, class: 'inp', placeholder: isDebug ? L('例如：POST /login 偶发 500', 'e.g. POST /login intermittently returns 500') : L('例如：给设置页增加导出 CSV 能力', 'e.g. Add CSV export to Settings page') })),
+      h('div', null, h('label', { class: 'lbl' }, L('模型绑定话术（选填，留空用默认配置）', 'Model routing instructions (optional, uses defaults if empty)')), bindInp),
+      pv?.data ? h('div', { class: 'row' }, span('muted', L('解析预览：', 'Parsed bindings: ')), ...PLAYBOOK_STAGES[pb].map((k) => span('tag', `${stageName(k)}: ${shorthand(pv.data.resolved?.[k])}`))) : null,
+      h('div', null, h('label', { class: 'lbl' }, L('项目目录（选填）', 'Project directory (optional)')), field(projKey, { class: 'inp mono', placeholder: L('留空自动使用当前会话目录', 'Defaults to current session cwd') }, curDir)),
+      h('label', { class: 'row muted', style: 'font-size:13px;cursor:pointer' },
+        h('input', { type: 'checkbox', checked: UI.autoConfirm, onchange: (e) => { UI.autoConfirm = e.target.checked; APP.schedule(); } }),
+        L('自动确认绑定并立即启动首阶段', 'Auto-confirm bindings and start first stage immediately'))),
+    h('div', { class: 'modal-foot' },
       btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
       btn(isDebug ? L('启动两速查错', 'Launch Debug') : L('启动新功能协作', 'Launch Pipeline'), { cls: 'primary', busyKey: `mcreate:${pb}`, onclick: submit })));
 }
@@ -893,9 +1030,11 @@ function authModalBody() {
   };
   const inp = field('auth:token', { class: 'inp mono', type: 'password', placeholder: L('粘贴 starfane_token…', 'Paste starfane_token…'), autocomplete: 'off' });
   inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
-  return h('div', { class: 'stack' },
+  return h('div', { class: 'modal-shell' },
+    h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
     h('div', { class: 'modal-head' }, h('h3', null, L('输入访问 Token', 'Authentication Required'))),
-    h('p', { class: 'muted' }, L('请粘贴本地 daemon 生成的 token（位于 ', 'Paste the token generated by your local daemon (at '), h('code', null, '<state>/web.token'), L('），或直接运行 ', '), or run '), h('code', null, 'starfane web'), L(' 自动登录。', ' to open pre-authenticated.')),
-    inp,
-    h('div', { class: 'row', style: 'justify-content:flex-end' }, btn(L('保存并连接', 'Save & Connect'), { cls: 'primary', onclick: save })));
+    h('div', { class: 'modal-body stack' },
+      h('p', { class: 'muted' }, L('请粘贴本地 daemon 生成的 token（位于 ', 'Paste the token generated by your local daemon (at '), h('code', null, '<state>/web.token'), L('），或直接运行 ', '), or run '), h('code', null, 'starfane web'), L(' 自动登录。', ' to open pre-authenticated.')),
+      inp),
+    h('div', { class: 'modal-foot' }, btn(L('保存并连接', 'Save & Connect'), { cls: 'primary', onclick: save })));
 }

@@ -38,8 +38,9 @@ import {
 
 export function autoGrow(ta) {
   if (!ta) return;
-  const minH = 52;
-  const maxH = 220;
+  const isMob = window.innerWidth <= 768;
+  const minH = isMob ? 34 : 52;
+  const maxH = isMob ? 132 : 220;
   if (ta.offsetHeight >= maxH - 1 && ta.scrollHeight > maxH + 2) {
     ta.style.height = `${maxH}px`;
     return;
@@ -468,8 +469,17 @@ export function renderSlashMenu(agent) {
   box.replaceChildren(
     h('div', { class: 'slash-list', role: 'listbox', 'aria-label': L('斜杠命令菜单', 'Slash command menu') }, listNodes),
     h('div', { class: 'slash-foot' },
-      h('span', null, L('↑↓ 选择 · Enter / Tab 确认 · Esc 关闭', '↑↓ select · Enter / Tab confirm · Esc close')),
-      span('tabular', L(`${items.length} 条命令`, `${items.length} commands`))),
+      h('span', { class: 'slash-kbd-hint' }, L('↑↓ 选择 · Enter / Tab 确认 · Esc 关闭', '↑↓ select · Enter / Tab confirm · Esc close')),
+      h('span', { class: 'row-nowrap', style: 'gap:8px;margin-left:auto' },
+        span('tabular', L(`${items.length} 条命令`, `${items.length} commands`)),
+        h('button', {
+          type: 'button',
+          class: 'slash-close-btn',
+          'aria-label': L('关闭命令菜单', 'Close command menu'),
+          title: L('关闭', 'Close'),
+          onmousedown: (e) => e.preventDefault(),
+          onclick: () => closeSlashMenu(),
+        }, '×'))),
   );
 }
 

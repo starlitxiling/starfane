@@ -38,6 +38,11 @@ const EMBEDDED_ASSETS: &[(&str, &[u8], &str)] = &[
     ("app.css", APP_CSS, "text/css; charset=utf-8"),
     ("logo.svg", LOGO_SVG, "image/svg+xml"),
     (
+        "manifest.webmanifest",
+        include_bytes!("../../../web/manifest.webmanifest"),
+        "application/manifest+json",
+    ),
+    (
         "js/constants.js",
         include_bytes!("../../../web/js/constants.js"),
         "text/javascript; charset=utf-8",
@@ -143,6 +148,7 @@ pub fn router(core: Core) -> Router {
         .route("/api/sessions/spawn", post(spawn_session))
         .route("/api/sessions/{id}/focus", post(focus))
         .route("/api/sessions/{id}/close", post(close_session))
+        .route("/api/sessions/{id}/key", post(send_session_key))
         .route("/api/sessions/{id}/ack", post(ack_session))
         .route("/api/sessions/{id}/transcript", get(session_transcript))
         .route("/api/panes/{pane_id}/preview", get(pane_preview))
@@ -372,13 +378,36 @@ async fn auth(State(core): State<Core>, req: Request, next: Next) -> Response {
 // Static assets (zero-copy `Bytes::from_static` + FNV-1a ETag `304`)
 // ---------------------------------------------------------------------------
 
+#[inline]
+fn fnv1a_update(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+}
+
 fn fnv1a_etag(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
+    fnv1a_update(&mut h, bytes);
     format!("\"{h:016x}-{}\"", bytes.len())
+}
+
+/// Stable 16-char FNV-1a 64-bit lowercase hex digest over all compiled-in `EMBEDDED_ASSETS`,
+/// exposed via `GET /api/health` so open browser tabs detect daemon UI updates automatically.
+fn embedded_ui_hash() -> &'static str {
+    static UI_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    UI_HASH
+        .get_or_init(|| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for (name, bytes, _) in EMBEDDED_ASSETS {
+                fnv1a_update(&mut h, name.as_bytes());
+                fnv1a_update(&mut h, &[0u8]);
+                fnv1a_update(&mut h, &(bytes.len() as u64).to_le_bytes());
+                fnv1a_update(&mut h, bytes);
+            }
+            format!("{h:016x}")
+        })
+        .as_str()
 }
 
 fn static_response(req_headers: &HeaderMap, bytes: Bytes, ctype: &'static str) -> Response {
@@ -499,6 +528,8 @@ async fn load_asset(core: &Core, name: &str) -> Option<(Bytes, &'static str)> {
         "image/svg+xml"
     } else if clean.ends_with(".woff2") {
         "font/woff2"
+    } else if clean.ends_with(".webmanifest") {
+        "application/manifest+json"
     } else {
         "application/octet-stream"
     };
@@ -602,6 +633,7 @@ async fn health(State(core): State<Core>, headers: HeaderMap) -> Response {
         "uptime_ms": id::now_ms().saturating_sub(core.started_ms()),
         "auth_enabled": core.config().web.auth_enabled,
         "lang": core.config().web.effective_lang(),
+        "ui_hash": embedded_ui_hash(),
     })))
 }
 
@@ -657,6 +689,23 @@ async fn focus(State(core): State<Core>, Path(id): Path<String>) -> Response {
 
 async fn close_session(State(core): State<Core>, Path(id): Path<String>) -> Response {
     respond(core.close_session_window(&SessionId(id)).await)
+}
+
+#[derive(Deserialize)]
+struct SendKeyBody {
+    key: String,
+}
+
+async fn send_session_key(
+    State(core): State<Core>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        let b: SendKeyBody = parse_body(&body)?;
+        core.send_session_key(&SessionId(id), &b.key).await
+    };
+    respond(r.await)
 }
 
 async fn ack_session(State(core): State<Core>, Path(id): Path<String>) -> Response {
@@ -1600,7 +1649,11 @@ async fn events(State(core): State<Core>, headers: HeaderMap) -> Response {
         }
     });
     Sse::new(EventStream { rx })
-        .keep_alive(KeepAlive::default())
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .event(Event::default().event("ping").data("{}")),
+        )
         .into_response()
 }
 
@@ -1809,6 +1862,149 @@ mod tests {
 
         assert!(load_asset(&core, "missing.js").await.is_none());
         assert!(load_asset(&core, "../fonts/terminal.woff2").await.is_none());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_streams_output_event_and_preserves_manifest() {
+        let root = std::env::temp_dir().join(format!("starfane-web-sse-{}", id::new_id("T")));
+        let mut cfg = crate::config::StarfaneConfig::default();
+        cfg.paths.tmux = "/usr/bin/false".into();
+        cfg.zellij.enabled = false;
+        cfg.web.auth_enabled = false;
+        let core = Core::new(&crate::DaemonConfig {
+            state_dir: root.join("state"),
+            socket: root.join("state/starfaned.sock"),
+            config: cfg,
+            web_dir: None,
+            foreground: true,
+        })
+        .unwrap();
+
+        // Preserve @mobile-ui's manifest.webmanifest embedded asset & MIME type.
+        let (manifest_bytes, manifest_mime) =
+            load_asset(&core, "manifest.webmanifest").await.unwrap();
+        assert_eq!(manifest_mime, "application/manifest+json");
+        assert!(!manifest_bytes.is_empty());
+
+        // Publish a DaemonEvent::Output into replay buffer, then consume it via /api/events SSE.
+        core.publish_output(
+            SessionId::new("mac-xiling:tmux-%39"),
+            Some(5),
+            Some(6),
+            vec![serde_json::json!({"role": "assistant", "text": "hello sse"})],
+            Some("live...".into()),
+            None,
+            false,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(core.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        // Use our peer_client::PeerSseSubscriber to read the real /api/events stream!
+        let sub = crate::peer_client::PeerSseSubscriber::new(format!("http://{addr}"), None)
+            .with_host_override(Some(format!("127.0.0.1:{}", core.config().web.port)))
+            .with_initial_last_event_id(Some("0".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = sub.spawn(tx);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for SSE output frame")
+            .expect("SSE channel closed");
+        assert_eq!(frame.event, "output");
+        assert_eq!(frame.id.as_deref(), Some("1"));
+        let decoded = frame.parse_daemon_event().unwrap();
+        match decoded {
+            DaemonEvent::Output {
+                seq,
+                session_id,
+                start_seq,
+                total_messages,
+                appended_messages,
+                live_tail,
+                dirty,
+                ..
+            } => {
+                assert_eq!(seq, 1);
+                assert_eq!(session_id.as_str(), "mac-xiling:tmux-%39");
+                assert_eq!(start_seq, Some(5));
+                assert_eq!(total_messages, Some(6));
+                assert_eq!(appended_messages.len(), 1);
+                assert_eq!(appended_messages[0]["text"], "hello sse");
+                assert_eq!(live_tail.as_deref(), Some("live..."));
+                assert!(!dirty);
+            }
+            other => panic!("expected DaemonEvent::Output, got {other:?}"),
+        }
+
+        drop(rx);
+        handle.abort();
+        server.abort();
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn health_includes_stable_embedded_ui_hash() {
+        let h1 = embedded_ui_hash();
+        let h2 = embedded_ui_hash();
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 16);
+        assert!(
+            h1.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "expected 16-char lowercase hex digest, got {h1:?}"
+        );
+
+        let root = std::env::temp_dir().join(format!("starfane-web-health-{}", id::new_id("T")));
+        let mut cfg = crate::config::StarfaneConfig::default();
+        cfg.paths.tmux = "/usr/bin/false".into();
+        cfg.zellij.enabled = false;
+        cfg.web.auth_enabled = false;
+        let core = Core::new(&crate::DaemonConfig {
+            state_dir: root.join("state"),
+            socket: root.join("state/starfaned.sock"),
+            config: cfg,
+            web_dir: None,
+            foreground: true,
+        })
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(core.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        let host_hdr = format!("127.0.0.1:{}", core.config().web.port);
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let req =
+            format!("GET /api/health HTTP/1.1\r\nHost: {host_hdr}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        server.abort();
+
+        let resp_str = String::from_utf8_lossy(&raw);
+        let (_, body) = resp_str.split_once("\r\n\r\n").expect("http response body");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["data"]["ui_hash"], h1);
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

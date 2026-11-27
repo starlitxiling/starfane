@@ -35,6 +35,67 @@ import {
 } from './store.js';
 
 const KIND_CLASS_SET = new Set(['feishu', 'telegram', 'discord', 'slack', 'wecom', 'qq', 'webhook', 'macos']);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+function svgNode(tag, attrs = {}, kids = []) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v != null) el.setAttribute(k, String(v));
+  }
+  for (const c of kids) if (c) el.appendChild(c);
+  return el;
+}
+
+function mobileTabIcon(v) {
+  const base = {
+    class: 'mnav-ico',
+    viewBox: '0 0 24 24',
+    width: '19',
+    height: '19',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.85',
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+    'aria-hidden': 'true',
+  };
+  if (v === 'workspace') {
+    return svgNode('svg', base, [
+      svgNode('rect', { x: 3, y: 4, width: 18, height: 15, rx: 3 }),
+      svgNode('path', { d: 'M8 9.5L11 12L8 14.5' }),
+      svgNode('line', { x1: 13, y1: 14.5, x2: 16.5, y2: 14.5 }),
+    ]);
+  }
+  if (v === 'inbox') {
+    return svgNode('svg', base, [
+      svgNode('path', { d: 'M3.5 13L5.5 5.5H18.5L20.5 13V18.5A1.5 1.5 0 0 1 19 20H5A1.5 1.5 0 0 1 3.5 18.5V13Z' }),
+      svgNode('path', { d: 'M3.5 13H8.5L10 15.5H14L15.5 13H20.5' }),
+    ]);
+  }
+  if (v === 'pipelines') {
+    return svgNode('svg', base, [
+      svgNode('rect', { x: 3, y: 4.5, width: 5.5, height: 5.5, rx: 1.5 }),
+      svgNode('rect', { x: 15.5, y: 4.5, width: 5.5, height: 5.5, rx: 1.5 }),
+      svgNode('rect', { x: 9.25, y: 14, width: 5.5, height: 5.5, rx: 1.5 }),
+      svgNode('path', { d: 'M8.5 7.25H15.5' }),
+      svgNode('path', { d: 'M5.75 10V12.25A4.5 4.5 0 0 0 9.25 16.75' }),
+      svgNode('path', { d: 'M18.25 10V12.25A4.5 4.5 0 0 1 14.75 16.75' }),
+    ]);
+  }
+  return svgNode('svg', base, [
+    svgNode('path', { d: 'M12 3L19 6V11.5C19 16 16 19.2 12 21C8 19.2 5 16 5 11.5V6L12 3Z' }),
+    svgNode('path', { d: 'M9 12L11 14L15.5 9.5' }),
+  ]);
+}
+
+function mobileViewLabel(v) {
+  return {
+    workspace: L('会话', 'Workspace'),
+    inbox: L('待处理', 'Inbox'),
+    pipelines: L('流水线', 'Pipelines'),
+    reviews: L('评审', 'Reviews'),
+  }[v] || viewLabel(v);
+}
 
 function safeKindClass(kind) {
   const k = String(kind || '').toLowerCase();
@@ -303,6 +364,7 @@ export function buildMutePopover() {
     role: 'dialog',
     'aria-label': L('通知静音与渠道设置', 'Notification mute & channel settings'),
   },
+  h('div', { class: 'sheet-handle', 'aria-hidden': 'true' }),
   header,
   statusBanner,
   channelsSection,
@@ -419,7 +481,8 @@ export function renderTop() {
       nav,
       h('div', { class: 'top-tools' }, connPill, muteWrap),
     );
-    TOP = { bar, nav, connPill, muteBtn, mutePopSlot, popKey: '' };
+    const mobileNav = $('#mobile-nav');
+    TOP = { bar, nav, mobileNav, connPill, muteBtn, mutePopSlot, popKey: '' };
     UI.topShell = TOP;
   }
   TOP.nav.replaceChildren(...VIEWS.map((v, i) => h('a', {
@@ -428,8 +491,25 @@ export function renderTop() {
     role: 'tab',
     title: L(`${viewLabel(v)}（快捷键 ${i + 1}）`, `${viewLabel(v)} (Shortcut ${i + 1})`),
   }, viewLabel(v), counts[v] ? span(`nav-count${v === 'inbox' ? ' attn' : ''}`, counts[v]) : null)));
+  if (TOP.mobileNav) {
+    TOP.mobileNav.setAttribute('role', 'tablist');
+    TOP.mobileNav.setAttribute('aria-label', L('主导航', 'Primary navigation'));
+    TOP.mobileNav.replaceChildren(...VIEWS.map((v) => h('a', {
+      class: `mnav-tab${UI.view === v ? ' on' : ''}`,
+      href: `#/${v}`,
+      role: 'tab',
+      'aria-selected': UI.view === v ? 'true' : 'false',
+      'aria-label': viewLabel(v),
+    },
+    h('span', { class: 'mnav-ico-wrap' },
+      mobileTabIcon(v),
+      counts[v] ? span(`mnav-badge${v === 'inbox' ? ' attn' : ''}`, counts[v] > 99 ? '99+' : String(counts[v])) : null),
+    span('mnav-lbl', mobileViewLabel(v)))));
+  }
+  TOP.connPill.className = `status-ind pill-soft conn-pill is-${cs}`;
   TOP.connPill.title = connTip;
-  TOP.connPill.replaceChildren(h('i', { class: `dot dot-${cs}` }), connTxt);
+  TOP.connPill.setAttribute('aria-label', connTxt);
+  TOP.connPill.replaceChildren(h('i', { class: `dot dot-${cs}` }), span('conn-label', connTxt));
 
   const now = Date.now();
   const pill = buildTopbarPillState(now);
@@ -437,6 +517,7 @@ export function renderTop() {
   TOP.muteBtn.className = pill.cls;
   TOP.muteBtn.setAttribute('aria-expanded', UI.muteMenu ? 'true' : 'false');
   TOP.muteBtn.replaceChildren(...pill.kids);
+  TOP.bar.classList.toggle('has-mute-open', Boolean(UI.muteMenu));
 
   const busySig = [...UI.busy]
     .filter((k) => k === 'mute' || k.startsWith('mute:') || k.startsWith('notify-test:'))
@@ -448,7 +529,17 @@ export function renderTop() {
     : 'closed';
   if (TOP.popKey !== popKey) {
     TOP.popKey = popKey;
-    if (UI.muteMenu) TOP.mutePopSlot.replaceChildren(buildMutePopover());
-    else TOP.mutePopSlot.replaceChildren();
+    if (UI.muteMenu) {
+      TOP.mutePopSlot.replaceChildren(
+        h('div', {
+          class: 'mute-backdrop',
+          'aria-hidden': 'true',
+          onclick: () => { UI.muteMenu = false; APP.rerender(); },
+        }),
+        buildMutePopover(),
+      );
+    } else {
+      TOP.mutePopSlot.replaceChildren();
+    }
   }
 }

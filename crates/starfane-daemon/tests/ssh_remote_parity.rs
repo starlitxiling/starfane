@@ -127,7 +127,8 @@ fn shared_env() -> &'static SharedTestEnv {
         for tool in [
             "sh", "bash", "ps", "stat", "date", "head", "tail", "cut", "tr", "sed", "awk",
             "sort", "ls", "wc", "mkdir", "chmod", "mv", "rm", "sleep", "cat", "gzip", "lsof",
-            "readlink", "env", "printf", "touch", "grep",
+            "readlink", "env", "printf", "touch", "grep", "base64", "mktemp", "dirname",
+            "basename",
         ] {
             if let Some(src) = find_system_tool(tool) {
                 let dst = no_sqlite_bin.join(tool);
@@ -216,6 +217,73 @@ if [ "$MODE" = "strip_sqlite3" ]; then
   export PATH="$RBIN:$NOSQL_BIN"
 else
   export PATH="$RBIN:$PATH"
+fi
+
+if [ "$1" = "/bin/sh -s" ]; then
+  FIFO="$(dirname "$LOG")/conduit.$$.fifo"
+  rm -f "$FIFO"
+  mkfifo "$FIFO"
+  /bin/sh -s <"$FIFO" &
+  SH_PID=$!
+  exec 8>"$FIFO"
+  rm -f "$FIFO"
+  trap 'exec 8>&- 2>/dev/null || true; kill -TERM "$SH_PID" 2>/dev/null || true; exit 0' INT TERM HUP
+  FIRST_LINE=1
+  while IFS= read -r _line; do
+    if [ "$FIRST_LINE" -eq 1 ]; then
+      FIRST_LINE=0
+      printf '%s\n' "$_line" >&8 || break
+      continue
+    fi
+    _op=${{_line%% *}}
+    if [ "$_op" = "PING" ] || [ "$_op" = "EXEC" ]; then
+      _cur_mode="normal"
+      if [ -f "$MODE_FILE" ]; then
+        _cur_mode=$(head -n 1 "$MODE_FILE" | tr -d '\r\n')
+      fi
+      printf '%s|%s\n' "$_op" "$ORIG_ARGS" >> "$LOG"
+      case "$_cur_mode" in
+        exit255_once)
+          printf 'normal\n' > "$MODE_FILE"
+          printf 'ControlSocket /tmp/stale.sock already exists, disabling multiplexing\nmux_client_request_session: session request failed: Broken pipe\n' >&2
+          exec 8>&- 2>/dev/null || true
+          kill -TERM "$SH_PID" 2>/dev/null || true
+          wait "$SH_PID" 2>/dev/null || true
+          exit 255
+          ;;
+        exit255_always)
+          printf 'ssh: connect to host dead.example: Connection refused\n' >&2
+          exec 8>&- 2>/dev/null || true
+          kill -TERM "$SH_PID" 2>/dev/null || true
+          wait "$SH_PID" 2>/dev/null || true
+          exit 255
+          ;;
+        hang)
+          sleep 30
+          exec 8>&- 2>/dev/null || true
+          kill -TERM "$SH_PID" 2>/dev/null || true
+          wait "$SH_PID" 2>/dev/null || true
+          exit 255
+          ;;
+        delay_150ms)
+          sleep 0.15
+          ;;
+        strip_sqlite3)
+          if [ "$MODE" != "strip_sqlite3" ]; then
+            printf 'mux_client_request_session: session request failed: Broken pipe\n' >&2
+            exec 8>&- 2>/dev/null || true
+            kill -TERM "$SH_PID" 2>/dev/null || true
+            wait "$SH_PID" 2>/dev/null || true
+            exit 255
+          fi
+          ;;
+      esac
+    fi
+    printf '%s\n' "$_line" >&8 || break
+  done
+  exec 8>&- 2>/dev/null || true
+  wait "$SH_PID"
+  exit $?
 fi
 
 exec /bin/sh -c "$1"
@@ -325,6 +393,15 @@ impl FakeSshHost {
         self.call_lines()
             .iter()
             .filter(|l| l.starts_with("CMD|"))
+            .count()
+    }
+
+    fn exec_call_count(&self) -> usize {
+        self.call_lines()
+            .iter()
+            .filter(|l| {
+                l.starts_with("EXEC|") || (l.starts_with("CMD|") && !l.contains("/bin/sh -s"))
+            })
             .count()
     }
 
@@ -530,13 +607,19 @@ async fn test_01_controlmaster_args_stale_socket_recovery_and_no_dispatch_retry(
     // 2. Stale ControlMaster socket (`exit255_once`) on idempotent `sync`:
     //    MUST clean up via `ssh -O exit` and transparently retry once -> succeeds!
     let cmds_before = remote.cmd_call_count();
+    let execs_before = remote.exec_call_count();
     let exits_before = remote.exit_call_count();
     remote.set_mode("exit255_once");
     core.sync_remote_host(&HostId::new("gpu-cm")).await;
     assert_eq!(
-        remote.cmd_call_count() - cmds_before,
+        remote.exec_call_count() - execs_before,
         2,
         "idempotent sync must perform exactly 1 retry after stale-mux exit 255"
+    );
+    assert_eq!(
+        remote.cmd_call_count() - cmds_before,
+        1,
+        "stale persistent conduit must respawn exactly 1 fresh ssh lane on retry"
     );
     assert_eq!(
         remote.exit_call_count() - exits_before,
@@ -559,6 +642,7 @@ async fn test_01_controlmaster_args_stale_socket_recovery_and_no_dispatch_retry(
         .find(|s| s.effective_host_id() == "gpu-cm")
         .expect("discovered remote claude session");
     let cmds_before_disp = remote.cmd_call_count();
+    let execs_before_disp = remote.exec_call_count();
     let exits_before_disp = remote.exit_call_count();
     remote.set_mode("exit255_once");
     let disp_res = core
@@ -577,9 +661,14 @@ async fn test_01_controlmaster_args_stale_socket_recovery_and_no_dispatch_retry(
         "mutating dispatch_interactive must return error on exit 255 without retrying"
     );
     assert_eq!(
-        remote.cmd_call_count() - cmds_before_disp,
+        remote.exec_call_count() - execs_before_disp,
         1,
-        "dispatch_interactive MUST NOT retry on exit 255 (1 CMD call only!)"
+        "dispatch_interactive MUST NOT retry on exit 255 (1 EXEC attempt only!)"
+    );
+    assert_eq!(
+        remote.cmd_call_count() - cmds_before_disp,
+        0,
+        "dispatch_interactive MUST NOT respawn a new ssh lane to retry"
     );
     assert_eq!(
         remote.exit_call_count() - exits_before_disp,
@@ -1138,6 +1227,7 @@ async fn test_04_incremental_mirror_cold_tail_zero_rtt_gzip_delta_backfill_and_m
 
     // 2. First HTTP transcript read + unchanged repeat poll -> 0 new SSH calls!
     let cmds_before_poll = remote.cmd_call_count();
+    let execs_before_poll = remote.exec_call_count();
     let (st1, r1) = http_json(
         addr,
         "GET",
@@ -1176,11 +1266,16 @@ async fn test_04_incremental_mirror_cold_tail_zero_rtt_gzip_delta_backfill_and_m
     assert_eq!(
         remote.cmd_call_count(),
         cmds_before_poll,
-        "unchanged remote transcript poll must make 0 SSH calls"
+        "unchanged remote transcript poll must spawn 0 SSH processes"
+    );
+    assert_eq!(
+        remote.exec_call_count(),
+        execs_before_poll,
+        "unchanged remote transcript poll must make 0 conduit calls"
     );
 
-    // 3. Append ~24 KiB (>= 16 KiB GZIP_COMPRESS_THRESHOLD) to remote JSONL, sync, and verify
-    //    delta arrives cleanly with updated turns & `synced_offset` advancing by exact appended bytes!
+    // 3. Append ~24 KiB (<= 64 KiB inline hot delta threshold) to remote JSONL, sync, and verify
+    //    delta arrives inline in 1 single v3 discovery RTT (0 extra SSH round-trips, 0 new spawns)!
     let mut delta_chunk = String::with_capacity(28_000);
     let delta_pad = "z".repeat(1_800);
     for j in 0..6 {
@@ -1201,12 +1296,18 @@ async fn test_04_incremental_mirror_cold_tail_zero_rtt_gzip_delta_backfill_and_m
     }
     let expected_total_bytes = (big_jsonl.len() + delta_chunk.len()) as u64;
     let cmds_before_delta = remote.cmd_call_count();
+    let execs_before_delta = remote.exec_call_count();
     core.sync_remote_host(&HostId::new("remote-big")).await;
-    // 1 compound discovery RTT + 1 GZ1 delta mirror RTT = 2 SSH calls total!
+    // v2 persistent conduit + v3 inline hot delta: 0 new SSH spawns & 1 single discovery EXEC RTT!
     assert_eq!(
-        remote.cmd_call_count() - cmds_before_delta,
-        2,
-        "sync + delta append must take exactly 2 SSH RTTs (1 discover + 1 GZ1 delta)"
+        remote.cmd_call_count(),
+        cmds_before_delta,
+        "persistent conduit must reuse existing SSH lane (0 new ssh spawns)"
+    );
+    assert_eq!(
+        remote.exec_call_count() - execs_before_delta,
+        1,
+        "sync + <=64KiB delta append must take 1 single v3 discover RTT with inline hot delta"
     );
     let meta_after_delta: Value =
         serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
@@ -1237,8 +1338,9 @@ async fn test_04_incremental_mirror_cold_tail_zero_rtt_gzip_delta_backfill_and_m
     );
 
     // 4. Request `?before=10&limit=60` (reaches start of tail window) -> triggers 1-RTT prefix
-    //    backfill (`base_offset == 0`) AND `?all=1` exposes turn-u-0 from byte 0!
+    //    backfill (`base_offset == 0`) over persistent conduit AND `?all=1` exposes turn-u-0 from byte 0!
     let cmds_before_bf = remote.cmd_call_count();
+    let execs_before_bf = remote.exec_call_count();
     let (st_bf, r_bf) = http_json(
         addr,
         "GET",
@@ -1249,15 +1351,21 @@ async fn test_04_incremental_mirror_cold_tail_zero_rtt_gzip_delta_backfill_and_m
     .await;
     assert_eq!(st_bf, 200, "{r_bf}");
     assert_eq!(
-        remote.cmd_call_count() - cmds_before_bf,
+        remote.cmd_call_count(),
+        cmds_before_bf,
+        "prefix backfill must reuse persistent conduit (0 new ssh spawns)"
+    );
+    assert_eq!(
+        remote.exec_call_count() - execs_before_bf,
         1,
-        "prefix backfill on upward paging must take 1 SSH RTT"
+        "prefix backfill on upward paging must take 1 conduit RTT"
     );
     let meta_after_bf: Value =
         serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
     assert_eq!(meta_after_bf["base_offset"].as_u64(), Some(0));
 
     let cmds_before_all = remote.cmd_call_count();
+    let execs_before_all = remote.exec_call_count();
     let (st_all, r_all) = http_json(
         addr,
         "GET",
@@ -1270,6 +1378,11 @@ async fn test_04_incremental_mirror_cold_tail_zero_rtt_gzip_delta_backfill_and_m
     assert_eq!(
         remote.cmd_call_count(),
         cmds_before_all,
+        "`?all=1` after backfill must spawn 0 SSH processes"
+    );
+    assert_eq!(
+        remote.exec_call_count(),
+        execs_before_all,
         "`?all=1` after backfill must hit 0-RTT local mirror"
     );
     let all_msgs = r_all["data"]["messages"].as_array().unwrap();
@@ -1650,8 +1763,9 @@ async fn test_07_single_rtt_compound_dispatch_copy_mode_and_stuck_retry() {
     );
     core.sync_remote_host(&HostId::new("remote-d")).await;
 
-    // Part A: copy-mode auto-cancel + paste + Enter completes in EXACTLY 1 `fake-ssh` call!
-    let calls_a = remote.cmd_call_count();
+    // Part A: copy-mode auto-cancel + paste + Enter completes in EXACTLY 1 conduit RTT (0 new ssh spawns)!
+    let cmds_a = remote.cmd_call_count();
+    let calls_a = remote.exec_call_count();
     let rep_a = core
         .handle(DaemonCommand::Dispatch {
             target: DispatchTarget::Session {
@@ -1673,9 +1787,14 @@ async fn test_07_single_rtt_compound_dispatch_copy_mode_and_stuck_retry() {
         "{rep_a}"
     );
     assert_eq!(
-        remote.cmd_call_count() - calls_a,
+        remote.cmd_call_count(),
+        cmds_a,
+        "dispatch must reuse persistent interactive conduit (0 new ssh spawns)"
+    );
+    assert_eq!(
+        remote.exec_call_count() - calls_a,
         1,
-        "copy-mode cancel + paste + submit must execute in 1 single SSH RTT"
+        "copy-mode cancel + paste + submit must execute in 1 single conduit RTT"
     );
     tokio::time::sleep(Duration::from_millis(120)).await;
     let got_a = std::fs::read_to_string(&rec_a).unwrap_or_default();
@@ -1684,8 +1803,9 @@ async fn test_07_single_rtt_compound_dispatch_copy_mode_and_stuck_retry() {
         "remote pane did not receive text: {got_a:?}"
     );
 
-    // Part B: First C-m swallowed -> automatic retry C-m submits cleanly (`retry_confirmed`, 2 RTTs)!
-    let calls_b = remote.cmd_call_count();
+    // Part B: First C-m swallowed -> automatic retry C-m submits cleanly (`retry_confirmed`, 2 conduit RTTs)!
+    let cmds_b = remote.cmd_call_count();
+    let calls_b = remote.exec_call_count();
     let rep_b = core
         .handle(DaemonCommand::Dispatch {
             target: DispatchTarget::Session {
@@ -1706,14 +1826,16 @@ async fn test_07_single_rtt_compound_dispatch_copy_mode_and_stuck_retry() {
             .contains("retry_confirmed"),
         "expected retry_confirmed ack: {rep_b}"
     );
+    assert_eq!(remote.cmd_call_count(), cmds_b);
     assert_eq!(
-        remote.cmd_call_count() - calls_b,
+        remote.exec_call_count() - calls_b,
         2,
-        "1 compound dispatch + 1 C-m retry = 2 SSH RTTs"
+        "1 compound dispatch + 1 C-m retry = 2 conduit RTTs"
     );
 
     // Part C: Persistently stuck prompt -> 2 bounded retries -> `Unconfirmed { ack: "stuck_in_prompt" }`!
-    let calls_c = remote.cmd_call_count();
+    let cmds_c = remote.cmd_call_count();
+    let calls_c = remote.exec_call_count();
     let rep_c = core
         .handle(DaemonCommand::Dispatch {
             target: DispatchTarget::Session {
@@ -1728,10 +1850,11 @@ async fn test_07_single_rtt_compound_dispatch_copy_mode_and_stuck_retry() {
         .unwrap();
     assert_eq!(rep_c["status"], "unconfirmed", "{rep_c}");
     assert_eq!(rep_c["ack"], "stuck_in_prompt", "{rep_c}");
+    assert_eq!(remote.cmd_call_count(), cmds_c);
     assert_eq!(
-        remote.cmd_call_count() - calls_c,
+        remote.exec_call_count() - calls_c,
         3,
-        "1 compound dispatch + 2 bounded C-m retries = 3 SSH RTTs"
+        "1 compound dispatch + 2 bounded C-m retries = 3 conduit RTTs"
     );
 }
 
@@ -1839,8 +1962,22 @@ async fn test_08_independent_circuit_breaker_hung_host_isolation_and_probe_auth(
         .unwrap();
     assert_eq!(fast_rec.status, HostStatus::Online);
     assert!(
-        fast_rec.rtt_ms.is_some_and(|ms| ms >= 100),
-        "delay_150ms should populate EWMA rtt_ms: {fast_rec:?}"
+        fast_rec.sync_ms.is_some_and(|ms| ms >= 100),
+        "delay_150ms discovery should populate sync_ms >= 100ms: {fast_rec:?}"
+    );
+    // Explicit probe forces a pure-transport `PING` under `delay_150ms`, updating EWMA `rtt_ms`.
+    let (st_fp, r_fp) = http_json(
+        addr,
+        "POST",
+        "/api/hosts/host-fast/probe",
+        Some("admin-secret-tok"),
+        Some(&json!({})),
+    )
+    .await;
+    assert_eq!(st_fp, 200, "{r_fp}");
+    assert!(
+        r_fp["data"]["rtt_ms"].as_u64().is_some_and(|ms| ms >= 25),
+        "delay_150ms probe should raise pure-transport EWMA rtt_ms: {r_fp}"
     );
     hung_task.abort();
     let _ = hung_task.await;

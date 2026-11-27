@@ -179,6 +179,16 @@ export function tpsOf(m) {
   return m.tps;
 }
 
+export function ttftOf(m) {
+  if (!m || !isFin(m.ttft_ms) || m.ttft_ms <= 0) return null;
+  return m.ttft_ms;
+}
+
+export function ttftTone(ms) {
+  if (!isFin(ms) || ms <= 0) return 'ok';
+  return ms < 3000 ? 'fast' : ms <= 12000 ? 'ok' : 'slow';
+}
+
 export function ctxTone(p) {
   if (p == null) return 'ok';
   if (p > 85) return 'high';
@@ -188,9 +198,10 @@ export function ctxTone(p) {
 
 export function metricsSrcLabel(src) {
   return {
+    agy_db: L('AGY 会话库 (原生)', 'AGY native DB'),
+    transcript: L('对话日志 (原生)', 'Native transcript'),
+    status_line: L('终端状态栏', 'Terminal status line'),
     cc_switch: L('cc-switch 代理日志', 'cc-switch proxy log'),
-    transcript: L('对话日志 (transcript)', 'Transcript log'),
-    status_line: L('终端状态栏 (status_line)', 'Terminal status_line'),
     none: L('暂无数据源', 'No telemetry source'),
   }[src] || src || L('未知', 'Unknown');
 }
@@ -210,11 +221,12 @@ export function buildTelemetryStrip(s) {
   const m = s?.metrics;
   const pctVal = ctxPctOf(m);
   const tpsVal = tpsOf(m);
+  const ttftVal = ttftOf(m);
   const tone = ctxTone(pctVal);
   const hasUsed = isFin(m?.context_used_tokens);
   const hasWin = isFin(m?.context_window_tokens) && m.context_window_tokens > 0;
   const hasCtx = pctVal != null || hasUsed;
-  if (!hasCtx && tpsVal == null) {
+  if (!hasCtx && tpsVal == null && ttftVal == null) {
     return h('div', { class: 'ws-telemetry', 'data-tel-sid': s?.session_id || '' },
       span('ws-tel-empty', L('遥测待采集', 'Telemetry pending')));
   }
@@ -228,17 +240,33 @@ export function buildTelemetryStrip(s) {
     ctxTipParts.push(L(`累计输入 ${fmtTokens(m?.total_input_tokens)} · 输出 ${fmtTokens(m?.total_output_tokens)}`, `Total in ${fmtTokens(m?.total_input_tokens)} · out ${fmtTokens(m?.total_output_tokens)}`));
   }
   const tpsTipParts = [];
-  if (isFin(m?.ttft_ms)) tpsTipParts.push(L(`首字延迟 TTFT：${fmtMs(m.ttft_ms)}`, `TTFT: ${fmtMs(m.ttft_ms)}`));
+  if (ttftVal != null) tpsTipParts.push(L(`首字延迟 TTFT：${fmtMs(ttftVal)}`, `TTFT: ${fmtMs(ttftVal)}`));
   if (isFin(m?.last_output_tokens) && isFin(m?.last_duration_ms)) {
     tpsTipParts.push(L(`最近回合：${fmtTokens(m.last_output_tokens)} tok / ${fmtMs(m.last_duration_ms)}`, `Last turn: ${fmtTokens(m.last_output_tokens)} tok / ${fmtMs(m.last_duration_ms)}`));
   }
   if (m?.source && m.source !== 'none') tpsTipParts.push(`${L('来源：', 'Source: ')}${metricsSrcLabel(m.source)}`);
+  const ttftTipParts = [];
+  if (ttftVal != null) {
+    const turnCnt = Array.isArray(m?.recent_turns) ? m.recent_turns.length : 0;
+    ttftTipParts.push(L(`最近首字延迟：${fmtMs(ttftVal)}`, `Latest TTFT: ${fmtMs(ttftVal)}`));
+    if (isFin(m?.avg_ttft_ms) && m.avg_ttft_ms > 0) {
+      ttftTipParts.push(L(`平均首字延迟：${fmtMs(m.avg_ttft_ms)}`, `Average TTFT: ${fmtMs(m.avg_ttft_ms)}`));
+    }
+    ttftTipParts.push(L(`已记录回合：${turnCnt}`, `Recorded turns: ${turnCnt}`));
+    if (m?.source && m.source !== 'none') ttftTipParts.push(`${L('来源：', 'Source: ')}${metricsSrcLabel(m.source)}`);
+  }
   const ctxCls = tone === 'high' ? ' ws-tel-high' : tone === 'warn' ? ' ws-tel-warn' : '';
+  const ttftCls = ttftVal != null ? (() => {
+    const t = ttftTone(ttftVal);
+    return t === 'fast' ? ' ttft-fast' : t === 'slow' ? ' ttft-slow' : '';
+  })() : '';
   return h('div', { class: 'ws-telemetry', 'data-tel-sid': s?.session_id || '' },
     hasCtx ? h('span', { class: `ws-tel-pill${ctxCls}`, title: ctxTipParts.join(' | ') || L('上下文容量', 'Context window') },
       ctxText, pctVal != null ? ctxBar(pctVal, false) : null) : null,
     tpsVal != null ? h('span', { class: 'ws-tel-pill', title: tpsTipParts.join(' | ') || L('输出速度', 'Output speed') },
-      `${tpsVal.toFixed(1)} tok/s`) : null);
+      `${tpsVal.toFixed(1)} tok/s`) : null,
+    ttftVal != null ? h('span', { class: `ws-tel-pill${ttftCls}`, title: ttftTipParts.join(' | ') || L('首字延迟', 'Time to first token') },
+      L(`首字 ${fmtMs(ttftVal)}`, `TTFT ${fmtMs(ttftVal)}`)) : null);
 }
 
 export function errText(e) {

@@ -1,11 +1,12 @@
-//! tmux inspection, focus detection, 7-point injection gate, and L4 interactive spawn.
+//! tmux inspection, focus detection, 7-point injection gate, L4 interactive spawn,
+//! and FD-isolated persistent SSH conduits.
 //!
-//! Std-only (plus `starfane-proto` / `serde`): every tmux call is a synchronous child process
-//! with a hard timeout. Pure decision logic ([`check_injection_gate`], [`is_user_watching`],
-//! [`resolve_pane`], [`validate_pointer_text`]) is separated from process I/O so it can be
-//! matrix-tested without a tmux server.
+//! Pure decision logic ([`check_injection_gate`], [`is_user_watching`], [`resolve_pane`],
+//! [`validate_pointer_text`]) is separated from process I/O so it can be matrix-tested without
+//! a tmux server.
 
 mod backup;
+mod conduit;
 mod discover;
 mod error;
 mod exec;
@@ -20,6 +21,10 @@ pub use backup::{
     save_snapshot_to_dir, shell_single_quote, validate_resume_id, BackupSaveOutcome, PaneAgentHint,
     RestoreOptions, RestoreReport, ResumedAgentInfo, SavedPane, SavedSession, SavedWindow,
     SnapshotSummary, TmuxBackupSnapshot, BACKUP_VERSION,
+};
+pub use conduit::{
+    ConduitLane, ConduitMeta, PersistentSshConduit, RemoteStatMode, SshConduitPool,
+    CONDUIT_FALLBACK_COOLDOWN, CONDUIT_HANDSHAKE_FAILURE_THRESHOLD,
 };
 pub use discover::{
     cap_page_bytes, capture_pane_tail, classify_panes, classify_panes_with,
@@ -45,7 +50,7 @@ pub use model::{
 };
 pub use mux::{
     is_tmux_pane_id, pane_mux_kind, parse_zellij_pane_id, qualify_host_pane, qualify_host_session,
-    split_host_prefix, GateProbe, MuxCapabilities, MuxKind, TerminalMux,
+    split_host_prefix, validate_interactive_key, GateProbe, MuxCapabilities, MuxKind, TerminalMux,
 };
 pub use resolve::{pid_ancestors, resolve_pane, PaneHint};
 pub use zellij::{
@@ -360,6 +365,74 @@ impl Tmux {
     pub fn submit_enter(&self, pane: &PaneId) -> Result<(), TmuxError> {
         valid_pane(pane)?;
         self.run(&["send-keys", "-t", pane.as_str(), "C-m"], None)?;
+        Ok(())
+    }
+
+    /// Send a single allowlisted interactive navigation/approval key to `pane`.
+    /// Validates the pane id and key against [`validate_interactive_key`], verifies the pane
+    /// exists and is alive, safely exits tmux `copy-mode`/`view-mode` if active, and delivers
+    /// the key via `tmux send-keys`.
+    pub fn send_key(&self, pane: &PaneId, key: &str) -> Result<(), TmuxError> {
+        valid_pane(pane)?;
+        let tmux_key = validate_interactive_key(key)?;
+        let state = self.run(
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "#{pane_dead}\t#{pane_in_mode}\t#{pane_mode}",
+            ],
+            None,
+        )?;
+        let trimmed = state.trim_end_matches(['\n', '\r']);
+        let parts = model::split_tmux_fields(trimmed);
+        if parts.first().is_some_and(|v| v.trim() == "1") {
+            return Err(TmuxError::Command {
+                args: format!("send-keys -t {}", pane.as_str()),
+                code: Some(1),
+                stderr: format!("pane {} is dead", pane.as_str()),
+            });
+        }
+        if parts.get(1).is_some_and(|v| v.trim() == "1") {
+            let mode = parts.get(2).copied().unwrap_or("").trim();
+            if !mode.is_empty() && !matches!(mode, "copy-mode" | "view-mode") {
+                return Err(TmuxError::Command {
+                    args: format!("send-keys -t {}", pane.as_str()),
+                    code: Some(1),
+                    stderr: format!("pane {} is in non-cancellable mode {mode:?}", pane.as_str()),
+                });
+            }
+            if let Err(e) = self.run(&["send-keys", "-t", pane.as_str(), "-X", "cancel"], None) {
+                let lower = e.to_string().to_ascii_lowercase();
+                if !lower.contains("not in a mode") {
+                    return Err(e);
+                }
+            }
+            thread::sleep(Duration::from_millis(30));
+            let after = self.run(
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane.as_str(),
+                    "#{pane_in_mode}",
+                ],
+                None,
+            )?;
+            if after.trim() != "0" {
+                return Err(TmuxError::Command {
+                    args: format!("send-keys -t {}", pane.as_str()),
+                    code: Some(1),
+                    stderr: format!("pane {} remained in copy-mode after cancel", pane.as_str()),
+                });
+            }
+        }
+        if tmux_key.len() == 1 {
+            self.run(&["send-keys", "-t", pane.as_str(), "-l", tmux_key], None)?;
+        } else {
+            self.run(&["send-keys", "-t", pane.as_str(), tmux_key], None)?;
+        }
         Ok(())
     }
 
@@ -812,6 +885,10 @@ impl TerminalMux for Tmux {
 
     fn submit_enter(&self, pane: &PaneId) -> Result<(), TmuxError> {
         Tmux::submit_enter(self, pane)
+    }
+
+    fn send_key(&self, pane: &PaneId, key: &str) -> Result<(), TmuxError> {
+        Tmux::send_key(self, pane, key)
     }
 
     fn spawn_window(&self, req: &SpawnWindow) -> Result<PaneId, TmuxError> {

@@ -2,16 +2,24 @@
 <html lang="zh-CN" data-lang="zh">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light">
+<meta name="theme-color" content="#FAF9F6">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="starfane">
 <title>starfane · 控制面</title>
 <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
+<link rel="apple-touch-icon" href="/assets/logo.svg">
+<link rel="manifest" href="/assets/manifest.webmanifest">
 <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
 <div id="app" class="app-shell">
   <header id="topbar" class="topbar"></header>
   <main id="view" class="view" aria-live="polite"></main>
+  <nav id="mobile-nav" class="mobile-nav"></nav>
 </div>
 <div id="drawer-root" class="drawer-root" aria-hidden="true"></div>
 <div id="toasts" class="toasts" role="status" aria-live="polite"></div>

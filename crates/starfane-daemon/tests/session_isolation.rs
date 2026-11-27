@@ -686,14 +686,21 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
     let self_pid = std::process::id();
     let pane_file = root.join("panes.txt");
     let tail_file = root.join("tail.txt");
-    // Even if tmux scrollback still shows yesterday's Codex status title `旧的 codex 会话`,
-    // a newly born Codex process (`self_pid`) MUST NOT attach yesterday's `1795488950` rollout!
+    let tail62_file = root.join("tail62.txt");
+    // 1. Even if tmux scrollback still shows yesterday's exited Codex status bar (`旧的 codex 会话`)
+    //    ABOVE a freshly launched blank Codex prompt, the new blank process MUST NOT attach
+    //    yesterday's `1795488950` rollout!
     std::fs::write(
         &tail_file,
-        "› Ask Codex to do anything\n  GPT-6.2-Sol xhigh · ~/.agent_session · 旧的 codex 会话\n",
+        "  GPT-6-Astra high · ~/.agent_session · 旧的 codex 会话\n❯ codex -m gpt-6.2-sol\n  >_ OpenAI Codex (v0.169.0)\n› Ask Codex to do anything\n  GPT-6.2-Sol xhigh · ~/.agent_session\n  ← for agents · ? for shortcuts\n",
     )
     .unwrap();
-    let mk_row = |pane: &str, pid: u32, cmd: &str, win: &str| {
+    std::fs::write(
+        &tail62_file,
+        "› Ask Codex to do anything\n  GPT-6.2-Sol xhigh · ~/.agent_session\n  ← for agents · ? for shortcuts\n",
+    )
+    .unwrap();
+    let mk_row = |pane: &str, pid: u32, cmd: &str, win: &str, hist: u32| {
         [
             pane,
             "agent-session",
@@ -713,6 +720,9 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
             "0",
             "0",
             win,
+            "",
+            &hist.to_string(),
+            "24",
         ]
         .join("\x1f")
     };
@@ -724,7 +734,8 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
                 "%61",
                 self_pid,
                 "codex -m gpt-6.2-sol -c model_reasoning_effort=\"xhigh\"",
-                "codex-1"
+                "codex-1",
+                10
             )
         ),
     )
@@ -734,8 +745,9 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
     write_executable(
         &fake_tmux,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"list-panes\" ]; then cat \"{}\"; exit 0; fi\nif [ \"$1\" = \"capture-pane\" ]; then cat \"{}\"; exit 0; fi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = \"list-panes\" ]; then cat \"{}\"; exit 0; fi\nif [ \"$1\" = \"capture-pane\" ]; then\n  for a in \"$@\"; do\n    if [ \"$a\" = \"%62\" ]; then cat \"{}\"; exit 0; fi\n  done\n  cat \"{}\"; exit 0\nfi\nexit 0\n",
             pane_file.display(),
+            tail62_file.display(),
             tail_file.display()
         ),
     );
@@ -754,7 +766,7 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
     .unwrap();
     core.set_home_dir_override(Some(home.clone()));
 
-    // 1. Pre-birth Codex thread with matching status title is rejected!
+    // 1a. Stale scrollback title above a blank live Codex prompt is rejected!
     core.sync_discovered_panes().await;
     let s1 = core
         .snapshot()
@@ -767,9 +779,72 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
     assert_eq!(s1.model.as_deref(), Some("gpt-6.2-sol"));
     assert_eq!(s1.effort.as_deref(), Some("xhigh"));
 
-    // 2. Insert a genuinely post-birth Codex thread (`created_at` & `updated_at` in future/now) ->
-    //    when TWO unresolved Codex panes share `~/.agent_session`, neither steals it; when ONE
-    //    unresolved pane is in `~/.agent_session`, it binds cleanly!
+    // 1b. Interactive TUI `/resume` displays the older thread's title on the ACTIVE bottom status bar
+    //     (`created_at < birth_ms`) -> resolves cleanly even when `%62` is a blank sibling in the SAME cwd!
+    std::fs::write(
+        &tail_file,
+        "› Ask Codex to do anything\n  GPT-6.2-Sol xhigh · ~/.agent_session · 旧的 codex 会话\n  ← for agents · ? for shortcuts\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &pane_file,
+        format!(
+            "{}\n{}\n",
+            mk_row("%61", self_pid, "codex -m gpt-6.2-sol", "codex-1", 20),
+            mk_row("%62", self_pid, "codex -m gpt-6.2-sol", "codex-2", 20)
+        ),
+    )
+    .unwrap();
+    core.sync_discovered_panes().await;
+    let snap_resumed = core.snapshot().sessions;
+    let r61 = snap_resumed
+        .iter()
+        .find(|s| s.session_id.as_str() == "tmux-%61")
+        .unwrap();
+    let r62 = snap_resumed
+        .iter()
+        .find(|s| s.session_id.as_str() == "tmux-%62")
+        .unwrap();
+    assert!(
+        r61.transcript_path
+            .as_deref()
+            .is_some_and(|p| p.contains("01a18088-9999-7820-9614-90298fe15a06")),
+        "explicit live status-bar title must resolve /resume thread even with sibling pane in same cwd: {r61:?}"
+    );
+    assert_eq!(
+        r62.transcript_path, None,
+        "blank sibling pane in same cwd must remain unbound: {r62:?}"
+    );
+
+    // 1c. Switching `%61` back to a blank `/new` prompt clears the stale title binding cleanly!
+    std::fs::write(
+        &tail_file,
+        "› Ask Codex to do anything\n  GPT-6.2-Sol xhigh · ~/.agent_session\n  ← for agents · ? for shortcuts\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &pane_file,
+        format!(
+            "{}\n{}\n",
+            mk_row("%61", self_pid, "codex -m gpt-6.2-sol", "codex-1", 30),
+            mk_row("%62", self_pid, "codex -m gpt-6.2-sol", "codex-2", 20)
+        ),
+    )
+    .unwrap();
+    core.sync_discovered_panes().await;
+    let r61_new = core
+        .snapshot()
+        .sessions
+        .into_iter()
+        .find(|s| s.session_id.as_str() == "tmux-%61")
+        .unwrap();
+    assert_eq!(
+        r61_new.transcript_path, None,
+        "switching to blank /new prompt must clear previous title binding"
+    );
+
+    // 2. Insert a new Codex thread -> when TWO Codex panes in the SAME cwd display the IDENTICAL
+    //    colliding status-bar title, neither steals it; when `%62` is closed (or blank), `%61` binds cleanly!
     let new_cx_id = "01b29999-aaaa-7820-9614-111122223333";
     let new_cx_tr = home
         .join(".codex/sessions/2026/11/25")
@@ -789,19 +864,18 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
             new_cx_tr.display()
         ),
     ));
-    std::fs::write(
-        &tail_file,
-        "› Ask Codex to do anything\n  GPT-6.2-Sol xhigh · ~/.agent_session · 全新的 codex 提问\n",
-    )
-    .unwrap();
+    let colliding_tail =
+        "› Ask Codex to do anything\n  GPT-6.2-Sol xhigh · ~/.agent_session · 全新的 codex 提问\n";
+    std::fs::write(&tail_file, colliding_tail).unwrap();
+    std::fs::write(&tail62_file, colliding_tail).unwrap();
 
-    // Two Codex panes (`%61` and `%62`) in same `cwd` -> ambiguous -> neither guesses!
+    // Two Codex panes (`%61` and `%62`) in same `cwd` with colliding status title -> ambiguous -> neither guesses!
     std::fs::write(
         &pane_file,
         format!(
             "{}\n{}\n",
-            mk_row("%61", self_pid, "codex -m gpt-6.2-sol", "codex-1"),
-            mk_row("%62", self_pid, "codex -m gpt-6.2-sol", "codex-2")
+            mk_row("%61", self_pid, "codex -m gpt-6.2-sol", "codex-1", 40),
+            mk_row("%62", self_pid, "codex -m gpt-6.2-sol", "codex-2", 40)
         ),
     )
     .unwrap();
@@ -815,7 +889,7 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
             .unwrap();
         assert_eq!(
             rec.transcript_path, None,
-            "ambiguous same-cwd panes must not guess"
+            "ambiguous same-cwd same-title panes must not guess"
         );
     }
 
@@ -824,7 +898,7 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
         &pane_file,
         format!(
             "{}\n",
-            mk_row("%61", self_pid, "codex -m gpt-6.2-sol", "codex-1")
+            mk_row("%61", self_pid, "codex -m gpt-6.2-sol", "codex-1", 50)
         ),
     )
     .unwrap();
@@ -855,7 +929,8 @@ async fn codex_title_collision_two_pane_ambiguity_and_same_pane_pid_restart_isol
                 "%61",
                 self_pid.saturating_add(77_777),
                 "codex -m gpt-5-codex -c model_reasoning_effort=\"low\"",
-                "codex-1"
+                "codex-1",
+                60
             )
         ),
     )
