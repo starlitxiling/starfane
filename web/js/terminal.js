@@ -423,6 +423,300 @@ export function extractInteractiveMenuSnippet(rawText, maxLines = 6) {
   return slice.map((l) => l.slice(minIndent)).join('\n').trim();
 }
 
+const QUESTION_CHAT_CHROME_GUARD_RE = /\?\s*for shortcuts\b|esc to interrupt\b|ctrl\+c to interrupt\b|ask codex to do anything/i;
+const STARTUP_MODAL_GUARD_RE = /do you trust the (?:files|contents) (?:in|of) this|trust this (?:folder|workspace|project|directory)|new mcp servers? found\b|update available\s*[·→]|yes,\s*i trust this folder/i;
+const WRITEIN_LABEL_RE = /^(?:write-in(?:\.{3}|…)?|type something\.?|type your own answer\b.*|other|custom(?:\.{3}|…)?|none of the above|自定义(?:输入|回答|选项)?)$/i;
+const RECOMMENDED_TAG_RE = /\(\s*recommended\s*\)|（\s*推荐\s*）/ig;
+
+function isQuestionFooterLine(trimmedLine) {
+  const fl = trimmedLine.toLowerCase();
+  const hasNavAction = fl.includes('navigate')
+    && ['submit', 'select', 'toggle', 'skip', 'cancel', 'confirm', 'next', 'prev', 'continue', 'switch', 'back']
+      .some((kw) => fl.includes(kw));
+  const hasSubmitModifier = [
+    'enter to submit', 'enter to select', 'enter to confirm', 'enter to continue',
+    'enter submit', 'enter confirm', 'enter continue',
+  ].some((kw) => fl.includes(kw)) && [
+    'tab', 'esc', 'cancel', 'skip', 'back', 'notes', 'unanswered',
+    'navigate', 'select', 'toggle', 'next', 'prev', '↑', '↓', 'up/down',
+  ].some((kw) => fl.includes(kw));
+  const hasToggle = (fl.includes('space to toggle') || fl.includes('space toggle'))
+    && ['enter', 'esc', 'navigate', '↑', '↓', 'cancel', 'submit', 'confirm', 'skip'].some((kw) => fl.includes(kw));
+  const hasWriteIn = (fl.includes('enter to submit') || fl.includes('enter submit'))
+    && (fl.includes('esc back') || fl.includes('esc to cancel') || fl.includes('esc cancel') || fl.includes('esc to go back'));
+  const hasCodexNotes = fl.includes('tab or esc to add notes')
+    || fl.includes('enter to submit answer')
+    || (fl.includes('unanswered') && fl.includes('enter') && fl.includes('submit'));
+  return hasNavAction || hasSubmitModifier || hasToggle || hasWriteIn || hasCodexNotes;
+}
+
+function joinWrappedText(prev, next) {
+  if (!prev) return next;
+  if (!next) return prev;
+  const last = prev[prev.length - 1];
+  const first = next[0];
+  const isCjk = (ch) => /[\u3000-\u9fff\uff00-\uffef]/.test(ch);
+  return isCjk(last) && isCjk(first) ? `${prev}${next}` : `${prev} ${next}`;
+}
+
+function parseQuestionTabsLine(trimmedLine) {
+  if (!/[☐☑]/.test(trimmedLine)) return null;
+  if (!(/[✔✓]/.test(trimmedLine) || (trimmedLine.match(/☐/g) || []).length >= 2)) return null;
+  const tabs = [];
+  const re = /([☐☑✔✓])\s*([^☐☑✔✓←→]+)/g;
+  let m;
+  while ((m = re.exec(trimmedLine)) !== null) {
+    const glyph = m[1];
+    const label = m[2].trim();
+    if (!label) continue;
+    tabs.push({
+      label,
+      done: glyph === '☑' || glyph === '✔' || glyph === '✓',
+      isSubmit: /^submit$/i.test(label) || /^提交$/.test(label),
+    });
+  }
+  return tabs.length >= 2 ? tabs : null;
+}
+
+/**
+ * Pure structured parser for interactive question / multi-choice / Write-in TUI prompts
+ * across AGY (`ask_question`), Claude Code (`AskUserQuestion`), and Codex CLI (`request_user_input`).
+ * Returns `null` when the terminal snippet is not an active question chooser.
+ */
+export function parseInteractivePrompt(rawText, agent = '') {
+  const normAgent = String(agent || '').toLowerCase();
+  if (!rawText || normAgent === 'shell') return null;
+
+  const clean = stripAnsi(rawText);
+  const nonEmpty = [];
+  for (const raw of clean.split('\n')) {
+    const unboxed = unboxLine(raw).replace(/\s+$/, '');
+    const trim = unboxed.trim();
+    if (!trim) continue;
+    const indent = unboxed.match(/^(\s*)/)[1].length;
+    nonEmpty.push({ raw: unboxed, trim, indent });
+  }
+  if (nonEmpty.length < 3) return null;
+
+  const win = nonEmpty.slice(-34);
+  const bottomStart = Math.max(0, win.length - 4);
+  const bottom4 = win.slice(bottomStart);
+  if (bottom4.some((l) => QUESTION_CHAT_CHROME_GUARD_RE.test(l.trim))) {
+    return null;
+  }
+
+  let footerRel = -1;
+  for (let i = bottom4.length - 1; i >= 0; i--) {
+    if (isQuestionFooterLine(bottom4[i].trim)) {
+      footerRel = i;
+      break;
+    }
+  }
+  if (footerRel < 0) return null;
+
+  const footerIdx = bottomStart + footerRel;
+  const footerText = win[footerIdx].trim;
+  const footerLower = footerText.toLowerCase();
+  const body = win.slice(0, footerIdx);
+  if (!body.length) return null;
+
+  const joinedBody = body.map((l) => l.trim).join('\n');
+  if (STARTUP_MODAL_GUARD_RE.test(joinedBody)) return null;
+
+  const isQuestionStepLine = (t) => /^(?:question|问题)\s*\d+\s*(?:\/|of)\s*\d+(?:\s*\([^)]*\))?(?:\s*[:：]\s*.*)?$/i.test(t);
+  const optStartRe = /^(\s*)([>❯›▸▶])?\s*([1-9])\.\s+(.*)$/;
+
+  // Walk bottom-up from the footer line to isolate ONLY the active bottom-most chooser block,
+  // preventing numbered markdown lists or agent reasoning higher up in scrollback from bleeding in.
+  let dialogStart = 0;
+  let seenOpt = false;
+  let seenOptOne = false;
+  for (let i = body.length - 1; i >= 0; i--) {
+    const t = body[i].trim;
+    if (PURE_BOX_RE.test(t)) {
+      dialogStart = i + 1;
+      break;
+    }
+    const om = body[i].raw.match(optStartRe);
+    if (om) {
+      const n = Number(om[3]);
+      if (seenOptOne || (seenOpt && n > 1 && i + 1 < body.length && /^\s*(?:question|问题)\b/i.test(body[i + 1].trim))) {
+        dialogStart = i + 1;
+        break;
+      }
+      seenOpt = true;
+      if (n === 1) seenOptOne = true;
+      continue;
+    }
+    if (seenOptOne && (/^\?\s+/.test(t) || /^[●▸]\s+/.test(t))) {
+      dialogStart = i + 1;
+      break;
+    }
+    if (isQuestionStepLine(t)) {
+      dialogStart = i;
+      break;
+    }
+    if (parseQuestionTabsLine(t)) {
+      dialogStart = i;
+      break;
+    }
+  }
+  const dialogBody = body.slice(dialogStart);
+
+  let stepCurrent = null;
+  let stepTotal = null;
+  let inlineTitle = '';
+  let tabs = [];
+  let hasQuestionBanner = false;
+  const preOptionTitleLines = [];
+  const options = [];
+  let foundCursor = false;
+  let hasAnyCheckbox = false;
+  let inWriteInCue = false;
+
+  for (let i = 0; i < dialogBody.length; i++) {
+    const line = dialogBody[i];
+    if (PURE_BOX_RE.test(line.trim)) continue;
+
+    if (!options.length) {
+      const parsedTabs = parseQuestionTabsLine(line.trim);
+      if (parsedTabs) {
+        tabs = parsedTabs;
+        hasQuestionBanner = true;
+        continue;
+      }
+      if (/^(?:question|问题)$/i.test(line.trim)) {
+        hasQuestionBanner = true;
+        continue;
+      }
+      const stepMatch = line.trim.match(/^(?:question|问题)\s*(\d+)\s*(?:\/|of)\s*(\d+)(?:\s*\([^)]*\))?(?:\s*[:：]\s*(.*))?$/i);
+      if (stepMatch) {
+        stepCurrent = Number(stepMatch[1]);
+        stepTotal = Number(stepMatch[2]);
+        hasQuestionBanner = true;
+        const rest = String(stepMatch[3] || '').trim();
+        if (rest) inlineTitle = rest;
+        continue;
+      }
+    }
+
+    const optMatch = line.raw.match(optStartRe);
+    if (optMatch) {
+      const optIndent = optMatch[1].length;
+      const cursor = Boolean(optMatch[2]);
+      const num = Number(optMatch[3]);
+      let rest = optMatch[4].trim();
+      let checked = false;
+      let rowCheckbox = false;
+
+      const cbMatch = rest.match(/^(?:\[( |x|X|✓|✔)\]|([☐☑]))\s*(.*)$/);
+      if (cbMatch) {
+        rowCheckbox = true;
+        hasAnyCheckbox = true;
+        const mark = cbMatch[1] || cbMatch[2] || '';
+        checked = mark === 'x' || mark === 'X' || mark === '✓' || mark === '✔' || mark === '☑';
+        rest = (cbMatch[3] || '').trim();
+      }
+
+      const recommended = RECOMMENDED_TAG_RE.test(rest);
+      const labelClean = rest.replace(RECOMMENDED_TAG_RE, '').replace(/\s{2,}/g, ' ').trim();
+      const isWriteIn = WRITEIN_LABEL_RE.test(labelClean) || /\bwrite-in(?:\.{3}|…)?$/i.test(labelClean);
+      let writeInTrigger = 'enter';
+      if (isWriteIn) {
+        if (/^none of the above$/i.test(labelClean) && footerLower.includes('tab')) {
+          writeInTrigger = 'tab';
+        } else if (/^type something\.?$/i.test(labelClean) && (normAgent === 'claude' || footerLower.includes('enter to select'))) {
+          writeInTrigger = 'direct';
+        }
+      }
+
+      if (cursor) foundCursor = true;
+      options.push({
+        index: options.length,
+        number: num,
+        indent: optIndent,
+        label: labelClean || rest,
+        description: '',
+        recommended,
+        checked,
+        rowCheckbox,
+        active: cursor,
+        isWriteIn,
+        writeInTrigger,
+      });
+      continue;
+    }
+
+    if (!options.length) {
+      const lt = line.trim;
+      const ll = lt.toLowerCase();
+      if (/^[>❯›]\s*/.test(lt) || ll.startsWith('write-in') || ll.startsWith('type something') || ll.startsWith('notes:') || ll.startsWith('your answer')) {
+        inWriteInCue = true;
+        continue;
+      }
+      if (/^(?:question|问题)$/i.test(lt)) {
+        hasQuestionBanner = true;
+        continue;
+      }
+      preOptionTitleLines.push(lt);
+    } else {
+      const prevOpt = options[options.length - 1];
+      if (line.indent >= prevOpt.indent + 3 && prevOpt.indent <= 4) {
+        prevOpt.description = joinWrappedText(prevOpt.description, line.trim);
+      } else if (line.indent >= prevOpt.indent + 2 && prevOpt.description) {
+        prevOpt.description = joinWrappedText(prevOpt.description, line.trim);
+      } else if (line.indent >= prevOpt.indent + 2 && !prevOpt.description && prevOpt.isWriteIn === false && prevOpt.label.length < 28 && !/[？?]$/.test(line.trim)) {
+        prevOpt.description = joinWrappedText(prevOpt.description, line.trim);
+      } else {
+        prevOpt.label = joinWrappedText(prevOpt.label, line.trim);
+      }
+    }
+  }
+
+  const footerHasToggle = /\bspace(?:\s+to)?\s+toggle\b/i.test(footerText);
+  const footerAllowsWriteIn = /(?:submit|confirm|select)/i.test(footerLower) && /(?:esc|back|cancel|notes)/i.test(footerLower);
+  const inWriteInMode = options.length === 0 && (hasQuestionBanner || stepCurrent != null) && inWriteInCue && footerAllowsWriteIn;
+
+  if (!inWriteInMode && (options.length < 2 || (!foundCursor && !hasAnyCheckbox))) {
+    return null;
+  }
+
+  const activeIdx = options.findIndex((o) => o.active);
+  const resolvedActive = activeIdx >= 0 ? activeIdx : 0;
+  const multiSelect = hasAnyCheckbox || footerHasToggle;
+  const title = inlineTitle || preOptionTitleLines.join(' ').trim() || L('请选择一个选项', 'Choose an option');
+
+  const inferredAgent = normAgent || (
+    tabs.length || footerLower.includes('enter to select')
+      ? 'claude'
+      : (footerLower.includes('tab or esc to add notes') || (stepCurrent != null && !inlineTitle && options.some((o) => !o.rowCheckbox))
+        ? 'codex'
+        : 'agy')
+  );
+
+  return {
+    kind: 'question',
+    agent: inferredAgent,
+    title,
+    stepCurrent,
+    stepTotal,
+    tabs,
+    multiSelect,
+    activeIndex: resolvedActive,
+    inWriteInMode,
+    options: options.map(({ indent: _indent, rowCheckbox: _rc, ...rest }) => rest),
+    actions: {
+      hasPrev: footerText.includes('←') || /\bprev\b|\bswitch\b|←\/→/i.test(footerLower),
+      hasNext: footerText.includes('→') || /\bnext\b|\bswitch\b|←\/→/i.test(footerLower),
+      hasToggle: footerHasToggle,
+      hasSubmit: /\b(?:enter|submit|confirm|select)\b/i.test(footerLower),
+      hasSkip: /\b(?:esc|skip|cancel|back)\b/i.test(footerLower),
+      hasTabNotes: /\btab\b/i.test(footerLower),
+    },
+    footerText,
+  };
+}
+
 export function cleanTerminalToMarkdown(raw, _agent) {
   const cleaned = formatTerminalText(raw);
   const lines = cleaned.split('\n').map((l) => l.replace(/\s+$/, ''));

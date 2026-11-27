@@ -8,8 +8,9 @@ use starfane_proto::{AgentKind, GateCheck, PaneId, PaneResolution, SessionState,
 use starfane_tmux::{
     adaptive_paste_settle_ms, check_injection_gate, check_injection_gate_with_screen,
     detect_blocking_startup_prompt, detect_codex_update_prompt, detect_folder_trust_prompt,
-    is_bare_slash_command, is_paste_stuck_in_prompt, is_user_watching, parse_client_line,
-    parse_clients, parse_pane_line, parse_panes, pid_ancestors, resolve_pane,
+    detect_interactive_question_prompt, is_bare_slash_command,
+    is_heuristic_interactive_prompt_reason, is_paste_stuck_in_prompt, is_user_watching,
+    parse_client_line, parse_clients, parse_pane_line, parse_panes, pid_ancestors, resolve_pane,
     validate_pointer_text, ClientInfo, GateConfig, PaneHint, PaneInfo, PaneStatus, SpawnWindow,
     Tmux, TmuxError, FIELD_SEP,
 };
@@ -2083,4 +2084,143 @@ fn kill_pane_closes_single_pane_window_and_preserves_sibling_split_pane() {
     assert_eq!(panes_after_split.len(), 1);
     assert_eq!(panes_after_split[0].pane_id, p_right);
     assert_eq!(sb.tmux.list_windows().unwrap().len(), 1);
+}
+
+#[test]
+fn detect_interactive_question_prompts_across_agy_claude_and_codex() {
+    // 1. Live AGY `ask_question` multi-select capture (with Write-in + esc to cancel status bar).
+    let agy_multi = "\
+Question
+────────────────────────────────────────────────────────────────────────────────
+
+Question 1/4: 希望支持哪些传输方式？
+
+> 1. [ ] (Recommended) Wi-Fi (PTP/IP) + USB-C 有线 (USB PTP) 双模
+  2. [x] 仅 Wi-Fi 无线传输（PTP/IP，无线替代 SnapBridge）
+  3. [ ] 仅 USB-C 有线直连（插线导图，速度最快）
+  4. [ ] 手机内置本地 FTP 服务端（适合 Z8/Z9/Z6III 等原生支持 FTP 的机身）
+  5. Write-in...
+
+  ↑/↓ Navigate · → Next · space Toggle · enter Submit · esc Skip
+esc to cancel                         auto · Orchestrator · Gemini 4 Neon · high
+";
+    assert_eq!(
+        detect_interactive_question_prompt(AgentKind::Agy, agy_multi),
+        Some("interactive question awaiting selection in AGY")
+    );
+    assert_eq!(
+        detect_blocking_startup_prompt(AgentKind::Agy, agy_multi),
+        Some("interactive question awaiting selection in AGY")
+    );
+    assert!(is_heuristic_interactive_prompt_reason(
+        detect_interactive_question_prompt(AgentKind::Agy, agy_multi)
+    ));
+
+    // 2. AGY active Write-in box mode.
+    let agy_writein = "\
+Question 1/4: 希望支持哪些传输方式？
+
+Write-in:
+> 优先 Wi-Fi + USB 备份
+
+  enter Submit · esc Back
+";
+    assert_eq!(
+        detect_interactive_question_prompt(AgentKind::Agy, agy_writein),
+        Some("interactive question awaiting selection in AGY")
+    );
+
+    // 3. Claude Code `AskUserQuestion` single-select and multi-select with tab strip + ANSI colors.
+    let claude_single = "\
+\x1b[1mWhich auth method should the API use?\x1b[0m
+
+❯ 1. OAuth 2.0 (Recommended)
+     Standard delegated token flow
+  2. Session cookies
+  3. Type something.
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+";
+    assert_eq!(
+        detect_interactive_question_prompt(AgentKind::Claude, claude_single),
+        Some("interactive question awaiting selection in Claude")
+    );
+
+    let claude_multi_tabs = "\
+☐ Auth  ☐ Storage  ✔ Submit
+
+Select storage backends:
+❯ 1. [✓] PostgreSQL
+  2. [ ] SQLite
+  3. [ ] Type something.
+
+Space to toggle · ↑/↓ to navigate · Tab/←/→ switch · Enter to confirm · Esc to cancel
+";
+    assert_eq!(
+        detect_interactive_question_prompt(AgentKind::Claude, claude_multi_tabs),
+        Some("interactive question awaiting selection in Claude")
+    );
+
+    // 4. Codex CLI `request_user_input` including Codex's bottom `context left` status line.
+    let codex_q = "\
+Question 1/3
+Where should we run integration tests?
+
+› 1. Docker Compose (Recommended)
+  2. Local native binaries
+  3. None of the above
+
+tab or esc to add notes · enter to submit
+gpt-5.4 high · 88% context left · ~/Work/workflow
+";
+    assert_eq!(
+        detect_interactive_question_prompt(AgentKind::Codex, codex_q),
+        Some("interactive question awaiting selection in Codex")
+    );
+    assert!(is_heuristic_interactive_prompt_reason(
+        detect_interactive_question_prompt(AgentKind::Codex, codex_q)
+    ));
+
+    // 5. Negative guards: Shell pane, normal chat lists with active composer chrome, and scrolled-up old menus.
+    assert_eq!(
+        detect_interactive_question_prompt(AgentKind::Shell, agy_multi),
+        None
+    );
+
+    let normal_chat_with_numbered_list = "\
+Here are the options:
+> 1. [ ] Option A
+  2. [ ] Option B
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+────────────────────────────────────────
+› Ask Codex to do anything
+  ? for shortcuts · 91% context left
+";
+    assert_eq!(
+        detect_interactive_question_prompt(AgentKind::Codex, normal_chat_with_numbered_list),
+        None
+    );
+
+    let scrolled_up_old_question = "\
+Question 1/2: Pick one
+> 1. Option A
+  2. Option B
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+Done choosing Option A.
+Now editing crates/starfane-daemon/src/core/discover.rs
+Running cargo test
+Finished step 1
+Finished step 2
+Waiting for next prompt
+";
+    assert_eq!(
+        detect_interactive_question_prompt(AgentKind::Claude, scrolled_up_old_question),
+        None
+    );
+    assert!(!is_heuristic_interactive_prompt_reason(None));
+    assert!(!is_heuristic_interactive_prompt_reason(Some(
+        "hook reported permission timeout"
+    )));
 }

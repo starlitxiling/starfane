@@ -574,10 +574,15 @@ export async function loadTranscript(sessionId, { silent = false, limit, all = f
         }
         if (same) {
           const hadStale = Boolean(prev.staleErr);
+          const tailChanged = typeof data?.live_tail === 'string' && data.live_tail !== prev.live_tail;
           prev.updatedMs = now;
           prev.staleErr = null;
+          if (typeof data?.live_tail === 'string') {
+            prev.live_tail = liveTail;
+            prev.liveTailUpdatedMs = liveTailUpdatedMs;
+          }
           const optChanged = reconcileOptimisticTurns(sessionId, prev);
-          if (hadStale || optChanged) {
+          if (hadStale || optChanged || tailChanged) {
             if (!prefetch || isActive) APP.notifyOutputUpdated(sessionId);
           } else if (isActive) {
             APP.updateOutputClock(sessionId);
@@ -1152,29 +1157,47 @@ export async function renameHostApi(hostId, displayName) {
   }, (r) => L(`主机名称已更新为「${r?.display_name || displayName}」`, `Host renamed to "${r?.display_name || displayName}"`));
 }
 
-function keySentToastLabel(key) {
+function keySentToastLabel(key, keys = [], text = null) {
+  if (text) return L('已提交自定义回答', 'Submitted custom answer');
+  if (Array.isArray(keys) && keys.length > 1) {
+    const last = keys[keys.length - 1];
+    if (last === 'Space') return L('已切换选项勾选状态', 'Toggled option selection');
+    if (last === 'Enter') return L('已选中并提交选项', 'Selected and submitted option');
+  }
   return {
     Up: L('已发送 ↑ 上移按键', 'Sent ↑ Up key'),
     Down: L('已发送 ↓ 下移按键', 'Sent ↓ Down key'),
+    Left: L('已发送 ← 上一题', 'Sent ← Previous'),
+    Right: L('已发送 → 下一题', 'Sent → Next'),
+    Tab: L('已发送 Tab 切换', 'Sent Tab key'),
+    Space: L('已发送 Space 勾选', 'Sent Space toggle'),
+    Backspace: L('已发送 Backspace 退格', 'Sent Backspace key'),
     Enter: L('已发送 ↵ 确认 (Enter)', 'Sent ↵ Confirm (Enter)'),
     Escape: L('已发送 Esc 取消', 'Sent Esc Cancel'),
   }[key] || L(`已发送按键 ${key}`, `Sent key ${key}`);
 }
 
-export async function sendSessionKeyApi(sessionId, key) {
+export async function sendSessionKeysApi(sessionId, { keys = [], text = null, submitText = true, busyTag = '', toastLabel = '' } = {}) {
   const sid = String(sessionId || '').trim();
-  const k = String(key || '').trim();
-  if (!sid || !k) return undefined;
+  const cleanKeys = (Array.isArray(keys) ? keys : []).map((x) => String(x || '').trim()).filter(Boolean);
+  const cleanText = typeof text === 'string' && text.length ? text : null;
+  if (!sid || (!cleanKeys.length && !cleanText)) return undefined;
   const busyKey = `key:${sid}`;
-  const btnBusyKey = `key:${sid}:${k}`;
+  const btnBusyKey = busyTag ? `key:${sid}:${busyTag}` : (cleanKeys.length === 1 && !cleanText ? `key:${sid}:${cleanKeys[0]}` : '');
   if (UI.busy.has(busyKey)) return undefined;
   const initialPane = S.sessions.get(sid)?.pane || null;
   UI.busy.add(busyKey);
-  UI.busy.add(btnBusyKey);
+  if (btnBusyKey) UI.busy.add(btnBusyKey);
   APP.schedule();
   try {
-    const res = await api('POST', `/api/sessions/${enc(sid)}/key`, { key: k });
-    toast(keySentToastLabel(k), 'ok');
+    const payload = cleanKeys.length === 1 && !cleanText
+      ? { key: cleanKeys[0] }
+      : {
+        keys: cleanKeys,
+        ...(cleanText ? { text: cleanText, submit_text: submitText !== false } : {}),
+      };
+    const res = await api('POST', `/api/sessions/${enc(sid)}/key`, payload);
+    toast(toastLabel || keySentToastLabel(cleanKeys[0] || '', cleanKeys, cleanText), 'ok');
     const refreshAfterKey = () => {
       syncStateSilent();
       const latest = S.sessions.get(sid);
@@ -1184,8 +1207,8 @@ export async function sendSessionKeyApi(sessionId, key) {
         loadPreview(initialPane, { mode: pvModeOf(initialPane), silent: true, force: true });
       }
     };
-    setTimeout(refreshAfterKey, 180);
-    setTimeout(refreshAfterKey, 700);
+    setTimeout(refreshAfterKey, 140);
+    setTimeout(refreshAfterKey, 550);
     return res;
   } catch (e) {
     if (e instanceof ApiError && e.status === 403) {
@@ -1202,9 +1225,15 @@ export async function sendSessionKeyApi(sessionId, key) {
     return undefined;
   } finally {
     UI.busy.delete(busyKey);
-    UI.busy.delete(btnBusyKey);
+    if (btnBusyKey) UI.busy.delete(btnBusyKey);
     APP.schedule();
   }
+}
+
+export async function sendSessionKeyApi(sessionId, key) {
+  const k = String(key || '').trim();
+  if (!k) return undefined;
+  return sendSessionKeysApi(sessionId, { keys: [k], busyTag: k, toastLabel: keySentToastLabel(k) });
 }
 
 export async function closeSessionApi(sessionId, { isSplitPane = false } = {}) {

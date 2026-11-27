@@ -126,7 +126,7 @@ import {
   parseTerminalTurns,
   renderChunkedTerminal,
 } from './terminal.js';
-import { isInteractivePromptSession, promptPreviewSourceFor, renderInteractivePromptBar } from './views.js';
+import { interactivePromptStateFor, isInteractivePromptSession, renderInteractivePromptBar } from './views.js';
 
 export { renderInteractivePromptBar };
 
@@ -615,7 +615,8 @@ function syncOutlineRail(W, s, effectiveMode) {
 
 function syncInteractivePromptBar(W, s) {
   if (!W?.promptBarSlot) return;
-  if (!isInteractivePromptSession(s)) {
+  const pState = interactivePromptStateFor(s);
+  if (!pState.show) {
     if (W.promptBarSig || !W.promptBarSlot.classList.contains('ws-hidden')) {
       W.promptBarSig = '';
       W.promptBarSlot.classList.add('ws-hidden');
@@ -624,21 +625,39 @@ function syncInteractivePromptBar(W, s) {
     return;
   }
   const sid = s.session_id;
-  const pvSrc = promptPreviewSourceFor(s);
-  const busySig = [
-    UI.busy.has(`key:${sid}`) ? 1 : 0,
-    UI.busy.has(`key:${sid}:Up`) ? 1 : 0,
-    UI.busy.has(`key:${sid}:Down`) ? 1 : 0,
-    UI.busy.has(`key:${sid}:Enter`) ? 1 : 0,
-    UI.busy.has(`key:${sid}:Escape`) ? 1 : 0,
-  ].join('');
-  const sig = `${sid}|${s.state}|${s.pane || ''}|${hashStr(s.last_error || '')}|${pvSrc.hash}|${busySig}|${UI.termGlyphMode}:${effectiveGlyphMode()}|${getLang()}`;
+  const writeInOpen = Boolean(UI.promptWriteIn.get(sid)?.open);
+  const busySig = [...UI.busy]
+    .filter((k) => k === `key:${sid}` || k.startsWith(`key:${sid}:`))
+    .sort()
+    .join(',');
+  const sig = `${sid}|${s.state}|${s.pane || ''}|${hashStr(s.last_error || '')}|${pState.pvSrc.hash}|${busySig}|w:${writeInOpen ? 1 : 0}|${UI.termGlyphMode}:${effectiveGlyphMode()}|${getLang()}`;
   if (W.promptBarSig === sig && !W.promptBarSlot.classList.contains('ws-hidden')) return;
+
+  const prevDetails = W.promptBarSlot.querySelector('.prompt-raw-details');
+  const prevDetailsOpen = Boolean(prevDetails?.open);
+  const prevInput = W.promptBarSlot.querySelector('.prompt-writein-input');
+  const hadInputFocus = Boolean(prevInput && document.activeElement === prevInput);
+  const selStart = hadInputFocus ? prevInput.selectionStart : null;
+  const selEnd = hadInputFocus ? prevInput.selectionEnd : null;
+
   W.promptBarSig = sig;
-  const node = renderInteractivePromptBar(s, { variant: 'workspace' });
+  const node = renderInteractivePromptBar(s, { variant: 'workspace', autoFetchPreview: true });
   if (node) {
     W.promptBarSlot.classList.remove('ws-hidden');
     W.promptBarSlot.replaceChildren(node);
+    if (prevDetailsOpen) {
+      const nextDetails = W.promptBarSlot.querySelector('.prompt-raw-details');
+      if (nextDetails) nextDetails.open = true;
+    }
+    if (hadInputFocus) {
+      const nextInput = W.promptBarSlot.querySelector('.prompt-writein-input');
+      if (nextInput) {
+        nextInput.focus();
+        if (selStart != null && selEnd != null && typeof nextInput.setSelectionRange === 'function') {
+          try { nextInput.setSelectionRange(selStart, selEnd); } catch { /* ignore non-text selection error */ }
+        }
+      }
+    }
   } else {
     W.promptBarSlot.classList.add('ws-hidden');
     W.promptBarSlot.replaceChildren();
@@ -675,7 +694,7 @@ export function ackSessionError(s) {
 
 function sessionAlertBanner(s) {
   if (!s || (s.state !== 'error' && !s.last_error)) return null;
-  if (isInteractivePromptSession(s)) return null;
+  if (isInteractivePromptSession(s) || interactivePromptStateFor(s).parsed) return null;
   const detail = s.last_error || L('Agent 上报了错误状态，请查看下方终端实时行或事件记录。', 'Agent reported an error state — check the live terminal tail or recent events below.');
   return h('div', { class: 'callout err' },
     h('div', { class: 'stack-xs grow' },

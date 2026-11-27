@@ -39,12 +39,13 @@ use starfane_proto::{
 use starfane_tmux::{
     adaptive_paste_settle_ms, cap_page_bytes, classify_panes_with_git_lookup,
     detect_blocking_startup_prompt, detect_codex_update_prompt, detect_folder_trust_prompt,
-    is_paste_stuck_in_prompt, parse_panes, parse_zellij_pane_id, qualify_host_pane,
-    qualify_host_session, shell_single_quote, trim_and_cap_tail, validate_interactive_key,
-    validate_interactive_text, CaptureRequest, ClientInfo, ConduitLane, DiscoverOptions,
-    DiscoveredPane, ExecTransport, FocusOutcome, GateConfig, PaneInfo, PanePreview, PaneStatus,
-    SshConduitPool, SshExec, TerminalMux, Tmux, TmuxError, ZellijMux, MAX_CAPTURE_BYTES,
-    MAX_CAPTURE_LINES, MAX_FULL_CAPTURE_BYTES, MAX_FULL_CAPTURE_LINES,
+    detect_interactive_question_prompt, is_paste_stuck_in_prompt, parse_panes,
+    parse_zellij_pane_id, qualify_host_pane, qualify_host_session, shell_single_quote,
+    trim_and_cap_tail, validate_interactive_key, validate_interactive_text, CaptureRequest,
+    ClientInfo, ConduitLane, DiscoverOptions, DiscoveredPane, ExecTransport, FocusOutcome,
+    GateConfig, PaneInfo, PanePreview, PaneStatus, SshConduitPool, SshExec, TerminalMux, Tmux,
+    TmuxError, ZellijMux, MAX_CAPTURE_BYTES, MAX_CAPTURE_LINES, MAX_FULL_CAPTURE_BYTES,
+    MAX_FULL_CAPTURE_LINES,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -730,6 +731,34 @@ pub trait NodeProvider: Send + Sync {
             Err(ApiError::bad_request(
                 "remote host does not support interactive keys",
             ))
+        })
+    }
+
+    fn send_keys_and_text<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+        keys: &'a [String],
+        text: Option<&'a str>,
+        submit_text: bool,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        let _ = submit_text;
+        if text.is_some_and(|t| !t.is_empty()) {
+            return Box::pin(async {
+                Err(ApiError::bad_request(
+                    "remote host does not support interactive Write-in text",
+                ))
+            });
+        }
+        let keys_owned = keys.to_vec();
+        Box::pin(async move {
+            for (idx, k) in keys_owned.iter().enumerate() {
+                self.send_key(remote_session, local_pane, k).await?;
+                if idx + 1 < keys_owned.len() {
+                    tokio::time::sleep(Duration::from_millis(35)).await;
+                }
+            }
+            Ok(())
         })
     }
 }
@@ -1748,13 +1777,16 @@ fn apply_ssh_pane_tail_watch(
             last_error: None,
         });
 
-    if let Some(reason) = detect_folder_trust_prompt(agent, tail) {
+    let apply_prompt = |entry: &mut SshPaneWatch,
+                        target_state: SessionState,
+                        ev_kind: EventKind,
+                        native_event: &'static str,
+                        reason: &'static str| {
         entry.last_hash = h;
         entry.stable_ticks = 0;
-        let changed = entry.state != SessionState::NeedsPermission
-            || entry.last_error.as_deref() != Some(reason);
+        let changed = entry.state != target_state || entry.last_error.as_deref() != Some(reason);
         let ev = if changed {
-            entry.state = SessionState::NeedsPermission;
+            entry.state = target_state;
             entry.last_error = Some(reason.to_string());
             entry.state_since_ms = now_ms;
             entry.last_event_ms = now_ms;
@@ -1763,14 +1795,14 @@ fn apply_ssh_pane_tail_watch(
                 id: EventId::new(id::new_id(id::prefix::EVENT)),
                 ts_ms: now_ms,
                 agent,
-                kind: EventKind::NeedsPermission,
+                kind: ev_kind,
                 confidence: Confidence::Heuristic,
                 session_id: qualified_sid.clone(),
                 subagent_id: None,
                 pane: Some(qualified_pane.clone()),
                 cwd: cwd.map(str::to_string),
                 model: model.map(str::to_string),
-                native_event: "tmux_trust_prompt_heuristic".into(),
+                native_event: native_event.into(),
                 transcript_path: None,
                 bind_token: None,
                 detail: EventDetail {
@@ -1781,54 +1813,42 @@ fn apply_ssh_pane_tail_watch(
         } else {
             None
         };
-        return (
+        (
             entry.state,
             entry.state_since_ms,
             entry.last_event_ms,
             entry.last_error.clone(),
             ev,
+        )
+    };
+
+    if let Some(reason) = detect_folder_trust_prompt(agent, tail) {
+        return apply_prompt(
+            entry,
+            SessionState::NeedsPermission,
+            EventKind::NeedsPermission,
+            "tmux_trust_prompt_heuristic",
+            reason,
         );
     }
 
     if let Some(reason) = detect_codex_update_prompt(agent, tail) {
-        entry.last_hash = h;
-        entry.stable_ticks = 0;
-        let changed =
-            entry.state != SessionState::NeedsInput || entry.last_error.as_deref() != Some(reason);
-        let ev = if changed {
-            entry.state = SessionState::NeedsInput;
-            entry.last_error = Some(reason.to_string());
-            entry.state_since_ms = now_ms;
-            entry.last_event_ms = now_ms;
-            Some(NormalizedEvent {
-                v: PROTO_VERSION,
-                id: EventId::new(id::new_id(id::prefix::EVENT)),
-                ts_ms: now_ms,
-                agent,
-                kind: EventKind::NeedsInput,
-                confidence: Confidence::Heuristic,
-                session_id: qualified_sid.clone(),
-                subagent_id: None,
-                pane: Some(qualified_pane.clone()),
-                cwd: cwd.map(str::to_string),
-                model: model.map(str::to_string),
-                native_event: "tmux_startup_modal_heuristic".into(),
-                transcript_path: None,
-                bind_token: None,
-                detail: EventDetail {
-                    error: Some(reason.to_string()),
-                    ..EventDetail::default()
-                },
-            })
-        } else {
-            None
-        };
-        return (
-            entry.state,
-            entry.state_since_ms,
-            entry.last_event_ms,
-            entry.last_error.clone(),
-            ev,
+        return apply_prompt(
+            entry,
+            SessionState::NeedsInput,
+            EventKind::NeedsInput,
+            "tmux_startup_modal_heuristic",
+            reason,
+        );
+    }
+
+    if let Some(reason) = detect_interactive_question_prompt(agent, tail) {
+        return apply_prompt(
+            entry,
+            SessionState::NeedsInput,
+            EventKind::NeedsInput,
+            "tmux_question_prompt_heuristic",
+            reason,
         );
     }
 
@@ -3572,7 +3592,7 @@ if [ -n "$PANES_OUT" ]; then
       continue
     fi
     printf '__SF_TAIL_BEGIN__ %s\n' "$_p_id"
-    {tmux} capture-pane -p -t "$_p_id" -S -20 2>/dev/null || true
+    {tmux} capture-pane -p -t "$_p_id" -S -36 2>/dev/null || true
     printf '\n__SF_TAIL_END__ %s\n' "$_p_id"
   done <<__SF_PANES_EOF__
 $PANES_US
@@ -3818,7 +3838,7 @@ if [ $? -ne 0 ] || [ -z "$M" ]; then
 else
   printf '__SF_DIRTY_META__ %s\t%s\n' "$P" "$M"
   printf '__SF_TAIL_BEGIN__ %s\n' "$P"
-  {tmux} capture-pane -p -t "$P" -S -20 2>/dev/null || true
+  {tmux} capture-pane -p -t "$P" -S -36 2>/dev/null || true
   printf '\n__SF_TAIL_END__ %s\n' "$P"
 fi
 "##,
@@ -8230,14 +8250,93 @@ printf '%s\n' "$META"
 
     fn send_key<'a>(
         &'a self,
-        _remote_session: &'a SessionId,
+        remote_session: &'a SessionId,
         local_pane: &'a PaneId,
         key: &'a str,
     ) -> BoxFuture<'a, Result<(), ApiError>> {
+        let keys_owned = vec![key.to_string()];
+        Box::pin(async move {
+            self.send_keys_and_text(remote_session, local_pane, &keys_owned, None, false)
+                .await
+        })
+    }
+
+    fn send_keys_and_text<'a>(
+        &'a self,
+        _remote_session: &'a SessionId,
+        local_pane: &'a PaneId,
+        keys: &'a [String],
+        text: Option<&'a str>,
+        submit_text: bool,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        let keys_owned = keys.to_vec();
+        let text_owned = text
+            .map(|raw| raw.replace('\r', ""))
+            .filter(|t| !t.is_empty());
         Box::pin(async move {
             validate_tmux_pane_id(local_pane)?;
-            let tmux_key =
-                validate_interactive_key(key).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            if keys_owned.len() > 16 {
+                return Err(ApiError::bad_request(format!(
+                    "too many interactive keys in batch ({}); max is 16",
+                    keys_owned.len()
+                )));
+            }
+            if keys_owned.is_empty() && text_owned.is_none() {
+                return Err(ApiError::bad_request(
+                    "interactive key request requires at least one key or non-empty text",
+                ));
+            }
+            let mut key_cmds = String::new();
+            for (idx, k) in keys_owned.iter().enumerate() {
+                let tmux_key = validate_interactive_key(k)
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+                let send_args = if tmux_key.len() == 1 {
+                    format!("-l {}", shell_single_quote(tmux_key))
+                } else {
+                    shell_single_quote(tmux_key)
+                };
+                key_cmds.push_str(&format!(
+                    "SEND_ERR=$({tmux} send-keys -t \"$PANE\" {send_args} </dev/null 2>&1)\nif [ $? -ne 0 ]; then\n  printf 'STATUS:ERR:%s\\n' \"$SEND_ERR\"\n  exit 0\nfi\n",
+                    tmux = self.tmux_cmd_prefix(),
+                ));
+                if idx + 1 < keys_owned.len() {
+                    key_cmds.push_str("sleep 0.035 </dev/null 2>/dev/null || true\n");
+                }
+            }
+            if let Some(ref t) = text_owned {
+                validate_interactive_text(t).map_err(|e| ApiError::bad_request(e.to_string()))?;
+                if t.chars().count() > 2000 {
+                    return Err(ApiError::bad_request(
+                        "interactive Write-in text exceeds 2000 chars",
+                    ));
+                }
+                if !keys_owned.is_empty() {
+                    key_cmds.push_str("sleep 0.090 </dev/null 2>/dev/null || true\n");
+                }
+                let tmux = self.tmux_cmd_prefix();
+                key_cmds.push_str(&format!(
+                    r##"BUF="sf_k_$$_$(date +%s)"
+LOAD_ERR=$({tmux} load-buffer -b "$BUF" - 2>&1)
+if [ $? -ne 0 ]; then
+  printf 'STATUS:ERR:load-buffer: %s\n' "$LOAD_ERR"
+  exit 0
+fi
+PASTE_ERR=$({tmux} paste-buffer -d -p -b "$BUF" -t "$PANE" </dev/null 2>&1)
+if [ $? -ne 0 ]; then
+  {tmux} delete-buffer -b "$BUF" </dev/null 2>/dev/null || true
+  printf 'STATUS:ERR:%s\n' "$PASTE_ERR"
+  exit 0
+fi
+"##,
+                    tmux = tmux,
+                ));
+                if submit_text {
+                    key_cmds.push_str(&format!(
+                        "sleep 0.120 </dev/null 2>/dev/null || true\nSEND_ERR=$({tmux} send-keys -t \"$PANE\" C-m </dev/null 2>&1)\nif [ $? -ne 0 ]; then\n  printf 'STATUS:ERR:%s\\n' \"$SEND_ERR\"\n  exit 0\nfi\n",
+                        tmux = self.tmux_cmd_prefix(),
+                    ));
+                }
+            }
 
             let _permit = self
                 .interactive_sem
@@ -8248,13 +8347,8 @@ printf '%s\n' "$META"
 
             let tmux_cmd = self.tmux_cmd_prefix();
             let pane_q = shell_single_quote(local_pane.as_str());
-            let send_args = if tmux_key.len() == 1 {
-                format!("-l {}", shell_single_quote(tmux_key))
-            } else {
-                shell_single_quote(tmux_key)
-            };
-            // Single ~15ms RTT over persistent `ConduitLane::Interactive` (NEVER auto-retried
-            // on exit 255 / transport failure so a keystroke is never double-sent).
+            // Single RTT over persistent `ConduitLane::Interactive` (NEVER auto-retried
+            // on exit 255 / transport failure so a keystroke/paste is never double-sent).
             let script = format!(
                 r##"{bootstrap}
 SF_TAB=$(printf '\t')
@@ -8290,17 +8384,13 @@ if [ "$P_INMODE" = "1" ]; then
       ;;
   esac
 fi
-SEND_ERR=$({tmux} send-keys -t "$PANE" {send_args} </dev/null 2>&1)
-if [ $? -ne 0 ]; then
-  printf 'STATUS:ERR:%s\n' "$SEND_ERR"
-  exit 0
-fi
+{key_cmds}
 printf 'STATUS:OK\n'
 "##,
                 bootstrap = REMOTE_PATH_BOOTSTRAP,
                 pane_q = pane_q,
                 tmux = tmux_cmd,
-                send_args = send_args,
+                key_cmds = key_cmds,
             );
 
             let out = self
@@ -8308,7 +8398,7 @@ printf 'STATUS:OK\n'
                 .exec_bytes(
                     ConduitLane::Interactive,
                     &script,
-                    None,
+                    text_owned.as_deref().map(str::as_bytes),
                     self.transport.timeout(),
                 )
                 .await
@@ -8348,6 +8438,11 @@ printf 'STATUS:OK\n'
                 .find(|l| l.starts_with("STATUS:"))
                 .unwrap_or("");
             if status_line == "STATUS:OK" {
+                self.discovery
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .tail_cache
+                    .remove(local_pane);
                 Ok(())
             } else if let Some(msg) = status_line.strip_prefix("STATUS:MISSING:") {
                 Err(ApiError::new(
@@ -9362,16 +9457,62 @@ impl NodeProvider for PeerDaemonNodeProvider {
     fn send_key<'a>(
         &'a self,
         remote_session: &'a SessionId,
-        _local_pane: &'a PaneId,
+        local_pane: &'a PaneId,
         key: &'a str,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        let keys_owned = vec![key.to_string()];
+        Box::pin(async move {
+            self.send_keys_and_text(remote_session, local_pane, &keys_owned, None, false)
+                .await
+        })
+    }
+
+    fn send_keys_and_text<'a>(
+        &'a self,
+        remote_session: &'a SessionId,
+        _local_pane: &'a PaneId,
+        keys: &'a [String],
+        text: Option<&'a str>,
+        submit_text: bool,
     ) -> BoxFuture<'a, Result<(), ApiError>> {
         let encoded_sid = pct_encode(remote_session.as_str());
         let path = format!("/api/sessions/{encoded_sid}/key");
-        let key_owned = key.to_string();
+        let keys_owned = keys.to_vec();
+        let text_owned = text
+            .map(|raw| raw.replace('\r', ""))
+            .filter(|t| !t.is_empty());
         Box::pin(async move {
-            validate_interactive_key(&key_owned)
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            let body = serde_json::json!({ "key": key_owned });
+            if keys_owned.len() > 16 {
+                return Err(ApiError::bad_request(format!(
+                    "too many interactive keys in batch ({}); max is 16",
+                    keys_owned.len()
+                )));
+            }
+            if keys_owned.is_empty() && text_owned.is_none() {
+                return Err(ApiError::bad_request(
+                    "interactive key request requires at least one key or non-empty text",
+                ));
+            }
+            for k in &keys_owned {
+                validate_interactive_key(k).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            }
+            if let Some(ref t) = text_owned {
+                validate_interactive_text(t).map_err(|e| ApiError::bad_request(e.to_string()))?;
+                if t.chars().count() > 2000 {
+                    return Err(ApiError::bad_request(
+                        "interactive Write-in text exceeds 2000 chars",
+                    ));
+                }
+            }
+            let body = if keys_owned.len() == 1 && text_owned.is_none() {
+                serde_json::json!({ "key": keys_owned[0] })
+            } else {
+                serde_json::json!({
+                    "keys": keys_owned,
+                    "text": text_owned,
+                    "submit_text": submit_text,
+                })
+            };
             let _ = self
                 .request_json("POST", &path, Some(&body))
                 .await
@@ -10131,6 +10272,49 @@ CODEX_DB_SIG 1:1:1|0:0:0\n\
         );
         assert_eq!(st, SessionState::Idle);
         assert_eq!(ev.unwrap().kind, EventKind::TurnComplete);
+
+        // 4. Interactive multi-choice question prompt on remote SSH pane -> NeedsInput + recovers on completion.
+        let codex_q = "\
+Question 1/2
+Pick deployment mode?
+› 1. Docker Compose (Recommended)
+  2. Native
+tab or esc to add notes · enter to submit
+gpt-5.4 high · 90% context left · ~/repo
+";
+        let (st, _, _, err, ev) = apply_ssh_pane_tail_watch(
+            &mut watch,
+            &pane,
+            &qsid,
+            &qpane,
+            AgentKind::Codex,
+            Some("/home/u/repo"),
+            None,
+            codex_q,
+            SessionState::Idle,
+            16_000,
+        );
+        assert_eq!(st, SessionState::NeedsInput);
+        assert_eq!(
+            err.as_deref(),
+            Some("interactive question awaiting selection in Codex")
+        );
+        assert_eq!(ev.unwrap().kind, EventKind::NeedsInput);
+
+        let (st, _, _, err, _) = apply_ssh_pane_tail_watch(
+            &mut watch,
+            &pane,
+            &qsid,
+            &qpane,
+            AgentKind::Codex,
+            Some("/home/u/repo"),
+            None,
+            "Applying Docker Compose setup...\n› Ask Codex to do anything\n? for shortcuts\n",
+            SessionState::NeedsInput,
+            19_000,
+        );
+        assert_eq!(st, SessionState::Working);
+        assert_eq!(err, None);
     }
 
     #[test]

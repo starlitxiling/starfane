@@ -33,9 +33,10 @@ import {
   loadReviews,
   refreshReview,
   sendSessionKeyApi,
+  sendSessionKeysApi,
 } from './api.js';
 import { renderInlineMd, renderMarkdown } from './markdown.js';
-import { extractInteractiveMenuSnippet } from './terminal.js';
+import { extractInteractiveMenuSnippet, parseInteractivePrompt } from './terminal.js';
 import {
   APP,
   S,
@@ -113,11 +114,24 @@ export function promptPreviewSourceFor(s) {
   return { text: '', hash: '' };
 }
 
+export function interactivePromptStateFor(s) {
+  if (!s || s.is_subagent || s.state === 'ended' || s.state === 'suspended') {
+    return { show: false, pvSrc: { text: '', hash: '' }, parsed: null };
+  }
+  const pvSrc = promptPreviewSourceFor(s);
+  const parsed = pvSrc.text ? parseInteractivePrompt(pvSrc.text, s.agent) : null;
+  return {
+    show: isInteractivePromptSession(s) || Boolean(parsed),
+    pvSrc,
+    parsed,
+  };
+}
+
 export function renderInteractivePromptBar(s, opts = {}) {
-  if (!isInteractivePromptSession(s)) return null;
+  const { show, pvSrc, parsed } = interactivePromptStateFor(s);
+  if (!show) return null;
   const variant = opts.variant === 'inbox' ? 'inbox' : 'workspace';
   const sid = s.session_id;
-  const pvSrc = promptPreviewSourceFor(s);
   if (opts.autoFetchPreview && s.pane && !pvSrc.text) {
     const hid = hostOf(s);
     const offline = hid !== 'local' && S.hosts.get(hid)?.status === 'offline';
@@ -125,10 +139,244 @@ export function renderInteractivePromptBar(s, opts = {}) {
       loadPreview(s.pane, { mode: pvModeOf(s.pane), silent: true });
     }
   }
-  const snippet = pvSrc.text ? extractInteractiveMenuSnippet(pvSrc.text, variant === 'inbox' ? 6 : 5) : '';
+  const snippet = pvSrc.text ? extractInteractiveMenuSnippet(pvSrc.text, variant === 'inbox' ? 8 : 7) : '';
   const sessionBusy = UI.busy.has(`key:${sid}`);
-  const canSend = Boolean(s.pane && s.state !== 'ended');
+  const canSend = Boolean(s.pane && s.state !== 'ended' && s.state !== 'suspended');
   const reason = String(s.last_error || '').trim();
+
+  const makeKeyBtn = (spec) => {
+    const isSelfBusy = UI.busy.has(`key:${sid}:${spec.key}`);
+    return h('button', {
+      type: 'button',
+      class: `btn ${spec.cls}${isSelfBusy ? ' is-busy' : ''}`,
+      'data-prompt-key': spec.key,
+      'data-prompt-sid': sid,
+      disabled: !canSend || sessionBusy,
+      title: canSend ? spec.title : L('该会话未绑定终端 pane，无法发送交互按键', 'No terminal pane attached — cannot send interactive keys'),
+      'aria-label': spec.title,
+      onclick: () => sendSessionKeyApi(sid, spec.key),
+    }, spec.label);
+  };
+
+  if (parsed && parsed.kind === 'question') {
+    const writeInState = UI.promptWriteIn.get(sid);
+    const showWriteIn = Boolean(parsed.inWriteInMode || writeInState?.open);
+    const headerTitle = parsed.multiSelect
+      ? L('请勾选选项（可多选）', 'Select options (multi-select)')
+      : L('请选择一项回答', 'Choose an option');
+    const stepBadge = parsed.stepCurrent && parsed.stepTotal
+      ? span('tag prompt-choice-step mono', `${parsed.stepCurrent}/${parsed.stepTotal}`)
+      : null;
+    const modeBadge = span('tag prompt-choice-mode', parsed.multiSelect ? L('多选', 'Multi-select') : L('单选', 'Single-select'));
+
+    const tabsEl = parsed.tabs.length > 0
+      ? h('div', { class: 'prompt-choice-tabs', role: 'tablist', 'aria-label': L('问题步骤标签', 'Question tabs') },
+        parsed.tabs.map((tab) => h('span', {
+          class: `prompt-choice-tab${tab.done ? ' is-done' : ''}${tab.isSubmit ? ' is-submit' : ''}`,
+        }, `${tab.done ? '✓' : '☐'} ${tab.label}`)))
+      : null;
+
+    const optionsListEl = parsed.options.length > 0
+      ? h('div', {
+        class: 'prompt-choice-list',
+        role: parsed.multiSelect ? 'group' : 'radiogroup',
+        'aria-label': parsed.title,
+      }, parsed.options.map((opt) => {
+        const isOptBusy = UI.busy.has(`key:${sid}:opt:${opt.index}`);
+        const writeInOpenForOpt = opt.isWriteIn && showWriteIn;
+        const indicator = opt.isWriteIn
+          ? '✎'
+          : (parsed.multiSelect ? (opt.checked ? '✓' : '') : String(opt.number));
+        return h('button', {
+          type: 'button',
+          class: `prompt-choice-opt${opt.active ? ' is-active' : ''}${opt.checked ? ' is-checked' : ''}${opt.isWriteIn ? ' is-writein' : ''}${writeInOpenForOpt ? ' is-open' : ''}${isOptBusy ? ' is-busy' : ''}`,
+          'data-choice-idx': String(opt.index),
+          'data-prompt-sid': sid,
+          disabled: !canSend || sessionBusy,
+          ...(parsed.multiSelect
+            ? { 'aria-pressed': opt.checked ? 'true' : 'false' }
+            : { role: 'radio', 'aria-checked': opt.active ? 'true' : 'false' }),
+          onclick: () => {
+            if (opt.isWriteIn) {
+              const prev = UI.promptWriteIn.get(sid) || { open: false, text: '', optionIndex: opt.index };
+              const nextOpen = parsed.inWriteInMode ? true : !prev.open;
+              UI.promptWriteIn.set(sid, { open: nextOpen, text: prev.text || '', optionIndex: opt.index });
+              APP.schedule();
+              if (nextOpen && typeof requestAnimationFrame === 'function') {
+                requestAnimationFrame(() => {
+                  const inpEl = [...document.querySelectorAll('.prompt-writein-input')].find((el) => el.dataset.promptSid === sid);
+                  inpEl?.focus?.();
+                });
+              }
+              return;
+            }
+            const delta = opt.index - parsed.activeIndex;
+            const arrows = delta > 0 ? Array(delta).fill('Down') : Array(-delta).fill('Up');
+            const keys = parsed.multiSelect ? [...arrows, 'Space'] : [...arrows, 'Enter'];
+            const shortOpt = opt.label.length > 26 ? `${opt.label.slice(0, 26)}…` : opt.label;
+            sendSessionKeysApi(sid, {
+              keys,
+              busyTag: `opt:${opt.index}`,
+              toastLabel: parsed.multiSelect
+                ? (opt.checked ? L(`已取消：${shortOpt}`, `Unchecked: ${shortOpt}`) : L(`已勾选：${shortOpt}`, `Checked: ${shortOpt}`))
+                : L(`已选择：${shortOpt}`, `Selected: ${shortOpt}`),
+            });
+          },
+        },
+        h('span', { class: `prompt-choice-box${parsed.multiSelect && !opt.isWriteIn ? ' is-check' : ' is-radio'}` }, indicator),
+        h('span', { class: 'prompt-choice-main' },
+          h('span', { class: 'prompt-choice-label-row' },
+            h('span', { class: 'prompt-choice-label' }, opt.label),
+            opt.recommended ? span('tag prompt-rec-tag', L('推荐', 'Recommended')) : null),
+          opt.description ? h('span', { class: 'prompt-choice-desc' }, opt.description) : null),
+        opt.active ? span('prompt-choice-cur', L('当前行', 'Cursor')) : null);
+      }))
+      : null;
+
+    let writeInPanelEl = null;
+    if (showWriteIn) {
+      const wiInp = h('input', {
+        type: 'text',
+        class: 'inp sm prompt-writein-input',
+        'data-prompt-sid': sid,
+        value: writeInState?.text || '',
+        placeholder: L('输入自定义回答（支持中文），Enter 发送并提交…', 'Type your custom answer, press Enter to submit…'),
+        autocomplete: 'off',
+        disabled: !canSend || sessionBusy,
+      });
+      const submitWriteIn = () => {
+        const txt = String(UI.promptWriteIn.get(sid)?.text ?? wiInp.value ?? '').trim();
+        if (!txt) {
+          toast(L('请先输入自定义回答内容', 'Enter a custom answer first'), 'warn');
+          wiInp.focus();
+          return;
+        }
+        let keys = [];
+        if (!parsed.inWriteInMode) {
+          const fallbackOpt = parsed.options.find((o) => o.isWriteIn) || parsed.options[parsed.options.length - 1];
+          const targetOpt = (writeInState?.optionIndex != null ? parsed.options[writeInState.optionIndex] : null) || fallbackOpt;
+          if (targetOpt) {
+            const delta = targetOpt.index - parsed.activeIndex;
+            const arrows = delta > 0 ? Array(delta).fill('Down') : Array(-delta).fill('Up');
+            if (targetOpt.writeInTrigger === 'direct') keys = arrows;
+            else if (targetOpt.writeInTrigger === 'tab') keys = [...arrows, 'Tab'];
+            else keys = [...arrows, 'Enter'];
+          } else {
+            keys = ['Enter'];
+          }
+        }
+        sendSessionKeysApi(sid, {
+          keys,
+          text: txt,
+          submitText: true,
+          busyTag: 'writein',
+          toastLabel: L('已提交自定义回答', 'Submitted custom answer'),
+        }).then((r) => {
+          if (r) {
+            UI.promptWriteIn.delete(sid);
+            APP.schedule();
+          }
+        });
+      };
+      wiInp.addEventListener('input', () => {
+        const cur = UI.promptWriteIn.get(sid) || { open: true, text: '', optionIndex: writeInState?.optionIndex ?? null };
+        UI.promptWriteIn.set(sid, { ...cur, open: true, text: wiInp.value });
+      });
+      wiInp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.isComposing) {
+          e.preventDefault();
+          submitWriteIn();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          if (parsed.inWriteInMode) {
+            sendSessionKeyApi(sid, 'Escape');
+          } else {
+            UI.promptWriteIn.delete(sid);
+            APP.schedule();
+          }
+        }
+      });
+      writeInPanelEl = h('div', { class: 'prompt-writein-row' },
+        wiInp,
+        h('div', { class: 'prompt-writein-acts' },
+          h('button', {
+            type: 'button',
+            class: `btn primary sm prompt-writein-send${UI.busy.has(`key:${sid}:writein`) ? ' is-busy' : ''}`,
+            'data-prompt-sid': sid,
+            disabled: !canSend || sessionBusy,
+            onclick: submitWriteIn,
+          }, L('发送回答', 'Submit answer')),
+          h('button', {
+            type: 'button',
+            class: 'btn ghost sm prompt-writein-cancel',
+            disabled: sessionBusy,
+            onclick: () => {
+              if (parsed.inWriteInMode) sendSessionKeyApi(sid, 'Escape');
+              else {
+                UI.promptWriteIn.delete(sid);
+                APP.schedule();
+              }
+            },
+          }, parsed.inWriteInMode ? L('返回选项 (Esc)', 'Back (Esc)') : L('收起', 'Close'))));
+    }
+
+    const showPrevBtn = parsed.actions.hasPrev || (parsed.stepCurrent != null && parsed.stepCurrent > 1);
+    const showNextBtn = parsed.actions.hasNext || (parsed.stepCurrent != null && parsed.stepTotal != null && parsed.stepCurrent < parsed.stepTotal);
+    const footerEl = h('div', { class: 'prompt-choice-footer' },
+      (showPrevBtn || showNextBtn)
+        ? h('div', { class: 'prompt-choice-nav' },
+          showPrevBtn ? makeKeyBtn({ key: 'Left', label: L('← 上一题', '← Prev'), cls: 'sm prompt-action-btn', title: L('上一题（Left）', 'Previous question (Left)') }) : null,
+          showNextBtn ? makeKeyBtn({ key: 'Right', label: L('→ 下一题', '→ Next'), cls: 'sm prompt-action-btn', title: L('下一题（Right）', 'Next question (Right)') }) : null)
+        : null,
+      h('div', { class: 'prompt-choice-submit' },
+        makeKeyBtn({ key: 'Escape', label: L('跳过 / 取消', 'Skip / Cancel'), cls: 'sm prompt-action-btn is-cancel', title: L('发送 Esc 跳过或取消', 'Send Escape to skip or cancel') }),
+        makeKeyBtn({
+          key: 'Enter',
+          label: parsed.multiSelect ? L('提交已选 (Enter)', 'Submit selected (Enter)') : L('↵ 确认提交', '↵ Confirm (Enter)'),
+          cls: 'primary sm prompt-action-btn is-confirm',
+          title: L('发送 Enter 确认提交当前选择', 'Send Enter to submit current choice'),
+        })));
+
+    const rawFallbackSpecs = [
+      { key: 'Up', label: '↑', cls: 'xs prompt-action-btn', title: L('方向上键 (Up)', 'Up arrow') },
+      { key: 'Down', label: '↓', cls: 'xs prompt-action-btn', title: L('方向下键 (Down)', 'Down arrow') },
+      { key: 'Left', label: '←', cls: 'xs prompt-action-btn', title: L('方向左键 (Left)', 'Left arrow') },
+      { key: 'Right', label: '→', cls: 'xs prompt-action-btn', title: L('方向右键 (Right)', 'Right arrow') },
+      { key: 'Space', label: 'Space', cls: 'xs prompt-action-btn', title: L('空格切换勾选 (Space)', 'Space toggle') },
+      { key: 'Tab', label: 'Tab', cls: 'xs prompt-action-btn', title: L('Tab 键', 'Tab key') },
+      { key: 'Enter', label: 'Enter', cls: 'xs prompt-action-btn', title: L('回车确认 (Enter)', 'Enter') },
+      { key: 'Escape', label: 'Esc', cls: 'xs prompt-action-btn is-cancel', title: L('Esc 取消', 'Escape') },
+    ];
+    const rawPreviewEl = snippet
+      ? h('pre', { class: 'prompt-action-preview', 'aria-label': L('终端原始预览', 'Raw terminal preview') }, snippet)
+      : null;
+    const rawDetailsEl = h('details', { class: 'prompt-raw-details' },
+      h('summary', { class: 'prompt-raw-summary' }, L('终端按键与原始预览', 'Raw keys & terminal preview')),
+      h('div', { class: 'prompt-raw-body' },
+        h('div', { class: 'prompt-raw-keys' }, rawFallbackSpecs.map(makeKeyBtn)),
+        rawPreviewEl));
+
+    return h('div', {
+      class: `prompt-action-card prompt-choice-card is-${variant}`,
+      role: 'region',
+      'aria-label': L('终端交互式问题选择器', 'Interactive terminal question selector'),
+      'data-prompt-bar-sid': sid,
+    },
+    h('div', { class: 'prompt-action-head' },
+      h('div', { class: 'prompt-action-title-wrap' },
+        h('i', { class: `dot dot-${s.state === 'needs_permission' ? 'needs_permission' : 'needs_input'}`, 'aria-hidden': 'true' }),
+        h('strong', { class: 'prompt-action-title' }, headerTitle)),
+      h('div', { class: 'prompt-choice-badges' }, stepBadge, modeBadge)),
+    tabsEl,
+    h('div', { class: 'prompt-choice-q' }, parsed.title),
+    !canSend
+      ? h('div', { class: 'prompt-action-nopane' }, L('当前会话未绑定终端 pane，无法发送交互选择', 'No terminal pane attached — interactive selection unavailable'))
+      : null,
+    optionsListEl,
+    writeInPanelEl,
+    footerEl,
+    rawDetailsEl);
+  }
 
   const keySpecs = [
     {
@@ -156,20 +404,6 @@ export function renderInteractivePromptBar(s, opts = {}) {
       title: L('向终端发送 Esc 键取消或返回（Escape）', 'Send Escape key to cancel or go back'),
     },
   ];
-
-  const makeKeyBtn = (spec) => {
-    const isSelfBusy = UI.busy.has(`key:${sid}:${spec.key}`);
-    return h('button', {
-      type: 'button',
-      class: `btn ${spec.cls}${isSelfBusy ? ' is-busy' : ''}`,
-      'data-prompt-key': spec.key,
-      'data-prompt-sid': sid,
-      disabled: !canSend || sessionBusy,
-      title: canSend ? spec.title : L('该会话未绑定终端 pane，无法发送交互按键', 'No terminal pane attached — cannot send interactive keys'),
-      'aria-label': spec.title,
-      onclick: () => sendSessionKeyApi(sid, spec.key),
-    }, spec.label);
-  };
 
   const previewEl = snippet
     ? h('pre', { class: 'prompt-action-preview', 'aria-label': L('终端交互菜单预览', 'Interactive terminal menu preview') }, snippet)
@@ -402,7 +636,7 @@ function inboxCard(it) {
         h('div', { class: 'row' }, btn(L('打开代码评审页', 'Open Reviews'), { cls: 'sm', onclick: () => APP.go('reviews', it.rid) })))
       : skeleton(3);
   } else if (s) {
-    const isInteractive = isInteractivePromptSession(s);
+    const isInteractive = interactivePromptStateFor(s).show;
     body = [
       isInteractive ? renderInteractivePromptBar(s, { variant: 'inbox', autoFetchPreview: true }) : null,
       !isInteractive && s.last_error ? h('div', { class: 'callout err' }, span(null, s.last_error)) : null,

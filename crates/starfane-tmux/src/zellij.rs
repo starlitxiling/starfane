@@ -581,6 +581,7 @@ fn map_interactive_key_for_zellij(key: &str) -> Result<&'static str, TmuxError> 
         "Right" => Ok("Right"),
         "Tab" => Ok("Tab"),
         "Space" => Ok("Space"),
+        "Backspace" => Ok("Backspace"),
         "C-c" => Ok("Ctrl c"),
         "y" => Ok("y"),
         "n" => Ok("n"),
@@ -588,6 +589,11 @@ fn map_interactive_key_for_zellij(key: &str) -> Result<&'static str, TmuxError> 
         "2" => Ok("2"),
         "3" => Ok("3"),
         "4" => Ok("4"),
+        "5" => Ok("5"),
+        "6" => Ok("6"),
+        "7" => Ok("7"),
+        "8" => Ok("8"),
+        "9" => Ok("9"),
         _ => Err(TmuxError::InvalidRequest(format!(
             "unsupported interactive key {key:?}"
         ))),
@@ -1362,6 +1368,12 @@ mod tests {
         assert_eq!(
             calls[4],
             vec!["-s", "work", "action", "send-keys", "-p", "terminal_9", "1"]
+        );
+        assert_eq!(map_interactive_key_for_zellij("5").unwrap(), "5");
+        assert_eq!(map_interactive_key_for_zellij("9").unwrap(), "9");
+        assert_eq!(
+            map_interactive_key_for_zellij("Backspace").unwrap(),
+            "Backspace"
         );
     }
 

@@ -832,18 +832,60 @@ impl Core {
     }
 
     /// Send an explicit human-clicked allowlisted interactive key (e.g. `Enter`, `Up`, `Down`,
-    /// `Escape`, `1`, `y`, `n`, `C-c`) to a live local or federated remote session pane.
-    ///
-    /// Serializes with text injection via the per-`(Core, Host, Pane)` lock and triggers a
-    /// rapid post-key discovery/dirty-pane refresh (~120ms settle) so resolved approval/input
-    /// prompts clear the pending attention queue promptly.
+    /// `Escape`, `1`..`9`, `Backspace`, `Space`, `Tab`, `y`, `n`, `C-c`) to a live local or
+    /// federated remote session pane.
     pub async fn send_session_key(
         &self,
         session_id: &SessionId,
         key: &str,
     ) -> Result<serde_json::Value, ApiError> {
-        starfane_tmux::validate_interactive_key(key)
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        self.send_session_keys(session_id, &[key.to_string()], None, false)
+            .await
+    }
+
+    /// Send an ordered sequence of allowlisted interactive keys (e.g. `["Down", "Down", "Space"]`)
+    /// and/or bracketed-paste Write-in text (optionally followed by `Enter`) to a live local or
+    /// federated remote session pane under one per-`(Core, Host, Pane)` lock.
+    ///
+    /// Evicts `tail_cache` on local panes and triggers a rapid post-key discovery/dirty-pane
+    /// refresh (~120ms settle) so in-place checkbox toggles and resolved prompts reflect at once.
+    pub async fn send_session_keys(
+        &self,
+        session_id: &SessionId,
+        keys: &[String],
+        text: Option<&str>,
+        submit_text: bool,
+    ) -> Result<serde_json::Value, ApiError> {
+        const MAX_INTERACTIVE_KEY_BATCH: usize = 16;
+        const MAX_WRITEIN_TEXT_CHARS: usize = 2000;
+
+        if keys.len() > MAX_INTERACTIVE_KEY_BATCH {
+            return Err(ApiError::bad_request(format!(
+                "too many interactive keys in batch ({}); max is {MAX_INTERACTIVE_KEY_BATCH}",
+                keys.len()
+            )));
+        }
+        for k in keys {
+            starfane_tmux::validate_interactive_key(k)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        }
+        let clean_text_buf = text.map(|raw| raw.replace('\r', ""));
+        let clean_text = clean_text_buf.as_deref().filter(|t| !t.is_empty());
+        if keys.is_empty() && clean_text.is_none() {
+            return Err(ApiError::bad_request(
+                "interactive key request requires at least one key or non-empty text",
+            ));
+        }
+        if let Some(t) = clean_text {
+            starfane_tmux::validate_interactive_text(t)
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            let chars = t.chars().count();
+            if chars > MAX_WRITEIN_TEXT_CHARS {
+                return Err(ApiError::bad_request(format!(
+                    "interactive Write-in text is {chars} chars; max is {MAX_WRITEIN_TEXT_CHARS}"
+                )));
+            }
+        }
 
         let (pane, host_id) = {
             let st = lock(&self.inner.state);
@@ -887,19 +929,43 @@ impl Core {
                 .strip_prefix(&format!("{}:", host_id.as_str()))
                 .map(SessionId::new)
                 .unwrap_or_else(|| session_id.clone());
-            provider.send_key(&remote_sid, &local_pane, key).await?;
+            provider
+                .send_keys_and_text(&remote_sid, &local_pane, keys, clean_text, submit_text)
+                .await?;
             Some(local_pane)
         } else {
             let core = self.clone();
             let pane_for_mux = pane.clone();
-            let key_owned = key.to_string();
-            tokio::task::spawn_blocking(move || core.inner.mux.send_key(&pane_for_mux, &key_owned))
-                .await
-                .map_err(|e| ApiError::internal(e.to_string()))?
-                .map_err(|e| match e {
-                    starfane_tmux::TmuxError::InvalidRequest(m) => ApiError::bad_request(m),
-                    other => ApiError::new(ErrorCode::Unavailable, format!("send key: {other}")),
-                })?;
+            let keys_owned = keys.to_vec();
+            let text_owned = clean_text.map(str::to_string);
+            tokio::task::spawn_blocking(move || -> Result<(), starfane_tmux::TmuxError> {
+                for (idx, k) in keys_owned.iter().enumerate() {
+                    core.inner.mux.send_key(&pane_for_mux, k)?;
+                    if idx + 1 < keys_owned.len() {
+                        std::thread::sleep(Duration::from_millis(35));
+                    }
+                }
+                if let Some(ref t) = text_owned {
+                    if !keys_owned.is_empty() {
+                        std::thread::sleep(Duration::from_millis(90));
+                    }
+                    core.inner.mux.paste_interactive_text(&pane_for_mux, t)?;
+                    if submit_text {
+                        std::thread::sleep(Duration::from_millis(120));
+                        core.inner.mux.submit_enter(&pane_for_mux)?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .map_err(|e| match e {
+                starfane_tmux::TmuxError::InvalidRequest(m) => ApiError::bad_request(m),
+                other => ApiError::new(ErrorCode::Unavailable, format!("send key: {other}")),
+            })?;
+            // Invalidate local tail cache unconditionally because in-place checkbox toggles
+            // (`Space` flipping `[ ]` <-> `[x]`) often leave `(history_size, cursor_x, cursor_y)` unchanged.
+            lock(&self.inner.discovery_cache).invalidate_tail_cache(&pane);
             None
         };
         drop(pane_guard);
@@ -911,7 +977,10 @@ impl Core {
                 "session_id": session_id,
                 "pane": pane,
                 "host_id": host_id,
-                "key": key,
+                "key": keys.first(),
+                "keys": keys,
+                "text_len": clean_text.map(|t| t.chars().count()).unwrap_or(0),
+                "submit_text": clean_text.is_some() && submit_text,
             }),
         );
 
@@ -935,7 +1004,9 @@ impl Core {
 
         Ok(serde_json::json!({
             "session_id": session_id,
-            "key": key,
+            "key": keys.first(),
+            "keys": keys,
+            "text_sent": clean_text.is_some(),
             "sent": true,
         }))
     }

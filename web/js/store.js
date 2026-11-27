@@ -194,6 +194,7 @@ export const UI = {
   loadingEarlierPane: null,
   drawerPvLines: 1000,
   termGlyphMode: loadGlyphMode(),
+  promptWriteIn: new Map(),
   slash: { open: false, start: 0, end: 0, query: '', items: [], idx: 0 },
   collapsedGroups: loadCollapsedGroups(),
   collapsedHosts: loadCollapsedHosts(),

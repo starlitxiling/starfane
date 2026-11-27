@@ -87,6 +87,10 @@ const MAX_TRANSCRIPT_BIRTH_CACHE: usize = 1024;
 const MIN_FINAL_EMPTY_BIRTH_FILE_LEN: u64 = 4096;
 
 impl DiscoveryScanCache {
+    pub(crate) fn invalidate_tail_cache(&mut self, pane: &PaneId) {
+        self.tail_cache.remove(pane);
+    }
+
     pub(crate) fn evict_pane(&mut self, pane: &PaneId) {
         self.panes_sig.clear();
         self.cached_discovered.retain(|d| &d.pane_id != pane);
@@ -122,8 +126,8 @@ impl DiscoveryScanCache {
 /// Number of unchanged 3-second polling ticks (~9s) before a `Working` legacy pane is
 /// considered `Idle` (heuristic `TurnComplete`).
 const LEGACY_STABLE_TICKS: u32 = 3;
-/// Number of tail lines hashed for legacy pane activity detection.
-const LEGACY_HASH_LINES: usize = 20;
+/// Number of tail lines hashed and analyzed for TUI prompts (trust, update, multi-choice questions).
+const LEGACY_HASH_LINES: usize = 36;
 /// Grace window for newly spawned interactive panes before discovery prunes them if
 /// the agent CLI is still launching in the pane.
 const LEGACY_SPAWN_GRACE_MS: u64 = 15_000;
@@ -757,9 +761,98 @@ pub(crate) fn reconcile_discovered_panes_with_restarts(
     }
 }
 
+enum HeuristicPromptMatch {
+    Permission {
+        reason: &'static str,
+        native_event: &'static str,
+    },
+    Input {
+        reason: &'static str,
+        native_event: &'static str,
+    },
+}
+
+fn classify_heuristic_prompt(agent: AgentKind, tail: &str) -> Option<HeuristicPromptMatch> {
+    if let Some(reason) = starfane_tmux::detect_folder_trust_prompt(agent, tail) {
+        return Some(HeuristicPromptMatch::Permission {
+            reason,
+            native_event: "tmux_trust_prompt_heuristic",
+        });
+    }
+    if let Some(reason) = starfane_tmux::detect_codex_update_prompt(agent, tail) {
+        return Some(HeuristicPromptMatch::Input {
+            reason,
+            native_event: "tmux_startup_modal_heuristic",
+        });
+    }
+    if let Some(reason) = starfane_tmux::detect_interactive_question_prompt(agent, tail) {
+        return Some(HeuristicPromptMatch::Input {
+            reason,
+            native_event: "tmux_question_prompt_heuristic",
+        });
+    }
+    None
+}
+
+fn apply_prompt_match_to_record(
+    rec: &mut SessionRecord,
+    matched: HeuristicPromptMatch,
+    now_ms: u64,
+) -> Option<(SessionRecord, Option<NormalizedEvent>)> {
+    let (target_state, ev_kind, reason, native_event) = match matched {
+        HeuristicPromptMatch::Permission {
+            reason,
+            native_event,
+        } => (
+            SessionState::NeedsPermission,
+            EventKind::NeedsPermission,
+            reason,
+            native_event,
+        ),
+        HeuristicPromptMatch::Input {
+            reason,
+            native_event,
+        } => (
+            SessionState::NeedsInput,
+            EventKind::NeedsInput,
+            reason,
+            native_event,
+        ),
+    };
+    if rec.state != target_state || rec.last_error.as_deref() != Some(reason) {
+        rec.state = target_state;
+        rec.last_error = Some(reason.to_string());
+        rec.state_since_ms = now_ms;
+        rec.last_event_ms = now_ms;
+        let ev = NormalizedEvent {
+            v: PROTO_VERSION,
+            id: EventId::new(id::new_id(id::prefix::EVENT)),
+            ts_ms: now_ms,
+            agent: rec.agent,
+            kind: ev_kind,
+            confidence: Confidence::Heuristic,
+            session_id: rec.session_id.clone(),
+            subagent_id: None,
+            pane: rec.pane.clone(),
+            cwd: rec.cwd.clone(),
+            model: rec.model.clone(),
+            native_event: native_event.into(),
+            transcript_path: None,
+            bind_token: None,
+            detail: EventDetail {
+                error: Some(reason.to_string()),
+                ..EventDetail::default()
+            },
+        };
+        Some((rec.clone(), Some(ev)))
+    } else {
+        None
+    }
+}
+
 /// Pure state transition for a legacy pane's tail-hash poll.
-/// Returns `Some((session, heuristic_event))` when state changed (including folder-trust
-/// approval prompts mapped to `SessionState::NeedsPermission` and heuristic `TurnComplete`).
+/// Returns `Some((session, heuristic_event))` when state changed (including folder-trust,
+/// Codex update, or multi-choice question prompts and heuristic `TurnComplete`).
 pub(crate) fn apply_legacy_tail_hash(
     st: &mut State,
     sid: &SessionId,
@@ -773,7 +866,7 @@ pub(crate) fn apply_legacy_tail_hash(
         return None;
     }
 
-    if let Some(reason) = starfane_tmux::detect_folder_trust_prompt(rec.agent, tail) {
+    if let Some(matched) = classify_heuristic_prompt(rec.agent, tail) {
         st.pane_watch.insert(
             pane.clone(),
             PaneWatch {
@@ -781,72 +874,7 @@ pub(crate) fn apply_legacy_tail_hash(
                 stable_ticks: 0,
             },
         );
-        if rec.state != SessionState::NeedsPermission || rec.last_error.as_deref() != Some(reason) {
-            rec.state = SessionState::NeedsPermission;
-            rec.last_error = Some(reason.to_string());
-            rec.state_since_ms = now_ms;
-            rec.last_event_ms = now_ms;
-            let ev = NormalizedEvent {
-                v: PROTO_VERSION,
-                id: EventId::new(id::new_id(id::prefix::EVENT)),
-                ts_ms: now_ms,
-                agent: rec.agent,
-                kind: EventKind::NeedsPermission,
-                confidence: Confidence::Heuristic,
-                session_id: rec.session_id.clone(),
-                subagent_id: None,
-                pane: rec.pane.clone(),
-                cwd: rec.cwd.clone(),
-                model: rec.model.clone(),
-                native_event: "tmux_trust_prompt_heuristic".into(),
-                transcript_path: None,
-                bind_token: None,
-                detail: EventDetail {
-                    error: Some(reason.to_string()),
-                    ..EventDetail::default()
-                },
-            };
-            return Some((rec.clone(), Some(ev)));
-        }
-        return None;
-    }
-
-    if let Some(reason) = starfane_tmux::detect_codex_update_prompt(rec.agent, tail) {
-        st.pane_watch.insert(
-            pane.clone(),
-            PaneWatch {
-                last_hash: h,
-                stable_ticks: 0,
-            },
-        );
-        if rec.state != SessionState::NeedsInput || rec.last_error.as_deref() != Some(reason) {
-            rec.state = SessionState::NeedsInput;
-            rec.last_error = Some(reason.to_string());
-            rec.state_since_ms = now_ms;
-            rec.last_event_ms = now_ms;
-            let ev = NormalizedEvent {
-                v: PROTO_VERSION,
-                id: EventId::new(id::new_id(id::prefix::EVENT)),
-                ts_ms: now_ms,
-                agent: rec.agent,
-                kind: EventKind::NeedsInput,
-                confidence: Confidence::Heuristic,
-                session_id: rec.session_id.clone(),
-                subagent_id: None,
-                pane: rec.pane.clone(),
-                cwd: rec.cwd.clone(),
-                model: rec.model.clone(),
-                native_event: "tmux_startup_modal_heuristic".into(),
-                transcript_path: None,
-                bind_token: None,
-                detail: EventDetail {
-                    error: Some(reason.to_string()),
-                    ..EventDetail::default()
-                },
-            };
-            return Some((rec.clone(), Some(ev)));
-        }
-        return None;
+        return apply_prompt_match_to_record(rec, matched, now_ms);
     }
 
     match st.pane_watch.get_mut(pane) {
@@ -1342,12 +1370,66 @@ fn sync_transcript_and_output_delta_with_label(
     (metrics, model, effort, delta)
 }
 
+/// Detect interactive TUI prompts (multi-choice questions, trust/MCP dialogs, Codex update modals)
+/// on hook-backed (`!discovered_only`) panes whose agents pause silently inside interactive choosers,
+/// and cleanly clear ONLY those heuristic states once the prompt disappears from the pane.
+pub(crate) fn apply_hooked_pane_interactive_prompt(
+    st: &mut State,
+    sid: &SessionId,
+    tail: &str,
+    now_ms: u64,
+) -> Option<(SessionRecord, Option<NormalizedEvent>)> {
+    let rec = st.sessions.get_mut(sid)?;
+    if rec.discovered_only
+        || rec.is_subagent
+        || rec.agent.is_shell()
+        || matches!(rec.state, SessionState::Ended | SessionState::Suspended)
+    {
+        return None;
+    }
+
+    if let Some(matched) = classify_heuristic_prompt(rec.agent, tail) {
+        return apply_prompt_match_to_record(rec, matched, now_ms);
+    }
+
+    if starfane_tmux::is_heuristic_interactive_prompt_reason(rec.last_error.as_deref()) {
+        rec.last_error = None;
+        if matches!(
+            rec.state,
+            SessionState::NeedsPermission | SessionState::NeedsInput
+        ) {
+            rec.state = SessionState::Idle;
+            rec.state_since_ms = now_ms;
+            rec.last_event_ms = now_ms;
+        }
+        return Some((rec.clone(), None));
+    }
+
+    None
+}
+
 fn check_live_tail_changed(core: &Core, sid: &SessionId, tail: &str) -> bool {
     let h = hash_tail(tail);
     let prev = lock(&core.inner.discovery_cache)
         .last_output_tail_hash
         .insert(sid.clone(), h);
     prev.is_some_and(|old| old != h)
+}
+
+fn check_live_tail_changed_or_initial_prompt(
+    core: &Core,
+    sid: &SessionId,
+    agent: AgentKind,
+    tail: &str,
+) -> bool {
+    let h = hash_tail(tail);
+    let prev = lock(&core.inner.discovery_cache)
+        .last_output_tail_hash
+        .insert(sid.clone(), h);
+    match prev {
+        Some(old) => old != h,
+        None => starfane_tmux::detect_blocking_startup_prompt(agent, tail).is_some(),
+    }
 }
 
 impl Core {
@@ -1797,6 +1879,45 @@ impl Core {
                                 } else {
                                     None
                                 }
+                            })
+                        };
+                        if let Some(hit_tail) = cached_tail {
+                            tails.insert(t.pane.clone(), hit_tail);
+                        } else {
+                            batch_capture_targets.push((t.pane.clone(), LEGACY_HASH_LINES));
+                            target_meta.insert(
+                                t.pane.clone(),
+                                (
+                                    t.history_size,
+                                    t.cursor_x,
+                                    t.cursor_y,
+                                    t.pane_in_mode,
+                                    t.current_command.clone(),
+                                ),
+                            );
+                        }
+                    } else if !t.pane_in_mode && !t.is_legacy && !t.agent.is_shell() {
+                        // Zero-CPU interactive prompt monitoring for hook-backed panes:
+                        // capture tmux tails ONLY on cache miss or fingerprint change (or explicit
+                        // invalidation after key send / hook turn transition) — NO periodic expiry!
+                        let is_zellij = t.pane.as_str().starts_with("zj:");
+                        let cached_tail = if is_zellij {
+                            dc.tail_cache.get_mut(&t.pane).and_then(|c| {
+                                if c.ticks_cached < 6 {
+                                    c.ticks_cached = c.ticks_cached.saturating_add(1);
+                                    Some(c.tail.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            dc.tail_cache.get(&t.pane).and_then(|c| {
+                                (c.history_size == t.history_size
+                                    && c.cursor_x == t.cursor_x
+                                    && c.cursor_y == t.cursor_y
+                                    && c.in_mode == t.pane_in_mode
+                                    && c.current_command == t.current_command)
+                                    .then(|| c.tail.clone())
                             })
                         };
                         if let Some(hit_tail) = cached_tail {
@@ -2299,6 +2420,28 @@ impl Core {
                 }
             }
 
+            let hooked_pane_sids: Vec<(SessionId, PaneId)> = st
+                .sessions
+                .values()
+                .filter(|s| {
+                    !s.discovered_only
+                        && !s.is_subagent
+                        && s.is_local_host()
+                        && !s.agent.is_shell()
+                        && !matches!(s.state, SessionState::Ended | SessionState::Suspended)
+                })
+                .filter_map(|s| s.pane.clone().map(|p| (s.session_id.clone(), p)))
+                .collect();
+            for (sid, pane) in hooked_pane_sids {
+                if let Some(tail) = tails.get(&pane) {
+                    if let Some(tr) =
+                        apply_hooked_pane_interactive_prompt(&mut st, &sid, tail, poll_now)
+                    {
+                        transitions.push(tr);
+                    }
+                }
+            }
+
             let agy_roots: Vec<AgyRootRef> = st
                 .sessions
                 .values()
@@ -2486,7 +2629,10 @@ impl Core {
                     let st_metrics =
                         pane_tail.and_then(|t| parse_status_line_metrics(item.agent, t, poll_now));
                     let live_tail = pane_tail.and_then(|t| {
-                        check_live_tail_changed(&core_tel, &item.sid, t).then(|| t.clone())
+                        check_live_tail_changed_or_initial_prompt(
+                            &core_tel, &item.sid, item.agent, t,
+                        )
+                        .then(|| t.clone())
                     });
                     let combined = merge_metrics(tr_metrics, st_metrics);
                     computed.push(ComputedRootMetrics {
@@ -5750,5 +5896,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hooked_pane_question_prompt_transitions_to_needs_input_and_clears_cleanly() {
+        let mut st = State::default();
+        let pane = PaneId::new("%62");
+        let agy_sid = SessionId::new("hook-agy-62");
+        st.sessions.insert(
+            agy_sid.clone(),
+            SessionRecord {
+                session_id: agy_sid.clone(),
+                agent: AgentKind::Agy,
+                pane: Some(pane.clone()),
+                pane_resolution: PaneResolution::Env,
+                cwd: Some("/repo".into()),
+                git_root: None,
+                model: Some("gemini-pro-orchestrator-neon".into()),
+                effort: Some("high".into()),
+                state: SessionState::Idle,
+                state_since_ms: 1_000,
+                last_event_id: None,
+                last_event_ms: 1_000,
+                last_message: None,
+                last_error: None,
+                parent_session_id: None,
+                is_subagent: false,
+                subagent_count: 0,
+                active_subagents: 0,
+                stage: None,
+                unread_inbox: 0,
+                confidence: Confidence::Exact,
+                tmux_target: Some("learning:0.0".into()),
+                tmux_label: Some("learning-nikon-apk".into()),
+                discovered_only: false,
+                transcript_path: None,
+                metrics: None,
+                host_id: None,
+                host_display_name: None,
+                mux_kind: Some("tmux".into()),
+                resume_id: None,
+                suspended_at_ms: None,
+            },
+        );
+
+        let agy_q = "\
+Question
+────────────────────────────────────────
+Question 1/4: 希望支持哪些传输方式？
+> 1. [ ] (Recommended) Wi-Fi (PTP/IP) + USB-C 有线
+  2. [ ] 仅 Wi-Fi 无线传输
+  5. Write-in...
+  ↑/↓ Navigate · → Next · space Toggle · enter Submit · esc Skip
+esc to cancel
+";
+        let (rec, ev_opt) =
+            apply_hooked_pane_interactive_prompt(&mut st, &agy_sid, agy_q, 5_000).unwrap();
+        assert_eq!(rec.state, SessionState::NeedsInput);
+        assert_eq!(
+            rec.last_error.as_deref(),
+            Some("interactive question awaiting selection in AGY")
+        );
+        assert_eq!(ev_opt.unwrap().kind, EventKind::NeedsInput);
+
+        // Repeat scan on unchanged screen stays idempotent (no duplicate event).
+        assert!(apply_hooked_pane_interactive_prompt(&mut st, &agy_sid, agy_q, 8_000).is_none());
+
+        // Returning to normal chat clears ONLY the heuristic state back to Idle.
+        let cleared = apply_hooked_pane_interactive_prompt(
+            &mut st,
+            &agy_sid,
+            "All options saved.\n> \nesc to interrupt\n",
+            11_000,
+        )
+        .unwrap();
+        assert_eq!(cleared.0.state, SessionState::Idle);
+        assert_eq!(cleared.0.last_error, None);
+        assert!(cleared.1.is_none());
+
+        // Non-heuristic hook permission state must NEVER be cleared by tail heuristic recovery.
+        let hook_rec = st.sessions.get_mut(&agy_sid).unwrap();
+        hook_rec.state = SessionState::NeedsPermission;
+        hook_rec.last_error = Some("hook tool approval requested".into());
+        assert!(
+            apply_hooked_pane_interactive_prompt(&mut st, &agy_sid, "All done.\n", 14_000)
+                .is_none()
+        );
+        assert_eq!(st.sessions[&agy_sid].state, SessionState::NeedsPermission);
+        assert_eq!(
+            st.sessions[&agy_sid].last_error.as_deref(),
+            Some("hook tool approval requested")
+        );
     }
 }

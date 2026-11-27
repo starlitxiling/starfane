@@ -756,9 +756,20 @@ async fn close_session(State(core): State<Core>, Path(id): Path<String>) -> Resp
     respond(core.close_session_window(&SessionId(id)).await)
 }
 
+fn default_send_key_submit_text() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 struct SendKeyBody {
-    key: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    keys: Vec<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default = "default_send_key_submit_text")]
+    submit_text: bool,
 }
 
 async fn send_session_key(
@@ -768,7 +779,20 @@ async fn send_session_key(
 ) -> Response {
     let r = async {
         let b: SendKeyBody = parse_body(&body)?;
-        core.send_session_key(&SessionId(id), &b.key).await
+        let effective_keys = if !b.keys.is_empty() {
+            b.keys
+        } else if let Some(k) = b.key {
+            vec![k]
+        } else {
+            Vec::new()
+        };
+        core.send_session_keys(
+            &SessionId(id),
+            &effective_keys,
+            b.text.as_deref(),
+            b.submit_text,
+        )
+        .await
     };
     respond(r.await)
 }

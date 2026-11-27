@@ -302,10 +302,309 @@ pub fn detect_codex_update_prompt(agent: AgentKind, text: &str) -> Option<&'stat
     hit.then_some("codex waiting on update prompt")
 }
 
-/// Detect any interactive blocking startup modal (folder-trust confirmation across Codex/Claude/AGY,
-/// or Codex's `Update available` startup chooser) where text injection must be blocked.
+/// Strip ANSI CSI and OSC escape sequences cleanly for plain-text TUI pattern matching.
+fn strip_ansi_escapes(text: &str) -> String {
+    if !text.contains('\x1b') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                let _ = chars.next();
+                for nc in chars.by_ref() {
+                    if ('@'..='~').contains(&nc) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                let _ = chars.next();
+                while let Some(nc) = chars.next() {
+                    if nc == '\x07' {
+                        break;
+                    }
+                    if nc == '\x1b' && chars.peek() == Some(&'\\') {
+                        let _ = chars.next();
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                let _ = chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// True when the bottom-most lines of a screen capture show an active agent chat composer bar
+/// (`? for shortcuts`, `esc to interrupt`, `ctrl+c to interrupt`, `ask codex to do anything`).
+/// Unlike [`has_bottom_active_chat_chrome`], this intentionally does NOT treat `context left`
+/// or `shift+tab` alone as chat composer chrome because Codex keeps `context left` visible
+/// beneath `request_user_input` prompts.
+fn has_bottom_chat_composer_chrome(bottom: &[&str]) -> bool {
+    bottom.iter().any(|l| {
+        let ll = l.to_ascii_lowercase();
+        ll.contains("? for shortcuts")
+            || ll.contains("esc to interrupt")
+            || ll.contains("ctrl+c to interrupt")
+            || ll.contains("ask codex to do anything")
+    })
+}
+
+/// True when `line` matches a selector navigation/submit footer line of AGY `ask_question`,
+/// Claude Code `AskUserQuestion`, or Codex CLI `request_user_input`.
+fn is_interactive_question_footer(line: &str) -> bool {
+    let fl = line.to_ascii_lowercase();
+    let has_nav_and_action = fl.contains("navigate")
+        && [
+            "submit", "select", "toggle", "skip", "cancel", "confirm", "next", "prev", "continue",
+            "switch", "back",
+        ]
+        .iter()
+        .any(|kw| fl.contains(kw));
+    let has_submit_and_modifier = [
+        "enter to submit",
+        "enter to select",
+        "enter to confirm",
+        "enter to continue",
+        "enter submit",
+        "enter confirm",
+        "enter continue",
+    ]
+    .iter()
+    .any(|kw| fl.contains(kw))
+        && [
+            "tab",
+            "esc",
+            "cancel",
+            "skip",
+            "back",
+            "notes",
+            "unanswered",
+            "navigate",
+            "select",
+            "toggle",
+            "next",
+            "prev",
+            "↑",
+            "↓",
+            "up/down",
+        ]
+        .iter()
+        .any(|kw| fl.contains(kw));
+    let has_toggle = (fl.contains("space to toggle") || fl.contains("space toggle"))
+        && [
+            "enter", "esc", "navigate", "↑", "↓", "cancel", "submit", "confirm", "skip",
+        ]
+        .iter()
+        .any(|kw| fl.contains(kw));
+    let has_writein_footer = (fl.contains("enter to submit") || fl.contains("enter submit"))
+        && (fl.contains("esc back")
+            || fl.contains("esc to cancel")
+            || fl.contains("esc cancel")
+            || fl.contains("esc to go back"));
+    let has_codex_notes = fl.contains("tab or esc to add notes")
+        || fl.contains("enter to submit answer")
+        || (fl.contains("unanswered") && fl.contains("enter") && fl.contains("submit"));
+    has_nav_and_action
+        || has_submit_and_modifier
+        || has_toggle
+        || has_writein_footer
+        || has_codex_notes
+}
+
+/// Parse a numbered TUI chooser row (`[>❯›▸▶]? [1-9]. [checkbox]? <text>`), returning
+/// `(option_number, has_cursor_marker, has_checkbox_marker)`.
+fn parse_question_option_line(line: &str) -> Option<(u8, bool, bool)> {
+    let mut s = line.trim_start();
+    let mut has_cursor = false;
+    if let Some(first) = s.chars().next() {
+        if matches!(first, '>' | '❯' | '›' | '▸' | '▶') {
+            has_cursor = true;
+            s = s[first.len_utf8()..].trim_start();
+        }
+    }
+    let mut chars = s.chars();
+    let digit = chars.next()?;
+    if !('1'..='9').contains(&digit) || chars.next() != Some('.') {
+        return None;
+    }
+    let after_dot = chars.as_str();
+    if !after_dot.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = after_dot.trim_start();
+    let has_checkbox = rest.starts_with("[ ]")
+        || rest.starts_with("[x]")
+        || rest.starts_with("[X]")
+        || rest.starts_with("[✓]")
+        || rest.starts_with("[✔]")
+        || rest.starts_with('☐')
+        || rest.starts_with('☑');
+    Some((digit as u8 - b'0', has_cursor, has_checkbox))
+}
+
+fn line_is_question_header_or_tabs(line: &str) -> bool {
+    let t = line.trim();
+    let tl = t.to_ascii_lowercase();
+    let is_q = tl == "question"
+        || tl.starts_with("question:")
+        || tl.starts_with("question ")
+        || (t.starts_with("问题") && (t.contains('/') || t.contains('：') || t.contains(':')));
+    let is_tabs = (t.contains('☐') || t.contains('☑'))
+        && (t.contains('✔') || t.contains('✓') || t.matches('☐').count() >= 2);
+    is_q || is_tabs
+}
+
+/// Detect whether terminal screen text displays an interactive multi-choice / single-choice /
+/// Write-in question widget from AGY (`ask_question`), Claude Code (`AskUserQuestion`), or
+/// Codex CLI (`request_user_input`).
+///
+/// Walks bottom-up from an active selector footer in the bottom 4 non-empty lines to isolate ONLY
+/// the bottom-most chooser dialog so numbered lists earlier in scrollback never bleed in.
+pub fn detect_interactive_question_prompt(agent: AgentKind, text: &str) -> Option<&'static str> {
+    if agent == AgentKind::Shell || text.trim().is_empty() {
+        return None;
+    }
+    if detect_folder_trust_prompt(agent, text).is_some()
+        || detect_codex_update_prompt(agent, text).is_some()
+    {
+        return None;
+    }
+    let clean = strip_ansi_escapes(text);
+    let non_empty: Vec<&str> = clean
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if non_empty.len() < 3 {
+        return None;
+    }
+    let window = &non_empty[non_empty.len().saturating_sub(32)..];
+    let bottom_start = window.len().saturating_sub(4);
+    let bottom4 = &window[bottom_start..];
+    if has_bottom_chat_composer_chrome(bottom4) {
+        return None;
+    }
+    let footer_rel = bottom4
+        .iter()
+        .rposition(|l| is_interactive_question_footer(l))?;
+    let footer_idx = bottom_start + footer_rel;
+    let raw_body = &window[..footer_idx];
+    if raw_body.is_empty() {
+        return None;
+    }
+
+    let mut dialog_start = 0usize;
+    let mut seen_opt_one = false;
+    for i in (0..raw_body.len()).rev() {
+        let l = raw_body[i];
+        if is_tui_divider_line(l) {
+            dialog_start = i + 1;
+            break;
+        }
+        if let Some((num, _, _)) = parse_question_option_line(l) {
+            if seen_opt_one {
+                dialog_start = i + 1;
+                break;
+            }
+            if num == 1 {
+                seen_opt_one = true;
+            }
+            continue;
+        }
+        if seen_opt_one && (l.starts_with("? ") || l.starts_with("● ") || l.starts_with("▸ ")) {
+            dialog_start = i + 1;
+            break;
+        }
+        if line_is_question_header_or_tabs(l) && !l.eq_ignore_ascii_case("question") {
+            dialog_start = i;
+            break;
+        }
+    }
+    let body = &raw_body[dialog_start..];
+    if body.is_empty() {
+        return None;
+    }
+
+    let mut option_count = 0usize;
+    let mut has_cursor_or_checkbox = false;
+    for line in body {
+        if let Some((_, cur, chk)) = parse_question_option_line(line) {
+            option_count += 1;
+            if cur || chk {
+                has_cursor_or_checkbox = true;
+            }
+        }
+    }
+
+    let fl = window[footer_idx].to_ascii_lowercase();
+    let has_header = body.iter().any(|l| line_is_question_header_or_tabs(l));
+    let footer_allows_writein =
+        (fl.contains("submit") || fl.contains("confirm") || fl.contains("select"))
+            && (fl.contains("esc")
+                || fl.contains("back")
+                || fl.contains("cancel")
+                || fl.contains("notes"));
+    let has_writein_cue = body.iter().any(|l| {
+        let lt = l.trim_start();
+        let ll = lt.to_ascii_lowercase();
+        lt.starts_with('>')
+            || lt.starts_with('❯')
+            || lt.starts_with('›')
+            || ll.contains("write-in")
+            || ll.contains("type something")
+            || ll.starts_with("notes:")
+            || ll.starts_with("your answer")
+    });
+    let active_writein = has_header && footer_allows_writein && has_writein_cue;
+
+    if (option_count >= 2 && has_cursor_or_checkbox) || active_writein {
+        Some(match agent {
+            AgentKind::Agy => "interactive question awaiting selection in AGY",
+            AgentKind::Claude => "interactive question awaiting selection in Claude",
+            AgentKind::Codex => "interactive question awaiting selection in Codex",
+            AgentKind::Shell => unreachable!(),
+        })
+    } else {
+        None
+    }
+}
+
+/// True when `reason` matches any of the static heuristic interactive/startup prompt strings
+/// produced by [`detect_folder_trust_prompt`], [`detect_codex_update_prompt`], or
+/// [`detect_interactive_question_prompt`].
+pub fn is_heuristic_interactive_prompt_reason(reason: Option<&str>) -> bool {
+    matches!(
+        reason.map(str::trim),
+        Some(
+            "codex waiting for folder trust approval"
+                | "claude waiting for folder trust approval"
+                | "claude waiting for mcp server approval"
+                | "agy waiting for folder trust approval"
+                | "codex waiting on update prompt"
+                | "interactive question awaiting selection in AGY"
+                | "interactive question awaiting selection in Claude"
+                | "interactive question awaiting selection in Codex"
+                | "interactive question awaiting selection"
+        )
+    )
+}
+
+/// Detect any interactive blocking prompt (folder-trust confirmation, Codex `Update available`,
+/// or active question chooser across Claude/Codex/AGY) where L2 text injection must be blocked.
 pub fn detect_blocking_startup_prompt(agent: AgentKind, text: &str) -> Option<&'static str> {
-    detect_folder_trust_prompt(agent, text).or_else(|| detect_codex_update_prompt(agent, text))
+    detect_folder_trust_prompt(agent, text)
+        .or_else(|| detect_codex_update_prompt(agent, text))
+        .or_else(|| detect_interactive_question_prompt(agent, text))
 }
 
 /// Strip an idle prompt prefix from the cursor line and report whether the remaining input

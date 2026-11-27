@@ -134,15 +134,21 @@ pub fn validate_interactive_key(key: &str) -> Result<&'static str, TmuxError> {
         "Right" => Ok("Right"),
         "Tab" => Ok("Tab"),
         "Space" => Ok("Space"),
+        "Backspace" => Ok("BSpace"),
         "y" => Ok("y"),
         "n" => Ok("n"),
         "1" => Ok("1"),
         "2" => Ok("2"),
         "3" => Ok("3"),
         "4" => Ok("4"),
+        "5" => Ok("5"),
+        "6" => Ok("6"),
+        "7" => Ok("7"),
+        "8" => Ok("8"),
+        "9" => Ok("9"),
         "C-c" => Ok("C-c"),
         _ => Err(TmuxError::InvalidRequest(format!(
-            "unsupported interactive key {key:?}; allowed: Enter, Escape, Up, Down, Left, Right, Tab, Space, y, n, 1, 2, 3, 4, C-c"
+            "unsupported interactive key {key:?}; allowed: Enter, Escape, Up, Down, Left, Right, Tab, Space, Backspace, y, n, 1..9, C-c"
         ))),
     }
 }
@@ -251,12 +257,12 @@ mod tests {
         assert_eq!(validate_interactive_key("Right").unwrap(), "Right");
         assert_eq!(validate_interactive_key("Tab").unwrap(), "Tab");
         assert_eq!(validate_interactive_key("Space").unwrap(), "Space");
+        assert_eq!(validate_interactive_key("Backspace").unwrap(), "BSpace");
         assert_eq!(validate_interactive_key("y").unwrap(), "y");
         assert_eq!(validate_interactive_key("n").unwrap(), "n");
-        assert_eq!(validate_interactive_key("1").unwrap(), "1");
-        assert_eq!(validate_interactive_key("2").unwrap(), "2");
-        assert_eq!(validate_interactive_key("3").unwrap(), "3");
-        assert_eq!(validate_interactive_key("4").unwrap(), "4");
+        for d in ["1", "2", "3", "4", "5", "6", "7", "8", "9"] {
+            assert_eq!(validate_interactive_key(d).unwrap(), d);
+        }
         assert_eq!(validate_interactive_key("C-c").unwrap(), "C-c");
 
         for bad in [
@@ -268,7 +274,8 @@ mod tests {
             "C-d",
             "Enter; rm -rf /",
             "y\n",
-            "5",
+            "0",
+            "10",
             "Y",
             "foo",
             "$(whoami)",

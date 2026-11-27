@@ -40,7 +40,8 @@ pub use exec::{
 pub use gate::{
     adaptive_paste_settle_ms, check_injection_gate, check_injection_gate_with_screen,
     check_interactive_gate, detect_blocking_startup_prompt, detect_codex_update_prompt,
-    detect_folder_trust_prompt, is_bare_slash_command, is_paste_stuck_in_prompt, is_user_watching,
+    detect_folder_trust_prompt, detect_interactive_question_prompt, is_bare_slash_command,
+    is_heuristic_interactive_prompt_reason, is_paste_stuck_in_prompt, is_user_watching,
     validate_interactive_text, validate_pointer_text, GateConfig,
 };
 pub use model::{

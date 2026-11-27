@@ -88,6 +88,22 @@ impl Core {
             let mut st = lock(&self.inner.state);
             apply_event(&mut st, &ev, git_root, pane, resolution)
         };
+        if matches!(
+            ev.kind,
+            EventKind::SessionStart
+                | EventKind::TurnComplete
+                | EventKind::NeedsInput
+                | EventKind::NeedsPermission
+                | EventKind::Interrupted
+        ) {
+            for s in &applied.updated {
+                if s.is_local_host() {
+                    if let Some(ref p) = s.pane {
+                        lock(&self.inner.discovery_cache).invalidate_tail_cache(p);
+                    }
+                }
+            }
+        }
         self.mark_dirty();
 
         self.publish(|seq| DaemonEvent::Event {

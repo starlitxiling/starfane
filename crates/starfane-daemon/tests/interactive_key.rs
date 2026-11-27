@@ -153,6 +153,18 @@ try:
             log("KEY:Tab")
         elif b == b" ":
             log("KEY:Space")
+        elif b == b"\x7f":
+            log("KEY:BSpace")
+        elif b[0] >= 0x80:
+            first = b[0]
+            need = 1 if (first & 0xE0) == 0xC0 else (2 if (first & 0xF0) == 0xE0 else 3)
+            buf = bytearray(b)
+            for _ in range(need):
+                r, _, _ = select.select([fd], [], [], 0.1)
+                if not r:
+                    break
+                buf.extend(os.read(fd, 1))
+            log("KEY:" + bytes(buf).decode("utf-8", "replace"))
         else:
             log("KEY:" + b.decode("utf-8", "replace"))
 finally:
@@ -382,7 +394,7 @@ async fn validation_auth_and_session_guards_reject_invalid_requests() {
     assert_eq!(body_ro["ok"], false);
     assert_eq!(body_ro["error"]["code"], "forbidden");
 
-    // 3. Shell injection & non-allowlisted keys -> 400 BadRequest.
+    // 3. Shell injection & non-allowlisted keys/batches/text -> 400 BadRequest.
     for bad_key in [
         "Enter; rm -rf /",
         "foo",
@@ -391,7 +403,8 @@ async fn validation_auth_and_session_guards_reject_invalid_requests() {
         "C-m",
         "y\n",
         "$(id)",
-        "5",
+        "0",
+        "10",
     ] {
         let (st_bad, body_bad) = post_json(
             addr,
@@ -405,6 +418,23 @@ async fn validation_auth_and_session_guards_reject_invalid_requests() {
             "expected 400 for bad key {bad_key:?}, got {st_bad}: {body_bad}"
         );
         assert_eq!(body_bad["ok"], false);
+        assert_eq!(body_bad["error"]["code"], "bad_request");
+    }
+    for bad_payload in [
+        json!({}),
+        json!({"keys": []}),
+        json!({"keys": [], "text": "   "}),
+        json!({"keys": ["Down", "BadKey"]}),
+        json!({"keys": vec!["Down"; 17]}),
+        json!({"keys": ["Enter"], "text": "bad\x1b[201~escape"}),
+        json!({"keys": ["Enter"], "text": "字".repeat(2001)}),
+    ] {
+        let (st_bad, body_bad) =
+            post_json(addr, "/api/sessions/s-live/key", Some(tok), &bad_payload).await;
+        assert_eq!(
+            st_bad, 400,
+            "expected 400 for payload {bad_payload}, got {st_bad}: {body_bad}"
+        );
         assert_eq!(body_bad["error"]["code"], "bad_request");
     }
 
@@ -596,7 +626,7 @@ async fn local_sandbox_tmux_delivers_menu_keys_cancels_copy_mode_and_selects_opt
     .await;
     assert!(log.contains("KEY:Down"));
 
-    // 3. Also verify literal single-char (`"1"`) and `"Escape"` delivery.
+    // 3. Also verify literal single-char (`"1"`, `"5"`), `"Backspace"`, and `"Escape"` delivery.
     let (st_one, _) = post_json(
         addr,
         "/api/sessions/s-menu-local/key",
@@ -606,6 +636,45 @@ async fn local_sandbox_tmux_delivers_menu_keys_cancels_copy_mode_and_selects_opt
     .await;
     assert_eq!(st_one, 200);
     wait_for_log_contains(&log_path, "KEY:1", Duration::from_secs(3)).await;
+
+    let (st_five, _) = post_json(
+        addr,
+        "/api/sessions/s-menu-local/key",
+        Some(tok),
+        &json!({"key": "5"}),
+    )
+    .await;
+    assert_eq!(st_five, 200);
+    wait_for_log_contains(&log_path, "KEY:5", Duration::from_secs(3)).await;
+
+    let (st_bs, _) = post_json(
+        addr,
+        "/api/sessions/s-menu-local/key",
+        Some(tok),
+        &json!({"key": "Backspace"}),
+    )
+    .await;
+    assert_eq!(st_bs, 200);
+    wait_for_log_contains(&log_path, "KEY:BSpace", Duration::from_secs(3)).await;
+
+    // 4. Verify atomic batch `keys` + bracketed-paste UTF-8 Write-in `text` + submit `Enter`.
+    let (st_batch, body_batch) = post_json(
+        addr,
+        "/api/sessions/s-menu-local/key",
+        Some(tok),
+        &json!({
+            "keys": ["Up", "Space", "Enter"],
+            "text": "优先 Wi-Fi + USB",
+            "submit_text": true,
+        }),
+    )
+    .await;
+    assert_eq!(st_batch, 200, "{body_batch}");
+    assert_eq!(body_batch["data"]["sent"], true);
+    assert_eq!(body_batch["data"]["text_sent"], true);
+    assert_eq!(body_batch["data"]["keys"], json!(["Up", "Space", "Enter"]));
+    let log_after_batch = wait_for_log_contains(&log_path, "KEY:优", Duration::from_secs(3)).await;
+    assert!(log_after_batch.contains("KEY:Space"), "{log_after_batch}");
 
     let (st_esc, _) = post_json(
         addr,
@@ -1019,6 +1088,20 @@ async fn peer_daemon_node_provider_proxies_send_key_over_http() {
         Duration::from_secs(3),
     )
     .await;
+
+    // Batch keys + Write-in text proxy through PeerDaemonNodeProvider cleanly.
+    let res_batch = hub_core
+        .send_session_keys(
+            &fed_sid,
+            &["Down".into(), "Space".into()],
+            Some("自定义选项"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res_batch["sent"], true);
+    assert_eq!(res_batch["text_sent"], true);
+    wait_for_log_contains(&log_path, "KEY:定", Duration::from_secs(3)).await;
 
     // Invalid key rejected locally before proxying to peer.
     let err = hub_core
