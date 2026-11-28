@@ -69,6 +69,7 @@ import {
 let renderTimer = 0;
 let renderPassive = false;
 let dirtyWhileHidden = false;
+let dirtyWhileComposing = false;
 let composing = false;
 let lastTopSig = '';
 let lastDrawerMounted = false;
@@ -140,11 +141,13 @@ function renderView() {
 }
 
 function rerender() {
-  if (composing) return;
+  if (composing) { dirtyWhileComposing = true; return; }
   dirtyWhileHidden = false;
+  dirtyWhileComposing = false;
   const a = document.activeElement;
   const fk = a && a.dataset ? a.dataset.draft : null;
   const sel = fk && a.selectionStart != null ? [a.selectionStart, a.selectionEnd] : null;
+  const taScroll = fk ? [a.scrollTop, a.scrollLeft] : null;
   const viewEl = $('#view');
   const persistentWsMounted = UI.view === 'workspace' && S.loaded && UI.wsShell?.grid?.parentNode === viewEl;
   const termBox = persistentWsMounted ? null : $('.term-viewport');
@@ -183,7 +186,7 @@ function rerender() {
   }
   if (modalEl?.open && modalTop) {
     const nextModalScroll = modalEl.querySelector('.modal-body') || modalEl;
-    nextModalScroll.scrollTop = modalTop;
+    if (nextModalScroll !== modalScrollEl) nextModalScroll.scrollTop = modalTop;
   }
   const nextTitle = `${alerts ? `(${alerts}) ` : ''}${L('starfane · 控制面', 'starfane · Control Plane')}`;
   if (document.title !== nextTitle) document.title = nextTitle;
@@ -200,6 +203,10 @@ function rerender() {
     if (n && n !== document.activeElement) {
       n.focus({ preventScroll: true });
       if (sel) { try { n.setSelectionRange(sel[0], sel[1]); } catch { /* ignore */ } }
+    }
+    if (n && taScroll && (n !== a || n.scrollTop !== taScroll[0] || n.scrollLeft !== taScroll[1])) {
+      n.scrollTop = taScroll[0];
+      n.scrollLeft = taScroll[1];
     }
   }
 }
@@ -291,11 +298,18 @@ Object.assign(APP, {
   renderAttachBar,
   closeSlashMenu,
   ackSessionError,
+  ensureOverlayFieldVisible: ensureFocusedOverlayFieldVisible,
 });
 
 // Global listeners.
 document.addEventListener('compositionstart', () => { composing = true; });
-document.addEventListener('compositionend', () => { composing = false; schedule(); });
+document.addEventListener('compositionend', () => {
+  composing = false;
+  if (dirtyWhileComposing) {
+    dirtyWhileComposing = false;
+    schedule();
+  }
+});
 document.addEventListener('toggle', (e) => {
   const d = e.target;
   if (d instanceof HTMLDetailsElement && d.dataset.k) {
@@ -330,21 +344,76 @@ modalEl.addEventListener('close', () => { if (!S.authNeeded) UI.modal = null; })
 modalEl.addEventListener('cancel', (e) => { if (S.authNeeded) e.preventDefault(); });
 modalEl.addEventListener('click', (e) => { if (e.target.id === 'modal' && !S.authNeeded) closeModal(); });
 
+function ensureFocusedOverlayFieldVisible(el) {
+  if (!el || !el.isConnected) return;
+  if (!/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;
+  const body = el.closest('.modal-body, .drawer-body');
+  if (!body) return;
+  if (typeof el._autoGrow === 'function') {
+    el._autoGrow();
+  }
+  const bodyRect = body.getBoundingClientRect();
+  const elRect = el.getBoundingClientRect();
+  if (bodyRect.height <= 0) return;
+  const pad = 12;
+  if (elRect.bottom > bodyRect.bottom - pad) {
+    const delta = elRect.bottom - (bodyRect.bottom - pad);
+    body.scrollTop = Math.min(Math.max(0, body.scrollHeight - body.clientHeight), Math.max(0, body.scrollTop + delta));
+  } else if (elRect.top < bodyRect.top + pad) {
+    const delta = (bodyRect.top + pad) - elRect.top;
+    body.scrollTop = Math.max(0, body.scrollTop - delta);
+  }
+}
+
+for (const host of [modalEl, $('#drawer-root')].filter(Boolean)) {
+  host.addEventListener('focusin', (e) => {
+    const t = e.target;
+    if (!t || window.innerWidth > 960 || !/^(INPUT|TEXTAREA)$/.test(t.tagName)) return;
+    requestAnimationFrame(() => ensureFocusedOverlayFieldVisible(t));
+    setTimeout(() => {
+      if (document.activeElement === t) ensureFocusedOverlayFieldVisible(t);
+    }, 280);
+  });
+}
+
 let vvRaf = 0;
+let maxNarrowInnerH = window.innerHeight;
+let lastNarrowW = window.innerWidth;
+let lastVvHeight = 0;
+let lastKbInset = 0;
+
 function syncMobileViewport() {
   const narrow = window.innerWidth <= 960;
   const vv = window.visualViewport;
   if (!narrow || !vv) {
     document.documentElement.style.removeProperty('--app-h');
+    document.documentElement.style.removeProperty('--kb-inset');
     document.documentElement.classList.remove('kb-open');
+    lastVvHeight = 0;
+    lastKbInset = 0;
     return;
   }
-  const hPx = Math.max(240, Math.round(vv.height));
+  if (Math.abs(window.innerWidth - lastNarrowW) > 40) {
+    maxNarrowInnerH = window.innerHeight;
+  } else {
+    maxNarrowInnerH = Math.max(maxNarrowInnerH, window.innerHeight);
+  }
+  lastNarrowW = window.innerWidth;
+  const hPx = Math.max(220, Math.round(vv.height));
+  const kbInset = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
   document.documentElement.style.setProperty('--app-h', `${hPx}px`);
-  const kbOpen = window.innerHeight - vv.height > 120;
+  document.documentElement.style.setProperty('--kb-inset', `${kbInset}px`);
+  const kbOpen = kbInset > 100 || (maxNarrowInnerH - vv.height > 120);
   const wasKbOpen = document.documentElement.classList.contains('kb-open');
+  const dimsChanged = hPx !== lastVvHeight || kbInset !== lastKbInset;
+  lastVvHeight = hPx;
+  lastKbInset = kbInset;
   document.documentElement.classList.toggle('kb-open', kbOpen);
-  if (kbOpen && !wasKbOpen) {
+  if (kbOpen && (!wasKbOpen || dimsChanged)) {
+    const actEl = document.activeElement;
+    if (actEl && (modalEl?.open && modalEl.contains(actEl) || $('#drawer-root')?.contains(actEl))) {
+      requestAnimationFrame(() => ensureFocusedOverlayFieldVisible(actEl));
+    }
     const vp = UI.wsShell?.vp || $('.term-viewport');
     if (vp && vp.scrollHeight - vp.scrollTop - vp.clientHeight < 96) {
       requestAnimationFrame(() => {

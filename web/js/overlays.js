@@ -1,6 +1,6 @@
 // starfane web console — Right Inspection Drawer & Modals (Spawn, Pipeline, Auth, Rename Host, Close Window)
 import { AGENTS, NON_TMUX_GROUP, PLAYBOOK_STAGES, SEVERITIES, TOKEN_KEY, effortLabel } from './constants.js';
-import { L, localeTag } from './i18n.js';
+import { L, getLang, localeTag } from './i18n.js';
 import {
   $,
   agentTag,
@@ -222,6 +222,9 @@ export function closeModal() {
   UI.suspendFreshSessionId = null;
   UI.spawnMissingDir = null;
   UI.spawnErr = '';
+  lastModalKey = null;
+  lastModalCoreSig = '';
+  lastModalListSig = '';
   APP.schedule();
 }
 
@@ -692,20 +695,121 @@ function drawerPaste(sid, att) {
     h('pre', { class: 'code-block', style: 'max-height:none' }, att.content));
 }
 
+let lastModalKey = null;
+let lastModalCoreSig = '';
+let lastModalListSig = '';
+
+function attachModalAutoGrow(ta) {
+  if (!ta) return ta;
+  ta.classList.add('modal-autogrow-ta');
+  const grow = () => {
+    if (!ta.isConnected) return;
+    const isMob = window.innerWidth <= 768;
+    const kbOpen = document.documentElement.classList.contains('kb-open');
+    const vvH = window.visualViewport?.height || window.innerHeight || 800;
+    const minH = isMob ? 76 : 80;
+    const maxH = kbOpen
+      ? Math.min(136, Math.max(84, Math.floor(vvH * 0.28)))
+      : (isMob ? 180 : 240);
+    const atEnd = ta.selectionStart != null && ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length;
+    if (ta.offsetHeight >= maxH - 1 && ta.scrollHeight > maxH + 2) {
+      ta.style.height = `${maxH}px`;
+      if (atEnd) ta.scrollTop = ta.scrollHeight;
+      return;
+    }
+    const prevTop = ta.scrollTop;
+    ta.style.height = 'auto';
+    const nextH = Math.min(maxH, Math.max(minH, ta.scrollHeight));
+    ta.style.height = `${nextH}px`;
+    if (atEnd && ta.scrollHeight > ta.clientHeight) {
+      ta.scrollTop = ta.scrollHeight;
+    } else if (prevTop > 0) {
+      ta.scrollTop = prevTop;
+    }
+  };
+  ta._autoGrow = grow;
+  ta.addEventListener('input', () => {
+    grow();
+    APP.ensureOverlayFieldVisible?.(ta);
+  });
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(grow);
+  return ta;
+}
+
 export function renderModal() {
   const d = $('#modal');
   const want = S.authNeeded ? 'auth' : UI.modal;
-  if (!want) { if (d.open) d.close(); return; }
-  if (!d.open) d.showModal();
-  if (want === 'auth') d.replaceChildren(authModalBody());
-  else if (want === 'spawn') d.replaceChildren(spawnModalBody());
-  else if (want === 'rename-host') d.replaceChildren(renameHostModalBody());
-  else if (want === 'close-session') d.replaceChildren(closeSessionModalBody());
-  else if (want === 'suspend-fresh') d.replaceChildren(suspendFreshModalBody());
-  else if (want === 'usage') {
+  if (!want) {
+    lastModalKey = null;
+    lastModalCoreSig = '';
+    lastModalListSig = '';
+    if (d.open) d.close();
+    return;
+  }
+  const wasOpen = Boolean(d.open);
+  if (!wasOpen) {
+    lastModalKey = null;
+    lastModalCoreSig = '';
+    lastModalListSig = '';
+    d.showModal();
+  }
+  if (want === 'auth') {
+    const sig = `auth|${getLang()}`;
+    if (wasOpen && lastModalKey === 'auth' && lastModalCoreSig === sig) return;
+    lastModalKey = 'auth';
+    lastModalCoreSig = sig;
+    lastModalListSig = '';
+    d.replaceChildren(authModalBody());
+  } else if (want === 'spawn') {
+    const ctx = buildSpawnModalContext();
+    const { coreSig, listSig, projects, sessionCandidates } = computeSpawnModalSigs(ctx);
+    if (wasOpen && lastModalKey === 'spawn' && lastModalCoreSig === coreSig) {
+      if (lastModalListSig !== listSig) {
+        lastModalListSig = listSig;
+        const projDl = d.querySelector('#sp-projects');
+        if (projDl) projDl.replaceChildren(...projects.map((p) => h('option', { value: p })));
+        const sessDl = d.querySelector('#sp-sessions');
+        if (sessDl) sessDl.replaceChildren(...sessionCandidates.map((s) => h('option', { value: s })));
+      }
+      return;
+    }
+    lastModalKey = 'spawn';
+    lastModalCoreSig = coreSig;
+    lastModalListSig = listSig;
+    d.replaceChildren(spawnModalBody(ctx));
+  } else if (want === 'rename-host') {
+    const hid = UI.renameHostId || 'local';
+    const sig = `rename-host|${getLang()}|${hid}|${hostDisplayName(hid)}|${UI.busy.has(`rename-host:${hid}`) ? 1 : 0}`;
+    if (wasOpen && lastModalKey === 'rename-host' && lastModalCoreSig === sig) return;
+    lastModalKey = 'rename-host';
+    lastModalCoreSig = sig;
+    lastModalListSig = '';
+    d.replaceChildren(renameHostModalBody());
+  } else if (want === 'close-session') {
+    lastModalKey = 'close-session';
+    lastModalCoreSig = '';
+    lastModalListSig = '';
+    d.replaceChildren(closeSessionModalBody());
+  } else if (want === 'suspend-fresh') {
+    lastModalKey = 'suspend-fresh';
+    lastModalCoreSig = '';
+    lastModalListSig = '';
+    d.replaceChildren(suspendFreshModalBody());
+  } else if (want === 'usage') {
+    lastModalKey = 'usage';
+    lastModalCoreSig = '';
+    lastModalListSig = '';
     if (S.usageState === 'idle') loadUsage(S.usageDays);
     d.replaceChildren(usageModalBody());
-  } else d.replaceChildren(pipelineModalBody(want));
+  } else {
+    const pv = UI.parsePreviews[`modal:${want}`];
+    const sig = `${want}|${getLang()}|${UI.autoConfirm ? 1 : 0}|${UI.busy.has(`mcreate:${want}`) ? 1 : 0}|${JSON.stringify(pv?.data?.resolved || null)}`;
+    if (wasOpen && lastModalKey === want && lastModalCoreSig === sig) return;
+    lastModalKey = want;
+    lastModalCoreSig = sig;
+    lastModalListSig = '';
+    d.replaceChildren(pipelineModalBody(want));
+  }
 }
 
 function usageKpiCard(title, totals) {
@@ -1104,7 +1208,7 @@ function renameHostModalBody() {
       btn(L('保存名称', 'Save Name'), { cls: 'primary', busyKey: `rename-host:${hostId}`, onclick: submit })));
 }
 
-function spawnModalBody() {
+function buildSpawnModalContext() {
   const hasMultiHosts = S.hosts.size > 1;
   const fallbackHost = hasMultiHosts && S.hosts.has(hostOf(currentSession())) ? hostOf(currentSession()) : 'local';
   const rawHost = draft('sp:host', fallbackHost);
@@ -1117,7 +1221,6 @@ function spawnModalBody() {
   const projects = knownProjects(targetHost);
   const prefs = loadSpawnPrefs();
   const agent = draft('sp:agent', prefs.last_agent || 'claude');
-  const curDir = '';
   const mInfo = modelsForAgent(agent);
   const selKey = `sp:modelSel:${agent}`;
   const effKey = `sp:effort:${agent}`;
@@ -1130,10 +1233,6 @@ function spawnModalBody() {
     curEff = effs.includes(mInfo.default_effort) ? mInfo.default_effort : effs[0];
     UI.drafts.set(effKey, curEff);
   }
-  const modelOpts = [...mInfo.models.map((m) => [m.id, m.label]), ['__custom__', L('自定义模型…', 'Custom model…')]];
-  const effortOpts = fixedEffort ? [['', L('固定配置', 'Fixed')]] : effs.map((e) => [e, effortLabel(e)]);
-  const dlId = 'sp-projects';
-  const sessDlId = 'sp-sessions';
   const cachedHostSessions = S.tmuxSessionsByHost.get(targetHost)
     || (!isRemote ? S.tmuxSessions : null);
   const activeSessionGroups = (cachedHostSessions && cachedHostSessions.length)
@@ -1144,6 +1243,80 @@ function spawnModalBody() {
       .filter((g) => g && g !== NON_TMUX_GROUP && g !== 'tmux');
   const sessionCandidates = [...new Set(['agent-session', ...activeSessionGroups])];
   const loadingSessions = isTmuxSessionsLoading(targetHost);
+  return {
+    hasMultiHosts,
+    targetHost,
+    isRemote,
+    targetHostRec,
+    targetHostStatus,
+    targetOffline,
+    targetDegraded,
+    projects,
+    agent,
+    mInfo,
+    selKey,
+    effKey,
+    curSel,
+    effs,
+    fixedEffort,
+    curEff,
+    sessionCandidates,
+    loadingSessions,
+  };
+}
+
+function computeSpawnModalSigs(ctx) {
+  const hostMetaSig = ctx.hasMultiHosts
+    ? sortedHosts().map((hr) => `${hr.id}:${hostDisplayName(hr.id)}:${hr.status || 'online'}:${hr.error || ''}`).join('|')
+    : 'single';
+  const missingSig = UI.spawnMissingDir ? `${UI.spawnMissingDir.hostId}:${UI.spawnMissingDir.path}` : '';
+  const coreSig = [
+    getLang(),
+    ctx.targetHost,
+    ctx.agent,
+    ctx.curSel,
+    ctx.fixedEffort ? 'fixed' : ctx.curEff,
+    UI.drafts.get('sp:createDir') === '1' ? 1 : 0,
+    ctx.loadingSessions ? 1 : 0,
+    UI.busy.has('spawn-sess') ? 1 : 0,
+    UI.busy.has(`probe-host:${ctx.targetHost}`) ? 1 : 0,
+    S.models ? 1 : 0,
+    missingSig,
+    UI.spawnErr || '',
+    hostMetaSig,
+  ].join('\n');
+  const listSig = `${ctx.projects.join('\u0001')}\u0002${ctx.sessionCandidates.join('\u0001')}`;
+  return {
+    coreSig,
+    listSig,
+    projects: ctx.projects,
+    sessionCandidates: ctx.sessionCandidates,
+  };
+}
+
+function spawnModalBody(ctx = buildSpawnModalContext()) {
+  const {
+    hasMultiHosts,
+    targetHost,
+    targetHostRec,
+    targetOffline,
+    targetDegraded,
+    projects,
+    agent,
+    mInfo,
+    selKey,
+    effKey,
+    curSel,
+    fixedEffort,
+    curEff,
+    sessionCandidates,
+    loadingSessions,
+  } = ctx;
+  const curDir = '';
+  const modelOpts = [...mInfo.models.map((m) => [m.id, m.label]), ['__custom__', L('自定义模型…', 'Custom model…')]];
+  const effortOpts = fixedEffort ? [['', L('固定配置', 'Fixed')]] : ctx.effs.map((e) => [e, effortLabel(e)]);
+  const dlId = 'sp-projects';
+  const sessDlId = 'sp-sessions';
   const persistCurrent = (ag, mSel, eSel) => {
     const modelVal = mSel === '__custom__' ? draft('sp:modelCustom').trim() : String(mSel || '').trim();
     saveSpawnPrefs(ag, { model: modelVal || undefined, effort: eSel || '' });
@@ -1389,7 +1562,7 @@ function spawnModalBody() {
         h('div', null, h('label', { class: 'lbl' }, L('tmux 窗口名（Window，选填）', 'tmux Window (optional)')),
           field('sp:name', { class: 'inp mono', placeholder: L(`留空顺延命名（如 ${agent}-1）`, `Auto-numbered if blank (e.g. ${agent}-1)`), autocomplete: 'off' }))),
       h('div', null, h('label', { class: 'lbl' }, L('首条消息（选填）', 'Initial prompt (optional)')),
-        field('sp:prompt', { tag: 'textarea', rows: 2, class: 'inp', placeholder: L('留空则仅打开干净的交互式会话…', 'Leave blank to open a fresh interactive session…') }))),
+        attachModalAutoGrow(field('sp:prompt', { tag: 'textarea', rows: 3, class: 'inp modal-autogrow-ta', placeholder: L('留空则仅打开干净的交互式会话…', 'Leave blank to open a fresh interactive session…') })))),
     h('div', { class: 'modal-foot' },
       btn(L('取消', 'Cancel'), { cls: 'ghost', onclick: closeModal }),
       btn(L('新建交互会话', 'Create Session'), {
@@ -1435,7 +1608,7 @@ function pipelineModalBody(pb) {
     h('div', { class: 'modal-head' }, h('h3', null, isDebug ? L('发起两速查错', 'New Two-Speed Debug') : L('发起新功能协作', 'New Feature Pipeline')), btn(L('关闭', 'Close'), { cls: 'ghost sm', onclick: closeModal })),
     h('div', { class: 'modal-body stack' },
       h('div', null, h('label', { class: 'lbl' }, isDebug ? L('故障现象 / 报错描述', 'Symptom / Error description') : L('需求目标', 'Feature Goal')),
-        field(goalKey, { tag: 'textarea', rows: 3, class: 'inp', placeholder: isDebug ? L('例如：POST /login 偶发 500', 'e.g. POST /login intermittently returns 500') : L('例如：给设置页增加导出 CSV 能力', 'e.g. Add CSV export to Settings page') })),
+        attachModalAutoGrow(field(goalKey, { tag: 'textarea', rows: 3, class: 'inp modal-autogrow-ta', placeholder: isDebug ? L('例如：POST /login 偶发 500', 'e.g. POST /login intermittently returns 500') : L('例如：给设置页增加导出 CSV 能力', 'e.g. Add CSV export to Settings page') }))),
       h('div', null, h('label', { class: 'lbl' }, L('模型绑定话术（选填，留空用默认配置）', 'Model routing instructions (optional, uses defaults if empty)')), bindInp),
       pv?.data ? h('div', { class: 'row' }, span('muted', L('解析预览：', 'Parsed bindings: ')), ...PLAYBOOK_STAGES[pb].map((k) => span('tag', `${stageName(k)}: ${shorthand(pv.data.resolved?.[k])}`))) : null,
       h('div', null, h('label', { class: 'lbl' }, L('项目目录（选填）', 'Project directory (optional)')), field(projKey, { class: 'inp mono', placeholder: L('留空自动使用当前会话目录', 'Defaults to current session cwd') }, curDir)),

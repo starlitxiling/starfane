@@ -1,5 +1,5 @@
 /* starfane web console */
- :root{--app-h:100vh;--bg:#FAF9F6;--bg-subtle:#F7F6F2;--bg-recessed:#F3F1EC;--surface:#FFFFFF;--surface-hover:#F9F8F5;--terminal-bg:#F5F3EE;--ink:#1E1D1B;--ink-2:#4A4742;--muted:#6B6862;--dim:#928E86;--border:rgba(24,24,27,0.08);--border-strong:rgba(24,24,27,0.14);--border-subtle:rgba(24,24,27,0.055);--shadow-card:0 1px 2px rgba(24,24,27,0.035),0 4px 12px rgba(24,24,27,0.025);--shadow-float:0 12px 32px rgba(24,24,27,0.09),0 2px 6px rgba(24,24,27,0.04);--shadow-seg:0 1px 2px rgba(24,24,27,0.06);--primary:#1E1D1B;--primary-hover:#33312D;--primary-ink:#FAF9F6;--blue:#2F5FD0;--blue-soft:rgba(47,95,208,0.09);--green:#237A4B;--green-soft:rgba(35,122,75,0.09);--amber:#A66810;--amber-soft:rgba(186,120,20,0.11);--red:#B43838;--red-soft:rgba(180,56,56,0.09);--plum:#6449A8;--plum-soft:rgba(100,73,168,0.09);--claude:#A9522E;--claude-soft:rgba(169,82,46,0.09);--codex:#22724A;--codex-soft:rgba(34,114,74,0.09);--agy:#3957B8;--agy-soft:rgba(57,87,184,0.09);--shell:#5E6270;--shell-soft:rgba(94,98,112,0.11);--font:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;--term-mono-base:"Symbols Nerd Font Mono","Symbols Nerd Font","MesloLGS NF","MesloLGS Nerd Font","MesloLGM NF","MesloLGL NF","JetBrainsMono Nerd Font Mono","JetBrainsMono Nerd Font","JetBrainsMonoNL Nerd Font","Hack Nerd Font Mono","Hack Nerd Font","FiraCode Nerd Font Mono","FiraCode Nerd Font","CaskaydiaCove Nerd Font Mono","CaskaydiaCove Nerd Font","CaskaydiaMono Nerd Font","Maple Mono NF CN","Maple Mono NF","Iosevka Nerd Font Mono","Iosevka Nerd Font","SauceCodePro Nerd Font Mono","SauceCodePro Nerd Font","Sarasa Term SC Nerd",ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono","Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",monospace;--term-mono:var(--term-mono-base);--r-sm:6px;--r-md:8px;--r-lg:12px;--r-pill:9999px;--ease:160ms ease;color-scheme:light}
+ :root{--app-h:100vh;--kb-inset:0px;--bg:#FAF9F6;--bg-subtle:#F7F6F2;--bg-recessed:#F3F1EC;--surface:#FFFFFF;--surface-hover:#F9F8F5;--terminal-bg:#F5F3EE;--ink:#1E1D1B;--ink-2:#4A4742;--muted:#6B6862;--dim:#928E86;--border:rgba(24,24,27,0.08);--border-strong:rgba(24,24,27,0.14);--border-subtle:rgba(24,24,27,0.055);--shadow-card:0 1px 2px rgba(24,24,27,0.035),0 4px 12px rgba(24,24,27,0.025);--shadow-float:0 12px 32px rgba(24,24,27,0.09),0 2px 6px rgba(24,24,27,0.04);--shadow-seg:0 1px 2px rgba(24,24,27,0.06);--primary:#1E1D1B;--primary-hover:#33312D;--primary-ink:#FAF9F6;--blue:#2F5FD0;--blue-soft:rgba(47,95,208,0.09);--green:#237A4B;--green-soft:rgba(35,122,75,0.09);--amber:#A66810;--amber-soft:rgba(186,120,20,0.11);--red:#B43838;--red-soft:rgba(180,56,56,0.09);--plum:#6449A8;--plum-soft:rgba(100,73,168,0.09);--claude:#A9522E;--claude-soft:rgba(169,82,46,0.09);--codex:#22724A;--codex-soft:rgba(34,114,74,0.09);--agy:#3957B8;--agy-soft:rgba(57,87,184,0.09);--shell:#5E6270;--shell-soft:rgba(94,98,112,0.11);--font:ui-sans-serif,-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",sans-serif;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;--term-mono-base:"Symbols Nerd Font Mono","Symbols Nerd Font","MesloLGS NF","MesloLGS Nerd Font","MesloLGM NF","MesloLGL NF","JetBrainsMono Nerd Font Mono","JetBrainsMono Nerd Font","JetBrainsMonoNL Nerd Font","Hack Nerd Font Mono","Hack Nerd Font","FiraCode Nerd Font Mono","FiraCode Nerd Font","CaskaydiaCove Nerd Font Mono","CaskaydiaCove Nerd Font","CaskaydiaMono Nerd Font","Maple Mono NF CN","Maple Mono NF","Iosevka Nerd Font Mono","Iosevka Nerd Font","SauceCodePro Nerd Font Mono","SauceCodePro Nerd Font","Sarasa Term SC Nerd",ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono","Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",monospace;--term-mono:var(--term-mono-base);--r-sm:6px;--r-md:8px;--r-lg:12px;--r-pill:9999px;--ease:160ms ease;color-scheme:light}
  *{box-sizing:border-box}
  html,body{height:100%}
  body{margin:0;font:14px/1.55 var(--font);color:var(--ink);background:var(--bg);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
@@ -141,6 +141,7 @@
  .inp:hover{border-color:rgba(24,24,27,0.22)}
  .inp:focus{outline:none;border-color:var(--ink-2);box-shadow:0 0 0 3px rgba(24,24,27,0.06)}
  textarea.inp{resize:vertical;min-height:76px;line-height:1.6}
+ .modal-autogrow-ta{resize:vertical;min-height:76px;max-height:240px;line-height:1.55;overflow-y:auto;overscroll-behavior:contain}
  select.inp{width:auto;min-width:96px;padding:7px 10px;background:var(--surface)}
  .inp.sm{padding:5px 10px;font-size:12.5px}
  .lbl{display:block;font-size:12.5px;font-weight:500;color:var(--ink-2);margin-bottom:6px}
@@ -926,14 +927,14 @@
   .attach-act{min-height:36px;padding:6px 9px;font-size:12px}
   .attach-tok{min-height:32px;padding:4px 8px}
   .sheet-handle{display:block;width:36px;height:4px;border-radius:9999px;background:rgba(24,24,27,0.18);margin:8px auto 2px;flex-shrink:0}
-  .drawer-panel{inset:auto 0 0 0;top:auto;left:0;right:0;bottom:0;width:100%;height:88dvh;max-height:88dvh;border-left:0;border-top:1px solid var(--border);border-radius:18px 18px 0 0;transform:translateY(100%)}
+  .drawer-panel{inset:auto 0 var(--kb-inset,0px) 0;top:auto;left:0;right:0;bottom:var(--kb-inset,0px);width:100%;height:min(88dvh,calc(var(--app-h,100dvh) - 10px));max-height:min(88dvh,calc(var(--app-h,100dvh) - 10px));border-left:0;border-top:1px solid var(--border);border-radius:18px 18px 0 0;transform:translateY(100%)}
   .drawer-root.open .drawer-panel{transform:translateY(0)}
   .drawer-head{padding:10px 16px 12px}
   .drawer-body{padding:14px 16px calc(24px + env(safe-area-inset-bottom,0px));-webkit-overflow-scrolling:touch}
   .kv-grid{grid-template-columns:1fr;gap:3px}
   .kv-k{font-size:12px;margin-top:6px}
   .kv-k:first-child{margin-top:0}
-  dialog.modal{position:fixed;inset:auto 0 0 0;width:100%;max-width:100%;max-height:90dvh;margin:0;padding:0;border:0;border-top:1px solid var(--border);border-radius:18px 18px 0 0;overflow:hidden}
+  dialog.modal{position:fixed;inset:auto 0 var(--kb-inset,0px) 0;width:100%;max-width:100%;max-height:min(90dvh,calc(var(--app-h,100dvh) - 10px));margin:0;padding:0;border:0;border-top:1px solid var(--border);border-radius:18px 18px 0 0;overflow:hidden}
   dialog.modal:has(.usage-modal){width:100%}
   .usage-modal .modal-head{flex-direction:column;align-items:stretch;gap:8px}
   .usage-head-acts{width:100%;justify-content:space-between}
@@ -941,10 +942,16 @@
   .usage-chart-cols{gap:2px;height:124px}
   .usage-tbl{min-width:600px}
   dialog.modal[open]{display:flex;flex-direction:column}
-  .modal-shell{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;max-height:90dvh;overflow:hidden}
+  .modal-shell{display:flex;flex-direction:column;flex:1 1 auto;min-height:0;max-height:min(90dvh,calc(var(--app-h,100dvh) - 10px));overflow:hidden}
   .modal-head{flex-shrink:0;padding:10px 16px 12px;margin:0;border-bottom:1px solid var(--border);background:var(--surface)}
   .modal-body{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:14px 16px;gap:14px}
   .modal-foot{flex-shrink:0;margin:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--border);background:var(--surface)}
+  .modal-autogrow-ta{resize:none;max-height:180px}
+  html.kb-open dialog.modal .sheet-handle{display:none}
+  html.kb-open dialog.modal .modal-head{padding:8px 14px}
+  html.kb-open dialog.modal .modal-body{padding:10px 14px 14px;gap:10px}
+  html.kb-open dialog.modal .modal-foot{padding:8px 14px}
+  html.kb-open .modal-autogrow-ta{max-height:136px}
   .view{padding:12px 12px calc(76px + env(safe-area-inset-bottom,0px))}
   .page-head{margin-bottom:14px;gap:10px}
   .page-head h1{font-size:19px}
